@@ -192,7 +192,7 @@ Adopt / adapt / reject decisions over the indexing-engine literature and practic
 | Source | Core idea | Verdict |
 |---|---|---|
 | **FoundationDB-style deterministic simulation (6.20)** | The whole system under a deterministic scheduler with fault injection | **Adopt via LabRuntime** (§15.5): ingest/merge/crash interleavings are seed-replayable. This is the house specialty; tantivy cannot do this. |
-| **Crash-only design (3.5)** | Recovery *is* the startup path | **Adopt**: opening an index = recovering it (§11.4). The manifest points only at sealed, checksummed artifacts; anything else is invisible garbage, GC'd on open. |
+| **Crash-only design (3.5)** | Recovery *is* the startup path | **Adopt**: opening an index = recovering its read-only snapshot (§11.4). The manifest points only at sealed, checksummed artifacts; anything else is invisible garbage retained by readers and GC'd only after writer admission. |
 | **Property-based + metamorphic testing (6.12; gauntlet skill)** | Semantics-preserving transforms must preserve results | **Adopt** as the core of the conformance gauntlet (§15.3). |
 | **E-graph / certified rewrites (6.6)** | Prove optimizations semantics-preserving | **Adapt the discipline, not the machinery**: every Argus pruning path carries a rank-safety argument and a differential fixture (pruned vs exhaustive) — §15.2. |
 
@@ -404,7 +404,7 @@ sections (each 64-byte aligned, order fixed by kind):
   STATS      per-field: total_tokens: u64, doc_count: u32 (avgdl inputs)
 file trailer: file_xxh3: u64, trailer_crc32: u32
 ```
-All integers are little-endian except the TERMDICT key's big-endian `field_ord` prefix, whose byte order preserves field-major lexical sort. All sections are independently checksummed (xxh3-64, verified lazily per-section on first touch + eagerly on `verify`); the durability `.fec` sidecar protects the whole file (its xxh3 fast-path matches the trailer hash).
+All integers are little-endian except the TERMDICT key's big-endian `field_ord` prefix, whose byte order preserves field-major lexical sort. All sections are independently checksummed (xxh3-64, verified lazily per-section on first touch + eagerly on `verify`); the durability `.fec` sidecar protects the whole file with a separate complete-source xxh3 witness. The trailer hash covers only the bytes before the trailer, so the encoder derives both hash domains in one traversal rather than equating them.
 
 ### 10.3 IDMAP/IDHASH dissolve the ord_table
 
@@ -436,7 +436,7 @@ Segments are ordered by ascending `docid_lo`; stats are ordered by ascending `fi
 
 ### 11.1 Write path choreography (asupersync)
 
-Ingest session = an asupersync region: shard workers (tasks) ← two-phase mpsc feeding batches; sealer task per shard; Keeper's manifest actor serializes publishes behind a cancel-aware `asupersync::sync::Mutex`. Cancellation drains: a cancelled session seals nothing, leaks nothing (arenas dropped, temp files GC'd on next open) — verified under LabRuntime with forced cancel points (§15.5). No detached threads; merges/compactions are region-scoped background tasks whose abandonment is always safe (outputs unreferenced until manifest publish).
+Ingest session = an asupersync region: shard workers (tasks) ← two-phase mpsc feeding batches; sealer task per shard; Keeper's manifest actor serializes publishes behind a cancel-aware `asupersync::sync::Mutex`. Cancellation drains: a cancelled session seals nothing and leaks no in-memory state (arenas dropped); any durable temp files remain inert until an admitted writer performs exact-name, grace-period GC — verified under LabRuntime with forced cancel points (§15.5). No detached threads; merges/compactions are region-scoped background tasks whose abandonment is always safe (outputs unreferenced until manifest publish).
 
 ### 11.2 Blocking discipline
 
@@ -444,11 +444,11 @@ Sealing (compress+write+fsync), merges, and compaction run under `spawn_blocking
 
 ### 11.3 Durability
 
-`commit(cx)`: seal current deltas → fsync segment files → write MANIFEST(gen+1) to temp → fsync → atomic rename over `MANIFEST` (keeping `MANIFEST.prev`) → fsync dir. Optional (`durable` feature): `FileProtector::protect` emits `.fec` for new segments + manifest post-publish. RaptorQ verify/repair-on-open comes free from the durability crate.
+`commit(cx)`: seal current deltas → fsync segment files → write MANIFEST(gen+1) to temp → fsync → atomic rename over `MANIFEST` (keeping `MANIFEST.prev`) → fsync dir. Optional (`durability` feature): `FileProtector` emits `.fec` for new segments and the temp MANIFEST, revalidates its complete-source witness against the exact immutable snapshot it encodes, rotates source/sidecar pairs together, and installs the new MANIFEST sidecar before the final directory fsync. Read-only `open` never mutates or repairs files; the dependent cross-process writer-recovery lane may verify and repair only after acquiring writer admission and matching each sidecar to the current complete-source witness.
 
-### 11.4 Crash-only open
+### 11.4 Crash-only recovery
 
-`open` = recover: read MANIFEST (fallback `MANIFEST.prev` on checksum failure), validate ranges (Q1-OB1) + section checksums lazily, GC unreferenced `seg-*.fslx`/`.tmp-*` files (with the durability crate's path-safety posture; **GC deletes only files matching Quill's own naming schema inside the index dir** — never user files), rebuild snapshot. Crash matrix (§15.5): kill-points at every arrow of §11.3, plus torn-manifest and partial-segment writes (fault-injected via LabRuntime VFS-style hooks + the pressure-harness conventions).
+Read-only `open` recovers a snapshot by reading MANIFEST (falling back to `MANIFEST.prev` on checksum failure), validating ranges (Q1-OB1), and checking section checksums lazily; it never repairs, renames, or removes files. After acquiring cross-process writer admission, `open_writer` recovery may repair only witness-matched sources and GC unreferenced `seg-*.fslx`/`.tmp-*` files with the durability crate's path-safety posture, exact Quill filename classifiers, and grace period. **GC deletes only files matching Quill's own naming schema inside the index dir** — never user files. Crash matrix (§15.5): kill-points at every arrow of §11.3, plus torn-manifest and partial-segment writes (fault-injected via LabRuntime VFS-style hooks + the pressure-harness conventions).
 
 ---
 
@@ -577,7 +577,7 @@ Created via `br` with dependencies (validated acyclic via `bv --robot-insights`)
 | **quill-e0 Contracts & Gauntlet Skeleton** | Language Contract + fixtures; FSLX registry; Q1 obligations doc; Divergence Register; gauntlet kernel (oracle wiring, comparators, EngineIdentity); perf manifests | G0 |
 | **quill-e1 Scribe** | engine-crate scaffolding (workspace membership, QuillConfig, errors, schema descriptors, tracing conventions); SIMD tokenizer (+3-way parity bench); CASS analyzer family; interner/arenas; columnar accumulator; radix flush; hash-vs-columnar A/B (ledgered); shard router + docid leases (R1 seal-at-lease-boundary) | G1 |
 | **quill-e2 Grimoire & Quiver** | prefix-block dict (field-namespaced keys); FOR/bitmap codecs + canonical scalar unpack and a retained SIMD differential candidate; block-max pairs; positions streams (u32); DOCLEN/IDMAP/IDHASH/NUMERIC/STOREDMETA/STATS sections | G1 |
-| **quill-e3 Keeper** | FSLX writer/reader; manifest + two-slot publish; crash-only open/GC; tombstones; concat-merge (Q1-OB2a/Q1-OB2b/Q1-OB3 fixtures); compaction (OB4); tiering; durability `.fec` integration | G1→G2 |
+| **quill-e3 Keeper** | FSLX writer/reader; manifest + two-slot publish; read-only crash recovery plus writer-admitted GC; tombstones; concat-merge (Q1-OB2a/Q1-OB2b/Q1-OB3 fixtures); compaction (OB4); tiering; durability `.fec` integration | G1→G2 |
 | **quill-e4 Argus** | parsers (default lenient + CASS grammar); planner; exhaustive kernel; MaxScore/BMW (+rank-safety differentials); phrase/range/glob; collectors; snippets; segment-parallel fan-out | G1→G2 |
 | **quill-e5 Delta** | per-shard delta segment; epoch publish; seal path; mixed-state conformance | G1→G2 |
 | **quill-e6 Gauntlet at scale** | corpus/query generators; metamorphic suites; ported behavioral tests; LabRuntime determinism + crash matrices; statistical gates; fusion e2e quality | G2 |

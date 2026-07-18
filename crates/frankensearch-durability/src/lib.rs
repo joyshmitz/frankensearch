@@ -22,6 +22,7 @@ pub mod file_protector;
 pub mod fsvi_protector;
 pub mod metrics;
 pub mod repair_trailer;
+#[cfg(feature = "tantivy")]
 pub mod tantivy_wrapper;
 
 pub use codec::{
@@ -32,8 +33,8 @@ pub use codec::{
 pub use config::DurabilityConfig;
 pub use file_protector::{
     DirectoryHealthReport, DirectoryProtectionReport, DurabilityProvider, FileHealth,
-    FileProtectionResult, FileProtector, FileRepairOutcome, FileVerifyResult, HealthCheckResult,
-    NoopDurability, RepairPipelineConfig,
+    FileProtectionResult, FileProtector, FileRepairOutcome, FileSourceWitness, FileVerifyResult,
+    HealthCheckResult, NoopDurability, RepairPipelineConfig,
 };
 pub use fsvi_protector::{FsviProtectionResult, FsviProtector, FsviRepairResult, FsviVerifyResult};
 pub use metrics::{DecodeOutcomeClass, DurabilityMetrics, DurabilityMetricsSnapshot};
@@ -41,6 +42,7 @@ pub use repair_trailer::{
     REPAIR_TRAILER_MAGIC, REPAIR_TRAILER_VERSION, RepairSymbol, RepairTrailerHeader,
     deserialize_repair_trailer, serialize_repair_trailer,
 };
+#[cfg(feature = "tantivy")]
 pub use tantivy_wrapper::{
     DurableTantivyIndex, SegmentHealthReport, SegmentProtectionReport, TantivySegmentProtector,
 };

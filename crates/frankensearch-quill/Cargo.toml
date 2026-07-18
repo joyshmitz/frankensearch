@@ -9,12 +9,16 @@ rust-version.workspace = true
 
 [features]
 default = []
+# Optional FSLX/MANIFEST repair sidecars. Tantivy integration remains outside
+# Quill's dependency graph even when durability is enabled.
+durability = ["dep:frankensearch-durability"]
 # Same-binary A/B helpers are available only to explicit benchmark builds.
 bench-internals = ["frankensearch-core/bench-internals"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-index = { workspace = true }
+frankensearch-durability = { workspace = true, optional = true }
 asupersync = { workspace = true }
 wide = { workspace = true }
 bytemuck = { workspace = true }
@@ -48,6 +52,11 @@ required-features = ["bench-internals"]
 
 [[bench]]
 name = "term_dictionary_ab"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "id_map_materialize_ab"
 harness = false
 required-features = ["bench-internals"]
 

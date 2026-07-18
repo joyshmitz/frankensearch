@@ -31,6 +31,37 @@ pub struct FileProtectionResult {
     pub repair_symbol_count: u32,
 }
 
+/// Caller-computed identity of an immutable source file.
+///
+/// `source_xxh3` covers every byte in the source file. It is intentionally
+/// distinct from format-specific hashes that cover only a prefix or exclude a
+/// trailer. Callers must compute the witness from the current immutable file
+/// and keep that file unchanged while using witness-aware APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileSourceWitness {
+    /// Complete source length in bytes.
+    pub source_len: u64,
+    /// xxh3-64 over the complete source file.
+    pub source_xxh3: u64,
+}
+
+impl FileSourceWitness {
+    /// Construct a witness from a complete source length and full-file hash.
+    #[must_use]
+    pub const fn new(source_len: u64, source_xxh3: u64) -> Self {
+        Self {
+            source_len,
+            source_xxh3,
+        }
+    }
+
+    /// Compute a full-file witness for an in-memory source.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self::new(saturating_u64(bytes.len()), xxh3_64(bytes))
+    }
+}
+
 /// Verification status for a payload+sidecar pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileVerifyResult {
@@ -363,11 +394,66 @@ impl FileProtector {
             .is_some_and(|name| name.starts_with('.') || name.contains(".corrupt."))
     }
 
-    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
+    /// Protect `path`, computing its full-file xxh3 while encoding it.
     pub fn protect_file(&self, path: &Path) -> SearchResult<FileProtectionResult> {
+        self.protect_file_impl(path, None)
+    }
+
+    /// Protect an immutable source using a caller-computed full-file witness.
+    ///
+    /// The current source is copied into one immutable snapshot, then both
+    /// encoded and hashed from that snapshot. Protection fails before writing
+    /// a sidecar unless its length and xxh3 match the caller's witness.
+    pub fn protect_file_with_witness(
+        &self,
+        path: &Path,
+        witness: FileSourceWitness,
+    ) -> SearchResult<FileProtectionResult> {
+        self.protect_file_impl(path, Some(witness))
+    }
+
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
+    fn protect_file_impl(
+        &self,
+        path: &Path,
+        witness: Option<FileSourceWitness>,
+    ) -> SearchResult<FileProtectionResult> {
         let file = fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let (encoded, source_xxh3) = if len == 0 {
+        if let Some(witness) = witness
+            && witness.source_len != len
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "source_witness.source_len".to_owned(),
+                value: witness.source_len.to_string(),
+                reason: format!(
+                    "does not match current source metadata length {len} for {}",
+                    path.display()
+                ),
+            });
+        }
+
+        let (encoded, source_xxh3) = if let Some(witness) = witness {
+            let snapshot = if len == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: The mapping is read-only. Copying it immediately
+                // binds the hash and repair symbols to the same bytes.
+                unsafe { Mmap::map(&file).map_err(SearchError::Io)? }.to_vec()
+            };
+            let source_xxh3 = xxh3_64(&snapshot);
+            if source_xxh3 != witness.source_xxh3 {
+                return Err(SearchError::InvalidConfig {
+                    field: "source_witness.source_xxh3".to_owned(),
+                    value: witness.source_xxh3.to_string(),
+                    reason: format!(
+                        "does not match current source xxh3 {source_xxh3} for {}",
+                        path.display()
+                    ),
+                });
+            }
+            (self.codec.encode(&snapshot)?, source_xxh3)
+        } else if len == 0 {
             (self.codec.encode(&[])?, xxh3_64(&[]))
         } else {
             // SAFETY: We assume the file is not modified concurrently (advisory).
@@ -409,6 +495,8 @@ impl FileProtector {
             file.write_all(&trailer)?;
             file.sync_all()?;
             fs::rename(&tmp_path, &sidecar_path)?;
+            #[cfg(unix)]
+            sync_parent_directory(&sidecar_path)?;
         }
 
         info!(
@@ -434,8 +522,30 @@ impl FileProtector {
     /// Falls back to CRC32 verification for V1 trailers or when xxh3 hash is zero.
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn verify_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileVerifyResult> {
-        self.verify_file_impl(path, sidecar_path)
-            .map(|(result, _)| result)
+        Self::verify_file_impl(path, sidecar_path).map(|(result, _)| result)
+    }
+
+    /// Check whether a sidecar is bound to an externally verified source
+    /// witness without reopening or hashing the source path.
+    ///
+    /// This method deliberately makes no claim about any filesystem path: the
+    /// caller must have computed `witness` from the current immutable source.
+    /// A mismatch is never authority to repair or overwrite that source,
+    /// because the sidecar itself may be stale.
+    pub fn sidecar_matches_witness(
+        &self,
+        sidecar_path: &Path,
+        witness: FileSourceWitness,
+    ) -> SearchResult<bool> {
+        let trailer_bytes = fs::read(sidecar_path)?;
+        let decoded = deserialize_repair_trailer(&trailer_bytes)?;
+        let header = &decoded.0;
+
+        // A zero hash identifies legacy V1 trailers and is not a trustworthy
+        // full-file witness, even if a caller also supplies zero.
+        Ok(header.source_xxh3 != 0
+            && header.source_len == witness.source_len
+            && header.source_xxh3 == witness.source_xxh3)
     }
 
     /// Like [`Self::verify_file`] but also returns the fully-decoded trailer. When
@@ -444,7 +554,6 @@ impl FileProtector {
     /// and recompute the source CRC32 a second time (the residual `verify_file` +
     /// `repair_file_internal` re-verify left by the fe866683 standalone-repair reuse).
     fn verify_file_impl(
-        &self,
         path: &Path,
         sidecar_path: &Path,
     ) -> SearchResult<(FileVerifyResult, (RepairTrailerHeader, Vec<RepairSymbol>))> {
@@ -469,21 +578,25 @@ impl FileProtector {
 
         // Fast path: xxh3 hash check (V2+ trailers have source_xxh3 != 0)
         // This is ~10x faster than CRC32 for large files.
+        let mut xxh3_matches = None;
         if source_xxh3 != 0 {
             let actual_xxh3 = mmap.as_ref().map_or_else(|| xxh3_64(&[]), |m| xxh3_64(m));
+            xxh3_matches = Some(actual_xxh3 == source_xxh3);
 
             if actual_xxh3 == source_xxh3 {
                 // Fast-path success: xxh3 matches, file is healthy
                 let actual_len = mmap.as_ref().map_or(0, |m| saturating_u64(m.len()));
-                let result = FileVerifyResult {
-                    healthy: true,
-                    expected_crc32: source_crc32,
-                    actual_crc32: source_crc32, // Not computed, use expected
-                    expected_xxh3: source_xxh3,
-                    expected_len: source_len,
-                    actual_len,
-                };
-                return Ok((result, decoded));
+                if actual_len == source_len {
+                    let result = FileVerifyResult {
+                        healthy: true,
+                        expected_crc32: source_crc32,
+                        actual_crc32: source_crc32, // Not computed, use expected
+                        expected_xxh3: source_xxh3,
+                        expected_len: source_len,
+                        actual_len,
+                    };
+                    return Ok((result, decoded));
+                }
             }
             // xxh3 mismatch — fall through to CRC32 for detailed result
         }
@@ -494,7 +607,9 @@ impl FileProtector {
             |m| (crc32fast::hash(m), saturating_u64(m.len())),
         );
 
-        let healthy = actual_crc32 == source_crc32 && actual_len == source_len;
+        let healthy = xxh3_matches.unwrap_or(true)
+            && actual_crc32 == source_crc32
+            && actual_len == source_len;
 
         let result = FileVerifyResult {
             healthy,
@@ -587,7 +702,9 @@ impl FileProtector {
                     let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
                     let header = &decoded_trailer.0;
                     (
-                        header.source_crc32 == crc32fast::hash(&[]) && header.source_len == 0,
+                        header.source_crc32 == crc32fast::hash(&[])
+                            && header.source_len == 0
+                            && (header.source_xxh3 == 0 || header.source_xxh3 == xxh3_64(&[])),
                         decoded_trailer,
                     )
                 } else {
@@ -597,7 +714,9 @@ impl FileProtector {
                     let header = &decoded_trailer.0;
                     let actual_crc32 = crc32fast::hash(&mmap);
                     (
-                        actual_crc32 == header.source_crc32 && len == header.source_len,
+                        actual_crc32 == header.source_crc32
+                            && len == header.source_len
+                            && (header.source_xxh3 == 0 || xxh3_64(&mmap) == header.source_xxh3),
                         decoded_trailer,
                     )
                 };
@@ -621,7 +740,10 @@ impl FileProtector {
 
         if header.source_len == 0 {
             let empty_crc32 = crc32fast::hash(&[]);
-            if header.source_crc32 != empty_crc32 {
+            let empty_xxh3 = xxh3_64(&[]);
+            if header.source_crc32 != empty_crc32
+                || (header.source_xxh3 != 0 && header.source_xxh3 != empty_xxh3)
+            {
                 self.metrics.record_repair_failure();
                 return Err(SearchError::IndexCorrupted {
                     path: sidecar_path.to_path_buf(),
@@ -704,6 +826,26 @@ impl FileProtector {
                     });
                 }
 
+                if header.source_xxh3 != 0 {
+                    let recovered_xxh3 = xxh3_64(&data);
+                    if recovered_xxh3 != header.source_xxh3 {
+                        self.metrics.record_repair_failure();
+                        warn!(
+                            path = %dest_path.display(),
+                            expected_xxh3 = header.source_xxh3,
+                            recovered_xxh3,
+                            "decoded payload failed xxh3 verification"
+                        );
+                        return Err(SearchError::IndexCorrupted {
+                            path: sidecar_path.to_path_buf(),
+                            detail: format!(
+                                "decoded payload xxh3 {recovered_xxh3} does not match V2 sidecar witness {}",
+                                header.source_xxh3
+                            ),
+                        });
+                    }
+                }
+
                 write_durable(dest_path, &data)?;
                 self.metrics.record_repair_success();
                 info!(
@@ -757,10 +899,7 @@ impl FileProtector {
     /// so `durability_bench` can A/B the corruption-detection decode reuse against it.
     #[cfg(feature = "bench-internals")]
     #[doc(hidden)]
-    pub fn verify_and_repair_file_no_reuse(
-        &self,
-        path: &Path,
-    ) -> SearchResult<HealthCheckResult> {
+    pub fn verify_and_repair_file_no_reuse(&self, path: &Path) -> SearchResult<HealthCheckResult> {
         self.verify_and_repair_file_with(path, false)
     }
 
@@ -779,7 +918,7 @@ impl FileProtector {
 
         // Verify once, retaining the decoded trailer. On corruption, hand it straight to repair
         // so it does not re-mmap the source, recompute its CRC32, and re-deserialize the sidecar.
-        let verified_decode = match self.verify_file_impl(path, &sidecar) {
+        let verified_decode = match Self::verify_file_impl(path, &sidecar) {
             Ok((verify, _)) if verify.healthy => {
                 return Ok(HealthCheckResult {
                     path: path.to_path_buf(),
@@ -1313,6 +1452,16 @@ fn append_to_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Persist a rename in the containing directory on Unix filesystems.
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|candidate| !candidate.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()
+}
+
 /// Write `data` to `path` and fsync before returning so the content is
 /// durable even under sudden power loss.  Used for repair outputs and
 /// other writes where silent data loss would be unacceptable.
@@ -1344,8 +1493,8 @@ mod tests {
     use fsqlite_types::cx::Cx;
 
     use super::{
-        DurabilityProvider, FileHealth, FileProtector, FileRepairOutcome, NoopDurability,
-        RepairPipelineConfig,
+        DurabilityProvider, FileHealth, FileProtector, FileRepairOutcome, FileSourceWitness,
+        NoopDurability, RepairPipelineConfig,
     };
     use crate::config::DurabilityConfig;
 
@@ -1455,6 +1604,153 @@ mod tests {
         let snapshot = protector.metrics_snapshot();
         assert_eq!(snapshot.repair_attempts, 1);
         assert_eq!(snapshot.repair_successes, 1);
+    }
+
+    #[test]
+    fn full_file_witness_is_revalidated_against_encoded_snapshot() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let path = temp_path("source-witness-roundtrip");
+        let payload = b"the witness covers the complete immutable file";
+        std::fs::write(&path, payload).expect("write payload");
+        let witness = FileSourceWitness::from_bytes(payload);
+
+        let protected = protector
+            .protect_file_with_witness(&path, witness)
+            .expect("protect with witness");
+        assert_eq!(protected.source_len, witness.source_len);
+        assert_eq!(protected.source_xxh3, witness.source_xxh3);
+
+        assert!(
+            protector
+                .sidecar_matches_witness(&protected.sidecar_path, witness)
+                .expect("sidecar matches witness")
+        );
+        assert!(
+            protector
+                .verify_file(&path, &protected.sidecar_path)
+                .expect("verify current path")
+                .healthy
+        );
+    }
+
+    #[test]
+    fn protect_with_witness_rejects_current_length_mismatch() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let path = temp_path("source-witness-length-mismatch");
+        let payload = b"immutable source";
+        std::fs::write(&path, payload).expect("write payload");
+        let actual = FileSourceWitness::from_bytes(payload);
+        let wrong = FileSourceWitness::new(actual.source_len + 1, actual.source_xxh3);
+
+        let error = protector
+            .protect_file_with_witness(&path, wrong)
+            .expect_err("mismatched witness length must fail");
+        assert!(matches!(
+            error,
+            frankensearch_core::SearchError::InvalidConfig { ref field, .. }
+                if field == "source_witness.source_len"
+        ));
+        assert!(!FileProtector::sidecar_path(&path).exists());
+    }
+
+    #[test]
+    fn protect_with_witness_rejects_same_length_source_mutation() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let path = temp_path("source-witness-hash-mismatch");
+        let original = b"immutable source bytes";
+        let mutated = b"mutable__ source bytes";
+        assert_eq!(original.len(), mutated.len());
+        std::fs::write(&path, original).expect("write original payload");
+        let stale_witness = FileSourceWitness::from_bytes(original);
+        std::fs::write(&path, mutated).expect("mutate payload without changing length");
+
+        let error = protector
+            .protect_file_with_witness(&path, stale_witness)
+            .expect_err("same-length source mutation must invalidate the witness");
+        assert!(matches!(
+            error,
+            frankensearch_core::SearchError::InvalidConfig { ref field, .. }
+                if field == "source_witness.source_xxh3"
+        ));
+        assert!(!FileProtector::sidecar_path(&path).exists());
+    }
+
+    #[test]
+    fn v2_xxh3_mismatch_cannot_be_masked_by_matching_crc_and_length() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let path = temp_path("source-witness-v2-authority");
+        let current = b"current immutable source";
+        let stale = b"stale__ immutable source";
+        assert_eq!(current.len(), stale.len());
+        std::fs::write(&path, current).expect("write current payload");
+        let protected = protector
+            .protect_file(&path)
+            .expect("protect current payload");
+
+        let trailer_bytes = std::fs::read(&protected.sidecar_path).expect("read sidecar");
+        let (mut header, symbols) =
+            crate::repair_trailer::deserialize_repair_trailer(&trailer_bytes)
+                .expect("decode sidecar");
+        header.source_xxh3 = FileSourceWitness::from_bytes(stale).source_xxh3;
+        let mismatched = crate::repair_trailer::serialize_repair_trailer(&header, &symbols)
+            .expect("encode mismatched sidecar");
+        std::fs::write(&protected.sidecar_path, mismatched).expect("write mismatched sidecar");
+
+        let verified = protector
+            .verify_file(&path, &protected.sidecar_path)
+            .expect("verify mismatched sidecar");
+        assert_eq!(verified.actual_crc32, verified.expected_crc32);
+        assert_eq!(verified.actual_len, verified.expected_len);
+        assert!(!verified.healthy);
+
+        let before_repair = std::fs::read(&path).expect("read before direct repair");
+        let repair_error = protector
+            .repair_file(&path, &protected.sidecar_path)
+            .expect_err("direct repair must reject an inconsistent V2 witness");
+        assert!(matches!(
+            repair_error,
+            frankensearch_core::SearchError::IndexCorrupted { ref path, ref detail }
+                if path == &protected.sidecar_path && detail.contains("xxh3")
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read after rejected direct repair"),
+            before_repair
+        );
+    }
+
+    #[test]
+    fn current_witness_mismatch_never_authorizes_repair() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let path = temp_path("source-witness-repair-fallback");
+        let payload = vec![42_u8; 700];
+        std::fs::write(&path, &payload).expect("write payload");
+        protector
+            .protect_file_with_witness(&path, FileSourceWitness::from_bytes(&payload))
+            .expect("protect with witness");
+
+        let mut corrupted = payload.clone();
+        corrupted[0] ^= 0xff;
+        std::fs::write(&path, &corrupted).expect("corrupt payload");
+        let current_witness = FileSourceWitness::from_bytes(&corrupted);
+
+        assert!(
+            !protector
+                .sidecar_matches_witness(&FileProtector::sidecar_path(&path), current_witness)
+                .expect("compare current witness")
+        );
+        let health = protector
+            .verify_and_repair_file(&path)
+            .expect("explicit authoritative repair");
+        assert!(matches!(health.status, FileHealth::Repaired { .. }));
+        assert_eq!(
+            std::fs::read(&path).expect("read repaired payload"),
+            payload
+        );
     }
 
     #[test]

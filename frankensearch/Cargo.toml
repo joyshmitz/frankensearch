@@ -38,7 +38,7 @@ frankensearch-lexical = { workspace = true, optional = true }
 frankensearch-fusion = { workspace = true }
 frankensearch-rerank = { workspace = true, optional = true }
 frankensearch-storage = { workspace = true, optional = true }
-frankensearch-durability = { workspace = true, optional = true }
+frankensearch-durability = { workspace = true, optional = true, features = ["tantivy"] }
 asupersync = { workspace = true }
 tracing = { workspace = true }
 

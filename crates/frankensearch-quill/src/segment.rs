@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::error::QuillError;
 use crate::schema::{FieldKind, SchemaDescriptor};
@@ -181,6 +181,15 @@ impl Default for SegmentLimits {
     }
 }
 
+/// Internal fault-injection points in the canonical segment temp writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SegmentWriteCheckpoint {
+    /// All bytes reached the file handle but have not been fsynced.
+    TempWritten,
+    /// The complete temp file has been fsynced.
+    TempSynced,
+}
+
 /// Owned canonical FSLX bytes ready for Keeper publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedSegment {
@@ -188,6 +197,7 @@ pub struct EncodedSegment {
     header: SegmentHeader,
     sections: Vec<SectionEntry>,
     file_xxh3: u64,
+    source_xxh3: u64,
 }
 
 impl EncodedSegment {
@@ -340,10 +350,16 @@ impl EncodedSegment {
             bytes.extend_from_slice(section.bytes);
         }
         debug_assert_eq!(bytes.len(), file_len - TRAILER_LEN);
-        let file_xxh3 = xxh3_64(&bytes);
+        let mut source_hasher = Xxh3::new();
+        source_hasher.update(&bytes);
+        let file_xxh3 = source_hasher.digest();
         let hash_bytes = file_xxh3.to_le_bytes();
+        let trailer_crc_bytes = crc32(&hash_bytes).to_le_bytes();
         bytes.extend_from_slice(&hash_bytes);
-        bytes.extend_from_slice(&crc32(&hash_bytes).to_le_bytes());
+        bytes.extend_from_slice(&trailer_crc_bytes);
+        source_hasher.update(&hash_bytes);
+        source_hasher.update(&trailer_crc_bytes);
+        let source_xxh3 = source_hasher.digest();
         debug_assert_eq!(bytes.len(), file_len);
 
         Ok(Self {
@@ -351,6 +367,7 @@ impl EncodedSegment {
             header: parsed_header,
             sections: table,
             file_xxh3,
+            source_xxh3,
         })
     }
 
@@ -384,10 +401,20 @@ impl EncodedSegment {
         u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
     }
 
-    /// Whole-file xxh3 witness stored in the trailer.
+    /// xxh3-64 over the file prefix before the trailer, stored in the trailer.
     #[must_use]
     pub const fn file_xxh3(&self) -> u64 {
         self.file_xxh3
+    }
+
+    /// xxh3-64 over every canonical FSLX byte, including the trailer.
+    ///
+    /// This derived witness is not persisted in FSLX. It binds a durability
+    /// sidecar to the complete source file without hashing the encoded bytes a
+    /// second time.
+    #[must_use]
+    pub const fn source_xxh3(&self) -> u64 {
+        self.source_xxh3
     }
 
     /// Create and durably sync the canonical Keeper temp file.
@@ -400,6 +427,17 @@ impl EncodedSegment {
     /// Returns an I/O error if the directory is unavailable, the temp already
     /// exists, a write fails, or `sync_all` fails.
     pub fn write_temp(&self, directory: &Path) -> Result<PendingSegmentFile, QuillError> {
+        self.write_temp_with_observer(directory, |_, _| Ok(()))
+    }
+
+    pub(crate) fn write_temp_with_observer<O>(
+        &self,
+        directory: &Path,
+        mut observe: O,
+    ) -> Result<PendingSegmentFile, QuillError>
+    where
+        O: FnMut(SegmentWriteCheckpoint, &Path) -> Result<(), QuillError>,
+    {
         let path = directory.join(format!(".tmp-segment-{:016x}", self.header.segment_id));
         let mut file = OpenOptions::new()
             .write(true)
@@ -407,12 +445,15 @@ impl EncodedSegment {
             .open(&path)?;
         file.write_all(&self.bytes)?;
         file.flush()?;
+        observe(SegmentWriteCheckpoint::TempWritten, &path)?;
         file.sync_all()?;
+        observe(SegmentWriteCheckpoint::TempSynced, &path)?;
         Ok(PendingSegmentFile {
             path,
             segment_id: self.header.segment_id,
             file_len: self.file_len(),
             file_xxh3: self.file_xxh3,
+            source_xxh3: self.source_xxh3,
         })
     }
 }
@@ -424,6 +465,7 @@ pub struct PendingSegmentFile {
     segment_id: u64,
     file_len: u64,
     file_xxh3: u64,
+    source_xxh3: u64,
 }
 
 impl PendingSegmentFile {
@@ -445,10 +487,18 @@ impl PendingSegmentFile {
         self.file_len
     }
 
-    /// Whole-file xxh3 witness.
+    /// xxh3-64 over the file prefix before the trailer.
     #[must_use]
     pub const fn file_xxh3(&self) -> u64 {
         self.file_xxh3
+    }
+
+    /// xxh3-64 over every canonical FSLX byte, including the trailer.
+    ///
+    /// This derived witness is not persisted in FSLX.
+    #[must_use]
+    pub const fn source_xxh3(&self) -> u64 {
+        self.source_xxh3
     }
 }
 
@@ -617,7 +667,7 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
         u64::try_from(self.source.as_ref().len()).unwrap_or(u64::MAX)
     }
 
-    /// Whole-file xxh3 witness stored in the trailer.
+    /// xxh3-64 over the file prefix before the trailer, stored in the trailer.
     #[must_use]
     pub const fn file_xxh3(&self) -> u64 {
         self.file_xxh3
@@ -664,7 +714,7 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
         }
     }
 
-    /// Eagerly revalidate the structure, every section, and whole-file witness.
+    /// Eagerly revalidate the structure, every section, and file-prefix witness.
     ///
     /// Unlike [`Self::section`], this always recomputes hashes so doctor flows
     /// do not trust an earlier lazy result.
@@ -1582,8 +1632,11 @@ mod tests {
         assert_eq!(first.file_xxh3(), 0x21db_dd03_9fa7_9ed3);
         assert_eq!(trailer_crc, 0xbc49_3767);
         assert_eq!(first.section_entries(), &PINNED_DEFAULT_ENTRIES);
+        assert_eq!(first.as_bytes(), independently_assembled_pinned_fixture());
         assert_eq!(first.as_bytes(), second.as_bytes());
         assert_eq!(first.file_xxh3(), second.file_xxh3());
+        assert_eq!(first.source_xxh3(), xxh3_64(first.as_bytes()));
+        assert_eq!(first.source_xxh3(), second.source_xxh3());
 
         let reader = SegmentReader::from_owned(first.as_bytes().to_vec(), DEFAULT_SCHEMA)?;
         assert_eq!(reader.header(), first.header());
@@ -2007,7 +2060,10 @@ mod tests {
         assert_eq!(pending.segment_id(), encoded.header().segment_id);
         assert_eq!(pending.file_len(), encoded.file_len());
         assert_eq!(pending.file_xxh3(), encoded.file_xxh3());
-        assert_eq!(fs::read(pending.path())?, encoded.as_bytes());
+        assert_eq!(pending.source_xxh3(), encoded.source_xxh3());
+        let pending_bytes = fs::read(pending.path())?;
+        assert_eq!(pending_bytes, encoded.as_bytes());
+        assert_eq!(pending.source_xxh3(), xxh3_64(&pending_bytes));
 
         assert!(matches!(
             SegmentReader::open_published(pending.path(), DEFAULT_SCHEMA),
