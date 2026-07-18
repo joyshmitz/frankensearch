@@ -40,13 +40,25 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
+use std::ops::Range;
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::contract::fieldnorm_to_id;
 use crate::error::QuillError;
-use crate::grimoire::MAX_TERM_BYTES;
+use crate::grimoire::{
+    ByteSpan, EncodedTermDictionary, MAX_TERM_BYTES, TermDictionaryError, TermInput, TermMetadata,
+    TermSectionLengths,
+};
+use crate::quiver::{
+    BlockMaxError, DocLenCodecError, DocLenFieldInput, EncodedDocLenSection, EncodedIdHashSection,
+    EncodedIdMapSection, EncodedPositionList, EncodedPostingList, EncodedStatsSection,
+    EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError, IdMapEntryInput,
+    PositionCodecError, Posting, StatsCodecError, StoredMetaCodecError,
+};
 use crate::schema::{Analyzer as AnalyzerKind, FieldKind, SchemaDescriptor};
+use crate::segment::{EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput};
 
 /// Default arena chunk size. 1 MiB amortizes chunk-vector growth while
 /// keeping per-shard reset cheap; term corpora that exceed it simply add
@@ -1837,10 +1849,1135 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
     }
 }
 
+/// One external-identity row supplied when an accumulator is sealed.
+///
+/// Scribe deliberately keeps document identifiers out of its token columns.
+/// The ordinal makes the sidecar self-checking: positional alignment alone
+/// cannot silently attach an identifier to the wrong accumulated document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushDocumentInput<'a> {
+    /// Shard-lease-relative document ordinal.
+    pub doc_ord: u32,
+    /// Non-empty external document identifier.
+    pub document_id: &'a str,
+    /// Unseeded xxh3-64 witness of canonical document content.
+    pub content_hash: u64,
+}
+
+impl<'a> FlushDocumentInput<'a> {
+    /// Construct a row from an externally computed content witness.
+    #[must_use]
+    pub const fn new(doc_ord: u32, document_id: &'a str, content_hash: u64) -> Self {
+        Self {
+            doc_ord,
+            document_id,
+            content_hash,
+        }
+    }
+
+    /// Construct a row while hashing canonical document content.
+    #[must_use]
+    pub fn from_canonical_content(
+        doc_ord: u32,
+        document_id: &'a str,
+        canonical_content: &[u8],
+    ) -> Self {
+        let entry = IdMapEntryInput::from_canonical_content(document_id, canonical_content);
+        Self::new(doc_ord, entry.document_id, entry.content_hash)
+    }
+}
+
+/// Fixed metadata and identity sidecar for one deterministic accumulator seal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushSegmentInput<'a> {
+    /// Collision-checked immutable segment identifier.
+    pub segment_id: u64,
+    /// Global document ID corresponding to shard-local ordinal zero.
+    pub lease_docid_base: u64,
+    /// Informational creation timestamp persisted in the segment header.
+    pub created_unix_s: i64,
+    /// Packed engine version persisted in the segment header.
+    pub engine_version: u32,
+    /// One identity row per completed accumulator document, in the same order.
+    pub documents: &'a [FlushDocumentInput<'a>],
+}
+
+/// Typed failures from [`flush_accumulator`].
+#[derive(Debug, Error)]
+pub enum FlushError {
+    /// Empty immutable segments are not produced by the shard flush path.
+    #[error("cannot flush an empty Scribe accumulator")]
+    EmptyAccumulator,
+    /// E2.7 owns the NUMERIC writer required by an indexed numeric field.
+    #[error("indexed numeric field {field_ord} ({field_name}) requires the E2.7 NUMERIC codec")]
+    IndexedNumericUnsupported {
+        /// Stable schema field ordinal.
+        field_ord: u16,
+        /// Stable schema field name.
+        field_name: &'static str,
+    },
+    /// Q1 R1 requires every shard lease to begin on its 65,536-doc boundary.
+    #[error(
+        "lease document base {lease_docid_base} is not aligned to {DOC_ORDS_PER_LEASE} documents"
+    )]
+    MisalignedLeaseBase {
+        /// Rejected global lease base.
+        lease_docid_base: u64,
+    },
+    /// The external identity sidecar must be one-for-one with completed docs.
+    #[error("flush identity sidecar has {actual} rows, expected {expected}")]
+    DocumentCountMismatch {
+        /// Completed accumulator document count.
+        expected: usize,
+        /// Supplied sidecar row count.
+        actual: usize,
+    },
+    /// An identity row drifted from its accumulator document.
+    #[error(
+        "flush identity row {index} names local ordinal {actual}, expected accumulator ordinal {expected}"
+    )]
+    DocumentOrdinalMismatch {
+        /// Completed-document index.
+        index: usize,
+        /// Accumulator ordinal at this index.
+        expected: u32,
+        /// Sidecar ordinal at this index.
+        actual: u32,
+    },
+    /// Rebase would leave the FSLX u32 global-document domain.
+    #[error(
+        "local document ordinal {doc_ord} rebased from lease base {lease_docid_base} exceeds u32"
+    )]
+    DocumentIdOverflow {
+        /// Supplied lease base.
+        lease_docid_base: u64,
+        /// Rejected local ordinal.
+        doc_ord: u32,
+    },
+    /// A private accumulator column invariant failed before durable bytes existed.
+    #[error("invalid token column for field {field_ord}: {detail}")]
+    InvalidTokenColumn {
+        /// Stable schema field ordinal.
+        field_ord: u16,
+        /// Stable invariant name.
+        detail: &'static str,
+    },
+    /// A token row referenced no term in the accumulator interner.
+    #[error("field {field_ord} token row references out-of-range local term id {term_id}")]
+    TermIdOutOfRange {
+        /// Stable schema field ordinal.
+        field_ord: u16,
+        /// Rejected local term id.
+        term_id: u32,
+    },
+    /// Every interned term must own at least one admitted token row.
+    #[error("interned local term id {term_id} has no token rows")]
+    TermHasNoRows {
+        /// Orphaned local term id.
+        term_id: u32,
+    },
+    /// Stable scatter relies on per-field source rows ascending by document.
+    #[error("term {term_id} rows descend at partition index {index}: {previous} then {current}")]
+    NonAscendingTermDocuments {
+        /// Dense local term id.
+        term_id: u32,
+        /// Index within the term partition.
+        index: usize,
+        /// Prior local document ordinal.
+        previous: u32,
+        /// Current local document ordinal.
+        current: u32,
+    },
+    /// One term frequency exceeded the durable u32 field.
+    #[error("term {term_id} frequency for local document {doc_ord} exceeds u32")]
+    TermFrequencyOverflow {
+        /// Dense local term id.
+        term_id: u32,
+        /// Local document ordinal.
+        doc_ord: u32,
+    },
+    /// Position deltas must not go backwards within one posting.
+    #[error(
+        "term {term_id} positions descend in local document {doc_ord}: {previous} then {current}"
+    )]
+    NonAscendingPositions {
+        /// Dense local term id.
+        term_id: u32,
+        /// Local document ordinal.
+        doc_ord: u32,
+        /// Prior absolute token position.
+        previous: u32,
+        /// Current absolute token position.
+        current: u32,
+    },
+    /// Checked host or durable-size arithmetic overflowed.
+    #[error("Scribe flush arithmetic overflow while computing {field}")]
+    ArithmeticOverflow {
+        /// Stable computation name.
+        field: &'static str,
+    },
+    /// A fallible flush allocation could not be satisfied.
+    #[error("unable to reserve {count} entries for Scribe flush {resource}")]
+    Allocation {
+        /// Stable allocation purpose.
+        resource: &'static str,
+        /// Requested entries or bytes.
+        count: usize,
+    },
+    /// POSTINGS/BLOCKMAX encoding failed.
+    #[error("Scribe POSTINGS/BLOCKMAX encoding failed: {0}")]
+    BlockMax(#[from] BlockMaxError),
+    /// POSITIONS encoding failed.
+    #[error("Scribe POSITIONS encoding failed: {0}")]
+    Positions(#[from] PositionCodecError),
+    /// TERMDICT encoding failed.
+    #[error("Scribe TERMDICT encoding failed: {0}")]
+    TermDictionary(#[from] TermDictionaryError),
+    /// DOCLEN encoding failed.
+    #[error("Scribe DOCLEN encoding failed: {0}")]
+    DocLen(#[from] DocLenCodecError),
+    /// IDMAP encoding failed.
+    #[error("Scribe IDMAP encoding failed: {0}")]
+    IdMap(#[from] IdMapCodecError),
+    /// IDHASH encoding failed.
+    #[error("Scribe IDHASH encoding failed: {0}")]
+    IdHash(#[from] IdHashCodecError),
+    /// STOREDMETA encoding failed.
+    #[error("Scribe STOREDMETA encoding failed: {0}")]
+    StoredMeta(#[from] StoredMetaCodecError),
+    /// STATS encoding failed.
+    #[error("Scribe STATS encoding failed: {0}")]
+    Stats(#[from] StatsCodecError),
+    /// Final FSLX framing failed.
+    #[error("Scribe segment framing failed: {0}")]
+    Segment(#[from] QuillError),
+}
+
+const RADIX_DIGIT_BITS: u32 = 16;
+const RADIX_DIGIT_BUCKETS: usize = 1 << RADIX_DIGIT_BITS;
+const PARALLEL_RADIX_ROWS_PER_CHUNK: usize = 4_096;
+const MAX_PARALLEL_RADIX_RANGE_BYTES: usize = 64 * 1024 * 1024;
+
+type DocLenColumns = (Vec<u16>, Vec<Vec<Option<u32>>>);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FlushTokenRow {
+    term_id: u32,
+    doc_ord: u32,
+    position: u32,
+}
+
+#[derive(Debug)]
+struct RadixPartition {
+    rows: Vec<FlushTokenRow>,
+    ranges: Vec<Range<usize>>,
+}
+
+/// Seal one shard accumulator into a complete deterministic FSLX mini-segment.
+///
+/// The accumulator is borrowed and is never reset by this function. A caller
+/// may therefore publish the returned bytes first and clear the shard only
+/// after Keeper makes the generation durable. Token rows are stably radix
+/// partitioned by dense local term id; each resulting slice is consumed
+/// directly by the posting builder, including stopword-heavy slices, without
+/// another per-term triple copy.
+///
+/// # Errors
+///
+/// Returns [`FlushError`] for sidecar drift, unsupported indexed numeric
+/// fields, rebase overflow, accumulator invariant failure, codec failure, or
+/// final segment-framing failure.
+pub fn flush_accumulator<A: TokenAnalyzer>(
+    accumulator: &ColumnarAccumulator<A>,
+    input: FlushSegmentInput<'_>,
+) -> Result<EncodedSegment, FlushError> {
+    let first_doc_ord = accumulator
+        .first_doc_ord()
+        .ok_or(FlushError::EmptyAccumulator)?;
+    let last_doc_ord = accumulator
+        .last_doc_ord()
+        .ok_or(FlushError::EmptyAccumulator)?;
+    let schema = accumulator.schema();
+    if let Some(field) = schema.fields.iter().find(|field| {
+        matches!(
+            field.kind,
+            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
+        )
+    }) {
+        return Err(FlushError::IndexedNumericUnsupported {
+            field_ord: field.id,
+            field_name: field.name,
+        });
+    }
+    if !input
+        .lease_docid_base
+        .is_multiple_of(u64::from(DOC_ORDS_PER_LEASE))
+    {
+        return Err(FlushError::MisalignedLeaseBase {
+            lease_docid_base: input.lease_docid_base,
+        });
+    }
+
+    validate_flush_documents(accumulator.document_ords(), input.documents)?;
+    let docid_lo = rebase_doc_id(input.lease_docid_base, first_doc_ord)?;
+    let last_docid = rebase_doc_id(input.lease_docid_base, last_doc_ord)?;
+    let docid_hi = last_docid
+        .checked_add(1)
+        .ok_or(FlushError::ArithmeticOverflow {
+            field: "exclusive document high bound",
+        })?;
+    let span =
+        usize::try_from(docid_hi - docid_lo).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "document span host size",
+        })?;
+    let doc_count = u32::try_from(accumulator.document_count()).map_err(|_| {
+        FlushError::ArithmeticOverflow {
+            field: "segment document count",
+        }
+    })?;
+
+    let (expected_field_ords, doclen_columns) =
+        build_doclen_columns(accumulator, first_doc_ord, span)?;
+    let rows = collect_flush_rows(accumulator)?;
+    let partition = stable_radix_partition(rows, accumulator.terms().len())?;
+    let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) =
+        encode_ordered_term_streams(
+            accumulator,
+            &partition,
+            input.lease_docid_base,
+            docid_lo,
+            &doclen_columns,
+        )?;
+    let term_sections = TermSectionLengths {
+        postings: durable_len(&postings_bytes, "POSTINGS length")?,
+        positions: schema_has_positions(schema)
+            .then(|| durable_len(&positions_bytes, "POSITIONS length"))
+            .transpose()?,
+        blockmax: durable_len(&blockmax_bytes, "BLOCKMAX length")?,
+    };
+    let termdict = EncodedTermDictionary::encode_sorted(schema, term_sections, &term_inputs)?;
+
+    let doclen_inputs = expected_field_ords
+        .iter()
+        .copied()
+        .zip(&doclen_columns)
+        .map(|(field_ord, values)| DocLenFieldInput::new(field_ord, values))
+        .collect::<Vec<_>>();
+    let doclen =
+        EncodedDocLenSection::encode(docid_lo, docid_hi, &expected_field_ords, &doclen_inputs)?;
+
+    let id_map_inputs = build_id_map_inputs(
+        input.documents,
+        first_doc_ord,
+        span,
+        accumulator.document_ords(),
+    )?;
+    let id_map = EncodedIdMapSection::encode(docid_lo, docid_hi, &id_map_inputs)?;
+    let id_hash = EncodedIdHashSection::encode(id_map.section()?)?;
+
+    let stored_meta = if accumulator.stored_fields().is_empty() {
+        None
+    } else {
+        Some(EncodedStoredMetaSection::encode_accumulator(
+            docid_lo,
+            docid_hi,
+            input.lease_docid_base,
+            accumulator,
+        )?)
+    };
+    let stats_rows = accumulator
+        .fields()
+        .iter()
+        .map(|field| FieldStats::new(field.field_ord(), field.total_tokens(), doc_count))
+        .collect::<Vec<_>>();
+    let stats = EncodedStatsSection::encode(&expected_field_ords, &stats_rows, doc_count)?;
+
+    let mut sections = Vec::new();
+    sections
+        .try_reserve_exact(10)
+        .map_err(|_| FlushError::Allocation {
+            resource: "section inputs",
+            count: 10,
+        })?;
+    sections.push(SectionInput::new(
+        SectionKind::TERMDICT,
+        termdict.as_bytes(),
+    ));
+    sections.push(SectionInput::new(SectionKind::POSTINGS, &postings_bytes));
+    if schema_has_positions(schema) {
+        sections.push(SectionInput::new(SectionKind::POSITIONS, &positions_bytes));
+    }
+    sections.push(SectionInput::new(SectionKind::BLOCKMAX, &blockmax_bytes));
+    sections.push(SectionInput::new(SectionKind::DOCLEN, doclen.as_bytes()));
+    sections.push(SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()));
+    sections.push(SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()));
+    if let Some(stored_meta) = &stored_meta {
+        sections.push(SectionInput::new(
+            SectionKind::STOREDMETA,
+            stored_meta.as_bytes(),
+        ));
+    }
+    sections.push(SectionInput::new(SectionKind::STATS, stats.as_bytes()));
+
+    EncodedSegment::encode(
+        SegmentHeaderInput {
+            segment_id: input.segment_id,
+            schema,
+            docid_lo,
+            docid_hi,
+            doc_count,
+            created_unix_s: input.created_unix_s,
+            engine_version: input.engine_version,
+        },
+        &sections,
+    )
+    .map_err(FlushError::from)
+}
+
+fn schema_has_positions(schema: SchemaDescriptor) -> bool {
+    schema.fields.iter().any(|field| {
+        matches!(
+            field.kind,
+            FieldKind::Text {
+                positions: true,
+                ..
+            }
+        )
+    })
+}
+
+fn validate_flush_documents(
+    document_ords: &[u32],
+    documents: &[FlushDocumentInput<'_>],
+) -> Result<(), FlushError> {
+    if documents.len() != document_ords.len() {
+        return Err(FlushError::DocumentCountMismatch {
+            expected: document_ords.len(),
+            actual: documents.len(),
+        });
+    }
+    for (index, (&expected, document)) in document_ords.iter().zip(documents).enumerate() {
+        if document.doc_ord != expected {
+            return Err(FlushError::DocumentOrdinalMismatch {
+                index,
+                expected,
+                actual: document.doc_ord,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn rebase_doc_id(lease_docid_base: u64, doc_ord: u32) -> Result<u64, FlushError> {
+    let docid =
+        lease_docid_base
+            .checked_add(u64::from(doc_ord))
+            .ok_or(FlushError::DocumentIdOverflow {
+                lease_docid_base,
+                doc_ord,
+            })?;
+    if docid > u64::from(u32::MAX) {
+        return Err(FlushError::DocumentIdOverflow {
+            lease_docid_base,
+            doc_ord,
+        });
+    }
+    Ok(docid)
+}
+
+fn durable_len(bytes: &[u8], field: &'static str) -> Result<u64, FlushError> {
+    u64::try_from(bytes.len()).map_err(|_| FlushError::ArithmeticOverflow { field })
+}
+
+fn build_doclen_columns<A: TokenAnalyzer>(
+    accumulator: &ColumnarAccumulator<A>,
+    first_doc_ord: u32,
+    span: usize,
+) -> Result<DocLenColumns, FlushError> {
+    let document_ords = accumulator.document_ords();
+    let mut field_ords = Vec::new();
+    let mut columns = Vec::new();
+    field_ords
+        .try_reserve_exact(accumulator.fields().len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "DOCLEN field ordinals",
+            count: accumulator.fields().len(),
+        })?;
+    columns
+        .try_reserve_exact(accumulator.fields().len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "DOCLEN columns",
+            count: accumulator.fields().len(),
+        })?;
+
+    for field in accumulator.fields() {
+        if field.document_lengths().len() != document_ords.len()
+            || field.fieldnorm_ids().len() != document_ords.len()
+        {
+            return Err(FlushError::InvalidTokenColumn {
+                field_ord: field.field_ord(),
+                detail: "document-length/fieldnorm row count drift",
+            });
+        }
+        let mut column = filled_vec(span, None, "DOCLEN span")?;
+        for (index, (&doc_ord, &length)) in document_ords
+            .iter()
+            .zip(field.document_lengths())
+            .enumerate()
+        {
+            let relative = doc_ord.checked_sub(first_doc_ord).ok_or_else(|| {
+                FlushError::InvalidTokenColumn {
+                    field_ord: field.field_ord(),
+                    detail: "document ordinal precedes segment lower bound",
+                }
+            })?;
+            let relative =
+                usize::try_from(relative).map_err(|_| FlushError::ArithmeticOverflow {
+                    field: "DOCLEN relative document index",
+                })?;
+            let slot = column
+                .get_mut(relative)
+                .ok_or_else(|| FlushError::InvalidTokenColumn {
+                    field_ord: field.field_ord(),
+                    detail: "document ordinal exceeds segment span",
+                })?;
+            *slot = Some(length);
+            if field.fieldnorm_ids()[index] != fieldnorm_to_id(length) {
+                return Err(FlushError::InvalidTokenColumn {
+                    field_ord: field.field_ord(),
+                    detail: "fieldnorm disagrees with raw document length",
+                });
+            }
+        }
+        field_ords.push(field.field_ord());
+        columns.push(column);
+    }
+    Ok((field_ords, columns))
+}
+
+fn build_id_map_inputs<'a>(
+    documents: &'a [FlushDocumentInput<'a>],
+    first_doc_ord: u32,
+    span: usize,
+    document_ords: &[u32],
+) -> Result<Vec<Option<IdMapEntryInput<'a>>>, FlushError> {
+    let mut entries = filled_vec(span, None, "IDMAP span")?;
+    for (&doc_ord, document) in document_ords.iter().zip(documents) {
+        let relative =
+            doc_ord
+                .checked_sub(first_doc_ord)
+                .ok_or(FlushError::ArithmeticOverflow {
+                    field: "IDMAP relative document index",
+                })?;
+        let relative = usize::try_from(relative).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "IDMAP relative document host index",
+        })?;
+        let slot = entries
+            .get_mut(relative)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "IDMAP document span",
+            })?;
+        *slot = Some(IdMapEntryInput::new(
+            document.document_id,
+            document.content_hash,
+        ));
+    }
+    Ok(entries)
+}
+
+fn collect_flush_rows<A: TokenAnalyzer>(
+    accumulator: &ColumnarAccumulator<A>,
+) -> Result<Vec<FlushTokenRow>, FlushError> {
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(accumulator.token_count())
+        .map_err(|_| FlushError::Allocation {
+            resource: "token rows",
+            count: accumulator.token_count(),
+        })?;
+    for field in accumulator.fields() {
+        if field.term_ids().len() != field.doc_ords().len()
+            || field
+                .positions()
+                .is_some_and(|positions| positions.len() != field.term_ids().len())
+        {
+            return Err(FlushError::InvalidTokenColumn {
+                field_ord: field.field_ord(),
+                detail: "parallel token column length drift",
+            });
+        }
+        let mut previous_doc = None;
+        let mut completed_index = 0_usize;
+        for index in 0..field.term_ids().len() {
+            let term_id = field.term_ids()[index];
+            let doc_ord = field.doc_ords()[index];
+            if usize::try_from(term_id).map_or(true, |id| id >= accumulator.terms().len()) {
+                return Err(FlushError::TermIdOutOfRange {
+                    field_ord: field.field_ord(),
+                    term_id,
+                });
+            }
+            if accumulator.terms().field_and_term(term_id).0 != field.field_ord() {
+                return Err(FlushError::InvalidTokenColumn {
+                    field_ord: field.field_ord(),
+                    detail: "term interner field namespace drift",
+                });
+            }
+            if previous_doc.is_some_and(|previous| doc_ord < previous) {
+                return Err(FlushError::InvalidTokenColumn {
+                    field_ord: field.field_ord(),
+                    detail: "token document ordinals descend",
+                });
+            }
+            while accumulator
+                .document_ords()
+                .get(completed_index)
+                .is_some_and(|completed| *completed < doc_ord)
+            {
+                completed_index += 1;
+            }
+            if accumulator.document_ords().get(completed_index) != Some(&doc_ord) {
+                return Err(FlushError::InvalidTokenColumn {
+                    field_ord: field.field_ord(),
+                    detail: "token references an incomplete document",
+                });
+            }
+            previous_doc = Some(doc_ord);
+            rows.push(FlushTokenRow {
+                term_id,
+                doc_ord,
+                position: field.positions().map_or(0, |positions| positions[index]),
+            });
+        }
+    }
+    Ok(rows)
+}
+
+fn stable_radix_partition(
+    rows: Vec<FlushTokenRow>,
+    term_count: usize,
+) -> Result<RadixPartition, FlushError> {
+    let chunk_count = rayon::current_num_threads()
+        .min(rows.len().div_ceil(PARALLEL_RADIX_ROWS_PER_CHUNK))
+        .max(1);
+    stable_radix_partition_with_chunks(rows, term_count, chunk_count)
+}
+
+fn stable_radix_partition_with_chunks(
+    rows: Vec<FlushTokenRow>,
+    term_count: usize,
+    chunk_count: usize,
+) -> Result<RadixPartition, FlushError> {
+    let chunk_count = chunk_count.max(1).min(rows.len().max(1));
+    let local_range_bytes = chunk_count
+        .checked_mul(term_count)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<Range<usize>>()));
+    if chunk_count == 1
+        || rows.is_empty()
+        || local_range_bytes.is_none_or(|bytes| bytes > MAX_PARALLEL_RADIX_RANGE_BYTES)
+    {
+        return stable_radix_partition_serial(rows, term_count);
+    }
+    let row_count = rows.len();
+    let chunk_len = rows.len().div_ceil(chunk_count);
+    let local_partitions: Result<Vec<_>, FlushError> = rows
+        .par_chunks(chunk_len)
+        .map(|chunk| {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(chunk.len())
+                .map_err(|_| FlushError::Allocation {
+                    resource: "thread-local radix rows",
+                    count: chunk.len(),
+                })?;
+            owned.extend_from_slice(chunk);
+            stable_radix_partition_serial(owned, term_count)
+        })
+        .collect();
+    let local_partitions = local_partitions?;
+    drop(rows);
+
+    let mut counts = filled_vec(term_count, 0_usize, "global radix histogram")?;
+    for partition in &local_partitions {
+        for (count, range) in counts.iter_mut().zip(&partition.ranges) {
+            *count = count
+                .checked_add(range.len())
+                .ok_or(FlushError::ArithmeticOverflow {
+                    field: "global radix histogram count",
+                })?;
+        }
+    }
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(term_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "global radix prefix ranges",
+            count: term_count,
+        })?;
+    let mut cursor = 0_usize;
+    for count in counts {
+        let end = cursor
+            .checked_add(count)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "global radix prefix sum",
+            })?;
+        ranges.push(cursor..end);
+        cursor = end;
+    }
+    if cursor != row_count {
+        return Err(FlushError::ArithmeticOverflow {
+            field: "global radix prefix coverage",
+        });
+    }
+
+    let mut output = filled_vec(row_count, FlushTokenRow::default(), "parallel radix output")?;
+    // Split the destination only at term boundaries, then give each disjoint
+    // slice to one Rayon callback. Every callback copies its term runs from
+    // source chunks in original chunk order: O(rows + chunks * terms), stable,
+    // and free of locks, atomics, or unsafe aliasing.
+    let term_groups = local_partitions.len().min(term_count).max(1);
+    let terms_per_group = term_count.div_ceil(term_groups);
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(term_groups)
+        .map_err(|_| FlushError::Allocation {
+            resource: "parallel radix output groups",
+            count: term_groups,
+        })?;
+    let mut output_tail = output.as_mut_slice();
+    let mut previous_output_end = 0_usize;
+    let mut term_start = 0_usize;
+    while term_start < term_count {
+        let term_end = term_start.saturating_add(terms_per_group).min(term_count);
+        let output_end = ranges
+            .get(term_end - 1)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "parallel radix group term range",
+            })?
+            .end;
+        let group_len =
+            output_end
+                .checked_sub(previous_output_end)
+                .ok_or(FlushError::ArithmeticOverflow {
+                    field: "parallel radix group output length",
+                })?;
+        let (group, tail) = output_tail.split_at_mut(group_len);
+        groups.push((term_start, term_end, group));
+        output_tail = tail;
+        previous_output_end = output_end;
+        term_start = term_end;
+    }
+    if !output_tail.is_empty() || previous_output_end != row_count {
+        return Err(FlushError::ArithmeticOverflow {
+            field: "parallel radix output group coverage",
+        });
+    }
+    groups
+        .into_par_iter()
+        .try_for_each(|(term_start, term_end, destination)| {
+            let mut destination_offset = 0_usize;
+            for term_id in term_start..term_end {
+                for partition in &local_partitions {
+                    let source_range =
+                        partition
+                            .ranges
+                            .get(term_id)
+                            .ok_or(FlushError::ArithmeticOverflow {
+                                field: "thread-local radix term range",
+                            })?;
+                    let source = partition.rows.get(source_range.clone()).ok_or(
+                        FlushError::ArithmeticOverflow {
+                            field: "thread-local radix source range",
+                        },
+                    )?;
+                    let destination_end = destination_offset.checked_add(source.len()).ok_or(
+                        FlushError::ArithmeticOverflow {
+                            field: "parallel radix destination range",
+                        },
+                    )?;
+                    let target = destination
+                        .get_mut(destination_offset..destination_end)
+                        .ok_or(FlushError::ArithmeticOverflow {
+                            field: "parallel radix destination coverage",
+                        })?;
+                    target.copy_from_slice(source);
+                    destination_offset = destination_end;
+                }
+            }
+            if destination_offset != destination.len() {
+                return Err(FlushError::ArithmeticOverflow {
+                    field: "parallel radix group scatter coverage",
+                });
+            }
+            Ok(())
+        })?;
+    Ok(RadixPartition {
+        rows: output,
+        ranges,
+    })
+}
+
+fn stable_radix_partition_serial(
+    rows: Vec<FlushTokenRow>,
+    term_count: usize,
+) -> Result<RadixPartition, FlushError> {
+    if rows.is_empty() {
+        return Ok(RadixPartition {
+            rows,
+            ranges: filled_vec(term_count, 0..0, "empty term ranges")?,
+        });
+    }
+    for row in &rows {
+        if usize::try_from(row.term_id).map_or(true, |term_id| term_id >= term_count) {
+            return Err(FlushError::TermIdOutOfRange {
+                field_ord: 0,
+                term_id: row.term_id,
+            });
+        }
+    }
+
+    let sorted = if term_count <= RADIX_DIGIT_BUCKETS {
+        stable_digit_scatter(&rows, 0, term_count)?.0
+    } else {
+        // MSD partition first, then one stable low-digit scatter inside each
+        // disjoint high-digit range. This preserves source order among equal
+        // ids and avoids a term-count-sized second histogram.
+        let high_bucket_count = term_count.div_ceil(RADIX_DIGIT_BUCKETS);
+        let (high_sorted, high_ranges) =
+            stable_digit_scatter(&rows, RADIX_DIGIT_BITS, high_bucket_count)?;
+        let mut output = filled_vec(rows.len(), FlushTokenRow::default(), "radix output")?;
+        for (high_digit, range) in high_ranges.into_iter().enumerate() {
+            if range.is_empty() {
+                continue;
+            }
+            let remaining_terms = term_count.saturating_sub(high_digit * RADIX_DIGIT_BUCKETS);
+            let low_bucket_count = remaining_terms.min(RADIX_DIGIT_BUCKETS);
+            let (low_sorted, _) =
+                stable_digit_scatter(&high_sorted[range.clone()], 0, low_bucket_count)?;
+            output[range].copy_from_slice(&low_sorted);
+        }
+        output
+    };
+
+    let mut ranges = filled_vec(term_count, 0..0, "term ranges")?;
+    let mut cursor = 0_usize;
+    for (term_id, range) in ranges.iter_mut().enumerate() {
+        let start = cursor;
+        while sorted
+            .get(cursor)
+            .is_some_and(|row| row.term_id as usize == term_id)
+        {
+            cursor += 1;
+        }
+        *range = start..cursor;
+    }
+    if cursor != sorted.len() {
+        return Err(FlushError::ArithmeticOverflow {
+            field: "radix partition coverage",
+        });
+    }
+    Ok(RadixPartition {
+        rows: sorted,
+        ranges,
+    })
+}
+
+fn stable_digit_scatter(
+    rows: &[FlushTokenRow],
+    shift: u32,
+    bucket_count: usize,
+) -> Result<(Vec<FlushTokenRow>, Vec<Range<usize>>), FlushError> {
+    let mut counts = filled_vec(bucket_count, 0_usize, "radix histogram")?;
+    for row in rows {
+        let digit = ((row.term_id >> shift) & 0xffff) as usize;
+        let count = counts
+            .get_mut(digit)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "radix digit domain",
+            })?;
+        *count = count.checked_add(1).ok_or(FlushError::ArithmeticOverflow {
+            field: "radix histogram count",
+        })?;
+    }
+
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(bucket_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "radix prefix ranges",
+            count: bucket_count,
+        })?;
+    let mut cursor = 0_usize;
+    for count in counts {
+        let end = cursor
+            .checked_add(count)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "radix prefix sum",
+            })?;
+        ranges.push(cursor..end);
+        cursor = end;
+    }
+    if cursor != rows.len() {
+        return Err(FlushError::ArithmeticOverflow {
+            field: "radix prefix coverage",
+        });
+    }
+    let mut write_offsets = Vec::new();
+    write_offsets
+        .try_reserve_exact(ranges.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "radix write offsets",
+            count: ranges.len(),
+        })?;
+    write_offsets.extend(ranges.iter().map(|range| range.start));
+    let mut output = filled_vec(rows.len(), FlushTokenRow::default(), "radix scatter")?;
+    for row in rows {
+        let digit = ((row.term_id >> shift) & 0xffff) as usize;
+        let destination = write_offsets
+            .get_mut(digit)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "radix scatter digit",
+            })?;
+        output[*destination] = *row;
+        *destination += 1;
+    }
+    Ok((output, ranges))
+}
+
+type OrderedTermStreams<'a> = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<TermInput<'a>>);
+
+fn encode_ordered_term_streams<'a, A: TokenAnalyzer>(
+    accumulator: &'a ColumnarAccumulator<A>,
+    partition: &RadixPartition,
+    lease_docid_base: u64,
+    docid_lo: u64,
+    doclen_columns: &[Vec<Option<u32>>],
+) -> Result<OrderedTermStreams<'a>, FlushError> {
+    let sorted_ids = accumulator.terms().sorted_ids();
+    let mut postings_bytes = Vec::new();
+    let mut positions_bytes = Vec::new();
+    let mut blockmax_bytes = Vec::new();
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(sorted_ids.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "TERMDICT inputs",
+            count: sorted_ids.len(),
+        })?;
+
+    for term_id_u32 in sorted_ids {
+        let term_id = usize::try_from(term_id_u32).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "local term host index",
+        })?;
+        let range = partition
+            .ranges
+            .get(term_id)
+            .ok_or(FlushError::TermHasNoRows {
+                term_id: term_id_u32,
+            })?;
+        if range.is_empty() {
+            return Err(FlushError::TermHasNoRows {
+                term_id: term_id_u32,
+            });
+        }
+        let rows = &partition.rows[range.clone()];
+        let field_ord = accumulator.terms().field_and_term(term_id_u32).0;
+        let field_index = accumulator
+            .fields()
+            .binary_search_by_key(&field_ord, FieldTokenColumns::field_ord)
+            .map_err(|_| FlushError::InvalidTokenColumn {
+                field_ord,
+                detail: "term references a non-indexed field",
+            })?;
+        let field = &accumulator.fields()[field_index];
+        let (postings, positions) = build_term_rows(
+            term_id_u32,
+            rows,
+            lease_docid_base,
+            field.positions().is_some(),
+        )?;
+        let field_doclens =
+            doclen_columns
+                .get(field_index)
+                .ok_or(FlushError::InvalidTokenColumn {
+                    field_ord,
+                    detail: "missing DOCLEN source column",
+                })?;
+        let (encoded_postings, encoded_blockmax) =
+            EncodedPostingList::encode_with_block_max(&postings, |global_docid| {
+                let relative = u64::from(global_docid).checked_sub(docid_lo)?;
+                let relative = usize::try_from(relative).ok()?;
+                field_doclens
+                    .get(relative)
+                    .copied()
+                    .flatten()
+                    .map(fieldnorm_to_id)
+            })?;
+        let encoded_positions = positions
+            .as_deref()
+            .map(|values| EncodedPositionList::encode(&postings, values))
+            .transpose()?;
+        let postings_span = append_span(
+            &mut postings_bytes,
+            encoded_postings.as_bytes(),
+            "POSTINGS span",
+        )?;
+        let positions_span = encoded_positions
+            .as_ref()
+            .map(|encoded| append_span(&mut positions_bytes, encoded.as_bytes(), "POSITIONS span"))
+            .transpose()?;
+        let blockmax_span = append_span(
+            &mut blockmax_bytes,
+            encoded_blockmax.as_bytes(),
+            "BLOCKMAX span",
+        )?;
+        let doc_freq = encoded_postings.doc_freq();
+        let metadata = positions_span.map_or_else(
+            || TermMetadata::without_positions(doc_freq, postings_span, blockmax_span),
+            |positions_span| {
+                TermMetadata::with_positions(doc_freq, postings_span, positions_span, blockmax_span)
+            },
+        );
+        let (field_ord, term) = accumulator.terms().field_and_term(term_id_u32);
+        inputs.push(TermInput::new(field_ord, term, metadata));
+    }
+    Ok((postings_bytes, positions_bytes, blockmax_bytes, inputs))
+}
+
+fn build_term_rows(
+    term_id: u32,
+    rows: &[FlushTokenRow],
+    lease_docid_base: u64,
+    stores_positions: bool,
+) -> Result<(Vec<Posting>, Option<Vec<u32>>), FlushError> {
+    let posting_count = rows
+        .windows(2)
+        .filter(|pair| pair[0].doc_ord != pair[1].doc_ord)
+        .count()
+        .saturating_add(1);
+    let mut postings = Vec::new();
+    postings
+        .try_reserve_exact(posting_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "term postings",
+            count: posting_count,
+        })?;
+    let mut positions = if stores_positions {
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(rows.len())
+            .map_err(|_| FlushError::Allocation {
+                resource: "term positions",
+                count: rows.len(),
+            })?;
+        Some(values)
+    } else {
+        None
+    };
+    let first = rows.first().ok_or(FlushError::TermHasNoRows { term_id })?;
+    let mut current_doc = first.doc_ord;
+    let mut frequency = 0_u32;
+    let mut previous_position = None;
+    for (index, row) in rows.iter().enumerate() {
+        if row.term_id != term_id {
+            return Err(FlushError::TermIdOutOfRange {
+                field_ord: 0,
+                term_id: row.term_id,
+            });
+        }
+        if row.doc_ord < current_doc {
+            return Err(FlushError::NonAscendingTermDocuments {
+                term_id,
+                index,
+                previous: current_doc,
+                current: row.doc_ord,
+            });
+        }
+        if row.doc_ord != current_doc {
+            postings.push(Posting::new(
+                u32::try_from(rebase_doc_id(lease_docid_base, current_doc)?).map_err(|_| {
+                    FlushError::DocumentIdOverflow {
+                        lease_docid_base,
+                        doc_ord: current_doc,
+                    }
+                })?,
+                frequency,
+            ));
+            current_doc = row.doc_ord;
+            frequency = 0;
+            previous_position = None;
+        }
+        if let Some(previous) = previous_position
+            && row.position < previous
+        {
+            return Err(FlushError::NonAscendingPositions {
+                term_id,
+                doc_ord: row.doc_ord,
+                previous,
+                current: row.position,
+            });
+        }
+        frequency = frequency
+            .checked_add(1)
+            .ok_or(FlushError::TermFrequencyOverflow {
+                term_id,
+                doc_ord: row.doc_ord,
+            })?;
+        if let Some(positions) = &mut positions {
+            positions.push(row.position);
+            previous_position = Some(row.position);
+        }
+    }
+    postings.push(Posting::new(
+        u32::try_from(rebase_doc_id(lease_docid_base, current_doc)?).map_err(|_| {
+            FlushError::DocumentIdOverflow {
+                lease_docid_base,
+                doc_ord: current_doc,
+            }
+        })?,
+        frequency,
+    ));
+    Ok((postings, positions))
+}
+
+fn append_span(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<ByteSpan, FlushError> {
+    let offset = durable_len(output, field)?;
+    output
+        .try_reserve(bytes.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: field,
+            count: bytes.len(),
+        })?;
+    output.extend_from_slice(bytes);
+    Ok(ByteSpan::new(offset, durable_len(bytes, field)?))
+}
+
+fn filled_vec<T: Clone>(
+    len: usize,
+    value: T,
+    resource: &'static str,
+) -> Result<Vec<T>, FlushError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(len)
+        .map_err(|_| FlushError::Allocation {
+            resource,
+            count: len,
+        })?;
+    output.resize(len, value);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grimoire::TermDictionary;
+    use crate::quiver::{IdHashSection, IdMapSection, PositionList, PostingList, StatsSection};
     use crate::schema::{CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor};
+    use crate::segment::SegmentReader;
     use frankensearch_lexical::tantivy_crate::tokenizer::TokenStream;
     use serde_json::Value;
     use std::hash::BuildHasherDefault;
@@ -1910,6 +3047,20 @@ mod tests {
     const UNSUPPORTED_ANALYZER_SCHEMA: SchemaDescriptor = SchemaDescriptor {
         name: "scribe-unsupported-analyzer-v1",
         fields: &UNSUPPORTED_ANALYZER_FIELDS,
+    };
+
+    const INDEXED_NUMERIC_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        id: 0,
+        name: "sequence",
+        kind: FieldKind::U64 {
+            indexed: true,
+            fast: false,
+        },
+        stored: true,
+    }];
+    const INDEXED_NUMERIC_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "scribe-indexed-numeric-v1",
+        fields: &INDEXED_NUMERIC_FIELDS,
     };
 
     #[derive(Debug, Default)]
@@ -3650,5 +4801,557 @@ mod tests {
             .saturating_add(accumulator.seen_fields.capacity().div_ceil(8))
             .saturating_add(accumulator.analyzer.bytes_reserved());
         assert_eq!(accumulator.bytes_reserved(), exact_components);
+    }
+
+    #[test]
+    fn radix_flush_is_byte_identical_and_reopens_every_section() {
+        let mut accumulator =
+            ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+        accumulator
+            .add_document_with_stored(
+                2,
+                &[
+                    IndexedFieldValue::new(0, "doc-a"),
+                    IndexedFieldValue::new(1, "alpha beta alpha"),
+                    IndexedFieldValue::new(2, "alpha alpha"),
+                ],
+                &[StoredFieldValue::new(3, b"stored-a")],
+            )
+            .expect("first sparse document accumulates");
+        accumulator
+            .add_document_with_stored(
+                5,
+                &[
+                    IndexedFieldValue::new(0, "doc-b"),
+                    IndexedFieldValue::new(1, "beta alpha"),
+                    IndexedFieldValue::new(2, "gamma"),
+                ],
+                &[StoredFieldValue::new(3, b"stored-b")],
+            )
+            .expect("second sparse document accumulates");
+        let identities = [
+            FlushDocumentInput::from_canonical_content(2, "doc-a", b"canonical-a"),
+            FlushDocumentInput::from_canonical_content(5, "doc-b", b"canonical-b"),
+        ];
+        let input = FlushSegmentInput {
+            segment_id: 0xfeed_beef,
+            lease_docid_base: 65_536,
+            created_unix_s: 1_700_000_000,
+            engine_version: 0x0001_0002,
+            documents: &identities,
+        };
+
+        let first = flush_accumulator(&accumulator, input).expect("first flush");
+        let second = flush_accumulator(&accumulator, input).expect("second flush");
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert_eq!(accumulator.document_ords(), &[2, 5]);
+
+        let reader = SegmentReader::from_bytes(first.as_bytes(), MIXED_POSITION_SCHEMA)
+            .expect("segment reopens");
+        reader.verify().expect("all section witnesses verify");
+        assert_eq!(reader.header().docid_lo, 65_538);
+        assert_eq!(reader.header().docid_hi, 65_542);
+        assert_eq!(reader.header().doc_count, 2);
+        let postings_bytes = reader
+            .section(SectionKind::POSTINGS)
+            .expect("POSTINGS checksum")
+            .expect("POSTINGS required");
+        let positions_bytes = reader
+            .section(SectionKind::POSITIONS)
+            .expect("POSITIONS checksum")
+            .expect("POSITIONS required");
+        let blockmax_bytes = reader
+            .section(SectionKind::BLOCKMAX)
+            .expect("BLOCKMAX checksum")
+            .expect("BLOCKMAX required");
+        let sections = TermSectionLengths {
+            postings: u64::try_from(postings_bytes.len()).expect("POSTINGS length"),
+            positions: Some(u64::try_from(positions_bytes.len()).expect("POSITIONS length")),
+            blockmax: u64::try_from(blockmax_bytes.len()).expect("BLOCKMAX length"),
+        };
+        let dictionary = TermDictionary::parse(
+            reader
+                .section(SectionKind::TERMDICT)
+                .expect("TERMDICT checksum")
+                .expect("TERMDICT required"),
+            MIXED_POSITION_SCHEMA,
+            sections,
+        )
+        .expect("TERMDICT reopens");
+        assert_eq!(dictionary.term_count() as usize, accumulator.terms().len());
+
+        for term_id in 0..u32::try_from(accumulator.terms().len()).expect("term count fits u32") {
+            let (field_ord, term) = accumulator.terms().field_and_term(term_id);
+            let field = accumulator
+                .fields()
+                .iter()
+                .find(|field| field.field_ord() == field_ord)
+                .expect("term field exists");
+            let mut expected_runs = Vec::<(u32, u32, Vec<u32>)>::new();
+            for index in 0..field.term_ids().len() {
+                if field.term_ids()[index] != term_id {
+                    continue;
+                }
+                let doc_id =
+                    u32::try_from(input.lease_docid_base + u64::from(field.doc_ords()[index]))
+                        .expect("fixture document id fits u32");
+                if let Some((previous_doc, frequency, run_positions)) = expected_runs.last_mut()
+                    && *previous_doc == doc_id
+                {
+                    *frequency += 1;
+                    if let Some(positions) = field.positions() {
+                        run_positions.push(positions[index]);
+                    }
+                } else {
+                    expected_runs.push((
+                        doc_id,
+                        1,
+                        field
+                            .positions()
+                            .map_or_else(Vec::new, |positions| vec![positions[index]]),
+                    ));
+                }
+            }
+            let entry = dictionary
+                .lookup(field_ord, term)
+                .expect("term lookup is valid")
+                .expect("every interned term is emitted");
+            assert_eq!(
+                entry.metadata.doc_freq,
+                u32::try_from(expected_runs.len()).expect("fixture doc frequency fits u32"),
+                "doc_freq drift for field {field_ord} term {:?}",
+                String::from_utf8_lossy(term)
+            );
+            let posting_start =
+                usize::try_from(entry.metadata.postings.offset).expect("posting offset");
+            let posting_end = posting_start
+                + usize::try_from(entry.metadata.postings.len).expect("posting length");
+            let posting_list = PostingList::parse(
+                &postings_bytes[posting_start..posting_end],
+                entry.metadata.doc_freq,
+            )
+            .expect("posting list reopens");
+            let decoded = posting_list.decode_all().expect("posting list decodes");
+            let expected_postings = expected_runs
+                .iter()
+                .map(|(doc_id, frequency, _)| Posting::new(*doc_id, *frequency))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                decoded,
+                expected_postings,
+                "posting drift for field {field_ord} term {:?}",
+                String::from_utf8_lossy(term)
+            );
+            if field.positions().is_some() {
+                let position_span = entry.metadata.positions.expect("position span required");
+                let position_start =
+                    usize::try_from(position_span.offset).expect("position offset");
+                let position_end =
+                    position_start + usize::try_from(position_span.len).expect("position length");
+                let position_list = PositionList::parse(
+                    &positions_bytes[position_start..position_end],
+                    &posting_list,
+                )
+                .expect("position list reopens");
+                for (ordinal, (_, _, expected_positions)) in expected_runs.iter().enumerate() {
+                    let actual_positions = position_list
+                        .positions_for_ordinal(
+                            u32::try_from(ordinal).expect("fixture posting ordinal fits u32"),
+                        )
+                        .expect("position run exists")
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("position run decodes");
+                    assert_eq!(actual_positions, *expected_positions);
+                }
+            } else {
+                assert!(entry.metadata.positions.is_none());
+            }
+        }
+
+        let alpha = dictionary
+            .lookup(1, b"alpha")
+            .expect("alpha lookup")
+            .expect("alpha exists");
+        assert_eq!(alpha.metadata.doc_freq, 2);
+        let posting_start =
+            usize::try_from(alpha.metadata.postings.offset).expect("posting offset");
+        let posting_end =
+            posting_start + usize::try_from(alpha.metadata.postings.len).expect("posting length");
+        let postings = PostingList::parse(
+            &postings_bytes[posting_start..posting_end],
+            alpha.metadata.doc_freq,
+        )
+        .expect("alpha postings reopen");
+        assert_eq!(
+            postings.decode_all().expect("alpha postings decode"),
+            [Posting::new(65_538, 2), Posting::new(65_541, 1)]
+        );
+        let position_span = alpha.metadata.positions.expect("alpha stores positions");
+        let position_start = usize::try_from(position_span.offset).expect("position offset");
+        let position_end =
+            position_start + usize::try_from(position_span.len).expect("position length");
+        let positions =
+            PositionList::parse(&positions_bytes[position_start..position_end], &postings)
+                .expect("alpha positions reopen");
+        assert_eq!(
+            positions
+                .positions_for_ordinal(0)
+                .expect("first alpha run")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("first alpha positions"),
+            [0, 2]
+        );
+        assert_eq!(
+            positions
+                .positions_for_ordinal(1)
+                .expect("second alpha run")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("second alpha positions"),
+            [1]
+        );
+
+        let id_map = IdMapSection::parse(
+            reader
+                .section(SectionKind::IDMAP)
+                .expect("IDMAP checksum")
+                .expect("IDMAP required"),
+            65_538,
+            65_542,
+        )
+        .expect("IDMAP reopens");
+        assert_eq!(id_map.get(65_538).expect("first id").document_id(), "doc-a");
+        assert!(!id_map.contains(65_539));
+        assert!(!id_map.contains(65_540));
+        assert_eq!(
+            id_map.get(65_541).expect("second id").document_id(),
+            "doc-b"
+        );
+        let id_hash = IdHashSection::parse(
+            reader
+                .section(SectionKind::IDHASH)
+                .expect("IDHASH checksum")
+                .expect("IDHASH required"),
+            id_map,
+        )
+        .expect("IDHASH reopens");
+        assert_eq!(id_hash.lookup("doc-a"), Some(65_538));
+        assert_eq!(id_hash.lookup("doc-b"), Some(65_541));
+
+        let stats = StatsSection::parse(
+            reader
+                .section(SectionKind::STATS)
+                .expect("STATS checksum")
+                .expect("STATS required"),
+            &[0, 1, 2],
+            2,
+        )
+        .expect("STATS reopens");
+        assert_eq!(stats.field(0), Some(FieldStats::new(0, 2, 2)));
+        assert_eq!(stats.field(1), Some(FieldStats::new(1, 5, 2)));
+        assert_eq!(stats.field(2), Some(FieldStats::new(2, 3, 2)));
+
+        let stored = crate::quiver::StoredMetaSection::parse(
+            reader
+                .section(SectionKind::STOREDMETA)
+                .expect("STOREDMETA checksum")
+                .expect("STOREDMETA required"),
+            65_538,
+            65_542,
+            &[3],
+        )
+        .expect("STOREDMETA reopens");
+        let stored_field = stored.field(3).expect("stored field");
+        assert_eq!(stored_field.get(65_538), Some(b"stored-a".as_slice()));
+        assert_eq!(stored_field.get(65_539), None);
+        assert_eq!(stored_field.get(65_541), Some(b"stored-b".as_slice()));
+    }
+
+    #[test]
+    fn radix_partition_preserves_equal_term_source_order_in_both_widths() {
+        let one_pass = stable_radix_partition(
+            vec![
+                FlushTokenRow {
+                    term_id: 2,
+                    doc_ord: 1,
+                    position: 7,
+                },
+                FlushTokenRow {
+                    term_id: 0,
+                    doc_ord: 2,
+                    position: 8,
+                },
+                FlushTokenRow {
+                    term_id: 2,
+                    doc_ord: 3,
+                    position: 9,
+                },
+            ],
+            3,
+        )
+        .expect("one-pass radix partition");
+        assert_eq!(
+            one_pass.rows,
+            [
+                FlushTokenRow {
+                    term_id: 0,
+                    doc_ord: 2,
+                    position: 8,
+                },
+                FlushTokenRow {
+                    term_id: 2,
+                    doc_ord: 1,
+                    position: 7,
+                },
+                FlushTokenRow {
+                    term_id: 2,
+                    doc_ord: 3,
+                    position: 9,
+                },
+            ]
+        );
+
+        let two_pass = stable_radix_partition(
+            vec![
+                FlushTokenRow {
+                    term_id: 65_536,
+                    doc_ord: 4,
+                    position: 1,
+                },
+                FlushTokenRow {
+                    term_id: 1,
+                    doc_ord: 5,
+                    position: 2,
+                },
+                FlushTokenRow {
+                    term_id: 65_536,
+                    doc_ord: 6,
+                    position: 3,
+                },
+                FlushTokenRow {
+                    term_id: 65_535,
+                    doc_ord: 7,
+                    position: 4,
+                },
+            ],
+            65_537,
+        )
+        .expect("two-pass radix partition");
+        assert_eq!(
+            two_pass
+                .rows
+                .iter()
+                .map(|row| (row.term_id, row.doc_ord))
+                .collect::<Vec<_>>(),
+            [(1, 5), (65_535, 7), (65_536, 4), (65_536, 6)]
+        );
+
+        let source = (0_u32..10_000)
+            .map(|ordinal| FlushTokenRow {
+                term_id: ordinal % 17,
+                doc_ord: ordinal,
+                position: ordinal,
+            })
+            .collect::<Vec<_>>();
+        let serial = stable_radix_partition_with_chunks(source.clone(), 17, 1)
+            .expect("serial reference partition");
+        let parallel = stable_radix_partition_with_chunks(source, 17, 4)
+            .expect("four-chunk parallel partition");
+        assert_eq!(parallel.rows, serial.rows);
+        assert_eq!(parallel.ranges, serial.ranges);
+
+        let mut seed = 0x7f4a_7c15_d2b7_4407_u64;
+        let mut high_cardinality_source = Vec::new();
+        for ordinal in 0_u32..12_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let term_id = if ordinal == 0 {
+                65_536
+            } else {
+                u32::try_from(seed % 65_537).expect("bounded seeded term id")
+            };
+            high_cardinality_source.push(FlushTokenRow {
+                term_id,
+                doc_ord: ordinal,
+                position: ordinal,
+            });
+        }
+        let high_cardinality_serial =
+            stable_radix_partition_with_chunks(high_cardinality_source.clone(), 65_537, 1)
+                .expect("two-pass serial reference partition");
+        let high_cardinality_parallel =
+            stable_radix_partition_with_chunks(high_cardinality_source, 65_537, 4)
+                .expect("two-pass four-chunk parallel partition");
+        assert_eq!(high_cardinality_parallel.rows, high_cardinality_serial.rows);
+        assert_eq!(
+            high_cardinality_parallel.ranges,
+            high_cardinality_serial.ranges
+        );
+    }
+
+    #[test]
+    fn flush_rejects_sidecar_drift_duplicates_numeric_and_docid_overflow() {
+        let empty = ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid schema");
+        assert!(matches!(
+            flush_accumulator(
+                &empty,
+                FlushSegmentInput {
+                    segment_id: 1,
+                    lease_docid_base: 0,
+                    created_unix_s: 0,
+                    engine_version: 0,
+                    documents: &[],
+                }
+            ),
+            Err(FlushError::EmptyAccumulator)
+        ));
+
+        let mut accumulator =
+            ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid schema");
+        accumulator
+            .add_document(7, &[IndexedFieldValue::new(1, "same")])
+            .expect("first document");
+        accumulator
+            .add_document(9, &[IndexedFieldValue::new(1, "same")])
+            .expect("second document");
+        let one_identity = [FlushDocumentInput::new(7, "only-one", 1)];
+        assert!(matches!(
+            flush_accumulator(
+                &accumulator,
+                FlushSegmentInput {
+                    segment_id: 2,
+                    lease_docid_base: 0,
+                    created_unix_s: 0,
+                    engine_version: 0,
+                    documents: &one_identity,
+                }
+            ),
+            Err(FlushError::DocumentCountMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        let drifted = [
+            FlushDocumentInput::new(7, "first", 1),
+            FlushDocumentInput::new(8, "second", 2),
+        ];
+        assert!(matches!(
+            flush_accumulator(
+                &accumulator,
+                FlushSegmentInput {
+                    segment_id: 3,
+                    lease_docid_base: 0,
+                    created_unix_s: 0,
+                    engine_version: 0,
+                    documents: &drifted,
+                }
+            ),
+            Err(FlushError::DocumentOrdinalMismatch {
+                index: 1,
+                expected: 9,
+                actual: 8
+            })
+        ));
+        let duplicates = [
+            FlushDocumentInput::new(7, "duplicate", 1),
+            FlushDocumentInput::new(9, "duplicate", 2),
+        ];
+        assert!(matches!(
+            flush_accumulator(
+                &accumulator,
+                FlushSegmentInput {
+                    segment_id: 4,
+                    lease_docid_base: 0,
+                    created_unix_s: 0,
+                    engine_version: 0,
+                    documents: &duplicates,
+                }
+            ),
+            Err(FlushError::IdHash(
+                IdHashCodecError::DuplicateDocumentId { .. }
+            ))
+        ));
+        let valid = [
+            FlushDocumentInput::new(7, "first", 1),
+            FlushDocumentInput::new(9, "second", 2),
+        ];
+        assert!(matches!(
+            flush_accumulator(
+                &accumulator,
+                FlushSegmentInput {
+                    segment_id: 5,
+                    lease_docid_base: 1,
+                    created_unix_s: 0,
+                    engine_version: 0,
+                    documents: &valid,
+                }
+            ),
+            Err(FlushError::MisalignedLeaseBase {
+                lease_docid_base: 1
+            })
+        ));
+        assert!(matches!(
+            flush_accumulator(
+                &accumulator,
+                FlushSegmentInput {
+                    segment_id: 6,
+                    lease_docid_base: 1_u64 << 32,
+                    created_unix_s: 0,
+                    engine_version: 0,
+                    documents: &valid,
+                }
+            ),
+            Err(FlushError::DocumentIdOverflow { doc_ord: 7, .. })
+        ));
+
+        let mut boundary =
+            ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid boundary schema");
+        boundary
+            .add_document(
+                DOC_ORDS_PER_LEASE - 1,
+                &[IndexedFieldValue::new(1, "last global document")],
+            )
+            .expect("last lease ordinal accumulates");
+        let boundary_identity = [FlushDocumentInput::new(
+            DOC_ORDS_PER_LEASE - 1,
+            "last-global-document",
+            4,
+        )];
+        let boundary_segment = flush_accumulator(
+            &boundary,
+            FlushSegmentInput {
+                segment_id: 7,
+                lease_docid_base: (1_u64 << 32) - u64::from(DOC_ORDS_PER_LEASE),
+                created_unix_s: 0,
+                engine_version: 0,
+                documents: &boundary_identity,
+            },
+        )
+        .expect("u32::MAX remains a valid posting docid");
+        assert_eq!(boundary_segment.header().docid_lo, u64::from(u32::MAX));
+        assert_eq!(boundary_segment.header().docid_hi, 1_u64 << 32);
+
+        let mut numeric =
+            ColumnarAccumulator::new(INDEXED_NUMERIC_SCHEMA).expect("valid numeric schema");
+        numeric
+            .add_document_with_stored(0, &[], &[StoredFieldValue::new(0, &42_u64.to_le_bytes())])
+            .expect("numeric stored bytes accumulate");
+        let numeric_identity = [FlushDocumentInput::new(0, "numeric", 3)];
+        assert!(matches!(
+            flush_accumulator(
+                &numeric,
+                FlushSegmentInput {
+                    segment_id: 8,
+                    lease_docid_base: 0,
+                    created_unix_s: 0,
+                    engine_version: 0,
+                    documents: &numeric_identity,
+                }
+            ),
+            Err(FlushError::IndexedNumericUnsupported {
+                field_ord: 0,
+                field_name: "sequence"
+            })
+        ));
     }
 }
