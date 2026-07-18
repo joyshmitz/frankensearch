@@ -87,9 +87,7 @@ pub enum ManifestCodecError {
         detail: String,
     },
     /// The byte stream ended before a field was complete.
-    #[error(
-        "truncated manifest at byte {offset}: need {needed} bytes, only {remaining} remain"
-    )]
+    #[error("truncated manifest at byte {offset}: need {needed} bytes, only {remaining} remain")]
     Truncated {
         /// Byte offset where the read began.
         offset: usize,
@@ -369,13 +367,12 @@ impl Manifest {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ManifestCodecError> {
         self.validate()?;
 
-        let segment_count = u32::try_from(self.segments.len()).map_err(|_| {
-            ManifestCodecError::ResourceLimit {
+        let segment_count =
+            u32::try_from(self.segments.len()).map_err(|_| ManifestCodecError::ResourceLimit {
                 resource: "segment count",
                 actual: usize_to_u64(self.segments.len()),
                 limit: u64::from(u32::MAX),
-            }
-        })?;
+            })?;
         let field_count = u32::try_from(self.field_stats.len()).map_err(|_| {
             ManifestCodecError::ResourceLimit {
                 resource: "field count",
@@ -483,11 +480,7 @@ impl Manifest {
         let schema_id = cursor.u64()?;
         let engine_version = cursor.u32()?;
         let flags = cursor.u32()?;
-        let segment_count = count_to_usize(
-            cursor.u32()?,
-            "segment count",
-            MAX_MANIFEST_SEGMENTS,
-        )?;
+        let segment_count = count_to_usize(cursor.u32()?, "segment count", MAX_MANIFEST_SEGMENTS)?;
         let minimum_segment_bytes = segment_count
             .checked_mul(SEGMENT_FIXED_BYTES + EMPTY_TOMBSTONES.len())
             .ok_or_else(|| non_canonical("segment byte count overflow"))?;
@@ -529,8 +522,7 @@ impl Manifest {
             });
         }
 
-        let field_count =
-            count_to_usize(cursor.u32()?, "field count", MAX_MANIFEST_FIELDS)?;
+        let field_count = count_to_usize(cursor.u32()?, "field count", MAX_MANIFEST_FIELDS)?;
         let minimum_stats_bytes = field_count
             .checked_mul(FIELD_STATS_BYTES)
             .ok_or_else(|| non_canonical("field-stats byte count overflow"))?;
@@ -863,8 +855,7 @@ impl ManifestPublisher {
 
 fn global_publish_lock() -> Arc<Mutex<()>> {
     Arc::clone(
-        PUBLISH_LOCK
-            .get_or_init(|| Arc::new(Mutex::with_name("quill.manifest_publish", ()))),
+        PUBLISH_LOCK.get_or_init(|| Arc::new(Mutex::with_name("quill.manifest_publish", ()))),
     )
 }
 
@@ -931,8 +922,8 @@ where
 {
     #[cfg(not(unix))]
     ensure_atomic_publish_supported(&directory)?;
-    let proposed = Manifest::from_bytes(bytes)
-        .map_err(|source| KeeperError::InvalidManifest { source })?;
+    let proposed =
+        Manifest::from_bytes(bytes).map_err(|source| KeeperError::InvalidManifest { source })?;
     let metadata = std::fs::metadata(&directory).map_err(|source| KeeperError::Io {
         operation: "inspect directory",
         path: directory.clone(),
@@ -942,7 +933,10 @@ where
         return Err(KeeperError::Io {
             operation: "inspect directory",
             path: directory,
-            source: io::Error::new(io::ErrorKind::NotADirectory, "index path is not a directory"),
+            source: io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "index path is not a directory",
+            ),
         });
     }
 
@@ -1177,14 +1171,15 @@ fn validate_segment_transitions(
                         ),
                     });
                 }
-                let monotone = tombstones_are_subset(&old.tombstones, &new.tombstones).map_err(
-                    |error| KeeperError::InvalidTransition {
-                        detail: format!(
-                            "cannot compare tombstones for segment {:#018x}: {error}",
-                            old.segment_id
-                        ),
-                    },
-                )?;
+                let monotone =
+                    tombstones_are_subset(&old.tombstones, &new.tombstones).map_err(|error| {
+                        KeeperError::InvalidTransition {
+                            detail: format!(
+                                "cannot compare tombstones for segment {:#018x}: {error}",
+                                old.segment_id
+                            ),
+                        }
+                    })?;
                 if !monotone {
                     return Err(KeeperError::InvalidTransition {
                         detail: format!(
@@ -1247,11 +1242,8 @@ struct TombstoneContainers<'a> {
 impl<'a> TombstoneContainers<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self, ManifestCodecError> {
         let mut cursor = ByteCursor::new(bytes);
-        let remaining = count_to_usize(
-            cursor.u32()?,
-            "tombstone chunk count",
-            MAX_TOMBSTONE_CHUNKS,
-        )?;
+        let remaining =
+            count_to_usize(cursor.u32()?, "tombstone chunk count", MAX_TOMBSTONE_CHUNKS)?;
         Ok(Self { cursor, remaining })
     }
 
@@ -1296,10 +1288,7 @@ impl<'a> TombstoneContainers<'a> {
     }
 }
 
-fn tombstones_are_subset(
-    previous: &[u8],
-    proposed: &[u8],
-) -> Result<bool, ManifestCodecError> {
+fn tombstones_are_subset(previous: &[u8], proposed: &[u8]) -> Result<bool, ManifestCodecError> {
     if previous == proposed {
         return Ok(true);
     }
@@ -1350,9 +1339,7 @@ fn array_is_subset_of_array(previous: &[u8], proposed: &[u8]) -> bool {
     let mut proposed_index = 0;
     for previous_index in 0..previous.len() / 2 {
         let old = array_value(previous, previous_index);
-        while proposed_index < proposed.len() / 2
-            && array_value(proposed, proposed_index) < old
-        {
+        while proposed_index < proposed.len() / 2 && array_value(proposed, proposed_index) < old {
             proposed_index += 1;
         }
         if proposed_index == proposed.len() / 2 || array_value(proposed, proposed_index) != old {
@@ -1376,13 +1363,11 @@ fn bitmap_is_subset_of_array(previous: &[u8], proposed: &[u8]) -> bool {
             let Ok(old) = u16::try_from(byte_index * 8 + bit) else {
                 return false;
             };
-            while proposed_index < proposed.len() / 2
-                && array_value(proposed, proposed_index) < old
+            while proposed_index < proposed.len() / 2 && array_value(proposed, proposed_index) < old
             {
                 proposed_index += 1;
             }
-            if proposed_index == proposed.len() / 2
-                || array_value(proposed, proposed_index) != old
+            if proposed_index == proposed.len() / 2 || array_value(proposed, proposed_index) != old
             {
                 return false;
             }
@@ -1427,21 +1412,21 @@ fn read_manifest_slot(path: &Path) -> Result<ManifestSlot, KeeperError> {
         source,
     })?;
     if file_length.len() > usize_to_u64(MAX_MANIFEST_BYTES) {
-        return Ok(ManifestSlot::Invalid(
-            ManifestCodecError::ResourceLimit {
-                resource: "byte length",
-                actual: file_length.len(),
-                limit: usize_to_u64(MAX_MANIFEST_BYTES),
-            },
-        ));
+        return Ok(ManifestSlot::Invalid(ManifestCodecError::ResourceLimit {
+            resource: "byte length",
+            actual: file_length.len(),
+            limit: usize_to_u64(MAX_MANIFEST_BYTES),
+        }));
     }
     let reserve = usize::try_from(file_length.len()).unwrap_or(MAX_MANIFEST_BYTES);
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(reserve).map_err(|error| KeeperError::Io {
-        operation: "allocate read buffer",
-        path: path.to_path_buf(),
-        source: io::Error::other(error.to_string()),
-    })?;
+    bytes
+        .try_reserve_exact(reserve)
+        .map_err(|error| KeeperError::Io {
+            operation: "allocate read buffer",
+            path: path.to_path_buf(),
+            source: io::Error::other(error.to_string()),
+        })?;
     let read_limit = usize_to_u64(MAX_MANIFEST_BYTES).saturating_add(1);
     file.take(read_limit)
         .read_to_end(&mut bytes)
@@ -1451,13 +1436,11 @@ fn read_manifest_slot(path: &Path) -> Result<ManifestSlot, KeeperError> {
             source,
         })?;
     if bytes.len() > MAX_MANIFEST_BYTES {
-        return Ok(ManifestSlot::Invalid(
-            ManifestCodecError::ResourceLimit {
-                resource: "byte length",
-                actual: usize_to_u64(bytes.len()),
-                limit: usize_to_u64(MAX_MANIFEST_BYTES),
-            },
-        ));
+        return Ok(ManifestSlot::Invalid(ManifestCodecError::ResourceLimit {
+            resource: "byte length",
+            actual: usize_to_u64(bytes.len()),
+            limit: usize_to_u64(MAX_MANIFEST_BYTES),
+        }));
     }
     Ok(match Manifest::from_bytes(&bytes) {
         Ok(manifest) => ManifestSlot::Valid(manifest),
@@ -1545,7 +1528,11 @@ fn validate_manifest(
     let mut seal_sequences = Vec::new();
     seal_sequences
         .try_reserve_exact(manifest.segments.len())
-        .map_err(|error| reject(format!("seal-sequence validation allocation failed: {error}")))?;
+        .map_err(|error| {
+            reject(format!(
+                "seal-sequence validation allocation failed: {error}"
+            ))
+        })?;
     seal_sequences.extend(manifest.segments.iter().map(|segment| segment.seal_seq));
     seal_sequences.sort_unstable();
     if let Some([duplicate, ..]) = seal_sequences.windows(2).find(|pair| pair[0] == pair[1]) {
@@ -1643,11 +1630,7 @@ fn consume_tombstone_set(
     cursor: &mut ByteCursor<'_>,
     range: Option<(u64, u64)>,
 ) -> Result<u64, ManifestCodecError> {
-    let chunk_count = count_to_usize(
-        cursor.u32()?,
-        "tombstone chunk count",
-        MAX_TOMBSTONE_CHUNKS,
-    )?;
+    let chunk_count = count_to_usize(cursor.u32()?, "tombstone chunk count", MAX_TOMBSTONE_CHUNKS)?;
     let mut previous_chunk = None;
     let mut total = 0_u64;
     for chunk_index in 0..chunk_count {
@@ -1858,13 +1841,14 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8], ManifestCodecError> {
-        let end = self.position.checked_add(length).ok_or_else(|| {
-            ManifestCodecError::Truncated {
-                offset: self.position,
-                needed: length,
-                remaining: self.remaining(),
-            }
-        })?;
+        let end =
+            self.position
+                .checked_add(length)
+                .ok_or_else(|| ManifestCodecError::Truncated {
+                    offset: self.position,
+                    needed: length,
+                    remaining: self.remaining(),
+                })?;
         let Some(bytes) = self.bytes.get(self.position..end) else {
             return Err(ManifestCodecError::Truncated {
                 offset: self.position,
@@ -2013,8 +1997,14 @@ mod tests {
         let patch = env!("CARGO_PKG_VERSION_PATCH")
             .parse::<u16>()
             .expect("crate patch fits packed engine version");
-        assert_eq!(CURRENT_ENGINE_VERSION, pack_engine_version(major, minor, patch));
-        assert_eq!(unpack_engine_version(CURRENT_ENGINE_VERSION), (major, minor, patch));
+        assert_eq!(
+            CURRENT_ENGINE_VERSION,
+            pack_engine_version(major, minor, patch)
+        );
+        assert_eq!(
+            unpack_engine_version(CURRENT_ENGINE_VERSION),
+            (major, minor, patch)
+        );
     }
 
     #[test]
@@ -2096,8 +2086,7 @@ mod tests {
         for length in 0..body.len() {
             let mut valid_crc_prefix = body[..length].to_vec();
             put_u32(&mut valid_crc_prefix, crc32fast::hash(&body[..length]));
-            let parsed =
-                std::panic::catch_unwind(|| Manifest::from_bytes(&valid_crc_prefix));
+            let parsed = std::panic::catch_unwind(|| Manifest::from_bytes(&valid_crc_prefix));
             assert!(
                 parsed.is_ok(),
                 "parser panicked at valid-CRC body truncation {length}"
@@ -2281,10 +2270,7 @@ mod tests {
     fn pair_loader_rejects_nonadjacent_valid_generations() -> TestResult {
         let directory = tempdir()?;
         write_manifest(&directory.path().join("MANIFEST"), &sample_manifest(9))?;
-        write_manifest(
-            &directory.path().join("MANIFEST.prev"),
-            &sample_manifest(3),
-        )?;
+        write_manifest(&directory.path().join("MANIFEST.prev"), &sample_manifest(3))?;
         assert!(matches!(
             load_manifest_pair(directory.path()),
             Err(KeeperError::InvalidGenerationPair {
@@ -2384,17 +2370,23 @@ mod tests {
             let directory = tempdir().expect("temp directory");
             let publisher = ManifestPublisher::new(directory.path());
             let first = sample_manifest(1);
-            publisher.publish(&cx, &first).await.expect("publish genesis");
+            publisher
+                .publish(&cx, &first)
+                .await
+                .expect("publish genesis");
 
             let mut second = sample_manifest(2);
             second.docid_high_watermark = first.docid_high_watermark + 100;
-            publisher.publish(&cx, &second).await.expect("publish second");
+            publisher
+                .publish(&cx, &second)
+                .await
+                .expect("publish second");
 
             let loaded = load_manifest_pair(directory.path()).expect("reopen pair");
             assert_eq!(loaded.manifest, second);
             assert_eq!(loaded.source, ManifestSource::Current);
-            let previous_bytes = std::fs::read(directory.path().join("MANIFEST.prev"))
-                .expect("read previous");
+            let previous_bytes =
+                std::fs::read(directory.path().join("MANIFEST.prev")).expect("read previous");
             assert_eq!(
                 Manifest::from_bytes(&previous_bytes).expect("parse previous"),
                 first
@@ -2408,7 +2400,10 @@ mod tests {
             let directory = tempdir().expect("temp directory");
             let publisher = ManifestPublisher::new(directory.path());
             let first = sample_manifest(1);
-            publisher.publish(&cx, &first).await.expect("publish genesis");
+            publisher
+                .publish(&cx, &first)
+                .await
+                .expect("publish genesis");
 
             assert!(matches!(
                 publisher.publish(&cx, &sample_manifest(3)).await,
@@ -2432,7 +2427,10 @@ mod tests {
             let directory = tempdir().expect("temp directory");
             let publisher = ManifestPublisher::new(directory.path());
             let first = sample_manifest(1);
-            publisher.publish(&cx, &first).await.expect("publish genesis");
+            publisher
+                .publish(&cx, &first)
+                .await
+                .expect("publish genesis");
 
             let mut mutated = sample_manifest(2);
             mutated.segments[0].file_xxh3 ^= 1;
@@ -2492,7 +2490,10 @@ mod tests {
             let directory = tempdir().expect("temp directory");
             let publisher = ManifestPublisher::new(directory.path());
             let first = sample_manifest(1);
-            publisher.publish(&cx, &first).await.expect("publish genesis");
+            publisher
+                .publish(&cx, &first)
+                .await
+                .expect("publish genesis");
 
             let empty = Manifest::empty(
                 2,
@@ -2597,17 +2598,13 @@ mod tests {
             let expected_bytes = proposed.to_bytes().expect("encode proposal");
 
             let first_result = publisher
-                .publish_with_generation_claim::<(), _>(
-                    &cx,
-                    &proposed,
-                    |path, generation| {
-                        Err(KeeperError::Io {
-                            operation: "test generation claim",
-                            path: path.join(format!("gen-{generation}.claim")),
-                            source: io::Error::other("injected claim failure"),
-                        })
-                    },
-                )
+                .publish_with_generation_claim::<(), _>(&cx, &proposed, |path, generation| {
+                    Err(KeeperError::Io {
+                        operation: "test generation claim",
+                        path: path.join(format!("gen-{generation}.claim")),
+                        source: io::Error::other("injected claim failure"),
+                    })
+                })
                 .await;
             assert!(matches!(
                 first_result,
@@ -2695,8 +2692,7 @@ mod tests {
         std::fs::create_dir(&directory).expect("create target index directory");
         let first_publisher = ManifestPublisher::new(&alias);
         let second_publisher = ManifestPublisher::new(&directory);
-        std::os::unix::fs::symlink(&directory, &alias)
-            .expect("create alias after first publisher");
+        std::os::unix::fs::symlink(&directory, &alias).expect("create alias after first publisher");
         let lock = first_publisher.publish_lock_for_test();
         assert!(Arc::ptr_eq(
             &lock,
