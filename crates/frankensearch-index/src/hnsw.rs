@@ -6,13 +6,16 @@
 //!
 //! The metadata sidecar (e.g. `vector.fast.hnsw`) stores `doc_ids`, config and
 //! dimension as JSON. Since format v2 the native `hnsw_rs` graph is also
-//! persisted next to it as `vector.fast.hnsw.graph` + `vector.fast.hnsw.data`,
-//! so `load()` deserializes the prebuilt graph directly instead of rebuilding
-//! it from vectors. Format v4 fingerprints every live source vector so a stale
-//! graph cannot survive an unsampled vector change. Legacy sidecars and any
+//! persisted in sidecars beside it, so `load()` deserializes the prebuilt graph
+//! directly instead of rebuilding it from vectors. Format v4 fingerprints
+//! every live source vector so a stale graph cannot survive an unsampled vector
+//! change. Format v5 records the exact
+//! generation directory and basename selected during atomic publication, so no
+//! save truncates the pair named by installed metadata. Legacy sidecars and any
 //! load failure fall back to the rebuild-from-`VectorIndex` path.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
@@ -58,9 +61,10 @@ impl Default for HnswConfig {
 /// Current on-disk metadata format. v2 added the native graph sidecars
 /// (`*.hnsw.graph` + `*.hnsw.data`) alongside the JSON metadata; v3 records
 /// graphs built with the dimension-aware `DistDot` roundoff budget; v4 replaces
-/// the sampled source fingerprint with a digest of every live vector. Older
-/// native graphs must be rebuilt under the current persistence contract.
-const HNSW_META_FORMAT_CURRENT: u32 = 4;
+/// the sampled source fingerprint with a digest of every live vector; v5 records
+/// the exact native sidecar generation and basename selected during publication.
+/// Older native graphs must be rebuilt under the current persistence contract.
+const HNSW_META_FORMAT_CURRENT: u32 = 5;
 
 // Keep the classical gamma_k floating-point error model in its well-conditioned
 // region. With u = f32::EPSILON / 2 and k = 8n + 32, this cap is exactly the
@@ -93,6 +97,19 @@ struct HnswMeta {
     /// other fingerprint and therefore cannot use omission to bypass validation.
     #[serde(default)]
     vector_fingerprint: u64,
+    /// Directory containing the native graph/data pair, relative to metadata.
+    /// Every save owns a fresh, atomically created generation so `file_dump`
+    /// never truncates the pair referenced by installed metadata.
+    #[serde(default)]
+    sidecar_generation: Option<String>,
+    /// Basename shared by the native `.hnsw.graph` and `.hnsw.data` files.
+    ///
+    /// A loaded `hnsw_rs` graph refuses to overwrite an occupied dump and
+    /// returns a randomized basename instead. Persisting that returned value
+    /// makes the metadata commit point authoritative. Missing location fields
+    /// invalidate current-format native loading and force a rebuild.
+    #[serde(default)]
+    sidecar_basename: Option<String>,
 }
 
 /// Diagnostics for one ANN query.
@@ -245,14 +262,10 @@ impl HnswIndex {
         meta: &HnswMeta,
         source_index: &VectorIndex,
     ) -> Option<Self> {
-        let parent = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let basename = hnsw_sidecar_basename(path).ok()?;
-        let graph = parent.join(format!("{basename}.hnsw.graph"));
-        let data = parent.join(format!("{basename}.hnsw.data"));
-        if !graph.is_file() || !data.is_file() {
+        let (sidecar_parent, basename) = persisted_hnsw_sidecar_location(path, meta).ok()?;
+        let graph = sidecar_parent.join(format!("{basename}.hnsw.graph"));
+        let data = sidecar_parent.join(format!("{basename}.hnsw.data"));
+        if !native_sidecar_pair_is_local(path, &sidecar_parent, &graph, &data) {
             return None;
         }
 
@@ -296,7 +309,7 @@ impl HnswIndex {
         // is the simplest sound way to obtain a `'static` graph, and the cost
         // is negligible because a persisted load happens about once per
         // process.
-        let hnsw = Box::leak(Box::new(HnswIo::new(parent, &basename)))
+        let hnsw = Box::leak(Box::new(HnswIo::new(&sidecar_parent, &basename)))
             .load_hnsw::<f32, DistDot>()
             .ok()?;
 
@@ -319,10 +332,12 @@ impl HnswIndex {
     /// Persist the ANN index to disk.
     ///
     /// Writes the JSON metadata sidecar (`doc_ids`, config, dimension) at
-    /// `path`, plus the native `hnsw_rs` graph as `{stem}.hnsw.graph` and
-    /// `{stem}.hnsw.data` next to it. Vectors are embedded in the native data
-    /// sidecar by `hnsw_rs`; the `VectorIndex` is only consulted on a v1/legacy
-    /// or fallback rebuild.
+    /// `path`, plus the native `hnsw_rs` graph and data pair next to it. The
+    /// metadata records the exact generation directory and basename returned by
+    /// `hnsw_rs`. Every save dumps into a fresh generation, so neither a newly
+    /// built nor mmap-backed loaded graph can truncate the currently installed
+    /// pair. Vectors are embedded in the native data sidecar; the `VectorIndex`
+    /// is only consulted on a legacy or fallback rebuild.
     ///
     /// # Errors
     ///
@@ -334,15 +349,34 @@ impl HnswIndex {
             .unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
 
-        // Persist the native graph + data sidecars first; only stamp the
-        // metadata as current once the graph is durably written, so a partial dump
-        // can never advertise a graph that isn't there.
-        let basename = hnsw_sidecar_basename(path)?;
-        self.hnsw.file_dump(parent, &basename).map_err(|error| {
-            SearchError::Io(std::io::Error::other(format!(
-                "failed to dump HNSW graph: {error}"
-            )))
-        })?;
+        // Persist into a unique generation first. `hnsw_rs` truncates an
+        // occupied basename for freshly built graphs and uses a racy random
+        // suffix for loaded graphs; an atomically created directory avoids both
+        // behaviors. Metadata remains the sole commit point.
+        let requested_basename = hnsw_sidecar_basename(path)?;
+        let generation_prefix = format!(".{requested_basename}.generation-");
+        let generation = tempfile::Builder::new()
+            .prefix(&generation_prefix)
+            .tempdir_in(parent)
+            .map_err(SearchError::Io)?;
+        let dumped_basename = self
+            .hnsw
+            .file_dump(generation.path(), &requested_basename)
+            .map_err(|error| {
+                SearchError::Io(std::io::Error::other(format!(
+                    "failed to dump HNSW graph: {error}"
+                )))
+            })?;
+        let dumped_basename = validate_hnsw_sidecar_basename(path, &dumped_basename)?;
+        sync_hnsw_sidecars(generation.path(), &dumped_basename)?;
+        let generation_name = generation
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ann_corrupted(path, "HNSW generation has no UTF-8 directory name"))?;
+        let generation_name = validate_hnsw_sidecar_basename(path, generation_name)?;
+        let _generation_path = generation.keep();
+        sync_hnsw_directory(parent)?;
 
         let meta = HnswMeta {
             format_version: HNSW_META_FORMAT_CURRENT,
@@ -350,10 +384,12 @@ impl HnswIndex {
             config: self.config,
             dimension: self.dimension,
             vector_fingerprint: self.vector_fingerprint,
+            sidecar_generation: Some(generation_name),
+            sidecar_basename: Some(dumped_basename),
         };
         let metadata_bytes = serde_json::to_vec(&meta)
             .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
-        std::fs::write(path, metadata_bytes).map_err(SearchError::Io)?;
+        publish_hnsw_metadata(path, parent, &metadata_bytes)?;
 
         Ok(())
     }
@@ -683,6 +719,150 @@ fn hnsw_sidecar_basename(path: &Path) -> SearchResult<String> {
         .filter(|stem| !stem.is_empty())
         .map(ToOwned::to_owned)
         .ok_or_else(|| ann_corrupted(path, "ANN sidecar path has no usable file stem"))
+}
+
+fn persisted_hnsw_sidecar_location(
+    path: &Path,
+    meta: &HnswMeta,
+) -> SearchResult<(PathBuf, String)> {
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let generation = meta
+        .sidecar_generation
+        .as_deref()
+        .ok_or_else(|| ann_corrupted(path, "current HNSW metadata has no sidecar generation"))?;
+    let generation = validate_hnsw_sidecar_basename(path, generation)?;
+    let basename = meta
+        .sidecar_basename
+        .as_deref()
+        .ok_or_else(|| ann_corrupted(path, "current HNSW metadata has no sidecar basename"))?;
+    let basename = validate_hnsw_sidecar_basename(path, basename)?;
+    Ok((parent.join(generation), basename))
+}
+
+fn validate_hnsw_sidecar_basename(path: &Path, basename: &str) -> SearchResult<String> {
+    let candidate = Path::new(basename);
+    if candidate.file_name() != Some(candidate.as_os_str()) {
+        return Err(ann_corrupted(
+            path,
+            "HNSW native sidecar basename must be one non-empty path component",
+        ));
+    }
+    Ok(basename.to_owned())
+}
+
+fn native_sidecar_pair_is_local(
+    metadata_path: &Path,
+    generation: &Path,
+    graph: &Path,
+    data: &Path,
+) -> bool {
+    let metadata_parent = metadata_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Ok(canonical_parent) = std::fs::canonicalize(metadata_parent) else {
+        return false;
+    };
+
+    let Ok(generation_metadata) = std::fs::symlink_metadata(generation) else {
+        return false;
+    };
+    if generation_metadata.file_type().is_symlink() || !generation_metadata.is_dir() {
+        return false;
+    }
+    let Ok(canonical_generation) = std::fs::canonicalize(generation) else {
+        return false;
+    };
+    if canonical_generation.parent() != Some(canonical_parent.as_path()) {
+        return false;
+    }
+
+    [graph, data].into_iter().all(|sidecar| {
+        let Ok(sidecar_metadata) = std::fs::symlink_metadata(sidecar) else {
+            return false;
+        };
+        if sidecar_metadata.file_type().is_symlink() || !sidecar_metadata.is_file() {
+            return false;
+        }
+        std::fs::canonicalize(sidecar).is_ok_and(|canonical_sidecar| {
+            canonical_sidecar.parent() == Some(canonical_generation.as_path())
+        })
+    })
+}
+
+fn sync_hnsw_sidecars(parent: &Path, basename: &str) -> SearchResult<()> {
+    for suffix in [".hnsw.graph", ".hnsw.data"] {
+        let sidecar_path = parent.join(format!("{basename}{suffix}"));
+        let sidecar = std::fs::File::open(&sidecar_path).map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to open dumped HNSW sidecar '{}': {error}",
+                    sidecar_path.display()
+                ),
+            ))
+        })?;
+        sidecar.sync_all().map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to sync dumped HNSW sidecar '{}': {error}",
+                    sidecar_path.display()
+                ),
+            ))
+        })?;
+    }
+    sync_hnsw_directory(parent)?;
+    Ok(())
+}
+
+fn sync_hnsw_directory(directory: &Path) -> SearchResult<()> {
+    #[cfg(unix)]
+    {
+        let handle = std::fs::File::open(directory).map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to open HNSW parent directory '{}': {error}",
+                    directory.display()
+                ),
+            ))
+        })?;
+        handle.sync_all().map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to sync HNSW parent directory '{}': {error}",
+                    directory.display()
+                ),
+            ))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+    }
+    Ok(())
+}
+
+fn publish_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResult<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(SearchError::Io)?;
+    temporary.write_all(bytes).map_err(SearchError::Io)?;
+    temporary.as_file().sync_all().map_err(SearchError::Io)?;
+    temporary.persist(path).map_err(|error| {
+        SearchError::Io(std::io::Error::new(
+            error.error.kind(),
+            format!(
+                "failed to atomically publish HNSW metadata '{}': {}",
+                path.display(),
+                error.error
+            ),
+        ))
+    })?;
+    sync_hnsw_directory(parent)
 }
 
 /// FNV-1a 64-bit. Chosen because it is deterministic across processes (unlike
@@ -1758,21 +1938,32 @@ mod tests {
         let save_path = temp_path("persist_native", "hnsw");
         ann.save(&save_path).expect("save");
 
-        // Current-format save writes the native graph + data sidecars next to the metadata.
-        let parent = save_path.parent().expect("parent");
-        let basename = save_path.file_stem().unwrap().to_str().unwrap();
-        assert!(
-            parent.join(format!("{basename}.hnsw.graph")).is_file(),
-            "native graph sidecar should exist"
-        );
-        assert!(
-            parent.join(format!("{basename}.hnsw.data")).is_file(),
-            "native data sidecar should exist"
-        );
-
         let meta: HnswMeta =
             serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse meta");
         assert_eq!(meta.format_version, HNSW_META_FORMAT_CURRENT);
+
+        // A fresh save gets the requested basename inside an owned generation
+        // and records that exact pair in current-format metadata.
+        let parent = save_path.parent().expect("parent");
+        let basename = save_path.file_stem().unwrap().to_str().unwrap();
+        let generation = meta
+            .sidecar_generation
+            .as_deref()
+            .expect("current metadata generation");
+        let sidecar_parent = parent.join(generation);
+        assert_eq!(meta.sidecar_basename.as_deref(), Some(basename));
+        assert!(
+            sidecar_parent
+                .join(format!("{basename}.hnsw.graph"))
+                .is_file(),
+            "native graph sidecar should exist"
+        );
+        assert!(
+            sidecar_parent
+                .join(format!("{basename}.hnsw.data"))
+                .is_file(),
+            "native data sidecar should exist"
+        );
 
         // Load goes through the native graph path and still answers correctly.
         let loaded = HnswIndex::load(&save_path, &index).expect("native load");
@@ -1782,6 +1973,180 @@ mod tests {
             .knn_search(&query, 3, HNSW_DEFAULT_EF_SEARCH)
             .expect("search");
         assert_eq!(hits[0].doc_id, "doc-0007");
+    }
+
+    #[test]
+    fn save_accepts_bare_relative_metadata_path() {
+        const CHILD_ENV: &str = "FRANKENSEARCH_HNSW_RELATIVE_SAVE_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let ann = HnswIndex::build_from_parts(
+                vec!["relative-doc".to_owned()],
+                vec![vec![1.0_f32, 0.0]],
+                2,
+                HnswConfig::default(),
+            )
+            .expect("build relative-path ANN");
+            let path = Path::new("relative.hnsw");
+            ann.save(path).expect("save to bare relative path");
+
+            let meta: HnswMeta =
+                serde_json::from_slice(&std::fs::read(path).expect("read relative-path metadata"))
+                    .expect("parse relative-path metadata");
+            let (sidecar_parent, basename) =
+                persisted_hnsw_sidecar_location(path, &meta).expect("resolve relative sidecars");
+            assert!(
+                sidecar_parent
+                    .join(format!("{basename}.hnsw.graph"))
+                    .is_file()
+            );
+            assert!(
+                sidecar_parent
+                    .join(format!("{basename}.hnsw.data"))
+                    .is_file()
+            );
+            return;
+        }
+
+        // The current working directory is process-global. Exercise the bare
+        // path in a child test process so parallel tests cannot observe a cwd
+        // change while still covering the end-to-end save contract.
+        let directory = tempfile::tempdir().expect("relative-path test directory");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("hnsw::tests::save_accepts_bare_relative_metadata_path")
+                .arg("--exact")
+                .arg("--nocapture")
+                .current_dir(directory.path())
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run relative-path child test");
+        assert!(
+            output.status.success(),
+            "relative-path child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn native_resave_atomically_publishes_new_generation() {
+        let original_source_path = temp_path("resave_original_source", "fsvi");
+        let original_source = write_index(
+            &original_source_path,
+            &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]],
+        )
+        .expect("original source");
+        let original_ann =
+            HnswIndex::build_from_vector_index(&original_source, HnswConfig::default())
+                .expect("original ann");
+        let destination = temp_path("resave_destination", "hnsw");
+        original_ann
+            .save(&destination)
+            .expect("seed occupied destination");
+        let original_meta: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&destination).expect("original metadata"))
+                .expect("parse original metadata");
+        let original_generation = original_meta
+            .sidecar_generation
+            .as_deref()
+            .expect("original generation");
+        let original_basename = original_meta
+            .sidecar_basename
+            .as_deref()
+            .expect("original basename");
+        let destination_parent = destination.parent().expect("destination parent");
+        let original_sidecar_parent = destination_parent.join(original_generation);
+        let original_graph_path =
+            original_sidecar_parent.join(format!("{original_basename}.hnsw.graph"));
+        let original_data_path =
+            original_sidecar_parent.join(format!("{original_basename}.hnsw.data"));
+        let original_graph = std::fs::read(&original_graph_path).expect("original graph bytes");
+        let original_data = std::fs::read(&original_data_path).expect("original data bytes");
+
+        // Load a graph over the same IDs/count/dimension but different vectors.
+        // hnsw_rs marks every loaded graph as mmap-backed. Saving this value
+        // over occupied metadata must publish a fresh generation without
+        // touching the previously authoritative pair.
+        let changed_source_path = temp_path("resave_changed_source", "fsvi");
+        let changed_source = write_index(
+            &changed_source_path,
+            &[vec![0.0_f32, 1.0], vec![1.0_f32, 0.0]],
+        )
+        .expect("changed source");
+        let changed_seed =
+            HnswIndex::build_from_vector_index(&changed_source, HnswConfig::default())
+                .expect("changed ann");
+        let changed_seed_path = temp_path("resave_changed_seed", "hnsw");
+        changed_seed
+            .save(&changed_seed_path)
+            .expect("save changed native graph");
+        let changed_meta: HnswMeta = serde_json::from_slice(
+            &std::fs::read(&changed_seed_path).expect("changed native metadata"),
+        )
+        .expect("parse changed native metadata");
+        let changed_loaded =
+            HnswIndex::try_load_native_graph(&changed_seed_path, &changed_meta, &changed_source)
+                .expect("force changed graph through the native mmap-backed load path");
+        changed_loaded
+            .save(&destination)
+            .expect("resave loaded graph over occupied destination");
+
+        let meta: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&destination).expect("metadata"))
+                .expect("parse metadata");
+        let requested = hnsw_sidecar_basename(&destination).expect("requested basename");
+        let published_generation = meta
+            .sidecar_generation
+            .as_deref()
+            .expect("current metadata must name its generation");
+        let published = meta
+            .sidecar_basename
+            .as_deref()
+            .expect("current metadata must name its native pair");
+        assert_ne!(
+            published_generation, original_generation,
+            "every save must publish a collision-free generation"
+        );
+        assert_eq!(
+            published, requested,
+            "metadata must record file_dump's basename"
+        );
+        let published_parent = destination_parent.join(published_generation);
+        assert!(
+            published_parent
+                .join(format!("{published}.hnsw.graph"))
+                .is_file()
+        );
+        assert!(
+            published_parent
+                .join(format!("{published}.hnsw.data"))
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read(&original_graph_path).expect("retained original graph"),
+            original_graph,
+            "resave must not truncate the graph named by old metadata"
+        );
+        assert_eq!(
+            std::fs::read(&original_data_path).expect("retained original data"),
+            original_data,
+            "resave must not truncate the data named by old metadata"
+        );
+
+        let native = HnswIndex::try_load_native_graph(&destination, &meta, &changed_source)
+            .expect("published metadata must admit the returned native pair");
+        let native_hits = native
+            .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search published native graph");
+        assert_eq!(native_hits[0].doc_id, "doc-0001");
+
+        let reloaded = HnswIndex::load(&destination, &changed_source)
+            .expect("reload atomically published graph");
+        let reloaded_hits = reloaded
+            .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search reloaded graph");
+        assert_eq!(reloaded_hits[0].doc_id, "doc-0001");
     }
 
     #[test]
@@ -1800,10 +2165,10 @@ mod tests {
         // VectorIndex instead of failing.
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse");
-        value
-            .as_object_mut()
-            .expect("object")
-            .remove("format_version");
+        let object = value.as_object_mut().expect("object");
+        object.remove("format_version");
+        object.remove("sidecar_generation");
+        object.remove("sidecar_basename");
         let v1_path = temp_path("persist_v1_legacy", "hnsw");
         std::fs::write(&v1_path, serde_json::to_vec(&value).expect("v1 json")).expect("write v1");
 
@@ -1817,39 +2182,135 @@ mod tests {
     }
 
     #[test]
-    fn load_never_treats_v3_native_graph_as_v4() {
+    fn load_never_treats_v4_native_graph_as_v5() {
         // The source index says doc-0000 is e0 and doc-0001 is e1.
-        let source_path = temp_path("persist_v3_source", "fsvi");
+        let source_path = temp_path("persist_v4_source", "fsvi");
         let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
             .expect("source index");
 
         // Build a valid native graph with the same document IDs but the two
-        // vectors swapped, then mark its metadata as v3 and disable the vector
-        // fingerprint so the format boundary is the sole guard. If load accepts
-        // v3 as current, an e0 query returns doc-0001. Correct v4-only loading
-        // rebuilds from source and returns doc-0000.
-        let swapped_path = temp_path("persist_v3_swapped", "fsvi");
+        // vectors swapped, then mark its metadata as v4 while forging the live
+        // source fingerprint. That makes the format boundary the sole guard: if
+        // load accepts v4 as current, an e0 query returns doc-0001. Correct
+        // v5-only loading rebuilds from source and returns doc-0000.
+        let swapped_path = temp_path("persist_v4_swapped", "fsvi");
         let swapped_index = write_index(&swapped_path, &[vec![0.0_f32, 1.0], vec![1.0_f32, 0.0]])
             .expect("swapped index");
         let swapped_ann = HnswIndex::build_from_vector_index(&swapped_index, HnswConfig::default())
             .expect("swapped ann");
-        let save_path = temp_path("persist_v3_native", "hnsw");
+        let save_path = temp_path("persist_v4_native", "hnsw");
         swapped_ann.save(&save_path).expect("save native graph");
 
         let mut meta: HnswMeta =
             serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse");
-        meta.format_version = 3;
-        meta.vector_fingerprint = 0;
-        std::fs::write(&save_path, serde_json::to_vec(&meta).expect("serialize v3"))
-            .expect("write v3 metadata");
+        meta.format_version = 4;
+        meta.vector_fingerprint =
+            fingerprint_live_vector_index(&source_index, 2, 2).expect("live source fingerprint");
+        std::fs::write(&save_path, serde_json::to_vec(&meta).expect("serialize v4"))
+            .expect("write v4 metadata");
 
-        let loaded = HnswIndex::load(&save_path, &source_index).expect("rebuild v3");
+        let loaded = HnswIndex::load(&save_path, &source_index).expect("rebuild v4");
         let hits = loaded
             .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
             .expect("search rebuilt graph");
         assert_eq!(
             hits[0].doc_id, "doc-0000",
-            "v3 sampled-fingerprint graph must be rebuilt under v4's full fingerprint contract"
+            "v4 metadata without the v5 generation publication contract must rebuild"
+        );
+    }
+
+    #[test]
+    fn current_metadata_rejects_missing_or_nonlocal_sidecar_locations() {
+        let source_path = temp_path("persist_location_validation_source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("build graph");
+        let save_path = temp_path("persist_location_validation", "hnsw");
+        ann.save(&save_path).expect("save native graph");
+        let metadata_bytes = std::fs::read(&save_path).expect("metadata bytes");
+
+        for (field, replacement) in [
+            ("sidecar_generation", None),
+            ("sidecar_basename", None),
+            ("sidecar_generation", Some("../escape")),
+            ("sidecar_basename", Some("nested/escape")),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&metadata_bytes).expect("metadata value");
+            let object = value.as_object_mut().expect("metadata object");
+            if let Some(replacement) = replacement {
+                object.insert(field.to_owned(), replacement.into());
+            } else {
+                object.remove(field);
+            }
+            let meta: HnswMeta = serde_json::from_value(value).expect("parse corrupted metadata");
+            assert!(
+                persisted_hnsw_sidecar_location(&save_path, &meta).is_err(),
+                "invalid {field} must fail location validation"
+            );
+            assert!(
+                HnswIndex::try_load_native_graph(&save_path, &meta, &source_index).is_none(),
+                "invalid {field} must fail native loading closed"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_metadata_rejects_symlinked_native_sidecars() {
+        use std::os::unix::fs::symlink;
+
+        let source_path = temp_path("persist_symlink_source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("build graph");
+        let save_path = temp_path("persist_symlink_validation", "hnsw");
+        ann.save(&save_path).expect("save native graph");
+        let metadata_bytes = std::fs::read(&save_path).expect("metadata bytes");
+        let original: HnswMeta =
+            serde_json::from_slice(&metadata_bytes).expect("parse native metadata");
+        let parent = save_path.parent().expect("metadata parent");
+        let generation = original
+            .sidecar_generation
+            .as_deref()
+            .expect("native generation");
+        let basename = original
+            .sidecar_basename
+            .as_deref()
+            .expect("native basename");
+        let original_generation = parent.join(generation);
+
+        let generation_link_name = format!("{generation}-link");
+        symlink(&original_generation, parent.join(&generation_link_name))
+            .expect("create generation symlink");
+        let mut generation_link_meta: HnswMeta =
+            serde_json::from_slice(&metadata_bytes).expect("parse generation-link metadata");
+        generation_link_meta.sidecar_generation = Some(generation_link_name);
+        assert!(
+            HnswIndex::try_load_native_graph(&save_path, &generation_link_meta, &source_index)
+                .is_none(),
+            "native loading must not follow a generation symlink"
+        );
+
+        let sidecar_link_generation_name = format!("{generation}-sidecar-links");
+        let sidecar_link_generation = parent.join(&sidecar_link_generation_name);
+        std::fs::create_dir(&sidecar_link_generation).expect("create sidecar-link generation");
+        for suffix in [".hnsw.graph", ".hnsw.data"] {
+            symlink(
+                original_generation.join(format!("{basename}{suffix}")),
+                sidecar_link_generation.join(format!("{basename}{suffix}")),
+            )
+            .expect("create native sidecar symlink");
+        }
+        let mut sidecar_link_meta: HnswMeta =
+            serde_json::from_slice(&metadata_bytes).expect("parse sidecar-link metadata");
+        sidecar_link_meta.sidecar_generation = Some(sidecar_link_generation_name);
+        assert!(
+            HnswIndex::try_load_native_graph(&save_path, &sidecar_link_meta, &source_index)
+                .is_none(),
+            "native loading must not follow graph or data symlinks"
         );
     }
 
@@ -1959,7 +2420,7 @@ mod tests {
             .expect("search original");
         assert_eq!(original_hits[0].doc_id, "doc-0007");
         // Sanity that the fingerprint actually got stamped.
-        let meta: HnswMeta =
+        let mut meta: HnswMeta =
             serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse meta");
         assert_ne!(
             meta.vector_fingerprint, 0,
@@ -1978,18 +2439,36 @@ mod tests {
         // Copy the metadata + graph + data sidecars next to the swapped FSVI
         // so the load path's directory layout is plausible.
         let swap_save_path = temp_path("persist_swap_after", "hnsw");
-        std::fs::copy(&save_path, &swap_save_path).expect("copy meta");
         let src_parent = save_path.parent().expect("src parent");
         let dst_parent = swap_save_path.parent().expect("dst parent");
-        let src_stem = save_path.file_stem().unwrap().to_str().unwrap();
+        let src_generation = meta
+            .sidecar_generation
+            .as_deref()
+            .expect("source metadata generation");
+        let src_stem = meta
+            .sidecar_basename
+            .as_deref()
+            .expect("source metadata basename");
         let dst_stem = swap_save_path.file_stem().unwrap().to_str().unwrap();
+        let dst_generation = format!(".{dst_stem}.relocated");
+        let dst_sidecar_parent = dst_parent.join(&dst_generation);
+        std::fs::create_dir(&dst_sidecar_parent).expect("create relocated generation");
         for ext in ["hnsw.graph", "hnsw.data"] {
             std::fs::copy(
-                src_parent.join(format!("{src_stem}.{ext}")),
-                dst_parent.join(format!("{dst_stem}.{ext}")),
+                src_parent
+                    .join(src_generation)
+                    .join(format!("{src_stem}.{ext}")),
+                dst_sidecar_parent.join(format!("{dst_stem}.{ext}")),
             )
             .expect("copy sidecar");
         }
+        meta.sidecar_generation = Some(dst_generation);
+        meta.sidecar_basename = Some(dst_stem.to_owned());
+        std::fs::write(
+            &swap_save_path,
+            serde_json::to_vec(&meta).expect("serialize relocated metadata"),
+        )
+        .expect("write relocated metadata");
 
         // Load against the swapped FSVI. The fingerprint mismatch must trigger
         // the rebuild fallback, which sees doc-0007 ≈ basis_99 and therefore
