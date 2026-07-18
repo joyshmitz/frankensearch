@@ -1,0 +1,3982 @@
+//! Engine-neutral query trees and the shipping default lenient parser.
+//!
+//! Parsing is deliberately separated from scorer construction. The tree uses
+//! stable Quill field identifiers, never Tantivy field handles, and malformed
+//! user input is recovered or dropped with diagnostics rather than promoted to
+//! a search error.
+
+use std::fmt;
+use std::ops::Bound;
+
+use thiserror::Error;
+
+use crate::schema::{Analyzer as AnalyzerKind, FieldDescriptor, FieldKind, SchemaDescriptor};
+use crate::scribe::{FrankensearchTokenizer, analyze_admitted};
+
+/// Maximum number of Unicode scalar values admitted to the default parser.
+pub const MAX_QUERY_LENGTH: usize = 10_000;
+
+/// Maximum recursive group depth accepted by the lenient parser.
+///
+/// The input-length limit already bounds work; this separate cap prevents a
+/// hostile parenthesis run from turning into unbounded native-stack growth.
+pub const MAX_QUERY_DEPTH: usize = 64;
+
+const CONTENT_FIELD_NAME: &str = "content";
+const TITLE_FIELD_NAME: &str = "title";
+const TITLE_BOOST: f32 = 2.0;
+
+/// One queryable field and its parser-time score multiplier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueryField {
+    /// Stable schema-local field identifier.
+    pub field_id: u16,
+    /// Multiplicative score boost applied when this branch is lowered.
+    pub boost: f32,
+}
+
+impl QueryField {
+    /// Construct a field target.
+    #[must_use]
+    pub const fn new(field_id: u16, boost: f32) -> Self {
+        Self { field_id, boost }
+    }
+}
+
+/// One normalized phrase term with its analyzer position.
+///
+/// Positions are retained even when an oversized predecessor was rejected, so
+/// lowerers cannot accidentally turn a gapped phrase into an adjacent phrase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionedTerm {
+    /// Logical analyzer position.
+    pub position: u32,
+    /// Normalized term text.
+    pub text: String,
+}
+
+/// One schema-typed scalar used by numeric ranges and sets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum QueryValue {
+    /// Signed 64-bit value.
+    I64(i64),
+    /// Unsigned 64-bit value.
+    U64(u64),
+    /// Exact field-typed text value after analyzer normalization.
+    Str(String),
+}
+
+impl PositionedTerm {
+    /// Construct a positioned phrase term.
+    #[must_use]
+    pub fn new(position: u32, text: impl Into<String>) -> Self {
+        Self {
+            position,
+            text: text.into(),
+        }
+    }
+}
+
+/// Clause occurrence shared by query planning and scorer lowering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Occur {
+    /// The child must match.
+    Must,
+    /// The child is optional unless the Boolean node has no required child.
+    Should,
+    /// The child must not match and contributes no score.
+    MustNot,
+}
+
+/// Explicit source operator retained for fixture explanations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BooleanOperator {
+    /// Explicit conjunction.
+    And,
+    /// Explicit disjunction.
+    Or,
+}
+
+/// One owned child in a Boolean query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BooleanClause {
+    /// Match occurrence.
+    pub occur: Occur,
+    /// Child query.
+    pub query: Query,
+}
+
+impl BooleanClause {
+    /// Construct a Boolean child.
+    #[must_use]
+    pub fn new(occur: Occur, query: Query) -> Self {
+        Self { occur, query }
+    }
+}
+
+/// Engine-neutral lexical query tree.
+///
+/// Text and phrase leaves may target several fields when analysis produced the
+/// same token sequence for each field. This preserves the default parser's
+/// ordered `[content, title]` expansion without smuggling backend handles into
+/// the durable query boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Query {
+    /// Match nothing.
+    Empty,
+    /// Match every live document.
+    All,
+    /// One analyzed term over one or more fields.
+    Term {
+        /// Ordered field expansion.
+        fields: Vec<QueryField>,
+        /// Normalized term text.
+        text: String,
+    },
+    /// Exact-position phrase over one or more fields.
+    Phrase {
+        /// Ordered field expansion.
+        fields: Vec<QueryField>,
+        /// Normalized terms in phrase order.
+        terms: Vec<PositionedTerm>,
+        /// Permitted positional slop.
+        slop: u32,
+        /// Whether the last term is a prefix.
+        prefix: bool,
+    },
+    /// Boolean combination.
+    Boolean {
+        /// Stable construction-order children.
+        clauses: Vec<BooleanClause>,
+        /// Explicit source operator, when one was present.
+        operator: Option<BooleanOperator>,
+    },
+    /// Inclusive/exclusive signed numeric range.
+    Range {
+        /// Stable numeric field identifier.
+        field_id: u16,
+        /// Lower bound.
+        lower: Bound<QueryValue>,
+        /// Upper bound.
+        upper: Bound<QueryValue>,
+    },
+    /// Exact set membership over one typed field.
+    Set {
+        /// Stable field identifier.
+        field_id: u16,
+        /// Values in stable source order after exact duplicate removal.
+        values: Vec<QueryValue>,
+    },
+    /// Glob pattern over an ordered set of fields.
+    Glob {
+        /// Stable field identifiers.
+        field_ids: Vec<u16>,
+        /// Original glob pattern.
+        pattern: String,
+    },
+    /// Explicit score multiplier.
+    Boost {
+        /// Wrapped query.
+        query: Box<Self>,
+        /// Finite, non-negative multiplier.
+        factor: f32,
+    },
+}
+
+impl Query {
+    /// Whether this tree is the match-none sentinel.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+}
+
+/// Stable user-facing classification preserved from the incumbent adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum QueryExplanation {
+    /// Empty or whitespace-only input.
+    Empty,
+    /// One whitespace-delimited fragment.
+    Simple,
+    /// Input wrapped in matching single or double quotes.
+    Phrase,
+    /// More than one whitespace-delimited fragment.
+    Boolean,
+}
+
+impl fmt::Display for QueryExplanation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("empty"),
+            Self::Simple => formatter.write_str("simple"),
+            Self::Phrase => formatter.write_str("phrase"),
+            Self::Boolean => formatter.write_str("boolean"),
+        }
+    }
+}
+
+/// Classify a raw query exactly as the shipping explanation surface does.
+#[must_use]
+pub fn classify_query(query: &str) -> QueryExplanation {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return QueryExplanation::Empty;
+    }
+    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        return QueryExplanation::Phrase;
+    }
+    if trimmed.split_whitespace().count() <= 1 {
+        QueryExplanation::Simple
+    } else {
+        QueryExplanation::Boolean
+    }
+}
+
+/// Parser recovery/normalization diagnostic category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryDiagnosticKind {
+    /// The query exceeded [`MAX_QUERY_LENGTH`].
+    Truncated,
+    /// Invalid syntax was repaired or skipped.
+    SyntaxRecovery,
+    /// A field prefix was not present in the schema.
+    UnknownField,
+    /// A known field cannot be queried by this parser.
+    UnsupportedField,
+    /// A fragment emitted no usable query branch.
+    DroppedFragment,
+    /// A typed range endpoint or set member did not match its schema field.
+    InvalidTypedValue,
+    /// A boost was malformed or outside the finite non-negative domain.
+    InvalidBoost,
+    /// Match-all was added to give an all-negative user query complement semantics.
+    AllNegativeRepair,
+    /// The nesting cap was reached.
+    DepthLimit,
+}
+
+/// One best-effort parse diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryDiagnostic {
+    /// Stable diagnostic category.
+    pub kind: QueryDiagnosticKind,
+    /// Human-readable contract explanation.
+    pub message: String,
+    /// Source byte offset, when tied to a fragment.
+    pub byte_offset: Option<usize>,
+    /// Source fragment, when useful and bounded by the query cap.
+    pub fragment: Option<String>,
+}
+
+/// Complete output of a lenient parse.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedQuery {
+    /// Recovered engine-neutral tree.
+    pub query: Query,
+    /// Incumbent-compatible explanation classification.
+    pub explanation: QueryExplanation,
+    /// Ordered recovery/truncation diagnostics.
+    pub diagnostics: Vec<QueryDiagnostic>,
+    /// Whether the input was truncated before lexing.
+    pub was_truncated: bool,
+}
+
+/// Invalid schema configuration for the shipping default parser.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum QueryParserConfigError {
+    /// The schema violates the dense-ID descriptor contract.
+    #[error("query schema {schema} is invalid: {detail}")]
+    InvalidSchema {
+        /// Schema diagnostic name.
+        schema: &'static str,
+        /// Descriptor validation detail.
+        detail: String,
+    },
+    /// A mandatory default field is absent.
+    #[error("default query field {field} is absent from schema {schema}")]
+    MissingDefaultField {
+        /// Schema diagnostic name.
+        schema: &'static str,
+        /// Missing field name.
+        field: &'static str,
+    },
+    /// A mandatory default field is not default-analyzed text.
+    #[error("default query field {field} in schema {schema} is not default-analyzed text")]
+    InvalidDefaultField {
+        /// Schema diagnostic name.
+        schema: &'static str,
+        /// Invalid field name.
+        field: &'static str,
+    },
+}
+
+/// Shipping lenient parser for the default `[content, title^2]` expansion.
+#[derive(Debug, Clone, Copy)]
+pub struct DefaultQueryParser {
+    schema: SchemaDescriptor,
+    default_fields: [QueryField; 2],
+}
+
+impl DefaultQueryParser {
+    /// Bind the parser to a schema containing default-analyzed `content` and
+    /// `title` fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when either mandatory field is missing or
+    /// uses a non-default analyzer or does not store positions.
+    pub fn new(schema: SchemaDescriptor) -> Result<Self, QueryParserConfigError> {
+        schema
+            .validate()
+            .map_err(|error| QueryParserConfigError::InvalidSchema {
+                schema: schema.name,
+                detail: error.to_string(),
+            })?;
+        let content = required_default_field(schema, CONTENT_FIELD_NAME)?;
+        let title = required_default_field(schema, TITLE_FIELD_NAME)?;
+        Ok(Self {
+            schema,
+            default_fields: [
+                QueryField::new(content.id, 1.0),
+                QueryField::new(title.id, TITLE_BOOST),
+            ],
+        })
+    }
+
+    /// Parse arbitrary user input without returning a syntax error.
+    #[must_use]
+    pub fn parse(&self, query: &str) -> ParsedQuery {
+        self.parse_lenient(query)
+    }
+
+    /// Explicitly named alias emphasizing that syntax never becomes a search
+    /// failure.
+    #[must_use]
+    pub fn parse_lenient(&self, query: &str) -> ParsedQuery {
+        let (query, was_truncated) = truncated_prefix(query);
+        let mut diagnostics = Vec::new();
+        if was_truncated {
+            emit_diagnostic(
+                &mut diagnostics,
+                QueryDiagnostic {
+                    kind: QueryDiagnosticKind::Truncated,
+                    message: format!("query truncated to {MAX_QUERY_LENGTH} Unicode scalar values"),
+                    byte_offset: Some(query.len()),
+                    fragment: None,
+                },
+            );
+        }
+
+        let explanation = classify_query(query);
+        let tokens = lex(query, &mut diagnostics);
+        let mut grammar = Grammar {
+            parser: *self,
+            tokens,
+            cursor: 0,
+            diagnostics,
+            dropped_fragments: 0,
+            lowered_atoms: Vec::new(),
+            field_scopes: Vec::new(),
+        };
+        grammar.recover_leading_binary_operators();
+        let mut parsed = grammar.parse_expression(0);
+        grammar.recover_trailing_tokens();
+        repair_root_all_negative(&mut parsed, &mut grammar);
+
+        ParsedQuery {
+            query: parsed.map_or(Query::Empty, |node| node.query),
+            explanation,
+            diagnostics: grammar.diagnostics,
+            was_truncated,
+        }
+    }
+}
+
+fn required_default_field(
+    schema: SchemaDescriptor,
+    name: &'static str,
+) -> Result<FieldDescriptor, QueryParserConfigError> {
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(QueryParserConfigError::MissingDefaultField {
+            schema: schema.name,
+            field: name,
+        });
+    };
+    if !matches!(
+        field.kind,
+        FieldKind::Text {
+            analyzer: AnalyzerKind::FrankensearchDefault,
+            positions: true,
+        }
+    ) {
+        return Err(QueryParserConfigError::InvalidDefaultField {
+            schema: schema.name,
+            field: name,
+        });
+    }
+    Ok(*field)
+}
+
+/// Return the character-safe prefix accepted by the parser and log truncation.
+#[must_use]
+pub fn truncate_query(query: &str) -> &str {
+    let (prefix, was_truncated) = truncated_prefix(query);
+    if was_truncated {
+        tracing::warn!(
+            target: crate::tracing_conventions::TARGET,
+            phase = crate::tracing_conventions::ARGUS_QUERY,
+            query_len = query.len(),
+            "query truncated to MAX_QUERY_LENGTH"
+        );
+    }
+    prefix
+}
+
+fn truncated_prefix(query: &str) -> (&str, bool) {
+    if query.len() <= MAX_QUERY_LENGTH {
+        return (query, false);
+    }
+    query
+        .char_indices()
+        .nth(MAX_QUERY_LENGTH)
+        .map_or((query, false), |(end, _)| (&query[..end], true))
+}
+
+fn emit_diagnostic(diagnostics: &mut Vec<QueryDiagnostic>, diagnostic: QueryDiagnostic) {
+    tracing::warn!(
+        target: crate::tracing_conventions::TARGET,
+        phase = crate::tracing_conventions::ARGUS_QUERY,
+        "lenient query parse diagnostic"
+    );
+    diagnostics.push(diagnostic);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtomToken {
+    raw: String,
+    field: Option<String>,
+    quoted: bool,
+    slop: u32,
+    prefix: bool,
+    boost: Option<String>,
+    byte_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RangeToken {
+    field: Option<String>,
+    lower: String,
+    upper: String,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+    boost: Option<String>,
+    byte_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetToken {
+    field: Option<String>,
+    values: Vec<String>,
+    boost: Option<String>,
+    byte_offset: usize,
+}
+
+fn range_dedup_key(token: &RangeToken) -> String {
+    format!(
+        "range:{:?}:{}:{}:{}:{}:{:?}",
+        token.field,
+        token.lower,
+        token.upper,
+        token.lower_inclusive,
+        token.upper_inclusive,
+        boost_dedup_key(token.boost.as_deref())
+    )
+}
+
+fn set_dedup_key(token: &SetToken) -> String {
+    format!(
+        "set:{:?}:{:?}:{:?}",
+        token.field,
+        token.values,
+        boost_dedup_key(token.boost.as_deref())
+    )
+}
+
+fn atom_dedup_key(atom: &AtomToken) -> String {
+    let boost = boost_dedup_key(atom.boost.as_deref());
+    format!(
+        "{:?}|{}|{}|{}|{}|{:?}",
+        atom.field, atom.raw, atom.quoted, atom.slop, atom.prefix, boost
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoostDedupKey {
+    Identity,
+    Factor(u32),
+}
+
+fn boost_dedup_key(raw: Option<&str>) -> BoostDedupKey {
+    raw.map_or(BoostDedupKey::Identity, |raw| {
+        match parse_boost_factor(raw) {
+            Some(factor) if factor.to_bits() == 1.0_f32.to_bits() => BoostDedupKey::Identity,
+            Some(factor) => BoostDedupKey::Factor(factor.to_bits()),
+            None => BoostDedupKey::Identity,
+        }
+    })
+}
+
+fn atom_cache_key(atom: &AtomToken) -> Option<String> {
+    if atom
+        .boost
+        .as_deref()
+        .is_some_and(|raw| parse_boost_factor(raw).is_none())
+    {
+        None
+    } else {
+        Some(format!("{atom:?}"))
+    }
+}
+
+fn parse_boost_factor(raw: &str) -> Option<f32> {
+    let (integer, fraction) = raw
+        .split_once('.')
+        .map_or((raw, None), |(integer, fraction)| (integer, Some(fraction)));
+    if integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|fraction| {
+            fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+    raw.parse::<f32>()
+        .ok()
+        .filter(|factor| factor.is_finite() && *factor >= 0.0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LexToken {
+    Atom(AtomToken),
+    Range(RangeToken),
+    Set(SetToken),
+    Dropped(usize),
+    And(usize),
+    Or(usize),
+    Not(usize),
+    Plus(usize),
+    Minus(usize),
+    LeftParen {
+        byte_offset: usize,
+        field: Option<String>,
+    },
+    RightParen {
+        byte_offset: usize,
+        boost: Option<String>,
+    },
+}
+
+impl LexToken {
+    const fn byte_offset(&self) -> usize {
+        match self {
+            Self::Atom(atom) => atom.byte_offset,
+            Self::Range(token) => token.byte_offset,
+            Self::Set(token) => token.byte_offset,
+            Self::Dropped(offset)
+            | Self::And(offset)
+            | Self::Or(offset)
+            | Self::Not(offset)
+            | Self::Plus(offset)
+            | Self::Minus(offset) => *offset,
+            Self::LeftParen { byte_offset, .. } | Self::RightParen { byte_offset, .. } => {
+                *byte_offset
+            }
+        }
+    }
+
+    const fn can_start_operand(&self) -> bool {
+        matches!(
+            self,
+            Self::Atom(_)
+                | Self::Range(_)
+                | Self::Set(_)
+                | Self::Dropped(_)
+                | Self::Not(_)
+                | Self::Plus(_)
+                | Self::Minus(_)
+                | Self::LeftParen { .. }
+        )
+    }
+}
+
+fn lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<LexToken> {
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    let mut open_groups = 0_usize;
+
+    while cursor < query.len() {
+        let Some(ch) = query[cursor..].chars().next() else {
+            break;
+        };
+        if ch.is_whitespace() {
+            cursor += ch.len_utf8();
+            continue;
+        }
+
+        if let Some((field, value_start)) = field_prefix(query, cursor) {
+            let value_start = skip_whitespace(query, value_start);
+            if query[value_start..].starts_with('(') {
+                tokens.push(LexToken::LeftParen {
+                    byte_offset: value_start,
+                    field: Some(unescape_field_name(field)),
+                });
+                open_groups += 1;
+                cursor = value_start + 1;
+                continue;
+            }
+            if let Some(delimiter) = query[value_start..]
+                .chars()
+                .next()
+                .filter(|candidate| matches!(candidate, '"' | '\''))
+            {
+                let (atom, next) = lex_quoted(
+                    query,
+                    value_start,
+                    delimiter,
+                    Some(unescape_field_name(field)),
+                    diagnostics,
+                );
+                tokens.push(LexToken::Atom(atom));
+                cursor = next;
+                continue;
+            }
+            if matches!(query[value_start..].chars().next(), Some('[' | '{')) {
+                let (token, next) =
+                    lex_typed_range(query, cursor, Some(field), value_start, diagnostics);
+                if let Some(token) = token {
+                    tokens.push(token);
+                } else {
+                    tokens.push(LexToken::Dropped(cursor));
+                }
+                cursor = next;
+                continue;
+            }
+            if let Some(open_offset) = set_open_offset(query, value_start) {
+                let (token, next) =
+                    lex_typed_set(query, cursor, Some(field), open_offset, diagnostics);
+                if let Some(token) = token {
+                    tokens.push(token);
+                } else {
+                    tokens.push(LexToken::Dropped(cursor));
+                }
+                cursor = next;
+                continue;
+            }
+            if comparison_operator(query, value_start).is_some() {
+                let (token, next) =
+                    lex_comparison_range(query, cursor, Some(field), value_start, diagnostics);
+                if let Some(token) = token {
+                    tokens.push(token);
+                } else {
+                    tokens.push(LexToken::Dropped(cursor));
+                }
+                cursor = next;
+                continue;
+            }
+
+            let end = scan_fragment_end(query, value_start);
+            let fragment = &query[value_start..end];
+            let (raw, boost, trailing_boost) = split_boost(fragment);
+            if let Some(relative) = trailing_boost {
+                emit_trailing_boost_diagnostic(diagnostics, value_start + relative);
+            }
+            let raw = unescape_fragment(raw).0;
+            if is_regex_fragment(&raw) {
+                emit_regex_diagnostic(diagnostics, cursor);
+                tokens.push(LexToken::Dropped(cursor));
+            } else {
+                tokens.push(LexToken::Atom(AtomToken {
+                    raw,
+                    field: Some(unescape_field_name(field)),
+                    quoted: false,
+                    slop: 0,
+                    prefix: false,
+                    boost: boost.map(str::to_owned),
+                    byte_offset: cursor,
+                }));
+            }
+            cursor = end;
+            continue;
+        }
+
+        if matches!(ch, '[' | '{') {
+            let (token, next) = lex_typed_range(query, cursor, None, cursor, diagnostics);
+            if let Some(token) = token {
+                tokens.push(token);
+            } else {
+                tokens.push(LexToken::Dropped(cursor));
+            }
+            cursor = next;
+            continue;
+        }
+        if let Some(open_offset) = set_open_offset(query, cursor) {
+            let (token, next) = lex_typed_set(query, cursor, None, open_offset, diagnostics);
+            if let Some(token) = token {
+                tokens.push(token);
+            } else {
+                tokens.push(LexToken::Dropped(cursor));
+            }
+            cursor = next;
+            continue;
+        }
+        if comparison_operator(query, cursor).is_some() {
+            let (token, next) = lex_comparison_range(query, cursor, None, cursor, diagnostics);
+            if let Some(token) = token {
+                tokens.push(token);
+            } else {
+                tokens.push(LexToken::Dropped(cursor));
+            }
+            cursor = next;
+            continue;
+        }
+
+        match ch {
+            '(' => {
+                tokens.push(LexToken::LeftParen {
+                    byte_offset: cursor,
+                    field: None,
+                });
+                open_groups += 1;
+                cursor += 1;
+                continue;
+            }
+            ')' => {
+                let (boost, next) = lex_boost_suffix(query, cursor + 1, diagnostics);
+                if open_groups == 0 {
+                    emit_diagnostic(
+                        diagnostics,
+                        QueryDiagnostic {
+                            kind: QueryDiagnosticKind::SyntaxRecovery,
+                            message: "syntax recovery: unmatched closing parenthesis dropped"
+                                .to_owned(),
+                            byte_offset: Some(cursor),
+                            fragment: None,
+                        },
+                    );
+                    tokens.push(LexToken::Dropped(cursor));
+                    break;
+                }
+                tokens.push(LexToken::RightParen {
+                    byte_offset: cursor,
+                    boost,
+                });
+                open_groups -= 1;
+                cursor = next;
+                continue;
+            }
+            '+' => {
+                tokens.push(LexToken::Plus(cursor));
+                cursor += 1;
+                continue;
+            }
+            '-' => {
+                tokens.push(LexToken::Minus(cursor));
+                cursor += 1;
+                continue;
+            }
+            '"' | '\'' => {
+                let (atom, next) = lex_quoted(query, cursor, ch, None, diagnostics);
+                tokens.push(LexToken::Atom(atom));
+                cursor = next;
+                continue;
+            }
+            _ => {}
+        }
+
+        let end = scan_fragment_end(query, cursor);
+        let fragment = &query[cursor..end];
+        let field: Option<String> = None;
+        let value = fragment;
+        let value_offset = cursor;
+        let (raw, boost, trailing_boost) = split_boost(value);
+        if let Some(relative) = trailing_boost {
+            emit_trailing_boost_diagnostic(diagnostics, value_offset + relative);
+        }
+        let (raw, raw_was_escaped) = unescape_fragment(raw);
+        if is_regex_fragment(&raw) {
+            emit_regex_diagnostic(diagnostics, cursor);
+            tokens.push(LexToken::Dropped(cursor));
+            cursor = end;
+            continue;
+        }
+        let operator_has_ascii_space = query.as_bytes().get(end) == Some(&b' ');
+        let token = if field.is_none() && boost.is_none() && !raw_was_escaped {
+            match raw.as_str() {
+                "AND" if operator_has_ascii_space => LexToken::And(cursor),
+                "OR" if operator_has_ascii_space => LexToken::Or(cursor),
+                "NOT" if operator_has_ascii_space => LexToken::Not(cursor),
+                _ => LexToken::Atom(AtomToken {
+                    raw,
+                    field,
+                    quoted: false,
+                    slop: 0,
+                    prefix: false,
+                    boost: None,
+                    byte_offset: cursor,
+                }),
+            }
+        } else {
+            LexToken::Atom(AtomToken {
+                raw,
+                field,
+                quoted: false,
+                slop: 0,
+                prefix: false,
+                boost: boost.map(str::to_owned),
+                byte_offset: cursor,
+            })
+        };
+        tokens.push(token);
+        cursor = end;
+    }
+
+    if tokens.len() == 1 {
+        let replacement = match &tokens[0] {
+            LexToken::And(offset) => Some(operator_atom("AND", *offset)),
+            LexToken::Or(offset) => Some(operator_atom("OR", *offset)),
+            LexToken::Not(offset) => {
+                emit_diagnostic(
+                    diagnostics,
+                    QueryDiagnostic {
+                        kind: QueryDiagnosticKind::SyntaxRecovery,
+                        message: "syntax recovery: standalone NOT retained as a literal".to_owned(),
+                        byte_offset: Some(*offset),
+                        fragment: None,
+                    },
+                );
+                Some(operator_atom("NOT", *offset))
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            tokens[0] = replacement;
+        }
+    }
+
+    tokens
+}
+
+fn field_prefix(query: &str, start: usize) -> Option<(&str, usize)> {
+    let first = query[start..].chars().next()?;
+    if first == '-' || (first != '\\' && is_field_special(first)) {
+        return None;
+    }
+    let mut escaped = false;
+    let mut field_end = None;
+    for (relative, ch) in query[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == ':' {
+            let colon = start + relative;
+            let end = field_end.map_or(colon, |end| start + end);
+            return (end > start).then_some((&query[start..end], colon + 1));
+        }
+        if is_field_special(ch) && ch != ' ' {
+            return None;
+        }
+        if ch.is_whitespace() {
+            field_end.get_or_insert(relative);
+            continue;
+        }
+        if field_end.is_some() {
+            break;
+        }
+    }
+    None
+}
+
+fn is_field_special(ch: char) -> bool {
+    matches!(
+        ch,
+        '+' | '^'
+            | '`'
+            | ':'
+            | '{'
+            | '}'
+            | '"'
+            | '\''
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '!'
+            | '\\'
+            | '*'
+            | ' '
+    )
+}
+
+fn unescape_field_name(field: &str) -> String {
+    let mut value = String::with_capacity(field.len());
+    let mut escaped = false;
+    for ch in field.chars() {
+        if escaped {
+            if !is_field_special(ch) {
+                value.push('\\');
+            }
+            value.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            value.push(ch);
+        }
+    }
+    if escaped {
+        value.push('\\');
+    }
+    value
+}
+
+fn skip_whitespace(query: &str, mut cursor: usize) -> usize {
+    while let Some(ch) = query[cursor..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    cursor
+}
+
+fn set_open_offset(query: &str, start: usize) -> Option<usize> {
+    let rest = query.get(start..)?.strip_prefix("IN")?;
+    let after_in = start + 2;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let open = skip_whitespace(query, after_in);
+    query[open..].starts_with('[').then_some(open)
+}
+
+fn lex_typed_range(
+    query: &str,
+    byte_offset: usize,
+    field: Option<&str>,
+    open_offset: usize,
+    diagnostics: &mut Vec<QueryDiagnostic>,
+) -> (Option<LexToken>, usize) {
+    let lower_inclusive = query.as_bytes().get(open_offset) == Some(&b'[');
+    let (close_offset, upper_inclusive, missing_close) = typed_close(query, open_offset).map_or(
+        (query.len(), lower_inclusive, true),
+        |(offset, inclusive)| (offset, inclusive, false),
+    );
+    if missing_close {
+        emit_typed_syntax_diagnostic(
+            diagnostics,
+            byte_offset,
+            "syntax recovery: unterminated typed range retained to end of query",
+        );
+    }
+    let interior = query[open_offset + 1..close_offset].trim();
+    let Some(parts) = split_set_values(interior) else {
+        emit_typed_syntax_diagnostic(
+            diagnostics,
+            byte_offset,
+            "syntax recovery: malformed typed range dropped",
+        );
+        return (
+            None,
+            close_offset.saturating_add(usize::from(!missing_close)),
+        );
+    };
+    let (lower, upper) = match parts.as_slice() {
+        [lower, separator, upper] if separator == "TO" => (lower.clone(), upper.clone()),
+        [lower, separator] if separator == "TO" => {
+            emit_typed_syntax_diagnostic(
+                diagnostics,
+                byte_offset,
+                "syntax recovery: typed range missing upper bound",
+            );
+            (lower.clone(), "*".to_owned())
+        }
+        [lower, upper] => {
+            emit_typed_syntax_diagnostic(
+                diagnostics,
+                byte_offset,
+                "syntax recovery: typed range missing keyword `TO`",
+            );
+            (lower.clone(), upper.clone())
+        }
+        [lower] => {
+            emit_typed_syntax_diagnostic(
+                diagnostics,
+                byte_offset,
+                "syntax recovery: typed range missing keyword `TO` and upper bound",
+            );
+            (lower.clone(), "*".to_owned())
+        }
+        _ => {
+            emit_typed_syntax_diagnostic(
+                diagnostics,
+                byte_offset,
+                "syntax recovery: typed range requires `lower TO upper`",
+            );
+            return (
+                None,
+                close_offset.saturating_add(usize::from(!missing_close)),
+            );
+        }
+    };
+    let after_close = close_offset.saturating_add(usize::from(!missing_close));
+    let (boost, next) = lex_boost_suffix(query, after_close, diagnostics);
+    (
+        Some(LexToken::Range(RangeToken {
+            field: field.map(unescape_field_name),
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+            boost,
+            byte_offset,
+        })),
+        next,
+    )
+}
+
+fn lex_typed_set(
+    query: &str,
+    byte_offset: usize,
+    field: Option<&str>,
+    open_offset: usize,
+    diagnostics: &mut Vec<QueryDiagnostic>,
+) -> (Option<LexToken>, usize) {
+    let (close_offset, closed_with_bracket, missing_close) = typed_close(query, open_offset)
+        .map_or((query.len(), true, true), |(offset, bracket)| {
+            (offset, bracket, false)
+        });
+    if missing_close {
+        emit_typed_syntax_diagnostic(
+            diagnostics,
+            byte_offset,
+            "syntax recovery: unterminated typed set retained to end of query",
+        );
+    }
+    if !missing_close && !closed_with_bracket {
+        emit_typed_syntax_diagnostic(
+            diagnostics,
+            byte_offset,
+            "syntax recovery: typed set requires square brackets",
+        );
+        return (None, close_offset + 1);
+    }
+    let after_close = close_offset.saturating_add(usize::from(!missing_close));
+    let Some(values) = split_set_values(&query[open_offset + 1..close_offset]) else {
+        emit_typed_syntax_diagnostic(
+            diagnostics,
+            byte_offset,
+            "syntax recovery: malformed typed set dropped",
+        );
+        return (None, after_close);
+    };
+    let (boost, next) = lex_boost_suffix(query, after_close, diagnostics);
+    (
+        Some(LexToken::Set(SetToken {
+            field: field.map(unescape_field_name),
+            values,
+            boost,
+            byte_offset,
+        })),
+        next,
+    )
+}
+
+fn split_set_values(interior: &str) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut delimiter = None;
+    let mut escaped = false;
+    let mut token_started = false;
+    for ch in interior.chars() {
+        if escaped {
+            if delimiter.is_none() && !is_query_escape(ch) {
+                current.push('\\');
+            }
+            current.push(ch);
+            escaped = false;
+            token_started = true;
+        } else if ch == '\\' {
+            escaped = true;
+            token_started = true;
+        } else if let Some(quote) = delimiter {
+            if ch == quote {
+                delimiter = None;
+            } else {
+                current.push(ch);
+            }
+        } else if matches!(ch, '"' | '\'') {
+            delimiter = Some(ch);
+            token_started = true;
+        } else if ch == ',' {
+            current.push(ch);
+            token_started = true;
+        } else if ch.is_whitespace() {
+            if token_started {
+                values.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+        } else {
+            current.push(ch);
+            token_started = true;
+        }
+    }
+    if escaped || delimiter.is_some() {
+        return None;
+    }
+    if token_started {
+        values.push(current);
+    }
+    Some(values)
+}
+
+fn comparison_operator(query: &str, start: usize) -> Option<(&'static str, usize)> {
+    for operator in [">=", "<=", ">", "<"] {
+        if query[start..].starts_with(operator) {
+            return Some((operator, operator.len()));
+        }
+    }
+    None
+}
+
+fn lex_comparison_range(
+    query: &str,
+    byte_offset: usize,
+    field: Option<&str>,
+    operator_offset: usize,
+    diagnostics: &mut Vec<QueryDiagnostic>,
+) -> (Option<LexToken>, usize) {
+    let Some((operator, operator_len)) = comparison_operator(query, operator_offset) else {
+        return (None, operator_offset);
+    };
+    let value_start = skip_whitespace(query, operator_offset + operator_len);
+    let end = scan_fragment_end(query, value_start);
+    let (value, boost, trailing_boost) = split_boost(&query[value_start..end]);
+    if let Some(relative) = trailing_boost {
+        emit_trailing_boost_diagnostic(diagnostics, value_start + relative);
+    }
+    if value.is_empty() {
+        emit_typed_syntax_diagnostic(
+            diagnostics,
+            byte_offset,
+            "syntax recovery: comparison range requires a bound",
+        );
+        return (None, end);
+    }
+    let value = unescape_fragment(value).0;
+    let (lower, upper, lower_inclusive, upper_inclusive) = match operator {
+        ">" => (value, "*".to_owned(), false, false),
+        ">=" => (value, "*".to_owned(), true, false),
+        "<" => ("*".to_owned(), value, false, false),
+        "<=" => ("*".to_owned(), value, false, true),
+        _ => return (None, end),
+    };
+    (
+        Some(LexToken::Range(RangeToken {
+            field: field.map(unescape_field_name),
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+            boost: boost.map(str::to_owned),
+            byte_offset,
+        })),
+        end,
+    )
+}
+
+fn typed_close(query: &str, open_offset: usize) -> Option<(usize, bool)> {
+    let mut delimiter = None;
+    let mut escaped = false;
+    for (relative, ch) in query[open_offset + 1..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if let Some(quote) = delimiter {
+            if ch == quote {
+                delimiter = None;
+            }
+        } else if matches!(ch, '"' | '\'') {
+            delimiter = Some(ch);
+        } else if matches!(ch, ']' | '}') {
+            return Some((open_offset + 1 + relative, ch == ']'));
+        }
+    }
+    None
+}
+
+fn emit_typed_syntax_diagnostic(
+    diagnostics: &mut Vec<QueryDiagnostic>,
+    byte_offset: usize,
+    message: &str,
+) {
+    emit_diagnostic(
+        diagnostics,
+        QueryDiagnostic {
+            kind: QueryDiagnosticKind::SyntaxRecovery,
+            message: message.to_owned(),
+            byte_offset: Some(byte_offset),
+            fragment: None,
+        },
+    );
+}
+
+fn lex_boost_suffix(
+    query: &str,
+    start: usize,
+    diagnostics: &mut Vec<QueryDiagnostic>,
+) -> (Option<String>, usize) {
+    if query.as_bytes().get(start) != Some(&b'^') {
+        return (None, start);
+    }
+    let end = scan_fragment_end(query, start);
+    let suffix = &query[start + 1..end];
+    let (boost, trailing) = split_boost_component(suffix);
+    if let Some(relative) = trailing {
+        emit_trailing_boost_diagnostic(diagnostics, start + 1 + relative);
+    }
+    (Some(boost.to_owned()), end)
+}
+
+fn emit_trailing_boost_diagnostic(diagnostics: &mut Vec<QueryDiagnostic>, byte_offset: usize) {
+    emit_diagnostic(
+        diagnostics,
+        QueryDiagnostic {
+            kind: QueryDiagnosticKind::SyntaxRecovery,
+            message: "syntax recovery: trailing boost suffix dropped".to_owned(),
+            byte_offset: Some(byte_offset),
+            fragment: None,
+        },
+    );
+}
+
+fn is_regex_fragment(raw: &str) -> bool {
+    raw.starts_with('/')
+}
+
+fn emit_regex_diagnostic(diagnostics: &mut Vec<QueryDiagnostic>, byte_offset: usize) {
+    emit_diagnostic(
+        diagnostics,
+        QueryDiagnostic {
+            kind: QueryDiagnosticKind::DroppedFragment,
+            message: "unsupported regular-expression query dropped".to_owned(),
+            byte_offset: Some(byte_offset),
+            fragment: None,
+        },
+    );
+}
+
+fn operator_atom(raw: &str, byte_offset: usize) -> LexToken {
+    LexToken::Atom(AtomToken {
+        raw: raw.to_owned(),
+        field: None,
+        quoted: false,
+        slop: 0,
+        prefix: false,
+        boost: None,
+        byte_offset,
+    })
+}
+
+fn scan_fragment_end(query: &str, start: usize) -> usize {
+    let mut escaped = false;
+    for (relative, ch) in query[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch.is_whitespace() || matches!(ch, '(' | ')') {
+            return start + relative;
+        }
+    }
+    query.len()
+}
+
+fn unescape_fragment(fragment: &str) -> (String, bool) {
+    let mut value = String::with_capacity(fragment.len());
+    let mut escaped = false;
+    let mut had_escape = false;
+    for ch in fragment.chars() {
+        if escaped {
+            if !is_query_escape(ch) {
+                value.push('\\');
+            }
+            value.push(ch);
+            escaped = false;
+            had_escape = true;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            value.push(ch);
+        }
+    }
+    had_escape |= escaped;
+    (value, had_escape)
+}
+
+fn is_query_escape(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '^' | '`' | ':' | '[' | ']' | '{' | '}' | '"' | '\'' | '(' | ')' | '\\' | '-'
+        )
+}
+
+fn lex_quoted(
+    query: &str,
+    quote_offset: usize,
+    delimiter: char,
+    field: Option<String>,
+    diagnostics: &mut Vec<QueryDiagnostic>,
+) -> (AtomToken, usize) {
+    let content_start = quote_offset + delimiter.len_utf8();
+    let mut raw = String::new();
+    let mut cursor = content_start;
+    let mut escaped = false;
+    let mut terminated = false;
+    while let Some(ch) = query[cursor..].chars().next() {
+        cursor += ch.len_utf8();
+        if escaped {
+            raw.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == delimiter {
+            terminated = true;
+            break;
+        } else {
+            raw.push(ch);
+        }
+    }
+    if escaped {
+        raw.push('\\');
+    }
+    if !terminated {
+        emit_diagnostic(
+            diagnostics,
+            QueryDiagnostic {
+                kind: QueryDiagnosticKind::SyntaxRecovery,
+                message: "syntax recovery: unterminated quoted fragment".to_owned(),
+                byte_offset: Some(quote_offset),
+                fragment: Some(raw.clone()),
+            },
+        );
+    }
+
+    let suffix_start = cursor;
+    let suffix_end = scan_fragment_end(query, suffix_start);
+    let suffix = &query[suffix_start..suffix_end];
+    let parsed_suffix = parse_phrase_suffix(suffix);
+    if let Some(relative) = parsed_suffix.recovery_offset {
+        let byte_offset = suffix_start + relative;
+        if parsed_suffix.trailing_boost {
+            emit_trailing_boost_diagnostic(diagnostics, byte_offset);
+        } else {
+            emit_typed_syntax_diagnostic(
+                diagnostics,
+                byte_offset,
+                if parsed_suffix.relex_suffix {
+                    "syntax recovery: unsupported phrase suffix retained as a separate fragment"
+                } else {
+                    "syntax recovery: unsupported phrase suffix dropped"
+                },
+            );
+        }
+    }
+    let next = if parsed_suffix.relex_suffix {
+        suffix_start
+    } else {
+        suffix_end
+    };
+    (
+        AtomToken {
+            raw,
+            field,
+            quoted: true,
+            slop: parsed_suffix.slop,
+            prefix: parsed_suffix.prefix,
+            boost: parsed_suffix.boost.map(str::to_owned),
+            byte_offset: quote_offset,
+        },
+        next,
+    )
+}
+
+struct ParsedPhraseSuffix<'a> {
+    slop: u32,
+    prefix: bool,
+    boost: Option<&'a str>,
+    recovery_offset: Option<usize>,
+    trailing_boost: bool,
+    relex_suffix: bool,
+}
+
+fn parse_phrase_suffix(suffix: &str) -> ParsedPhraseSuffix<'_> {
+    let mut slop = 0;
+    let mut prefix = false;
+    let mut consumed = 0;
+    if suffix.starts_with('*') {
+        prefix = true;
+        consumed = 1;
+    } else if let Some(rest) = suffix.strip_prefix('~') {
+        let digit_count = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digit_count != 0 {
+            let Ok(parsed_slop) = rest[..digit_count].parse() else {
+                return ParsedPhraseSuffix {
+                    slop,
+                    prefix,
+                    boost: None,
+                    recovery_offset: Some(0),
+                    trailing_boost: false,
+                    relex_suffix: true,
+                };
+            };
+            slop = parsed_slop;
+            consumed = 1 + digit_count;
+        } else {
+            return ParsedPhraseSuffix {
+                slop,
+                prefix,
+                boost: None,
+                recovery_offset: Some(0),
+                trailing_boost: false,
+                relex_suffix: true,
+            };
+        }
+    }
+    let rest = &suffix[consumed..];
+    if let Some(boost_suffix) = rest.strip_prefix('^') {
+        let (boost, trailing) = split_boost_component(boost_suffix);
+        if let Some(relative) = trailing {
+            return ParsedPhraseSuffix {
+                slop,
+                prefix,
+                boost: Some(boost),
+                recovery_offset: Some(consumed + 1 + relative),
+                trailing_boost: true,
+                relex_suffix: false,
+            };
+        }
+        return ParsedPhraseSuffix {
+            slop,
+            prefix,
+            boost: Some(boost_suffix),
+            recovery_offset: None,
+            trailing_boost: false,
+            relex_suffix: false,
+        };
+    }
+    ParsedPhraseSuffix {
+        slop,
+        prefix,
+        boost: None,
+        recovery_offset: (!rest.is_empty()).then_some(consumed),
+        trailing_boost: false,
+        relex_suffix: false,
+    }
+}
+
+fn find_unescaped(fragment: &str, needle: char) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, ch) in fragment.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == needle {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+fn split_boost(fragment: &str) -> (&str, Option<&str>, Option<usize>) {
+    let Some(first) = find_unescaped(fragment, '^').filter(|offset| *offset != 0) else {
+        return (fragment, None, None);
+    };
+    let suffix = &fragment[first + 1..];
+    let (boost, trailing) = split_boost_component(suffix);
+    (
+        &fragment[..first],
+        Some(boost),
+        trailing.map(|offset| first + 1 + offset),
+    )
+}
+
+fn split_boost_component(suffix: &str) -> (&str, Option<usize>) {
+    let syntax_end = find_unescaped(suffix, '^').unwrap_or(suffix.len());
+    let candidate = &suffix[..syntax_end];
+    let integer_digits = candidate.bytes().take_while(u8::is_ascii_digit).count();
+    if integer_digits == 0 {
+        return (
+            candidate,
+            (syntax_end != suffix.len()).then_some(syntax_end),
+        );
+    }
+
+    let mut valid_end = integer_digits;
+    if candidate.as_bytes().get(integer_digits) == Some(&b'.') {
+        let fraction_digits = candidate[integer_digits + 1..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        if fraction_digits != 0 {
+            valid_end = integer_digits + 1 + fraction_digits;
+        }
+    }
+    let trailing = if valid_end != candidate.len() {
+        Some(valid_end)
+    } else {
+        (syntax_end != suffix.len()).then_some(syntax_end)
+    };
+    (&candidate[..valid_end], trailing)
+}
+
+fn trim_typed_literal(raw: &str) -> &str {
+    if raw.len() >= 2 {
+        let bytes = raw.as_bytes();
+        if matches!(
+            (bytes.first(), bytes.last()),
+            (Some(&b'"'), Some(&b'"')) | (Some(&b'\''), Some(&b'\''))
+        ) {
+            return &raw[1..raw.len() - 1];
+        }
+    }
+    raw
+}
+
+#[derive(Debug)]
+struct ParsedNode {
+    query: Query,
+    occur: Option<Occur>,
+    from_not: bool,
+    dedup_key: String,
+}
+
+struct Grammar {
+    parser: DefaultQueryParser,
+    tokens: Vec<LexToken>,
+    cursor: usize,
+    diagnostics: Vec<QueryDiagnostic>,
+    dropped_fragments: usize,
+    lowered_atoms: Vec<(String, Option<Query>)>,
+    field_scopes: Vec<String>,
+}
+
+impl Grammar {
+    fn recover_leading_binary_operators(&mut self) {
+        while matches!(self.peek(), Some(LexToken::And(_) | LexToken::Or(_))) {
+            let offset = self.peek().map_or(0, LexToken::byte_offset);
+            self.cursor += 1;
+            self.syntax_diagnostic_at("syntax recovery: leading Boolean operator dropped", offset);
+        }
+    }
+
+    fn recover_operator_as_operand(&mut self) -> bool {
+        let Some((raw, offset)) = self.peek().and_then(|token| match token {
+            LexToken::And(offset) => Some(("AND", *offset)),
+            LexToken::Or(offset) => Some(("OR", *offset)),
+            _ => None,
+        }) else {
+            return false;
+        };
+        self.tokens[self.cursor] = operator_atom(raw, offset);
+        self.syntax_diagnostic_at(
+            "syntax recovery: repeated Boolean operator retained as a literal",
+            offset,
+        );
+        true
+    }
+
+    fn parse_expression(&mut self, depth: usize) -> Option<ParsedNode> {
+        self.parse_or(depth)
+    }
+
+    fn parse_or(&mut self, depth: usize) -> Option<ParsedNode> {
+        let dropped_before = self.dropped_fragments;
+        let mut nodes = Vec::new();
+        let mut syntactic_operands = 0;
+        let mut explicit_or = false;
+        let mut joined_from_explicit_or = false;
+
+        loop {
+            if !self.peek().is_some_and(LexToken::can_start_operand) {
+                break;
+            }
+            syntactic_operands += 1;
+            let mut node = self.parse_and(depth);
+            let joined_to_explicit_or = matches!(self.peek(), Some(LexToken::Or(_)));
+            if let Some(node) = node.as_mut()
+                && node.occur == Some(Occur::MustNot)
+                && (joined_from_explicit_or || joined_to_explicit_or)
+            {
+                wrap_direct_negative_or_operand(node);
+            }
+            if let Some(node) = node {
+                nodes.push(node);
+            }
+            if let Some(LexToken::Or(offset)) = self.peek() {
+                let offset = *offset;
+                self.cursor += 1;
+                if !self.peek().is_some_and(LexToken::can_start_operand)
+                    && !self.recover_operator_as_operand()
+                {
+                    self.syntax_diagnostic_at("syntax recovery: OR has no right operand", offset);
+                    break;
+                }
+                explicit_or = true;
+                joined_from_explicit_or = true;
+            } else if !self.peek().is_some_and(LexToken::can_start_operand) {
+                break;
+            } else {
+                joined_from_explicit_or = false;
+            }
+        }
+
+        let dropped = self.dropped_fragments > dropped_before;
+        combine_or(nodes, syntactic_operands, dropped, explicit_or)
+    }
+
+    fn parse_and(&mut self, depth: usize) -> Option<ParsedNode> {
+        let mut nodes = Vec::new();
+        let mut syntactic_operands = 1;
+        if let Some(mut node) = self.parse_unary(depth) {
+            if node.from_not && matches!(self.peek(), Some(LexToken::And(_))) {
+                wrap_not_for_and(&mut node);
+            }
+            nodes.push(node);
+        }
+        let mut explicit_and = false;
+        while let Some(LexToken::And(offset)) = self.peek() {
+            let offset = *offset;
+            self.cursor += 1;
+            if !self.peek().is_some_and(LexToken::can_start_operand)
+                && !self.recover_operator_as_operand()
+            {
+                self.syntax_diagnostic_at("syntax recovery: AND has no right operand", offset);
+                break;
+            }
+            explicit_and = true;
+            syntactic_operands += 1;
+            if let Some(mut node) = self.parse_unary(depth) {
+                if node.from_not {
+                    wrap_not_for_and(&mut node);
+                }
+                nodes.push(node);
+            }
+        }
+        if explicit_and {
+            combine_and(nodes, syntactic_operands)
+        } else {
+            nodes.pop()
+        }
+    }
+
+    fn parse_unary(&mut self, depth: usize) -> Option<ParsedNode> {
+        let mut occur = None;
+        let mut unary_offset = None;
+        let mut not_count = 0_usize;
+        while let Some(token) = self.peek() {
+            match token {
+                LexToken::Plus(offset) => {
+                    unary_offset = Some(*offset);
+                    occur = Some(Occur::Must);
+                    self.cursor += 1;
+                }
+                LexToken::Minus(offset) => {
+                    unary_offset = Some(*offset);
+                    occur = Some(Occur::MustNot);
+                    self.cursor += 1;
+                }
+                LexToken::Not(offset) => {
+                    unary_offset = Some(*offset);
+                    not_count += 1;
+                    self.cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        let Some(mut node) = self.parse_primary(depth) else {
+            if let Some(offset) = unary_offset {
+                self.drop_with_diagnostic(
+                    QueryDiagnosticKind::DroppedFragment,
+                    "unparseable unary fragment dropped",
+                    offset,
+                    None,
+                );
+            }
+            return None;
+        };
+        for _ in 1..not_count {
+            let dedup_key = std::mem::take(&mut node.dedup_key);
+            node.query = Query::Boolean {
+                clauses: vec![BooleanClause::new(Occur::MustNot, node.query)],
+                operator: None,
+            };
+            node.dedup_key = negative_boolean_dedup_key(&dedup_key);
+        }
+        if not_count != 0 {
+            if occur.is_some() {
+                wrap_not_for_and(&mut node);
+            } else {
+                node.occur = Some(Occur::MustNot);
+                node.from_not = true;
+            }
+        }
+        if let Some(occur) = occur {
+            node.occur = Some(occur);
+        }
+        Some(node)
+    }
+
+    fn parse_primary(&mut self, depth: usize) -> Option<ParsedNode> {
+        let token = self.tokens.get(self.cursor)?.clone();
+        let token_offset = token.byte_offset();
+        match token {
+            LexToken::Atom(mut atom) => {
+                self.cursor += 1;
+                if atom.field.is_none() {
+                    atom.field = self.field_scopes.last().cloned();
+                }
+                let dedup_key = atom_dedup_key(&atom);
+                let cache_key = atom_cache_key(&atom);
+                if let Some(cache_key) = cache_key.as_ref() {
+                    if let Some(index) = self
+                        .lowered_atoms
+                        .iter()
+                        .position(|(candidate, _)| candidate == cache_key)
+                    {
+                        let cached = self.lowered_atoms[index].1.clone();
+                        if cached.is_none() {
+                            self.dropped_fragments += 1;
+                        }
+                        return cached.map(|query| ParsedNode {
+                            query,
+                            occur: None,
+                            from_not: false,
+                            dedup_key,
+                        });
+                    }
+                }
+                let query = self.lower_atom(&atom);
+                if let Some(cache_key) = cache_key {
+                    self.lowered_atoms.push((cache_key, query.clone()));
+                }
+                query.map(|query| ParsedNode {
+                    query,
+                    occur: None,
+                    from_not: false,
+                    dedup_key,
+                })
+            }
+            LexToken::Range(mut token) => {
+                self.cursor += 1;
+                if token.field.is_none() {
+                    token.field = self.field_scopes.last().cloned();
+                }
+                let dedup_key = range_dedup_key(&token);
+                self.lower_range(&token).map(|query| ParsedNode {
+                    query,
+                    occur: None,
+                    from_not: false,
+                    dedup_key,
+                })
+            }
+            LexToken::Set(mut token) => {
+                self.cursor += 1;
+                if token.field.is_none() {
+                    token.field = self.field_scopes.last().cloned();
+                }
+                let dedup_key = set_dedup_key(&token);
+                self.lower_set(&token).map(|query| ParsedNode {
+                    query,
+                    occur: None,
+                    from_not: false,
+                    dedup_key,
+                })
+            }
+            LexToken::Dropped(_) => {
+                self.cursor += 1;
+                self.dropped_fragments += 1;
+                None
+            }
+            LexToken::LeftParen { byte_offset, field } => {
+                self.cursor += 1;
+                if depth >= MAX_QUERY_DEPTH {
+                    self.skip_group();
+                    self.drop_with_diagnostic(
+                        QueryDiagnosticKind::DepthLimit,
+                        "query group nesting limit reached; fragment dropped",
+                        byte_offset,
+                        None,
+                    );
+                    return None;
+                }
+                let scoped = field.is_some();
+                if let Some(field_name) = field {
+                    self.field_scopes.push(field_name);
+                }
+                self.recover_leading_binary_operators();
+                let parsed = self.parse_expression(depth + 1);
+                if scoped {
+                    let _ = self.field_scopes.pop();
+                }
+                let group_boost = if let Some(LexToken::RightParen {
+                    byte_offset: close_offset,
+                    boost,
+                }) = self.peek().cloned()
+                {
+                    self.cursor += 1;
+                    Some((boost, close_offset))
+                } else {
+                    self.syntax_diagnostic_at(
+                        "syntax recovery: missing closing parenthesis",
+                        byte_offset,
+                    );
+                    None
+                };
+                parsed.map(|mut node| {
+                    if let Some((boost, close_offset)) = group_boost {
+                        let boost_key = boost_dedup_key(boost.as_deref());
+                        node.query =
+                            self.apply_raw_boost(node.query, boost.as_deref(), close_offset, None);
+                        if !matches!(boost_key, BoostDedupKey::Identity) {
+                            node.dedup_key = format!("group:{}:{boost_key:?}", node.dedup_key);
+                        }
+                    }
+                    node
+                })
+            }
+            LexToken::RightParen { .. } | LexToken::And(_) | LexToken::Or(_) => None,
+            LexToken::Not(_) | LexToken::Plus(_) | LexToken::Minus(_) => {
+                self.syntax_diagnostic_at(
+                    "syntax recovery: unexpected unary token dropped",
+                    token_offset,
+                );
+                None
+            }
+        }
+    }
+
+    fn lower_atom(&mut self, atom: &AtomToken) -> Option<Query> {
+        if !atom.quoted && atom.raw == "*" {
+            if atom.field.is_none() {
+                return Some(self.apply_boost(Query::All, atom));
+            }
+            self.drop_with_diagnostic(
+                QueryDiagnosticKind::UnsupportedField,
+                "field-scoped match-all requires an unsupported existence query",
+                atom.byte_offset,
+                None,
+            );
+            return None;
+        }
+
+        let fields = if let Some(field_name) = atom.field.as_deref() {
+            let Some(descriptor) = self
+                .parser
+                .schema
+                .fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .copied()
+            else {
+                self.drop_with_diagnostic(
+                    QueryDiagnosticKind::UnknownField,
+                    &format!("unknown field {field_name}; unsupported field fragment dropped"),
+                    atom.byte_offset,
+                    Some(atom.raw.clone()),
+                );
+                return None;
+            };
+            vec![QueryField::new(
+                descriptor.id,
+                if descriptor.name == TITLE_FIELD_NAME {
+                    TITLE_BOOST
+                } else {
+                    1.0
+                },
+            )]
+        } else {
+            self.parser.default_fields.to_vec()
+        };
+
+        let mut field_queries = Vec::with_capacity(fields.len());
+        for field in fields {
+            let Some(descriptor) = self.field_by_id(field.field_id) else {
+                continue;
+            };
+            let Some(query) = self.analyze_field(descriptor, field, atom) else {
+                continue;
+            };
+            field_queries.push(query);
+        }
+        let Some(query) = merge_field_queries(field_queries) else {
+            self.dropped_fragments += 1;
+            return None;
+        };
+        Some(self.apply_boost(query, atom))
+    }
+
+    fn lower_range(&mut self, token: &RangeToken) -> Option<Query> {
+        let descriptor = self.resolve_typed_field(token.field.as_deref(), token.byte_offset)?;
+        let (lower, lower_invalid) = self.lower_bound(
+            descriptor,
+            &token.lower,
+            token.lower_inclusive,
+            token.byte_offset,
+        );
+        let (upper, upper_invalid) = self.lower_bound(
+            descriptor,
+            &token.upper,
+            token.upper_inclusive,
+            token.byte_offset,
+        );
+        if (lower_invalid && upper_invalid)
+            || matches!((&lower, &upper), (Bound::Unbounded, Bound::Unbounded))
+        {
+            self.dropped_fragments += 1;
+            self.push_diagnostic(QueryDiagnostic {
+                kind: QueryDiagnosticKind::DroppedFragment,
+                message: "typed range without a usable bound dropped".to_owned(),
+                byte_offset: Some(token.byte_offset),
+                fragment: None,
+            });
+            return None;
+        }
+        let query = Query::Range {
+            field_id: descriptor.id,
+            lower,
+            upper,
+        };
+        Some(self.apply_raw_boost(query, token.boost.as_deref(), token.byte_offset, None))
+    }
+
+    fn lower_set(&mut self, token: &SetToken) -> Option<Query> {
+        let descriptor = self.resolve_typed_field(token.field.as_deref(), token.byte_offset)?;
+        let mut values = Vec::with_capacity(token.values.len());
+        for raw in &token.values {
+            match Self::lower_typed_value(descriptor, raw) {
+                Some(value) if !values.contains(&value) => values.push(value),
+                Some(_) => {}
+                None => self.push_diagnostic(QueryDiagnostic {
+                    kind: QueryDiagnosticKind::InvalidTypedValue,
+                    message: format!(
+                        "invalid typed set member for field {}; member dropped",
+                        descriptor.name
+                    ),
+                    byte_offset: Some(token.byte_offset),
+                    fragment: None,
+                }),
+            }
+        }
+        let query = Query::Set {
+            field_id: descriptor.id,
+            values,
+        };
+        Some(self.apply_raw_boost(query, token.boost.as_deref(), token.byte_offset, None))
+    }
+
+    fn resolve_typed_field(
+        &mut self,
+        field_name: Option<&str>,
+        byte_offset: usize,
+    ) -> Option<FieldDescriptor> {
+        let Some(field_name) = field_name else {
+            self.drop_with_diagnostic(
+                QueryDiagnosticKind::DroppedFragment,
+                "typed range or set requires a field scope",
+                byte_offset,
+                None,
+            );
+            return None;
+        };
+        let Some(descriptor) = self
+            .parser
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .copied()
+        else {
+            self.drop_with_diagnostic(
+                QueryDiagnosticKind::UnknownField,
+                &format!("unknown field {field_name}; typed fragment dropped"),
+                byte_offset,
+                None,
+            );
+            return None;
+        };
+        let queryable = match descriptor.kind {
+            FieldKind::Keyword => true,
+            FieldKind::Text {
+                analyzer: AnalyzerKind::FrankensearchDefault,
+                ..
+            } => true,
+            FieldKind::I64 { indexed, fast } | FieldKind::U64 { indexed, fast } => indexed || fast,
+            FieldKind::StoredOnly | FieldKind::Text { .. } => false,
+        };
+        if !queryable {
+            self.drop_with_diagnostic(
+                QueryDiagnosticKind::UnsupportedField,
+                &format!("field {} does not support typed queries", descriptor.name),
+                byte_offset,
+                None,
+            );
+            return None;
+        }
+        Some(descriptor)
+    }
+
+    fn lower_bound(
+        &mut self,
+        descriptor: FieldDescriptor,
+        raw: &str,
+        inclusive: bool,
+        byte_offset: usize,
+    ) -> (Bound<QueryValue>, bool) {
+        if raw == "*" {
+            return (Bound::Unbounded, false);
+        }
+        let Some(value) = Self::lower_typed_value(descriptor, raw) else {
+            self.push_diagnostic(QueryDiagnostic {
+                kind: QueryDiagnosticKind::InvalidTypedValue,
+                message: format!(
+                    "invalid typed range bound for field {}; bound made unbounded",
+                    descriptor.name
+                ),
+                byte_offset: Some(byte_offset),
+                fragment: None,
+            });
+            return (Bound::Unbounded, true);
+        };
+        if inclusive {
+            (Bound::Included(value), false)
+        } else {
+            (Bound::Excluded(value), false)
+        }
+    }
+
+    fn lower_typed_value(descriptor: FieldDescriptor, raw: &str) -> Option<QueryValue> {
+        let raw = trim_typed_literal(raw);
+        match descriptor.kind {
+            FieldKind::I64 { indexed, fast } if indexed || fast => {
+                raw.parse().ok().map(QueryValue::I64)
+            }
+            FieldKind::U64 { indexed, fast } if indexed || fast => {
+                raw.parse().ok().map(QueryValue::U64)
+            }
+            FieldKind::Keyword => Some(QueryValue::Str(raw.to_owned())),
+            FieldKind::Text {
+                analyzer: AnalyzerKind::FrankensearchDefault,
+                ..
+            } => {
+                let mut analyzer = FrankensearchTokenizer::default();
+                let mut terms = Vec::new();
+                let report = analyze_admitted(
+                    &mut analyzer,
+                    AnalyzerKind::FrankensearchDefault,
+                    raw,
+                    &mut |token| terms.push(token.text.clone()),
+                )
+                .ok()?;
+                if report.oversized_tokens == 0 && terms.len() == 1 {
+                    terms.pop().map(QueryValue::Str)
+                } else {
+                    None
+                }
+            }
+            FieldKind::StoredOnly
+            | FieldKind::Text { .. }
+            | FieldKind::I64 { .. }
+            | FieldKind::U64 { .. } => None,
+        }
+    }
+
+    fn field_by_id(&self, field_id: u16) -> Option<FieldDescriptor> {
+        self.parser
+            .schema
+            .fields
+            .get(usize::from(field_id))
+            .copied()
+            .filter(|field| field.id == field_id)
+    }
+
+    fn analyze_field(
+        &mut self,
+        descriptor: FieldDescriptor,
+        field: QueryField,
+        atom: &AtomToken,
+    ) -> Option<Query> {
+        match descriptor.kind {
+            FieldKind::Text {
+                analyzer: AnalyzerKind::FrankensearchDefault,
+                positions,
+            } => {
+                let mut analyzer = FrankensearchTokenizer::default();
+                let mut terms = Vec::new();
+                let Ok(report) = analyze_admitted(
+                    &mut analyzer,
+                    AnalyzerKind::FrankensearchDefault,
+                    &atom.raw,
+                    &mut |token| {
+                        terms.push(PositionedTerm::new(token.position, token.text.clone()));
+                    },
+                ) else {
+                    self.drop_with_diagnostic(
+                        QueryDiagnosticKind::UnsupportedField,
+                        "default analyzer implementation is unavailable",
+                        atom.byte_offset,
+                        None,
+                    );
+                    return None;
+                };
+                if report.oversized_tokens != 0 {
+                    return Some(Query::Empty);
+                }
+                if !positions && terms.len() > 1 {
+                    self.push_diagnostic(QueryDiagnostic {
+                        kind: QueryDiagnosticKind::UnsupportedField,
+                        message: format!(
+                            "field {} cannot execute a multi-term phrase without positions",
+                            descriptor.name
+                        ),
+                        byte_offset: Some(atom.byte_offset),
+                        fragment: None,
+                    });
+                    return None;
+                }
+                match terms.len() {
+                    0 => None,
+                    1 if atom.prefix => {
+                        self.push_diagnostic(QueryDiagnostic {
+                            kind: QueryDiagnosticKind::DroppedFragment,
+                            message: "phrase prefix requires at least two analyzed terms; field branch dropped"
+                                .to_owned(),
+                            byte_offset: Some(atom.byte_offset),
+                            fragment: None,
+                        });
+                        None
+                    }
+                    1 => terms.pop().map(|term| Query::Term {
+                        fields: vec![field],
+                        text: term.text,
+                    }),
+                    _ => Some(Query::Phrase {
+                        fields: vec![field],
+                        terms,
+                        slop: atom.slop,
+                        prefix: atom.prefix,
+                    }),
+                }
+            }
+            FieldKind::Keyword if atom.prefix => {
+                self.push_diagnostic(QueryDiagnostic {
+                    kind: QueryDiagnosticKind::DroppedFragment,
+                    message:
+                        "phrase prefix requires at least two analyzed terms; field branch dropped"
+                            .to_owned(),
+                    byte_offset: Some(atom.byte_offset),
+                    fragment: None,
+                });
+                None
+            }
+            FieldKind::Keyword => (!atom.raw.is_empty()).then(|| Query::Term {
+                fields: vec![field],
+                text: atom.raw.clone(),
+            }),
+            FieldKind::Text { .. } => {
+                self.drop_with_diagnostic(
+                    QueryDiagnosticKind::UnsupportedField,
+                    &format!(
+                        "field {} uses an analyzer unsupported by the default parser",
+                        descriptor.name
+                    ),
+                    atom.byte_offset,
+                    Some(atom.raw.clone()),
+                );
+                None
+            }
+            FieldKind::StoredOnly
+            | FieldKind::I64 { indexed: false, .. }
+            | FieldKind::U64 { indexed: false, .. }
+            | FieldKind::I64 { indexed: true, .. }
+            | FieldKind::U64 { indexed: true, .. } => {
+                self.drop_with_diagnostic(
+                    QueryDiagnosticKind::UnsupportedField,
+                    &format!(
+                        "field {} is not a text field supported by this parser",
+                        descriptor.name
+                    ),
+                    atom.byte_offset,
+                    Some(atom.raw.clone()),
+                );
+                None
+            }
+        }
+    }
+
+    fn apply_boost(&mut self, query: Query, atom: &AtomToken) -> Query {
+        self.apply_raw_boost(
+            query,
+            atom.boost.as_deref(),
+            atom.byte_offset,
+            Some(atom.raw.clone()),
+        )
+    }
+
+    fn apply_raw_boost(
+        &mut self,
+        query: Query,
+        raw_boost: Option<&str>,
+        byte_offset: usize,
+        fragment: Option<String>,
+    ) -> Query {
+        let Some(raw_boost) = raw_boost else {
+            return query;
+        };
+        match parse_boost_factor(raw_boost) {
+            Some(factor) if factor.to_bits() == 1.0_f32.to_bits() => query,
+            Some(factor) => Query::Boost {
+                query: Box::new(query),
+                factor,
+            },
+            _ => {
+                self.push_diagnostic(QueryDiagnostic {
+                    kind: QueryDiagnosticKind::InvalidBoost,
+                    message: format!("invalid boost {raw_boost:?}; recovered branch without boost"),
+                    byte_offset: Some(byte_offset),
+                    fragment,
+                });
+                query
+            }
+        }
+    }
+
+    fn skip_group(&mut self) {
+        let mut depth = 1_usize;
+        while let Some(token) = self.tokens.get(self.cursor) {
+            self.cursor += 1;
+            match token {
+                LexToken::LeftParen { .. } => depth += 1,
+                LexToken::RightParen { .. } => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<&LexToken> {
+        self.tokens.get(self.cursor)
+    }
+
+    fn push_diagnostic(&mut self, diagnostic: QueryDiagnostic) {
+        emit_diagnostic(&mut self.diagnostics, diagnostic);
+    }
+
+    fn drop_with_diagnostic(
+        &mut self,
+        kind: QueryDiagnosticKind,
+        message: &str,
+        byte_offset: usize,
+        fragment: Option<String>,
+    ) {
+        self.dropped_fragments += 1;
+        self.push_diagnostic(QueryDiagnostic {
+            kind,
+            message: message.to_owned(),
+            byte_offset: Some(byte_offset),
+            fragment,
+        });
+    }
+
+    fn syntax_diagnostic_at(&mut self, message: &str, byte_offset: usize) {
+        self.push_diagnostic(QueryDiagnostic {
+            kind: QueryDiagnosticKind::SyntaxRecovery,
+            message: message.to_owned(),
+            byte_offset: Some(byte_offset),
+            fragment: None,
+        });
+    }
+
+    fn recover_trailing_tokens(&mut self) {
+        while let Some(token) = self.tokens.get(self.cursor) {
+            let offset = token.byte_offset();
+            self.cursor += 1;
+            self.drop_with_diagnostic(
+                QueryDiagnosticKind::DroppedFragment,
+                "unparseable trailing fragment dropped",
+                offset,
+                None,
+            );
+        }
+    }
+}
+
+fn wrap_direct_negative_or_operand(node: &mut ParsedNode) {
+    let dedup_key = std::mem::take(&mut node.dedup_key);
+    let query = std::mem::replace(&mut node.query, Query::Empty);
+    node.query = Query::Boolean {
+        clauses: vec![BooleanClause::new(Occur::MustNot, query)],
+        operator: None,
+    };
+    node.occur = None;
+    node.from_not = false;
+    node.dedup_key = negative_boolean_dedup_key(&dedup_key);
+}
+
+fn wrap_not_for_and(node: &mut ParsedNode) {
+    let dedup_key = std::mem::take(&mut node.dedup_key);
+    let query = std::mem::replace(&mut node.query, Query::Empty);
+    node.query = Query::Boolean {
+        clauses: vec![BooleanClause::new(Occur::MustNot, query)],
+        operator: None,
+    };
+    node.occur = None;
+    node.from_not = false;
+    node.dedup_key = negative_boolean_dedup_key(&dedup_key);
+}
+
+fn negative_boolean_dedup_key(child: &str) -> String {
+    format!(
+        "{:?}:{:?}",
+        Option::<BooleanOperator>::None,
+        [(Occur::MustNot, child)]
+    )
+}
+
+fn combine_and(nodes: Vec<ParsedNode>, syntactic_operands: usize) -> Option<ParsedNode> {
+    combine_boolean(
+        nodes,
+        Occur::Must,
+        Some(BooleanOperator::And),
+        syntactic_operands,
+        false,
+    )
+}
+
+fn combine_or(
+    nodes: Vec<ParsedNode>,
+    syntactic_operands: usize,
+    dropped: bool,
+    explicit_or: bool,
+) -> Option<ParsedNode> {
+    combine_boolean(
+        nodes,
+        Occur::Should,
+        explicit_or.then_some(BooleanOperator::Or),
+        syntactic_operands,
+        dropped,
+    )
+}
+
+fn combine_boolean(
+    nodes: Vec<ParsedNode>,
+    default_occur: Occur,
+    operator: Option<BooleanOperator>,
+    syntactic_operands: usize,
+    dropped: bool,
+) -> Option<ParsedNode> {
+    let mut clauses = Vec::with_capacity(nodes.len() + 1);
+    let mut keys = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let occur = node.occur.unwrap_or(default_occur);
+        if !keys.iter().any(|(candidate_occur, candidate_key)| {
+            *candidate_occur == occur && candidate_key == &node.dedup_key
+        }) {
+            keys.push((occur, node.dedup_key));
+            clauses.push(BooleanClause::new(occur, node.query));
+        }
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+
+    if clauses.len() == 1
+        && !dropped
+        && clauses[0].occur == default_occur
+        && (syntactic_operands == 1 || default_occur == Occur::Should)
+    {
+        let clause = clauses.pop()?;
+        let (_, dedup_key) = keys.pop()?;
+        return Some(ParsedNode {
+            query: clause.query,
+            occur: None,
+            from_not: false,
+            dedup_key,
+        });
+    }
+
+    let dedup_key = format!("{operator:?}:{keys:?}");
+    Some(ParsedNode {
+        query: Query::Boolean { clauses, operator },
+        occur: None,
+        from_not: false,
+        dedup_key,
+    })
+}
+
+fn repair_root_all_negative(node: &mut Option<ParsedNode>, grammar: &mut Grammar) {
+    let Some(parsed) = node else {
+        return;
+    };
+    if !query_is_all_negative(&parsed.query) {
+        return;
+    }
+    if !add_all_to_negative_root(&mut parsed.query) {
+        return;
+    }
+    grammar.push_diagnostic(QueryDiagnostic {
+        kind: QueryDiagnosticKind::AllNegativeRepair,
+        message: "all-negative query repaired with All".to_owned(),
+        byte_offset: None,
+        fragment: None,
+    });
+}
+
+fn query_is_all_negative(query: &Query) -> bool {
+    match query {
+        Query::Boolean { clauses, .. } => {
+            !clauses.is_empty()
+                && clauses.iter().all(|clause| {
+                    clause.occur == Occur::MustNot || query_is_all_negative(&clause.query)
+                })
+        }
+        Query::Boost { query, .. } => query_is_all_negative(query),
+        Query::Empty
+        | Query::All
+        | Query::Term { .. }
+        | Query::Phrase { .. }
+        | Query::Range { .. }
+        | Query::Set { .. }
+        | Query::Glob { .. } => false,
+    }
+}
+
+fn add_all_to_negative_root(query: &mut Query) -> bool {
+    match query {
+        Query::Boolean { clauses, .. } => {
+            clauses.push(BooleanClause::new(Occur::Should, Query::All));
+            true
+        }
+        Query::Boost { query, .. } => add_all_to_negative_root(query),
+        Query::Empty
+        | Query::All
+        | Query::Term { .. }
+        | Query::Phrase { .. }
+        | Query::Range { .. }
+        | Query::Set { .. }
+        | Query::Glob { .. } => false,
+    }
+}
+
+fn merge_field_queries(queries: Vec<Query>) -> Option<Query> {
+    let first = queries.first()?.clone();
+    match first {
+        Query::Term { text, .. }
+            if queries.iter().all(
+                |query| matches!(query, Query::Term { text: candidate, .. } if candidate == &text),
+            ) =>
+        {
+            let mut fields = Vec::new();
+            for query in queries {
+                let Query::Term {
+                    fields: query_fields,
+                    ..
+                } = query
+                else {
+                    return None;
+                };
+                fields.extend(query_fields);
+            }
+            Some(Query::Term { fields, text })
+        }
+        Query::Phrase {
+            terms,
+            slop,
+            prefix,
+            ..
+        } if queries.iter().all(|query| {
+            matches!(
+                query,
+                Query::Phrase {
+                    terms: candidate_terms,
+                    slop: candidate_slop,
+                    prefix: candidate_prefix,
+                    ..
+                } if candidate_terms == &terms
+                    && *candidate_slop == slop
+                    && *candidate_prefix == prefix
+            )
+        }) =>
+        {
+            let mut fields = Vec::new();
+            for query in queries {
+                let Query::Phrase {
+                    fields: query_fields,
+                    ..
+                } = query
+                else {
+                    return None;
+                };
+                fields.extend(query_fields);
+            }
+            Some(Query::Phrase {
+                fields,
+                terms,
+                slop,
+                prefix,
+            })
+        }
+        Query::Empty if queries.iter().all(Query::is_empty) => Some(Query::Empty),
+        _ => Some(Query::Boolean {
+            clauses: queries
+                .into_iter()
+                .map(|query| BooleanClause::new(Occur::Should, query))
+                .collect(),
+            operator: None,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    use frankensearch_core::traits::LexicalSearch;
+    use frankensearch_core::types::IndexableDocument;
+    use frankensearch_lexical::TantivyIndex;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::schema::{
+        Analyzer, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind, SchemaDescriptor,
+    };
+
+    const TYPED_FIELDS: [FieldDescriptor; 7] = [
+        FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "signed",
+            kind: FieldKind::I64 {
+                indexed: true,
+                fast: false,
+            },
+            stored: false,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "unsigned",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: false,
+        },
+        FieldDescriptor {
+            id: 5,
+            name: "stored",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 6,
+            name: "summary",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: false,
+        },
+    ];
+
+    const TYPED_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "query-parser-typed-test",
+        fields: &TYPED_FIELDS,
+    };
+
+    fn parser() -> DefaultQueryParser {
+        DefaultQueryParser::new(DEFAULT_SCHEMA).expect("default schema supports its parser")
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct EvalDoc {
+        id: &'static str,
+        content: &'static str,
+        title: &'static str,
+    }
+
+    fn analyzed_terms(text: &str) -> Vec<String> {
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut terms = Vec::new();
+        let result = analyze_admitted(
+            &mut analyzer,
+            AnalyzerKind::FrankensearchDefault,
+            text,
+            &mut |token| terms.push(token.text.clone()),
+        );
+        assert!(result.is_ok(), "default analyzer is registered");
+        terms
+    }
+
+    fn field_text(doc: EvalDoc, field_id: u16) -> Option<&'static str> {
+        match DEFAULT_SCHEMA.fields.get(usize::from(field_id))?.name {
+            "id" => Some(doc.id),
+            "content" => Some(doc.content),
+            "title" => Some(doc.title),
+            _ => None,
+        }
+    }
+
+    fn field_term_matches(doc: EvalDoc, field: QueryField, needle: &str) -> bool {
+        let Some(text) = field_text(doc, field.field_id) else {
+            return false;
+        };
+        if DEFAULT_SCHEMA.fields[usize::from(field.field_id)].kind == FieldKind::Keyword {
+            text == needle
+        } else {
+            analyzed_terms(text).iter().any(|term| term == needle)
+        }
+    }
+
+    fn field_phrase_matches(
+        doc: EvalDoc,
+        field: QueryField,
+        phrase: &[PositionedTerm],
+        prefix: bool,
+    ) -> bool {
+        let Some(text) = field_text(doc, field.field_id) else {
+            return false;
+        };
+        let haystack = analyzed_terms(text);
+        let Some(first_position) = phrase.first().map(|term| term.position) else {
+            return false;
+        };
+        haystack.iter().enumerate().any(|(start, _)| {
+            phrase.iter().enumerate().all(|(index, term)| {
+                let relative = term.position.saturating_sub(first_position);
+                let Ok(relative) = usize::try_from(relative) else {
+                    return false;
+                };
+                let Some(candidate) = haystack.get(start.saturating_add(relative)) else {
+                    return false;
+                };
+                if prefix && index + 1 == phrase.len() {
+                    candidate.starts_with(&term.text)
+                } else {
+                    candidate == &term.text
+                }
+            })
+        })
+    }
+
+    fn string_bound_matches(
+        value: &str,
+        lower: &Bound<QueryValue>,
+        upper: &Bound<QueryValue>,
+    ) -> bool {
+        let lower_matches = match lower {
+            Bound::Included(QueryValue::Str(lower)) => value >= lower.as_str(),
+            Bound::Excluded(QueryValue::Str(lower)) => value > lower.as_str(),
+            Bound::Unbounded => true,
+            Bound::Included(_) | Bound::Excluded(_) => false,
+        };
+        let upper_matches = match upper {
+            Bound::Included(QueryValue::Str(upper)) => value <= upper.as_str(),
+            Bound::Excluded(QueryValue::Str(upper)) => value < upper.as_str(),
+            Bound::Unbounded => true,
+            Bound::Included(_) | Bound::Excluded(_) => false,
+        };
+        lower_matches && upper_matches
+    }
+
+    fn ast_matches(query: &Query, doc: EvalDoc) -> bool {
+        match query {
+            Query::Empty => false,
+            Query::All => true,
+            Query::Term { fields, text } => fields
+                .iter()
+                .copied()
+                .any(|field| field_term_matches(doc, field, text)),
+            Query::Phrase {
+                fields,
+                terms,
+                prefix,
+                ..
+            } => fields
+                .iter()
+                .copied()
+                .any(|field| field_phrase_matches(doc, field, terms, *prefix)),
+            Query::Boolean { clauses, .. } => {
+                let mut has_must = false;
+                let mut should_count = 0_usize;
+                let mut should_match = false;
+                for clause in clauses {
+                    let child_matches = ast_matches(&clause.query, doc);
+                    match clause.occur {
+                        Occur::Must => {
+                            has_must = true;
+                            if !child_matches {
+                                return false;
+                            }
+                        }
+                        Occur::Should => {
+                            should_count += 1;
+                            should_match |= child_matches;
+                        }
+                        Occur::MustNot if child_matches => return false,
+                        Occur::MustNot => {}
+                    }
+                }
+                has_must || (should_count != 0 && should_match)
+            }
+            Query::Range {
+                field_id,
+                lower,
+                upper,
+            } => field_text(doc, *field_id)
+                .is_some_and(|value| string_bound_matches(value, lower, upper)),
+            Query::Set { field_id, values } => field_text(doc, *field_id).is_some_and(|value| {
+                values
+                    .iter()
+                    .any(|candidate| candidate == &QueryValue::Str(value.to_owned()))
+            }),
+            Query::Glob { field_ids, pattern } => field_ids
+                .iter()
+                .copied()
+                .any(|field_id| field_text(doc, field_id).is_some_and(|value| value == pattern)),
+            Query::Boost { query, .. } => ast_matches(query, doc),
+        }
+    }
+
+    fn field_name(schema: SchemaDescriptor, field_id: u16) -> &'static str {
+        schema.fields[usize::from(field_id)].name
+    }
+
+    fn value_json(value: &QueryValue) -> Value {
+        match value {
+            QueryValue::I64(value) => json!(value),
+            QueryValue::U64(value) => json!(value),
+            QueryValue::Str(value) => json!(value),
+        }
+    }
+
+    fn value_tag(value: &QueryValue) -> &'static str {
+        match value {
+            QueryValue::I64(_) => "I64",
+            QueryValue::U64(_) => "U64",
+            QueryValue::Str(_) => "Str",
+        }
+    }
+
+    fn bound_json(bound: &Bound<QueryValue>) -> Value {
+        match bound {
+            Bound::Included(value) => {
+                json!({ "bound": "Included", "value": value_json(value) })
+            }
+            Bound::Excluded(value) => {
+                json!({ "bound": "Excluded", "value": value_json(value) })
+            }
+            Bound::Unbounded => json!({ "bound": "Unbounded" }),
+        }
+    }
+
+    fn typed_tag<'a>(prefix: &'a str, values: impl IntoIterator<Item = &'a QueryValue>) -> String {
+        let suffix = values.into_iter().next().map_or("Str", value_tag);
+        format!("{prefix}{suffix}")
+    }
+
+    fn fixture_json(query: &Query, occur: Option<Occur>) -> Value {
+        match query {
+            Query::Empty => json!({ "type": "Empty" }),
+            Query::All => json!({ "type": "All" }),
+            Query::Term { fields, text } => {
+                let fields = fields
+                    .iter()
+                    .map(|field| {
+                        json!({
+                            "name": field_name(DEFAULT_SCHEMA, field.field_id),
+                            "boost": field.boost,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut value = json!({ "type": "Term", "text": text, "fields": fields });
+                if occur == Some(Occur::MustNot) {
+                    value["score"] = json!(0.0);
+                }
+                value
+            }
+            Query::Phrase {
+                fields,
+                terms,
+                slop,
+                prefix,
+            } => {
+                let fields = fields
+                    .iter()
+                    .map(|field| {
+                        json!({
+                            "name": field_name(DEFAULT_SCHEMA, field.field_id),
+                            "boost": field.boost,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let terms = terms
+                    .iter()
+                    .map(|term| term.text.as_str())
+                    .collect::<Vec<_>>();
+                let mut value = json!({
+                    "type": if *prefix { "PhrasePrefix" } else { "Phrase" },
+                    "terms": terms,
+                    "slop": slop,
+                    "fields": fields,
+                });
+                if occur == Some(Occur::MustNot) {
+                    value["score"] = json!(0.0);
+                }
+                value
+            }
+            Query::Boolean { clauses, operator } => {
+                let children = clauses
+                    .iter()
+                    .map(|clause| {
+                        json!({
+                            "occur": match clause.occur {
+                                Occur::Must => "Must",
+                                Occur::Should => "Should",
+                                Occur::MustNot => "MustNot",
+                            },
+                            "query": fixture_json(&clause.query, Some(clause.occur)),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut value = json!({ "type": "Boolean", "children": children });
+                if let Some(operator) = operator {
+                    value["operator"] = json!(match operator {
+                        BooleanOperator::And => "AND",
+                        BooleanOperator::Or => "OR",
+                    });
+                }
+                value
+            }
+            Query::Range {
+                field_id,
+                lower,
+                upper,
+            } => {
+                let values = [lower, upper].into_iter().filter_map(|bound| match bound {
+                    Bound::Included(value) | Bound::Excluded(value) => Some(value),
+                    Bound::Unbounded => None,
+                });
+                json!({
+                    "type": typed_tag("Range", values),
+                    "field": field_name(DEFAULT_SCHEMA, *field_id),
+                    "lower": bound_json(lower),
+                    "upper": bound_json(upper),
+                })
+            }
+            Query::Set { field_id, values } => json!({
+                "type": typed_tag("Set", values),
+                "field": field_name(DEFAULT_SCHEMA, *field_id),
+                "values": values.iter().map(value_json).collect::<Vec<_>>(),
+            }),
+            Query::Glob { field_ids, pattern } => json!({
+                "type": "Glob",
+                "pattern": pattern,
+                "fields": field_ids
+                    .iter()
+                    .map(|field_id| field_name(DEFAULT_SCHEMA, *field_id))
+                    .collect::<Vec<_>>(),
+            }),
+            Query::Boost { query, factor } => json!({
+                "type": "Boost",
+                "factor": factor,
+                "query": fixture_json(query, occur),
+            }),
+        }
+    }
+
+    #[test]
+    fn default_parser_matches_pinned_tantivy_fixture_trees() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/quill_language_contract.json"
+        ))
+        .expect("language fixture parses");
+        let cases = fixture["parse_tree_cases"]
+            .as_array()
+            .expect("parse tree case array");
+        let expected = cases
+            .iter()
+            .filter(|case| case["parser"] == "default_lenient")
+            .count();
+        let mut executed = 0;
+        for case in cases {
+            if case["parser"] != "default_lenient" {
+                continue;
+            }
+            let id = case["id"].as_str().expect("fixture id");
+            let input = case["input"].as_str().expect("fixture input");
+            let parsed = parser().parse(input);
+            assert_eq!(
+                fixture_json(&parsed.query, None),
+                case["expected_ast"],
+                "fixture {id}"
+            );
+            if let Some(expected) = case.get("expected_diagnostic").and_then(Value::as_str) {
+                assert!(
+                    parsed
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.message.contains(expected)),
+                    "fixture {id} expected diagnostic {expected:?}, got {:?}",
+                    parsed.diagnostics
+                );
+            } else {
+                assert!(
+                    parsed.diagnostics.is_empty(),
+                    "fixture {id} unexpectedly diagnosed {:?}",
+                    parsed.diagnostics
+                );
+            }
+            executed += 1;
+        }
+        assert_eq!(executed, expected, "every pinned default parser case ran");
+    }
+
+    #[test]
+    fn harvested_query_corpus_never_fails_or_panics() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/queries.json"))
+                .expect("query corpus parses");
+        for row in fixture.as_array().expect("query rows") {
+            let query = row["query"].as_str().expect("query string");
+            let _ = parser().parse(query);
+        }
+    }
+
+    #[test]
+    fn parser_result_sets_match_the_pinned_tantivy_adapter() {
+        const DOCS: [EvalDoc; 10] = [
+            EvalDoc {
+                id: "doc-a",
+                content: "rust ownership error handling",
+                title: "Rust",
+            },
+            EvalDoc {
+                id: "doc-b",
+                content: "rust deprecated",
+                title: "Legacy Rust",
+            },
+            EvalDoc {
+                id: "doc-c",
+                content: "deprecated ownership",
+                title: "Old",
+            },
+            EvalDoc {
+                id: "doc-d",
+                content: "and",
+                title: "Conjunction",
+            },
+            EvalDoc {
+                id: "doc-e",
+                content: "or",
+                title: "Disjunction",
+            },
+            EvalDoc {
+                id: "doc-f",
+                content: "transformers text embeddings",
+                title: "Semantic Search",
+            },
+            EvalDoc {
+                id: "doc-g",
+                content: "search index new",
+                title: "SearchIndex",
+            },
+            EvalDoc {
+                id: "doc-z",
+                content: "unrelated",
+                title: "Nothing",
+            },
+            EvalDoc {
+                id: "foo bar",
+                content: "space sentinel",
+                title: "Escaped",
+            },
+            EvalDoc {
+                id: "foo:bar",
+                content: "colon sentinel",
+                title: "Escaped",
+            },
+        ];
+
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/queries.json"))
+                .expect("query corpus parses");
+        let mut queries = fixture
+            .as_array()
+            .expect("query rows")
+            .iter()
+            .map(|row| row["query"].as_str().expect("query string").to_owned())
+            .collect::<Vec<_>>();
+        queries.extend(
+            [
+                "rust OR -deprecated",
+                "-rust OR deprecated",
+                "-deprecated rust OR ownership",
+                "rust -deprecated OR ownership",
+                "rust OR -deprecated AND ownership",
+                "rust OR (-deprecated)",
+                "rust AND NOT deprecated",
+                "rust AND -deprecated",
+                "rust NOT deprecated",
+                "rust NOT",
+                "NOT\tdeprecated",
+                "rust NOT\tdeprecated",
+                "NOT NOT rust",
+                "NOT NOT",
+                "rust AND",
+                "rust OR",
+                "rust AND\townership",
+                "rust\nAND ownership",
+                "rust OR OR ownership",
+                "rust AND AND ownership",
+                "(OR rust)",
+                "rust ) ownership",
+                "(rust OR ownership)^2",
+                "rust^2^3",
+                "id:doc-a^2^3",
+                "\"rust\"^2^3",
+                "\"rust ownership\"~deprecated",
+                "\"rust ownership\"~4294967296",
+                "title:(rust OR \"error handling\")",
+                "title : ownership",
+                "title: ownership",
+                "+title:Rust",
+                "-title:Rust",
+                "foo*:bar",
+                r"id:foo\ bar",
+                r"id:foo\:bar",
+                r"id:foo\q",
+                r"SearchIndex\:\:new",
+                "/rust/",
+                "rust OR /ownership/",
+                "-/rust/ rust",
+                "rust AND /ownership/ deprecated",
+                "id:[doc-a TO doc-z}",
+                "id:[doc-a doc-c]",
+                "id:[doc-a TO",
+                "id:[doc-a",
+                "id: IN [doc-a doc-c]",
+                "id:([doc-a TO doc-c} OR IN [doc-z])",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let index = TantivyIndex::in_memory().expect("create Tantivy oracle");
+            let documents = DOCS
+                .iter()
+                .map(|doc| {
+                    IndexableDocument::new(doc.id, doc.content).with_title(doc.title.to_owned())
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index oracle documents");
+            index.commit(&cx).await.expect("commit oracle documents");
+
+            let mut mismatches = Vec::new();
+            for raw in queries {
+                let mut oracle = index
+                    .search_doc_ids(&cx, &raw, DOCS.len())
+                    .expect("execute Tantivy oracle")
+                    .into_iter()
+                    .map(|hit| hit.doc_id.to_string())
+                    .collect::<Vec<_>>();
+                oracle.sort_unstable();
+                let parsed = parser().parse(&raw);
+                let mut quill = DOCS
+                    .iter()
+                    .copied()
+                    .filter(|doc| ast_matches(&parsed.query, *doc))
+                    .map(|doc| doc.id.to_owned())
+                    .collect::<Vec<_>>();
+                quill.sort_unstable();
+                if quill != oracle {
+                    mismatches.push(format!(
+                        "{raw:?}: quill={quill:?}, oracle={oracle:?}, ast={:?}",
+                        parsed.query
+                    ));
+                }
+            }
+            assert!(
+                mismatches.is_empty(),
+                "result-set differential mismatches:\n{}",
+                mismatches.join("\n")
+            );
+        });
+    }
+
+    #[test]
+    fn classification_preserves_incumbent_surface() {
+        assert_eq!(classify_query(""), QueryExplanation::Empty);
+        assert_eq!(classify_query("   "), QueryExplanation::Empty);
+        assert_eq!(classify_query("rust"), QueryExplanation::Simple);
+        assert_eq!(
+            classify_query("  authentication  "),
+            QueryExplanation::Simple
+        );
+        assert_eq!(
+            classify_query("\"error handling\""),
+            QueryExplanation::Phrase
+        );
+        assert_eq!(classify_query("'single quotes'"), QueryExplanation::Phrase);
+        assert_eq!(classify_query("rust async"), QueryExplanation::Boolean);
+        assert_eq!(QueryExplanation::Empty.to_string(), "empty");
+        assert_eq!(QueryExplanation::Simple.to_string(), "simple");
+        assert_eq!(QueryExplanation::Phrase.to_string(), "phrase");
+        assert_eq!(QueryExplanation::Boolean.to_string(), "boolean");
+
+        let json =
+            serde_json::to_string(&QueryExplanation::Phrase).expect("query explanation serializes");
+        let decoded: QueryExplanation =
+            serde_json::from_str(&json).expect("query explanation deserializes");
+        assert_eq!(decoded, QueryExplanation::Phrase);
+    }
+
+    #[test]
+    fn empty_whitespace_and_lone_signs_lower_to_match_none() {
+        for query in ["", "   ", "-", "+"] {
+            assert!(
+                parser().parse(query).query.is_empty(),
+                "{query:?} must not become a match-all query"
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_is_character_counted_and_boundary_safe() {
+        let short = "hello world";
+        assert_eq!(truncate_query(short), short);
+
+        let at_limit = "a".repeat(MAX_QUERY_LENGTH);
+        assert_eq!(truncate_query(&at_limit), at_limit);
+
+        let over = "a".repeat(MAX_QUERY_LENGTH + 3);
+        assert_eq!(truncate_query(&over).len(), MAX_QUERY_LENGTH);
+
+        let multibyte = "é".repeat(MAX_QUERY_LENGTH + 3);
+        let truncated = truncate_query(&multibyte);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert_eq!(truncated.chars().count(), MAX_QUERY_LENGTH);
+        assert_eq!(truncated.len(), MAX_QUERY_LENGTH * 'é'.len_utf8());
+
+        let byte_long_but_char_short = "é".repeat(MAX_QUERY_LENGTH / 2 + 1);
+        assert_eq!(
+            truncate_query(&byte_long_but_char_short),
+            byte_long_but_char_short
+        );
+    }
+
+    #[test]
+    fn parse_reports_truncation_once_and_uses_the_prefix() {
+        let query = format!("needle {}", "padding ".repeat(2_000));
+        let parsed = parser().parse(&query);
+        assert!(parsed.was_truncated);
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == QueryDiagnosticKind::Truncated)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lenient_corners_drop_or_recover_without_error() {
+        let cases = [
+            "-", "+", "NOT", "AND", "OR", "rust AND", "OR rust", "@user", "#hashtag", "foo:bar",
+            "a+b", "hello!", "((rust)", "rust ))",
+        ];
+        for case in cases {
+            let _ = parser().parse(case);
+        }
+    }
+
+    #[test]
+    fn standalone_and_leading_operator_recovery_is_pinned() {
+        for (raw, normalized) in [("AND", "and"), ("OR", "or"), ("NOT", "not")] {
+            let query = parser().parse(raw).query;
+            assert!(
+                matches!(&query, Query::Term { .. }),
+                "standalone {raw} must be retained as a literal"
+            );
+            let Query::Term { text, .. } = query else {
+                continue;
+            };
+            assert_eq!(text, normalized);
+        }
+        for raw in ["AND rust", "OR rust"] {
+            let parsed = parser().parse(raw);
+            assert!(matches!(parsed.query, Query::Term { ref text, .. } if text == "rust"));
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_grouping_and_phrase_suffixes_are_retained() {
+        let parsed = parser().parse("(rust OR ownership) AND \"error handling\"~2");
+        assert!(matches!(
+            &parsed.query,
+            Query::Boolean {
+                operator: Some(BooleanOperator::And),
+                ..
+            }
+        ));
+        let Query::Boolean {
+            clauses,
+            operator: Some(BooleanOperator::And),
+        } = parsed.query
+        else {
+            return;
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(matches!(
+            clauses[1].query,
+            Query::Phrase {
+                slop: 2,
+                prefix: false,
+                ..
+            }
+        ));
+
+        let recovered = parser().parse("\"error handling\"~2*");
+        assert!(matches!(
+            recovered.query,
+            Query::Phrase {
+                slop: 2,
+                prefix: false,
+                ..
+            }
+        ));
+        assert!(recovered.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                && diagnostic.message.contains("phrase suffix")
+        }));
+    }
+
+    #[test]
+    fn analyzed_phrase_terms_retain_positions() {
+        let query = parser().parse("src/main.rs").query;
+        assert!(matches!(&query, Query::Phrase { .. }));
+        let Query::Phrase { terms, .. } = query else {
+            return;
+        };
+        assert_eq!(
+            terms,
+            [
+                PositionedTerm::new(0, "src"),
+                PositionedTerm::new(1, "main"),
+                PositionedTerm::new(2, "rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn field_ids_not_backend_handles_are_stored_in_leaves() {
+        let parsed = parser().parse("title:Rust");
+        assert_eq!(
+            parsed.query,
+            Query::Term {
+                fields: vec![QueryField::new(2, TITLE_BOOST)],
+                text: "rust".to_owned(),
+            }
+        );
+
+        let id = parser().parse("id:Case-Sensitive");
+        assert_eq!(
+            id.query,
+            Query::Term {
+                fields: vec![QueryField::new(0, 1.0)],
+                text: "Case-Sensitive".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn boosts_groups_and_scopes_canonicalize_before_dedup() {
+        assert!(matches!(
+            parser().parse("(rust) rust").query,
+            Query::Term { .. }
+        ));
+        assert!(matches!(
+            parser().parse("rust rust^1").query,
+            Query::Term { .. }
+        ));
+        assert!(matches!(
+            parser().parse("rust^2 rust^2.0").query,
+            Query::Boost { factor, .. } if factor.to_bits() == 2.0_f32.to_bits()
+        ));
+
+        for raw in ["rust^2^3", "(rust)^2^3", "\"rust\"^2^3"] {
+            let recovered = parser().parse(raw);
+            assert!(matches!(
+                recovered.query,
+                Query::Boost { factor, .. } if factor.to_bits() == 2.0_f32.to_bits()
+            ));
+            assert!(recovered.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                    && diagnostic.message.contains("trailing boost")
+            }));
+        }
+        let leading_decimal = parser().parse("rust^.5");
+        assert!(matches!(leading_decimal.query, Query::Term { .. }));
+        assert!(
+            leading_decimal
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.kind == QueryDiagnosticKind::InvalidBoost })
+        );
+        let trailing_decimal = parser().parse("rust^2.");
+        assert!(matches!(
+            trailing_decimal.query,
+            Query::Boost { factor, .. } if factor.to_bits() == 2.0_f32.to_bits()
+        ));
+        assert!(trailing_decimal.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                && diagnostic.message.contains("trailing boost")
+        }));
+
+        let invalid = parser().parse("rust rust^scientific1e2");
+        assert!(matches!(invalid.query, Query::Term { .. }));
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::InvalidBoost)
+        );
+
+        let scoped = parser().parse("title:(rust) content:(rust)").query;
+        let Query::Boolean { clauses, .. } = scoped else {
+            return;
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_ne!(clauses[0].query, clauses[1].query);
+
+        let recovered = parser().parse("unknown:(bad title:good)");
+        assert!(
+            ast_matches(
+                &recovered.query,
+                EvalDoc {
+                    id: "explicit-child",
+                    content: "bad",
+                    title: "good",
+                },
+            ),
+            "the valid explicit inner field was not preserved: {:?}",
+            recovered.query
+        );
+    }
+
+    #[test]
+    fn typed_ranges_sets_comparisons_and_partial_recovery_are_pinned() {
+        let typed_parser =
+            DefaultQueryParser::new(TYPED_SCHEMA).expect("typed test schema is valid");
+        assert_eq!(
+            typed_parser.parse("signed:[-5 TO 10}").query,
+            Query::Range {
+                field_id: 3,
+                lower: Bound::Included(QueryValue::I64(-5)),
+                upper: Bound::Excluded(QueryValue::I64(10)),
+            }
+        );
+        assert_eq!(
+            typed_parser
+                .parse("unsigned: >= 18446744073709551615")
+                .query,
+            Query::Range {
+                field_id: 4,
+                lower: Bound::Included(QueryValue::U64(u64::MAX)),
+                upper: Bound::Unbounded,
+            }
+        );
+
+        let partial = typed_parser.parse("unsigned:[bad TO 3]");
+        assert_eq!(
+            partial.query,
+            Query::Range {
+                field_id: 4,
+                lower: Bound::Unbounded,
+                upper: Bound::Included(QueryValue::U64(3)),
+            }
+        );
+        assert!(
+            partial
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::InvalidTypedValue)
+        );
+
+        let set = typed_parser.parse("unsigned: IN [1 bad 2 1]");
+        assert_eq!(
+            set.query,
+            Query::Set {
+                field_id: 4,
+                values: vec![QueryValue::U64(1), QueryValue::U64(2)],
+            }
+        );
+        assert_eq!(
+            typed_parser.parse("unsigned: IN []").query,
+            Query::Set {
+                field_id: 4,
+                values: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parser().parse(r#"id: IN [foo,bar ""]"#).query,
+            Query::Set {
+                field_id: 0,
+                values: vec![
+                    QueryValue::Str("foo,bar".to_owned()),
+                    QueryValue::Str(String::new()),
+                ],
+            }
+        );
+        assert_eq!(
+            parser().parse(r#"id: IN ["foo]bar"]"#).query,
+            Query::Set {
+                field_id: 0,
+                values: vec![QueryValue::Str("foo]bar".to_owned())],
+            }
+        );
+        assert_eq!(
+            parser().parse(r#"id: IN ["foo\q"]"#).query,
+            Query::Set {
+                field_id: 0,
+                values: vec![QueryValue::Str("fooq".to_owned())],
+            }
+        );
+        let unterminated_set = parser().parse("id: IN [doc-a doc-b");
+        assert_eq!(
+            unterminated_set.query,
+            Query::Set {
+                field_id: 0,
+                values: vec![
+                    QueryValue::Str("doc-a".to_owned()),
+                    QueryValue::Str("doc-b".to_owned()),
+                ],
+            }
+        );
+        assert!(unterminated_set.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                && diagnostic.message.contains("unterminated typed set")
+        }));
+        assert_eq!(
+            parser().parse(r"id:[foo\ bar TO z]").query,
+            Query::Range {
+                field_id: 0,
+                lower: Bound::Included(QueryValue::Str("foo bar".to_owned())),
+                upper: Bound::Included(QueryValue::Str("z".to_owned())),
+            }
+        );
+        assert_eq!(
+            parser().parse(r"id:[foo\\:bar TO z]").query,
+            Query::Range {
+                field_id: 0,
+                lower: Bound::Included(QueryValue::Str(r"foo\:bar".to_owned())),
+                upper: Bound::Included(QueryValue::Str("z".to_owned())),
+            }
+        );
+        let unterminated = parser().parse("id:[a TO z");
+        assert_eq!(
+            unterminated.query,
+            Query::Range {
+                field_id: 0,
+                lower: Bound::Included(QueryValue::Str("a".to_owned())),
+                upper: Bound::Included(QueryValue::Str("z".to_owned())),
+            }
+        );
+        assert!(unterminated.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                && diagnostic.message.contains("unterminated typed range")
+        }));
+        let missing_to = parser().parse("id:[a z]");
+        assert_eq!(
+            missing_to.query,
+            Query::Range {
+                field_id: 0,
+                lower: Bound::Included(QueryValue::Str("a".to_owned())),
+                upper: Bound::Included(QueryValue::Str("z".to_owned())),
+            }
+        );
+        assert!(missing_to.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                && diagnostic.message.contains("missing keyword `TO`")
+        }));
+        for raw in ["id:[a TO", "id:[a"] {
+            assert_eq!(
+                parser().parse(raw).query,
+                Query::Range {
+                    field_id: 0,
+                    lower: Bound::Included(QueryValue::Str("a".to_owned())),
+                    upper: Bound::Unbounded,
+                },
+                "{raw}"
+            );
+        }
+        assert!(typed_parser.parse("stored:[a TO b]").query.is_empty());
+        assert!(typed_parser.parse("summary:\"two words\"").query.is_empty());
+        assert!(typed_parser.parse("signed:[* TO *]").query.is_empty());
+
+        assert_eq!(
+            parser().parse("ord:[0 TO 1]").query,
+            Query::Range {
+                field_id: 4,
+                lower: Bound::Included(QueryValue::U64(0)),
+                upper: Bound::Included(QueryValue::U64(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_retains_valid_siblings_and_repairs_recursive_negatives() {
+        for raw in ["(OR rust)", "(AND rust)"] {
+            let parsed = parser().parse(raw);
+            assert!(matches!(parsed.query, Query::Term { ref text, .. } if text == "rust"));
+            assert!(parsed.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                    && diagnostic.byte_offset == Some(1)
+            }));
+        }
+
+        let unmatched = parser().parse("rust ) ownership");
+        assert!(matches!(
+            unmatched.query,
+            Query::Boolean { ref clauses, .. }
+                if clauses.len() == 1
+                    && matches!(&clauses[0].query, Query::Term { text, .. } if text == "rust")
+        ));
+        assert!(unmatched.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                && diagnostic.byte_offset == Some(5)
+        }));
+        assert_eq!(
+            parser()
+                .parse("rust ))")
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery)
+                .count(),
+            1
+        );
+
+        let all_negative = parser().parse("(-alpha) OR (-beta)");
+        let Query::Boolean { clauses, .. } = all_negative.query else {
+            return;
+        };
+        assert!(matches!(
+            clauses.last(),
+            Some(BooleanClause {
+                occur: Occur::Should,
+                query: Query::All
+            })
+        ));
+        assert!(
+            all_negative
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::AllNegativeRepair)
+        );
+
+        let boosted = parser().parse("(-alpha)^2");
+        assert!(matches!(
+            boosted.query,
+            Query::Boost { ref query, .. }
+                if matches!(query.as_ref(), Query::Boolean { clauses, .. }
+                    if matches!(clauses.last(), Some(BooleanClause {
+                        occur: Occur::Should,
+                        query: Query::All,
+                    })))
+        ));
+    }
+
+    #[test]
+    fn quoted_escapes_single_quotes_and_phrase_prefix_errors_are_pinned() {
+        assert!(matches!(
+            parser().parse("title:'error handling'").query,
+            Query::Phrase { ref terms, .. } if terms.len() == 2
+        ));
+        assert!(matches!(
+            parser().parse(r#"title:"say \"hello\"""#).query,
+            Query::Phrase { ref terms, .. }
+                if terms.iter().map(|term| term.text.as_str()).eq(["say", "hello"])
+        ));
+        let prefix = parser().parse("\"word\"*");
+        assert!(prefix.query.is_empty());
+        assert!(
+            prefix
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::DroppedFragment)
+        );
+
+        let malformed_slop = parser().parse("\"rust ownership\"~deprecated");
+        assert!(matches!(
+            malformed_slop.query,
+            Query::Boolean { ref clauses, .. }
+                if clauses.len() == 2
+                    && matches!(&clauses[0].query, Query::Phrase { slop: 0, .. })
+                    && matches!(&clauses[1].query, Query::Term { text, .. } if text == "deprecated")
+        ));
+        assert!(malformed_slop.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::SyntaxRecovery
+                && diagnostic
+                    .message
+                    .contains("retained as a separate fragment")
+        }));
+
+        let overflowing_slop = parser().parse("\"rust ownership\"~4294967296");
+        assert!(matches!(
+            overflowing_slop.query,
+            Query::Boolean { ref clauses, .. }
+                if clauses.len() == 2
+                    && matches!(&clauses[0].query, Query::Phrase { slop: 0, .. })
+                    && matches!(&clauses[1].query, Query::Term { text, .. } if text == "4294967296")
+        ));
+    }
+
+    #[test]
+    fn unquoted_escapes_and_unsupported_regex_recover_without_retargeting() {
+        assert_eq!(
+            parser().parse(r"id:foo\ bar").query,
+            Query::Term {
+                fields: vec![QueryField::new(0, 1.0)],
+                text: "foo bar".to_owned(),
+            }
+        );
+        assert_eq!(
+            parser().parse(r"id:foo\:bar").query,
+            Query::Term {
+                fields: vec![QueryField::new(0, 1.0)],
+                text: "foo:bar".to_owned(),
+            }
+        );
+        assert_eq!(
+            parser().parse(r"id:foo\q").query,
+            Query::Term {
+                fields: vec![QueryField::new(0, 1.0)],
+                text: r"foo\q".to_owned(),
+            }
+        );
+
+        let regex = parser().parse("/rust/");
+        assert!(regex.query.is_empty());
+        assert!(regex.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::DroppedFragment
+                && diagnostic.message.contains("regular-expression")
+        }));
+        assert!(matches!(
+            parser().parse("-/rust/ rust").query,
+            Query::Boolean { ref clauses, .. }
+                if clauses.len() == 1
+                    && matches!(&clauses[0].query, Query::Term { text, .. } if text == "rust")
+        ));
+    }
+
+    #[test]
+    fn dedup_is_raw_and_does_not_merge_distinct_normalized_fragments() {
+        assert!(matches!(
+            parser().parse("rust rust").query,
+            Query::Term { .. }
+        ));
+        let distinct = parser().parse("Rust rust").query;
+        assert!(matches!(&distinct, Query::Boolean { .. }));
+        let Query::Boolean { clauses, .. } = distinct else {
+            return;
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].query, clauses[1].query);
+
+        let recursive = parser().parse("a OR -b OR (-b)").query;
+        assert!(matches!(
+            recursive,
+            Query::Boolean { ref clauses, .. } if clauses.len() == 2
+        ));
+    }
+
+    #[test]
+    fn all_negative_repair_is_root_only() {
+        let query = parser().parse("rust OR (-deprecated)").query;
+        assert!(matches!(&query, Query::Boolean { .. }));
+        let Query::Boolean { clauses, .. } = query else {
+            return;
+        };
+        assert!(matches!(&clauses[1].query, Query::Boolean { .. }));
+        let Query::Boolean {
+            clauses: negative, ..
+        } = &clauses[1].query
+        else {
+            return;
+        };
+        assert_eq!(negative.len(), 1);
+        assert_eq!(negative[0].occur, Occur::MustNot);
+    }
+
+    #[test]
+    fn schemas_without_both_default_fields_are_rejected() {
+        assert!(matches!(
+            DefaultQueryParser::new(FSFS_CHUNK_SCHEMA),
+            Err(QueryParserConfigError::MissingDefaultField { field: "title", .. })
+        ));
+
+        const NO_POSITIONS_FIELDS: [FieldDescriptor; 2] = [
+            FieldDescriptor {
+                id: 0,
+                name: "content",
+                kind: FieldKind::Text {
+                    analyzer: Analyzer::FrankensearchDefault,
+                    positions: false,
+                },
+                stored: true,
+            },
+            FieldDescriptor {
+                id: 1,
+                name: "title",
+                kind: FieldKind::Text {
+                    analyzer: Analyzer::FrankensearchDefault,
+                    positions: true,
+                },
+                stored: true,
+            },
+        ];
+        const NO_POSITIONS_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+            name: "query-parser-no-positions-test",
+            fields: &NO_POSITIONS_FIELDS,
+        };
+        assert!(matches!(
+            DefaultQueryParser::new(NO_POSITIONS_SCHEMA),
+            Err(QueryParserConfigError::InvalidDefaultField {
+                field: "content",
+                ..
+            })
+        ));
+
+        const GAPPED_FIELDS: [FieldDescriptor; 2] = [
+            FieldDescriptor {
+                id: 0,
+                name: "content",
+                kind: FieldKind::Text {
+                    analyzer: Analyzer::FrankensearchDefault,
+                    positions: true,
+                },
+                stored: true,
+            },
+            FieldDescriptor {
+                id: 2,
+                name: "title",
+                kind: FieldKind::Text {
+                    analyzer: Analyzer::FrankensearchDefault,
+                    positions: true,
+                },
+                stored: true,
+            },
+        ];
+        const GAPPED_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+            name: "query-parser-gapped-test",
+            fields: &GAPPED_FIELDS,
+        };
+        assert!(matches!(
+            DefaultQueryParser::new(GAPPED_SCHEMA),
+            Err(QueryParserConfigError::InvalidSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn range_and_glob_ast_variants_use_stable_field_ids() {
+        let range = Query::Range {
+            field_id: 5,
+            lower: Bound::Included(QueryValue::I64(10)),
+            upper: Bound::Excluded(QueryValue::I64(20)),
+        };
+        let set = Query::Set {
+            field_id: 5,
+            values: vec![QueryValue::I64(10), QueryValue::I64(20)],
+        };
+        let glob = Query::Glob {
+            field_ids: vec![6, 7],
+            pattern: "cache*".to_owned(),
+        };
+        assert!(matches!(range, Query::Range { field_id: 5, .. }));
+        assert!(matches!(set, Query::Set { field_id: 5, .. }));
+        assert!(matches!(glob, Query::Glob { field_ids, .. } if field_ids == [6, 7]));
+    }
+
+    #[test]
+    fn recursive_depth_is_bounded() {
+        let query = format!(
+            "{}needle{}",
+            "(".repeat(MAX_QUERY_DEPTH + 20),
+            ")".repeat(MAX_QUERY_DEPTH + 20)
+        );
+        let parsed = parser().parse(&query);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::DepthLimit)
+        );
+    }
+
+    #[test]
+    fn deterministic_hostile_strings_do_not_panic() {
+        let alphabet = b"abc XYZ0123\"'():^+-*/._@#\t\n";
+        let alphabet_len = u64::try_from(alphabet.len()).expect("alphabet length fits u64");
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for length in 0..512 {
+            let mut input = String::with_capacity(length);
+            for _ in 0..length {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let index =
+                    usize::try_from(state % alphabet_len).expect("alphabet index fits usize");
+                input.push(char::from(alphabet[index]));
+            }
+            let _ = parser().parse(&input);
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("test log buffer lock is not poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_lenient_diagnostic_is_also_logged_at_warn() {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || TestLogWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+        let capture_buffer = Arc::clone(&buffer);
+        let parsed = tracing::subscriber::with_default(subscriber, || {
+            let mut parsed = parser().parse("unknown_field:value \"unterminated");
+            for _ in 0..256 {
+                let captured_bytes = capture_buffer
+                    .lock()
+                    .expect("test log buffer lock is not poisoned");
+                let captured = String::from_utf8_lossy(&captured_bytes).lines().count();
+                if captured >= parsed.diagnostics.len() {
+                    break;
+                }
+                drop(captured_bytes);
+                tracing::callsite::rebuild_interest_cache();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                parsed = parser().parse("unknown_field:value \"unterminated");
+            }
+            parsed
+        });
+        assert!(!parsed.diagnostics.is_empty());
+        let logs = String::from_utf8(
+            buffer
+                .lock()
+                .expect("test log buffer lock is not poisoned")
+                .clone(),
+        )
+        .expect("captured tracing output is UTF-8");
+        let diagnostic_lines = logs
+            .lines()
+            .filter(|line| line.contains("lenient query parse diagnostic"))
+            .collect::<Vec<_>>();
+        assert!(
+            diagnostic_lines.len() >= parsed.diagnostics.len(),
+            "captured {} warning events for {} diagnostics: {logs:?}",
+            diagnostic_lines.len(),
+            parsed.diagnostics.len()
+        );
+        assert!(diagnostic_lines.iter().all(|line| {
+            line.trim_start().starts_with("WARN ")
+                && line.contains(crate::tracing_conventions::TARGET)
+        }));
+        assert!(!logs.contains("unknown_field"));
+        assert!(!logs.contains("unterminated"));
+        assert!(!logs.contains("value"));
+    }
+}

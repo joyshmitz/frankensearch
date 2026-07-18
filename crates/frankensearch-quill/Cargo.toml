@@ -25,6 +25,7 @@ crc32fast = { workspace = true }
 xxhash-rust = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
 # Stored metadata stays opaque until result materialization. Durable formats
 # never use serde or serde_json.
 serde_json = { workspace = true }
@@ -38,6 +39,7 @@ asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 frankensearch-lexical = { workspace = true, features = ["bench-internals"] }
 tempfile = "3.27"
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "postings_decode_ab"

@@ -365,6 +365,89 @@
       "expected_diagnostic": "unsupported field fragment dropped"
     },
     {
+      "id": "query-default-string-range-mixed-bounds",
+      "query_class": "range",
+      "parser": "default_lenient",
+      "input": "title:[A TO B}",
+      "expected_ast": {
+        "type": "RangeStr",
+        "field": "title",
+        "lower": { "bound": "Included", "value": "a" },
+        "upper": { "bound": "Excluded", "value": "b" }
+      }
+    },
+    {
+      "id": "query-default-string-set-stable-dedup",
+      "query_class": "set",
+      "parser": "default_lenient",
+      "input": "id: IN [alpha beta alpha]",
+      "expected_ast": {
+        "type": "SetStr",
+        "field": "id",
+        "values": ["alpha", "beta"]
+      }
+    },
+    {
+      "id": "query-default-group-boost",
+      "query_class": "boolean",
+      "parser": "default_lenient",
+      "input": "(rust OR ownership)^2",
+      "expected_ast": {
+        "type": "Boost",
+        "factor": 2.0,
+        "query": {
+          "type": "Boolean",
+          "operator": "OR",
+          "children": [
+            { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+            { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+          ]
+        }
+      }
+    },
+    {
+      "id": "query-default-field-scoped-group",
+      "query_class": "boolean",
+      "parser": "default_lenient",
+      "input": "title:(rust OR \"error handling\")",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Phrase", "terms": ["error", "handling"], "slop": 0, "fields": [{ "name": "title", "boost": 2.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-default-field-scope-explicit-override",
+      "query_class": "boolean",
+      "parser": "default_lenient",
+      "input": "title:(rust AND id:Doc-1)",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "title", "boost": 2.0 }] } },
+          { "occur": "Must", "query": { "type": "Term", "text": "Doc-1", "fields": [{ "name": "id", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-default-field-scoped-typed-leaves",
+      "query_class": "boolean",
+      "parser": "default_lenient",
+      "input": "id:([a TO m} OR IN [z])",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          { "occur": "Should", "query": { "type": "RangeStr", "field": "id", "lower": { "bound": "Included", "value": "a" }, "upper": { "bound": "Excluded", "value": "m" } } },
+          { "occur": "Should", "query": { "type": "SetStr", "field": "id", "values": ["z"] } }
+        ]
+      }
+    },
+    {
       "id": "query-boolean-or-tighter-than-and",
       "query_class": "boolean",
       "parser": "cass",
@@ -896,7 +979,7 @@
   "surface_coverage": [
     { "surface": "schema", "fixture_ids": ["behavior-schema-default-fields"] },
     { "surface": "analyzers", "fixture_ids": ["analyzer-default-ascii-split-lower", "analyzer-default-unicode-lower-offsets", "analyzer-default-unicode-lower-expansion", "analyzer-hyphen-compound-and-parts", "analyzer-hyphen-cjk-bigrams", "analyzer-prefix-no-hyphen-decompose", "analyzer-cass-limit-256-kept", "analyzer-cass-limit-257-dropped", "analyzer-tantivy-index-limit-65530-kept", "analyzer-tantivy-index-limit-65531-dropped", "analyzer-quill-query-limit-65531-dropped", "helper-edge-prefix-ascii", "helper-preview-unicode", "behavior-analyzers", "behavior-oversized-token-position-gap"] },
-    { "surface": "queries", "fixture_ids": ["query-identifier-path-phrase", "query-identifier-raw-colon-dropped", "query-short-keyword-default-or", "query-natural-language-default-or", "query-phrase-both-fields", "query-quoted-single-token-is-term", "query-default-and-precedes-or", "query-default-field-and-boost", "query-default-all-negative-complement", "query-default-recursive-dedup", "query-lenient-unterminated-quote-recovers", "query-boolean-or-tighter-than-and", "query-boolean-negative-standalone-universe", "query-boolean-negative-or-operand-universe", "query-boolean-and-not-no-all-score", "query-boolean-repeated-not-is-idempotent", "query-glob-exact", "query-glob-prefix", "query-glob-suffix", "query-glob-substring", "query-glob-complex", "query-range-inclusive-created-at", "query-cjk-all-bigrams", "query-cjk-mixed-script-keeps-cjk-only", "query-cjk-single-character-unigram", "query-empty-cass-all", "query-boolean-should-optional-with-must", "query-boolean-should-only-required", "query-boolean-should-plus-mustnot-required", "query-boolean-mustnot-only-empty", "helper-query-truncate-unicode", "behavior-boolean-occur", "behavior-cass-prefix-and-cjk-boundaries", "behavior-quill-oversized-query-lowering"] },
+    { "surface": "queries", "fixture_ids": ["query-identifier-path-phrase", "query-identifier-raw-colon-dropped", "query-short-keyword-default-or", "query-natural-language-default-or", "query-phrase-both-fields", "query-quoted-single-token-is-term", "query-default-and-precedes-or", "query-default-field-and-boost", "query-default-all-negative-complement", "query-default-recursive-dedup", "query-lenient-unterminated-quote-recovers", "query-lenient-diagnostic-keeps-valid-sibling", "query-default-string-range-mixed-bounds", "query-default-string-set-stable-dedup", "query-default-group-boost", "query-default-field-scoped-group", "query-default-field-scope-explicit-override", "query-default-field-scoped-typed-leaves", "query-boolean-or-tighter-than-and", "query-boolean-negative-standalone-universe", "query-boolean-negative-or-operand-universe", "query-boolean-and-not-no-all-score", "query-boolean-repeated-not-is-idempotent", "query-glob-exact", "query-glob-prefix", "query-glob-suffix", "query-glob-substring", "query-glob-complex", "query-range-inclusive-created-at", "query-cjk-all-bigrams", "query-cjk-mixed-script-keeps-cjk-only", "query-cjk-single-character-unigram", "query-empty-cass-all", "query-boolean-should-optional-with-must", "query-boolean-should-only-required", "query-boolean-should-plus-mustnot-required", "query-boolean-mustnot-only-empty", "helper-query-truncate-unicode", "behavior-boolean-occur", "behavior-cass-prefix-and-cjk-boundaries", "behavior-quill-oversized-query-lowering"] },
     { "surface": "collectors", "fixture_ids": ["behavior-collectors", "behavior-pagination-and-limit-zero"] },
     { "surface": "scoring", "fixture_ids": ["score-bm25-constants-operation-order", "score-bm25-operation-order-bits", "score-fieldnorm-landmarks", "score-avgdl-uses-raw-statistics", "score-deleted-doc-statistics-until-merge", "score-multifield-title-boost", "score-cass-fields-unboosted", "score-cass-fast-range-constant", "score-phrase-bm25", "score-required-scorers-cost-order", "score-cass-regex-fields-constant", "score-deterministic-total-order", "score-epsilon-layout-class", "score-epsilon-component-boundary", "behavior-scoring"] },
     { "surface": "writer", "fixture_ids": ["behavior-writer-mutations"] },

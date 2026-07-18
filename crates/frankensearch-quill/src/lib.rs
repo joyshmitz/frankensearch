@@ -19,6 +19,7 @@ pub mod contract;
 pub mod error;
 pub mod grimoire;
 pub mod keeper;
+pub mod query;
 pub mod quiver;
 pub mod schema;
 pub mod scribe;
@@ -39,6 +40,11 @@ pub use keeper::{
     MANIFEST_MAGIC, Manifest, ManifestCodecError, ManifestFieldStats, ManifestPublisher,
     ManifestSegment, ManifestSource, load_manifest_pair, pack_engine_version,
     unpack_engine_version,
+};
+pub use query::{
+    BooleanClause, BooleanOperator, DefaultQueryParser, MAX_QUERY_DEPTH, MAX_QUERY_LENGTH, Occur,
+    ParsedQuery, PositionedTerm, Query, QueryDiagnostic, QueryDiagnosticKind, QueryExplanation,
+    QueryField, QueryParserConfigError, QueryValue, classify_query, truncate_query,
 };
 pub use schema::{
     Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind,
