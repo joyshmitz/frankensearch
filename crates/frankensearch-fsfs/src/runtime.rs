@@ -18,7 +18,7 @@ use asupersync::fs::{
     read as async_file_read, read_to_string as async_file_read_to_string,
     remove_file as async_file_remove,
 };
-use asupersync::runtime::spawn_blocking;
+use asupersync::runtime::{RuntimeBuilder, spawn_blocking};
 use dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
@@ -409,6 +409,8 @@ const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 const FSFS_DAEMON_REQUEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
 const FSFS_DAEMON_RESPONSE_MAX_BYTES: usize = 4 << 20; // 4 MiB
 const FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS: u64 = 5_000;
+/// Idle-accept poll cadence for the shutdown-aware serve loop (bd-egkb).
+const FSFS_SERVE_ACCEPT_POLL_MS: u64 = 50;
 const FSFS_DAEMON_CONNECT_MAX_ATTEMPTS: usize = 80;
 const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
 
@@ -3605,7 +3607,17 @@ impl FsfsRuntime {
     ///
     /// Returns `SearchError` when command parsing/validation fails or
     /// downstream CLI runtime logic fails.
+    #[allow(clippy::future_not_send)]
     pub async fn run_cli(&self, cx: &Cx) -> SearchResult<()> {
+        self.run_cli_inner(cx, None).await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn run_cli_inner(
+        &self,
+        cx: &Cx,
+        shutdown: Option<&ShutdownCoordinator>,
+    ) -> SearchResult<()> {
         match self.cli_input.command {
             CliCommand::Help => {
                 print_cli_help();
@@ -3615,7 +3627,7 @@ impl FsfsRuntime {
             CliCommand::Update => self.run_update_command(),
             CliCommand::Uninstall => self.run_uninstall_command(),
             CliCommand::Tui => self.run_tui(cx).await,
-            command => self.run_cli_scaffold(cx, command).await,
+            command => self.run_cli_scaffold(cx, command, shutdown).await,
         }
     }
 
@@ -4253,14 +4265,20 @@ impl FsfsRuntime {
         entry
     }
 
-    async fn run_cli_scaffold(&self, cx: &Cx, command: CliCommand) -> SearchResult<()> {
+    #[allow(clippy::future_not_send)]
+    async fn run_cli_scaffold(
+        &self,
+        cx: &Cx,
+        command: CliCommand,
+        shutdown: Option<&ShutdownCoordinator>,
+    ) -> SearchResult<()> {
         self.validate_command_inputs(command)?;
         if command == CliCommand::Search {
             self.run_search_command(cx).await?;
             return Ok(());
         }
         if command == CliCommand::Serve {
-            self.run_search_serve_command(cx).await?;
+            self.run_search_serve_command(cx, shutdown).await?;
             return Ok(());
         }
         if command == CliCommand::Explain {
@@ -4642,10 +4660,14 @@ impl FsfsRuntime {
         }
     }
 
-    async fn run_search_serve_command(&self, cx: &Cx) -> SearchResult<()> {
+    async fn run_search_serve_command(
+        &self,
+        cx: &Cx,
+        shutdown: Option<&ShutdownCoordinator>,
+    ) -> SearchResult<()> {
         #[cfg(unix)]
         if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
-            return self.run_search_serve_socket_command(cx).await;
+            return self.run_search_serve_socket_command(cx, shutdown).await;
         }
 
         self.run_search_serve_stdio_command(cx).await
@@ -4722,7 +4744,11 @@ impl FsfsRuntime {
         clippy::future_not_send,
         clippy::significant_drop_tightening
     )]
-    async fn run_search_serve_socket_command(&self, cx: &Cx) -> SearchResult<()> {
+    async fn run_search_serve_socket_command(
+        &self,
+        cx: &Cx,
+        shutdown: Option<&ShutdownCoordinator>,
+    ) -> SearchResult<()> {
         let socket_path = self.resolve_daemon_socket_path()?;
         if let Some(parent) = socket_path.parent()
             && !parent.as_os_str().is_empty()
@@ -4746,101 +4772,166 @@ impl FsfsRuntime {
         }
 
         let listener = UnixListener::bind(&socket_path).map_err(SearchError::Io)?;
+        // Nonblocking accept polled on a short cadence: a SIGTERM landing while
+        // idle in accept is observed within one poll interval instead of
+        // hanging until the next client or a parent SIGKILL (bd-egkb).
+        listener.set_nonblocking(true).map_err(SearchError::Io)?;
 
         let _socket_guard = SocketPathGuard {
             path: socket_path.clone(),
         };
 
-        let mut resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
-        let mut hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
+        let resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
+        let hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
+        let shared = Arc::new(std::sync::Mutex::new((resources, hot_cache)));
+        let stop_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        loop {
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(error) => return Err(SearchError::Io(error)),
-            };
-            if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(
-                FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
-            ))) {
-                warn!(
-                    error = %error,
-                    "fsfs daemon failed to set socket read timeout; skipping request"
-                );
-                continue;
-            }
-            if let Err(error) = stream.set_write_timeout(Some(Duration::from_millis(
-                FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
-            ))) {
-                warn!(
-                    error = %error,
-                    "fsfs daemon failed to set socket write timeout; skipping request"
-                );
-                continue;
-            }
-
-            let raw_request = match Self::read_search_serve_socket_request(&mut stream) {
-                Ok(Some(raw_request)) => raw_request,
-                Ok(None) => continue,
-                Err(error) => {
-                    let response =
-                        Self::search_serve_error_response(String::new(), "full", error.to_string());
-                    if let Err(write_error) =
-                        Self::write_search_serve_socket_response(&mut stream, &response)
-                    {
-                        warn!(
-                            error = %write_error,
-                            "fsfs daemon failed to write socket error response"
-                        );
+        // Every accepted client runs on its own scoped thread so one stalled
+        // or partial client cannot serialize the rest; search execution
+        // serializes only on the shared resource lock for the compute
+        // duration. The scope joins every client before returning, bounded by
+        // the per-client I/O timeouts.
+        std::thread::scope(|scope| {
+            loop {
+                if stop_requested.load(std::sync::atomic::Ordering::Relaxed)
+                    || cx.is_cancel_requested()
+                    || shutdown.is_some_and(|coordinator| coordinator.is_shutting_down())
+                {
+                    break;
+                }
+                let (stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(FSFS_SERVE_ACCEPT_POLL_MS));
+                        continue;
                     }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(SearchError::Io(error)),
+                };
+                if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(
+                    FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
+                ))) {
+                    warn!(
+                        error = %error,
+                        "fsfs daemon failed to set socket read timeout; skipping request"
+                    );
                     continue;
                 }
-            };
-            let raw = raw_request.trim();
-            if raw.is_empty() {
-                continue;
+                if let Err(error) = stream.set_write_timeout(Some(Duration::from_millis(
+                    FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
+                ))) {
+                    warn!(
+                        error = %error,
+                        "fsfs daemon failed to set socket write timeout; skipping request"
+                    );
+                    continue;
+                }
+                let shared = Arc::clone(&shared);
+                let stop_requested = Arc::clone(&stop_requested);
+                let runtime = self.clone();
+                scope.spawn(move || {
+                    Self::handle_search_serve_socket_client(
+                        runtime,
+                        stream,
+                        shared,
+                        stop_requested,
+                        hot_cache_enabled,
+                    );
+                });
             }
+            Ok(())
+        })
+    }
 
-            if matches!(raw, "quit" | "exit" | ":quit" | ":exit" | ":shutdown") {
-                break;
+    #[cfg(unix)]
+    fn handle_search_serve_socket_client(
+        runtime: Self,
+        mut stream: UnixStream,
+        shared: Arc<
+            std::sync::Mutex<(
+                SearchExecutionResources,
+                HashMap<SearchCacheKey, Vec<SearchPayload>>,
+            )>,
+        >,
+        stop_requested: Arc<std::sync::atomic::AtomicBool>,
+        hot_cache_enabled: bool,
+    ) {
+        let raw_request = match Self::read_search_serve_socket_request(&mut stream) {
+            Ok(Some(raw_request)) => raw_request,
+            Ok(None) => return,
+            Err(error) => {
+                let response =
+                    Self::search_serve_error_response(String::new(), "full", error.to_string());
+                if let Err(write_error) =
+                    Self::write_search_serve_socket_response(&mut stream, &response)
+                {
+                    warn!(
+                        error = %write_error,
+                        "fsfs daemon failed to write socket error response"
+                    );
+                }
+                return;
             }
+        };
+        let raw = raw_request.trim();
+        if raw.is_empty() {
+            return;
+        }
+        if matches!(raw, "quit" | "exit" | ":quit" | ":exit" | ":shutdown") {
+            stop_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
 
-            let response = match Self::parse_search_serve_request(raw) {
-                Ok(request) => {
-                    let request_query = request.query.clone();
-                    let request_mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
-                    match self
+        let response = match Self::parse_search_serve_request(raw) {
+            Ok(request) => {
+                let request_query = request.query.clone();
+                let request_mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
+                let scheduler = match RuntimeBuilder::current_thread().build() {
+                    Ok(scheduler) => scheduler,
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "fsfs daemon failed to build a client scheduler; dropping request"
+                        );
+                        return;
+                    }
+                };
+                let cx = Cx::for_request();
+                let execute = scheduler.block_on(async {
+                    let mut guard = shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let (resources, hot_cache) = &mut *guard;
+                    runtime
                         .execute_search_serve_request(
-                            cx,
+                            &cx,
                             request,
-                            &mut resources,
-                            &mut hot_cache,
+                            resources,
+                            hot_cache,
                             hot_cache_enabled,
                         )
                         .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => Self::search_serve_error_response(
-                            request_query,
-                            request_mode,
-                            error.to_string(),
-                        ),
-                    }
+                });
+                match execute {
+                    Ok(response) => response,
+                    Err(error) => Self::search_serve_error_response(
+                        request_query,
+                        request_mode,
+                        error.to_string(),
+                    ),
                 }
-                Err(error) => {
-                    Self::search_serve_error_response(String::new(), "full", error.to_string())
-                }
-            };
-            if let Err(error) = Self::write_search_serve_socket_response(&mut stream, &response) {
-                warn!(
-                    error = %error,
-                    "fsfs daemon failed to write socket response"
-                );
             }
+            Err(error) => {
+                Self::search_serve_error_response(String::new(), "full", error.to_string())
+            }
+        };
+        if let Err(error) = Self::write_search_serve_socket_response(&mut stream, &response) {
+            warn!(
+                error = %error,
+                "fsfs daemon failed to write socket response"
+            );
         }
-
-        Ok(())
     }
 
     fn parse_search_serve_request(raw: &str) -> SearchResult<SearchServeRequest> {
@@ -11607,7 +11698,7 @@ impl FsfsRuntime {
         cx: &Cx,
         shutdown: &ShutdownCoordinator,
     ) -> SearchResult<()> {
-        self.run_cli(cx).await?;
+        self.run_cli_inner(cx, Some(shutdown)).await?;
 
         let watch_enabled_for_command = self.config.indexing.watch_mode
             && matches!(
@@ -15926,6 +16017,7 @@ fn emit_lite_build_model_hint(model_root: &Path) {
 mod tests {
     use std::fs;
     use std::future::{Future, poll_fn};
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -15933,9 +16025,9 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use asupersync::test_utils::run_test_with_cx;
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
+    use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::{
         Embedder, IndexableDocument, LexicalSearch, ModelCategory, SearchFuture,
     };
@@ -15978,8 +16070,8 @@ mod tests {
     use crate::query_planning::QueryIntentClass;
     use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
     use crate::stream_protocol::{
-        StreamEvent, StreamEventKind, StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE,
-        decode_stream_frame_ndjson, decode_stream_frame_toon,
+        StreamEvent, StreamEventKind, StreamFrame, StreamTerminalStatus,
+        TOON_STREAM_RECORD_SEPARATOR_BYTE, decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
 
@@ -16482,6 +16574,186 @@ mod tests {
             rendered.ends_with(".sock"),
             "daemon socket path should end with .sock: {rendered}"
         );
+    }
+
+    #[cfg(unix)]
+    fn futures_lite_block_on<F: Future>(future: F) -> F::Output {
+        // run_test_with_cx already drives the executor; nested block_on is not
+        // available, so fixtures build the index through this tiny current-
+        // thread driver only when the caller is NOT on an executor thread.
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("fixture scheduler")
+            .block_on(future)
+    }
+
+    #[cfg(unix)]
+    fn connect_socket_with_retry(path: &Path) -> std::os::unix::net::UnixStream {
+        for _ in 0..200 {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(stream) => return stream,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!("serve socket did not become ready: {}", path.display());
+    }
+
+    #[cfg(unix)]
+    fn spawn_socket_serve(
+        index_root: PathBuf,
+        socket_path: PathBuf,
+        coordinator: Arc<ShutdownCoordinator>,
+    ) -> std::thread::JoinHandle<frankensearch_core::SearchResult<()>> {
+        std::thread::spawn(move || {
+            let scheduler = RuntimeBuilder::current_thread()
+                .build()
+                .expect("serve scheduler");
+            let cx = Cx::for_request();
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Serve,
+                daemon: true,
+                daemon_socket: Some(socket_path),
+                index_dir: Some(index_root),
+                format: OutputFormat::Jsonl,
+                ..CliInput::default()
+            });
+            scheduler.block_on(async move {
+                runtime
+                    .run_search_serve_socket_command(&cx, Some(coordinator.as_ref()))
+                    .await
+            })
+        })
+    }
+
+    #[cfg(unix)]
+    fn join_with_timeout(
+        handle: std::thread::JoinHandle<frankensearch_core::SearchResult<()>>,
+        bound: Duration,
+    ) -> frankensearch_core::SearchResult<()> {
+        let start = std::time::Instant::now();
+        loop {
+            if handle.is_finished() {
+                break;
+            }
+            assert!(
+                start.elapsed() < bound,
+                "serve did not exit within {bound:?} of shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.join().expect("serve thread must not panic")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_socket_observes_shutdown_while_idle_in_accept_and_cleans_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src")).expect("create project source dir");
+        fs::write(project.join("src/auth.rs"), "/// Authentication tokens.\n")
+            .expect("write source");
+        let index_root = project.join(".frankensearch");
+        let socket_path = temp.path().join("serve.sock");
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = ".frankensearch".to_owned();
+        futures_lite_block_on(async {
+            FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&Cx::for_request(), InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+        });
+
+        let coordinator: Arc<ShutdownCoordinator> = Arc::new(ShutdownCoordinator::new());
+        let handle = spawn_socket_serve(index_root, socket_path.clone(), Arc::clone(&coordinator));
+        // Wait for readiness, then request shutdown while the loop is idle in
+        // accept: it must exit within a bound and remove the socket.
+        let probe = connect_socket_with_retry(&socket_path);
+        drop(probe);
+        coordinator.request_shutdown(ShutdownReason::UserRequest);
+        let result = join_with_timeout(handle, Duration::from_secs(2));
+        assert!(result.is_ok(), "serve exits cleanly: {result:?}");
+        assert!(!socket_path.exists(), "socket path is removed on shutdown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_socket_slow_client_does_not_serialize_a_complete_client() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src")).expect("create project source dir");
+        fs::write(
+            project.join("src/auth.rs"),
+            "/// Authentication middleware validates bearer tokens.\n",
+        )
+        .expect("write source");
+        let index_root = project.join(".frankensearch");
+        let socket_path = temp.path().join("serve.sock");
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = ".frankensearch".to_owned();
+        futures_lite_block_on(async {
+            FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&Cx::for_request(), InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+        });
+
+        let coordinator: Arc<ShutdownCoordinator> = Arc::new(ShutdownCoordinator::new());
+        let handle = spawn_socket_serve(index_root, socket_path.clone(), Arc::clone(&coordinator));
+
+        // Client A connects and stalls without sending a request.
+        let stalled = connect_socket_with_retry(&socket_path);
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Client B completes a full query round trip while A holds its read
+        // window open; B must not wait for A's timeout.
+        let mut complete = connect_socket_with_retry(&socket_path);
+        complete
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let request = serde_json::json!({"query": "authentication", "limit": 5});
+        complete
+            .write_all(
+                serde_json::to_vec(&request)
+                    .expect("request bytes")
+                    .as_slice(),
+            )
+            .expect("write request");
+        complete.write_all(b"\n").expect("write newline");
+        complete.flush().expect("flush request");
+        complete
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close request");
+        let started = std::time::Instant::now();
+        let mut raw_response = String::new();
+        use std::io::Read as _;
+        complete
+            .read_to_string(&mut raw_response)
+            .expect("read response");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "complete client was not serialized behind the stalled client: {elapsed:?}"
+        );
+        let response: serde_json::Value =
+            serde_json::from_str(raw_response.trim()).expect("response is JSON");
+        assert_eq!(response["ok"], serde_json::json!(true), "query succeeds");
+        drop(stalled);
+        drop(complete);
+
+        coordinator.request_shutdown(ShutdownReason::UserRequest);
+        let result = join_with_timeout(handle, Duration::from_secs(6));
+        assert!(result.is_ok(), "serve exits cleanly: {result:?}");
+        assert!(!socket_path.exists(), "socket path is removed");
     }
 
     #[test]
@@ -19422,8 +19694,8 @@ mod tests {
 
             let fast_embedder = HashEmbedder::default_384();
             let query_vector = fast_embedder.embed_sync("alpha beta");
-            let mut vector_writer = VectorIndex::create(&vector_path, "hash-384", 384)
-                .expect("create vector index");
+            let mut vector_writer =
+                VectorIndex::create(&vector_path, "hash-384", 384).expect("create vector index");
             vector_writer
                 .write_record("docs/a.md", &query_vector)
                 .expect("write vector record");
@@ -19499,8 +19771,8 @@ mod tests {
             let fast_embedder = HashEmbedder::default_384();
             let query = "quality cancellation ordering";
             let query_vector = fast_embedder.embed_sync(query);
-            let mut vector_writer = VectorIndex::create(&vector_path, "hash-384", 384)
-                .expect("create vector index");
+            let mut vector_writer =
+                VectorIndex::create(&vector_path, "hash-384", 384).expect("create vector index");
             vector_writer
                 .write_record("docs/quality.md", &query_vector)
                 .expect("write vector record");

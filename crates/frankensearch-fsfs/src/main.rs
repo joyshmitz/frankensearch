@@ -188,7 +188,8 @@ fn main() -> SearchResult<()> {
     let cx = Cx::for_request();
     let run_with_shutdown = matches!(interface_mode, InterfaceMode::Tui)
         || app_runtime.config().indexing.watch_mode
-        || command == CliCommand::Daemon;
+        || command == CliCommand::Daemon
+        || command == CliCommand::Serve;
     // ── Startup version check (non-blocking) ──────────────────────────
     // Print a one-line update notice from cache. If the cache is expired
     // or missing, spawn a background thread to refresh it for next time.
