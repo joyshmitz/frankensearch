@@ -71,7 +71,8 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Root cause: `CassWildcardPattern::to_regex` emits explicit `^`/`$` assertions, but pinned `tantivy-fst 0.5.0` rejects zero-width assertions and already matches regexes against the whole term. `cass_build_term_query_clauses` ignores both title/content construction failures; an empty top-level clause list then becomes `AllQuery`.
 - Consumer impact: lone suffix globs such as `*bar` return every document. Affected complex wildcard operands can silently disappear from compound or filtered queries. Substring globs and complex globs bounded by `*` at both ends are unaffected by this anchor failure.
 - Fixture: `query-glob-suffix` plus the result-level differential named above
-- Decision: fix (bead: `bd-cass-wildcard-fst-anchors-t3f9`)
+- Decision: fix completed 2026-07-18 (bead: `bd-cass-wildcard-fst-anchors-t3f9`)
+- Resolution: shipping suffix and complex globs now emit anchor-free FST regexes, and regex construction errors propagate to one explicit match-none root instead of silently removing an operand. Real Tantivy tests cover title/content suffixes, substrings, complex whole-term boundaries, compound operands, filters, and forced construction failure; the Quill-oracle result differential now treats the former DIV-002 shapes as ordinary parity cases.
 - Reviewer: not required for a fix decision
 
 ### DIV-003: same-position phrase terms are alternatives

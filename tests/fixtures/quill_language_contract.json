@@ -567,7 +567,7 @@
         "pattern": "*suffix",
         "class": "Suffix",
         "strategy": "RegexQuery",
-        "regex": ".*suffix$",
+        "regex": ".*suffix",
         "fields": ["content", "title"]
       }
     },
@@ -595,7 +595,7 @@
         "pattern": "a*b*c",
         "class": "Complex",
         "strategy": "RegexQuery",
-        "regex": "^a.*b.*c$",
+        "regex": "a.*b.*c",
         "fields": ["content", "title"],
         "question_mark_operator": false
       }

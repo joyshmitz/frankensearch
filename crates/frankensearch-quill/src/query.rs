@@ -2631,11 +2631,13 @@ impl CassWildcardPattern {
         }
     }
 
-    /// Return the incumbent-compatible regex for regex-backed classes.
+    /// Return the anchor-free Tantivy FST regex for regex-backed classes.
+    ///
+    /// The FST engine matches complete terms and rejects `^` / `$` assertions.
     #[must_use]
     pub fn to_regex(&self) -> Option<String> {
         match self {
-            Self::Suffix(core) => Some(format!(".*{}$", cass_escape_regex(core))),
+            Self::Suffix(core) => Some(format!(".*{}", cass_escape_regex(core))),
             Self::Substring(core) => Some(format!(".*{}.*", cass_escape_regex(core))),
             Self::Complex(pattern) => Some(cass_complex_regex(pattern)),
             Self::Exact(_) | Self::Prefix(_) => None,
@@ -2678,8 +2680,6 @@ fn cass_complex_regex(pattern: &str) -> String {
     let mut regex = String::with_capacity(pattern.len().saturating_mul(2).saturating_add(2));
     if pattern.starts_with('*') {
         regex.push_str(".*");
-    } else {
-        regex.push('^');
     }
     let core = pattern.trim_start_matches('*').trim_end_matches('*');
     for ch in core.chars() {
@@ -2697,8 +2697,6 @@ fn cass_complex_regex(pattern: &str) -> String {
     }
     if pattern.ends_with('*') {
         regex.push_str(".*");
-    } else {
-        regex.push('$');
     }
     regex
 }
@@ -4416,7 +4414,13 @@ mod tests {
             ("auth || search", CassQueryFilters::default()),
             ("\"error handling\"", CassQueryFilters::default()),
             ("foo*", CassQueryFilters::default()),
+            ("*bar", CassQueryFilters::default()),
+            ("*baz", CassQueryFilters::default()),
             ("*bar*", CassQueryFilters::default()),
+            ("f*bar", CassQueryFilters::default()),
+            ("*foo*baz", CassQueryFilters::default()),
+            ("*bar *baz", CassQueryFilters::default()),
+            ("f*o", CassQueryFilters::default()),
             ("搜索", CassQueryFilters::default()),
             ("auth AND NOT deprecated", CassQueryFilters::default()),
             ("auth OR NOT deprecated", CassQueryFilters::default()),
@@ -4427,6 +4431,15 @@ mod tests {
                 CassQueryFilters {
                     agents: vec!["claude".to_owned(), "codex".to_owned()],
                     workspaces: vec!["/alpha".to_owned(), "/beta".to_owned()],
+                    ..CassQueryFilters::default()
+                },
+            ),
+            (
+                "*cache",
+                CassQueryFilters {
+                    agents: vec!["claude".to_owned()],
+                    workspaces: vec!["/alpha".to_owned()],
+                    source_filter: CassSourceFilter::Remote,
                     ..CassQueryFilters::default()
                 },
             ),
@@ -4498,26 +4511,6 @@ mod tests {
                 .map(|doc| doc.msg_idx)
                 .collect::<BTreeSet<_>>();
             assert_eq!(native, oracle, "result-set differential for {raw:?}");
-        }
-
-        for (raw, expected_native) in [("*bar", BTreeSet::from([5])), ("f*o", BTreeSet::new())] {
-            let oracle_query = cass_build_tantivy_query(raw, &OracleFilters::default(), &fields);
-            let oracle = searcher
-                .search(&*oracle_query, &DocSetCollector)
-                .expect("search known shipping regex-glob gap");
-            let parsed = cass_parser().parse(raw, &CassQueryFilters::default());
-            let native = DOCS
-                .iter()
-                .copied()
-                .filter(|doc| cass_ast_matches(&parsed.query, *doc))
-                .map(|doc| doc.msg_idx)
-                .collect::<BTreeSet<_>>();
-            assert_eq!(
-                oracle.len(),
-                DOCS.len(),
-                "shipping silently drops rejected regex glob {raw:?}"
-            );
-            assert_eq!(native, expected_native, "native glob semantics for {raw:?}");
         }
     }
 

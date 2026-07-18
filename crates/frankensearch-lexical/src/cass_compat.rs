@@ -1883,15 +1883,16 @@ impl CassWildcardPattern {
     #[must_use]
     pub fn to_regex(&self) -> Option<String> {
         match self {
-            Self::Suffix(core) => Some(format!(".*{}$", cass_escape_regex(core))),
+            // tantivy-fst regexes already match the complete term and reject
+            // zero-width assertions, so explicit `^` / `$` anchors are both
+            // unnecessary and invalid here.
+            Self::Suffix(core) => Some(format!(".*{}", cass_escape_regex(core))),
             Self::Substring(core) => Some(format!(".*{}.*", cass_escape_regex(core))),
             Self::Complex(full_term) => {
                 let mut regex = String::with_capacity(full_term.len() * 2 + 2);
 
                 if full_term.starts_with('*') {
                     regex.push_str(".*");
-                } else {
-                    regex.push('^');
                 }
 
                 let trimmed_start = full_term.trim_start_matches('*');
@@ -1913,8 +1914,6 @@ impl CassWildcardPattern {
 
                 if full_term.ends_with('*') {
                     regex.push_str(".*");
-                } else {
-                    regex.push('$');
                 }
 
                 Some(regex)
@@ -2175,17 +2174,20 @@ fn cass_build_cjk_term_query(bigrams: &[String], fields: &CassFields) -> Option<
     }
 }
 
+type CassRegexQueryFactory = fn(Field, &str) -> SearchResult<RegexQuery>;
+
 /// Build query clauses for a single term based on its wildcard pattern.
 fn cass_build_term_query_clauses(
     pattern: &CassWildcardPattern,
     fields: &CassFields,
-) -> Vec<(Occur, Box<dyn Query>)> {
+    regex_query_factory: CassRegexQueryFactory,
+) -> SearchResult<Vec<(Occur, Box<dyn Query>)>> {
     let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     match pattern {
         CassWildcardPattern::Exact(term) | CassWildcardPattern::Prefix(term) => {
             if term.is_empty() {
-                return shoulds;
+                return Ok(shoulds);
             }
             // CJK terms must be decomposed into bigrams to match the indexed tokens.
             if contains_cjk(term) {
@@ -2193,7 +2195,7 @@ fn cass_build_term_query_clauses(
                 if let Some(q) = cass_build_cjk_term_query(&bigrams, fields) {
                     shoulds.push((Occur::Should, q));
                 }
-                return shoulds;
+                return Ok(shoulds);
             }
             for (field, index_record_option) in cass_term_query_fields(fields) {
                 shoulds.push((
@@ -2209,53 +2211,59 @@ fn cass_build_term_query_clauses(
         | CassWildcardPattern::Substring(_)
         | CassWildcardPattern::Complex(_) => {
             if let Some(regex_pattern) = pattern.to_regex() {
-                if let Ok(rq) = cass_regex_query_cached(fields.content, &regex_pattern) {
-                    shoulds.push((Occur::Should, Box::new(rq)));
-                }
-                if let Ok(rq) = cass_regex_query_cached(fields.title, &regex_pattern) {
-                    shoulds.push((Occur::Should, Box::new(rq)));
-                }
+                let content_query = regex_query_factory(fields.content, &regex_pattern)?;
+                let title_query = regex_query_factory(fields.title, &regex_pattern)?;
+                shoulds.push((Occur::Should, Box::new(content_query)));
+                shoulds.push((Occur::Should, Box::new(title_query)));
             }
         }
     }
 
-    shoulds
+    Ok(shoulds)
 }
 
 /// Build a compound query that requires all term parts to match (implicit AND).
-fn cass_build_compound_term_query(parts: &[String], fields: &CassFields) -> Option<Box<dyn Query>> {
+fn cass_build_compound_term_query(
+    parts: &[String],
+    fields: &CassFields,
+    regex_query_factory: CassRegexQueryFactory,
+) -> SearchResult<Option<Box<dyn Query>>> {
     let mut subqueries: Vec<Box<dyn Query>> = Vec::new();
     for part in parts {
         let pattern = CassWildcardPattern::parse(part);
-        let term_shoulds = cass_build_term_query_clauses(&pattern, fields);
+        let term_shoulds = cass_build_term_query_clauses(&pattern, fields, regex_query_factory)?;
         if !term_shoulds.is_empty() {
             subqueries.push(Box::new(BooleanQuery::new(term_shoulds)));
         }
     }
 
-    match subqueries.len() {
+    Ok(match subqueries.len() {
         0 => None,
         1 => subqueries.pop(),
         _ => {
             let musts = subqueries.into_iter().map(|q| (Occur::Must, q)).collect();
             Some(Box::new(BooleanQuery::new(musts)))
         }
-    }
+    })
 }
 
 /// Build a phrase query (exact order) across title/content fields.
-fn cass_build_phrase_query(terms: &[String], fields: &CassFields) -> Option<Box<dyn Query>> {
+fn cass_build_phrase_query(
+    terms: &[String],
+    fields: &CassFields,
+    regex_query_factory: CassRegexQueryFactory,
+) -> SearchResult<Option<Box<dyn Query>>> {
     if terms.is_empty() {
-        return None;
+        return Ok(None);
     }
     if terms.len() == 1 {
-        return cass_build_compound_term_query(terms, fields);
+        return cass_build_compound_term_query(terms, fields, regex_query_factory);
     }
 
     // If any term contains CJK, fall back to compound term query (AND of bigrams)
     // because PhraseQuery expects exact indexed tokens and CJK is bigram-indexed.
     if terms.iter().any(|t| contains_cjk(t)) {
-        return cass_build_compound_term_query(terms, fields);
+        return cass_build_compound_term_query(terms, fields, regex_query_factory);
     }
 
     let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -2266,7 +2274,7 @@ fn cass_build_phrase_query(terms: &[String], fields: &CassFields) -> Option<Box<
             .collect::<Vec<_>>();
         shoulds.push((Occur::Should, Box::new(PhraseQuery::new(phrase_terms))));
     }
-    Some(Box::new(BooleanQuery::new(shoulds)))
+    Ok(Some(Box::new(BooleanQuery::new(shoulds))))
 }
 
 /// Build Tantivy query clauses from boolean tokens.
@@ -2275,7 +2283,8 @@ fn cass_build_phrase_query(terms: &[String], fields: &CassFields) -> Option<Box<
 fn cass_build_boolean_query_clauses(
     tokens: &[CassQueryToken],
     fields: &CassFields,
-) -> Vec<(Occur, Box<dyn Query>)> {
+    regex_query_factory: CassRegexQueryFactory,
+) -> SearchResult<Vec<(Occur, Box<dyn Query>)>> {
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     let mut pending_or_group: Vec<Box<dyn Query>> = Vec::new();
     let mut next_occur = Occur::Must;
@@ -2306,7 +2315,8 @@ fn cass_build_boolean_query_clauses(
             }
             CassQueryToken::Term(term) => {
                 let parts = cass_normalize_term_parts(term);
-                let term_query = cass_build_compound_term_query(&parts, fields);
+                let term_query =
+                    cass_build_compound_term_query(&parts, fields, regex_query_factory)?;
                 let Some(term_query) = term_query else {
                     continue;
                 };
@@ -2322,7 +2332,7 @@ fn cass_build_boolean_query_clauses(
             }
             CassQueryToken::Phrase(phrase) => {
                 let terms = cass_normalize_phrase_terms(phrase);
-                let phrase_query = cass_build_phrase_query(&terms, fields);
+                let phrase_query = cass_build_phrase_query(&terms, fields, regex_query_factory)?;
                 let Some(phrase_query) = phrase_query else {
                     continue;
                 };
@@ -2350,12 +2360,35 @@ fn cass_build_boolean_query_clauses(
         clauses.insert(0, (Occur::Must, Box::new(AllQuery)));
     }
 
-    clauses
+    Ok(clauses)
+}
+
+fn cass_match_none_query() -> Box<dyn Query> {
+    Box::new(BooleanQuery::new(vec![
+        (Occur::Must, Box::new(AllQuery)),
+        (Occur::MustNot, Box::new(AllQuery)),
+    ]))
+}
+
+fn cass_fail_closed_tantivy_query(
+    raw_query: &str,
+    result: SearchResult<Box<dyn Query>>,
+) -> Box<dyn Query> {
+    result.unwrap_or_else(|error| {
+        warn!(
+            query_bytes = raw_query.len(),
+            error = %error,
+            "CASS query construction failed; returning an explicit match-none query"
+        );
+        cass_match_none_query()
+    })
 }
 
 /// Build a cass-compatible Tantivy query for `raw_query`, applying filters.
 ///
 /// Returns an `AllQuery` when the query is empty.
+/// Regex construction errors are logged and converted to an explicit
+/// match-none query because this compatibility API predates fallible returns.
 #[must_use]
 pub fn cass_build_tantivy_query(
     raw_query: &str,
@@ -2364,7 +2397,16 @@ pub fn cass_build_tantivy_query(
 ) -> Box<dyn Query> {
     let tokens = cass_parse_boolean_query(raw_query);
     let has_boolean_operators = !tokens.is_empty() && cass_has_boolean_operators(raw_query);
-    cass_build_tantivy_query_from_tokens(tokens, has_boolean_operators, filters, fields)
+    cass_fail_closed_tantivy_query(
+        raw_query,
+        cass_try_build_tantivy_query_from_tokens(
+            tokens,
+            has_boolean_operators,
+            filters,
+            fields,
+            cass_regex_query_cached,
+        ),
+    )
 }
 
 /// Single-parse candidate retained for same-binary performance and query-tree
@@ -2380,26 +2422,42 @@ pub fn cass_build_tantivy_query_single_parse(
 ) -> Box<dyn Query> {
     let tokens = cass_parse_boolean_query(raw_query);
     let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
-    cass_build_tantivy_query_from_tokens(tokens, has_boolean_operators, filters, fields)
+    cass_fail_closed_tantivy_query(
+        raw_query,
+        cass_try_build_tantivy_query_from_tokens(
+            tokens,
+            has_boolean_operators,
+            filters,
+            fields,
+            cass_regex_query_cached,
+        ),
+    )
 }
 
-fn cass_build_tantivy_query_from_tokens(
+fn cass_try_build_tantivy_query_from_tokens(
     tokens: Vec<CassQueryToken>,
     has_boolean_operators: bool,
     filters: &CassQueryFilters,
     fields: &CassFields,
-) -> Box<dyn Query> {
+    regex_query_factory: CassRegexQueryFactory,
+) -> SearchResult<Box<dyn Query>> {
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     if tokens.is_empty() {
         clauses.push((Occur::Must, Box::new(AllQuery)));
     } else if has_boolean_operators {
-        clauses.extend(cass_build_boolean_query_clauses(&tokens, fields));
+        clauses.extend(cass_build_boolean_query_clauses(
+            &tokens,
+            fields,
+            regex_query_factory,
+        )?);
     } else {
         for token in tokens {
             if let CassQueryToken::Term(term_str) = token {
                 let parts = cass_normalize_term_parts(&term_str);
-                if let Some(term_query) = cass_build_compound_term_query(&parts, fields) {
+                if let Some(term_query) =
+                    cass_build_compound_term_query(&parts, fields, regex_query_factory)?
+                {
                     clauses.push((Occur::Must, term_query));
                 }
             }
@@ -2477,7 +2535,7 @@ fn cass_build_tantivy_query_from_tokens(
         }
     }
 
-    match clauses.len() {
+    Ok(match clauses.len() {
         0 => Box::new(AllQuery),
         1 => {
             if let Some((occur, query_box)) = clauses.pop() {
@@ -2490,7 +2548,7 @@ fn cass_build_tantivy_query_from_tokens(
             }
         }
         _ => Box::new(BooleanQuery::new(clauses)),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2528,6 +2586,115 @@ mod cass_query_tests {
                 (msg_idx, score)
             })
             .collect()
+    }
+
+    fn cass_result_ids(
+        searcher: &tantivy::Searcher,
+        fields: &CassFields,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+    ) -> Vec<u64> {
+        scored_cass_results(searcher, fields, raw_query, filters)
+            .into_keys()
+            .collect()
+    }
+
+    fn cass_result_fixture() -> (tempfile::TempDir, CassTantivyIndex) {
+        let directory = tempfile::tempdir().expect("temporary CASS result index directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create CASS result index");
+        let documents = [
+            CassDocumentRef {
+                agent: "claude",
+                workspace: Some("/alpha"),
+                workspace_original: Some("/alpha"),
+                source_path: "/fixture/0.jsonl",
+                msg_idx: 0,
+                created_at: Some(100),
+                title: Some("Current Alpha"),
+                content: "alpha active",
+                source_id: "local-a",
+                origin_kind: "local",
+                origin_host: None,
+                conversation_id: None,
+            },
+            CassDocumentRef {
+                agent: "claude",
+                workspace: Some("/alpha"),
+                workspace_original: Some("/alpha"),
+                source_path: "/fixture/1.jsonl",
+                msg_idx: 1,
+                created_at: Some(200),
+                title: Some("Legacy Alpha"),
+                content: "alpha deprecated",
+                source_id: "local-b",
+                origin_kind: "local",
+                origin_host: None,
+                conversation_id: None,
+            },
+            CassDocumentRef {
+                agent: "codex",
+                workspace: Some("/beta"),
+                workspace_original: Some("/beta"),
+                source_path: "/fixture/2.jsonl",
+                msg_idx: 2,
+                created_at: Some(300),
+                title: Some("Current Beta"),
+                content: "beta active",
+                source_id: "remote-a",
+                origin_kind: "ssh",
+                origin_host: Some("worker-a"),
+                conversation_id: None,
+            },
+            CassDocumentRef {
+                agent: "claude",
+                workspace: Some("/gamma"),
+                workspace_original: Some("/gamma"),
+                source_path: "/fixture/3.jsonl",
+                msg_idx: 3,
+                created_at: Some(400),
+                title: Some("Current Gamma"),
+                content: "gamma active",
+                source_id: "remote-b",
+                origin_kind: "ssh",
+                origin_host: Some("worker-b"),
+                conversation_id: None,
+            },
+            CassDocumentRef {
+                agent: "codex",
+                workspace: Some("/delta"),
+                workspace_original: Some("/delta"),
+                source_path: "/fixture/4.jsonl",
+                msg_idx: 4,
+                created_at: Some(500),
+                title: Some("Currentish Omega"),
+                content: "xalpha archived",
+                source_id: "local-c",
+                origin_kind: "local",
+                origin_host: None,
+                conversation_id: None,
+            },
+            CassDocumentRef {
+                agent: "gemini",
+                workspace: Some("/delta"),
+                workspace_original: Some("/delta"),
+                source_path: "/fixture/5.jsonl",
+                msg_idx: 5,
+                created_at: Some(600),
+                title: Some("Middle Marker"),
+                content: "alphabeta retained",
+                source_id: "local-d",
+                origin_kind: "local",
+                origin_host: None,
+                conversation_id: None,
+            },
+        ];
+        index
+            .add_cass_document_refs(&documents)
+            .expect("index CASS result documents");
+        index.commit().expect("commit CASS result documents");
+        (directory, index)
     }
 
     #[test]
@@ -3000,72 +3167,7 @@ mod cass_query_tests {
 
     #[test]
     fn cass_standalone_negation_matches_complement_and_is_score_neutral() {
-        let directory = tempfile::tempdir().expect("temporary CASS Boolean index directory");
-        let mut index =
-            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
-                .expect("create CASS Boolean index");
-        let documents = [
-            CassDocumentRef {
-                agent: "claude",
-                workspace: Some("/alpha"),
-                workspace_original: Some("/alpha"),
-                source_path: "/fixture/0.jsonl",
-                msg_idx: 0,
-                created_at: Some(100),
-                title: Some("Current Alpha"),
-                content: "alpha active",
-                source_id: "local-a",
-                origin_kind: "local",
-                origin_host: None,
-                conversation_id: None,
-            },
-            CassDocumentRef {
-                agent: "claude",
-                workspace: Some("/alpha"),
-                workspace_original: Some("/alpha"),
-                source_path: "/fixture/1.jsonl",
-                msg_idx: 1,
-                created_at: Some(200),
-                title: Some("Legacy Alpha"),
-                content: "alpha deprecated",
-                source_id: "local-b",
-                origin_kind: "local",
-                origin_host: None,
-                conversation_id: None,
-            },
-            CassDocumentRef {
-                agent: "codex",
-                workspace: Some("/beta"),
-                workspace_original: Some("/beta"),
-                source_path: "/fixture/2.jsonl",
-                msg_idx: 2,
-                created_at: Some(300),
-                title: Some("Current Beta"),
-                content: "beta active",
-                source_id: "remote-a",
-                origin_kind: "ssh",
-                origin_host: Some("worker-a"),
-                conversation_id: None,
-            },
-            CassDocumentRef {
-                agent: "claude",
-                workspace: Some("/gamma"),
-                workspace_original: Some("/gamma"),
-                source_path: "/fixture/3.jsonl",
-                msg_idx: 3,
-                created_at: Some(400),
-                title: Some("Current Gamma"),
-                content: "gamma active",
-                source_id: "remote-b",
-                origin_kind: "ssh",
-                origin_host: Some("worker-b"),
-                conversation_id: None,
-            },
-        ];
-        index
-            .add_cass_document_refs(&documents)
-            .expect("index CASS Boolean documents");
-        index.commit().expect("commit CASS Boolean documents");
+        let (_directory, index) = cass_result_fixture();
         let reader = index.reader().expect("open CASS Boolean reader");
         reader.reload().expect("reload CASS Boolean reader");
         let searcher = reader.searcher();
@@ -3077,7 +3179,7 @@ mod cass_query_tests {
                 scored_cass_results(&searcher, &fields, raw_query, &CassQueryFilters::default());
             assert_eq!(
                 actual.keys().copied().collect::<Vec<_>>(),
-                vec![0, 2, 3],
+                vec![0, 2, 3, 4, 5],
                 "standalone complement result set for {raw_query:?}"
             );
             for (msg_idx, score) in actual {
@@ -3118,12 +3220,14 @@ mod cass_query_tests {
             "alpha AND NOT deprecated",
             &CassQueryFilters::default(),
         );
-        assert_eq!(mixed.keys().copied().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(
-            mixed[&0].to_bits(),
-            positive_scores[&0].to_bits(),
-            "positive AND NOT gained a score-producing AllQuery anchor"
-        );
+        assert_eq!(mixed.keys().copied().collect::<Vec<_>>(), vec![0, 5]);
+        for (msg_idx, score) in mixed {
+            assert_eq!(
+                score.to_bits(),
+                positive_scores[&msg_idx].to_bits(),
+                "positive AND NOT gained a score-producing AllQuery anchor"
+            );
+        }
 
         let all_negative = scored_cass_results(
             &searcher,
@@ -3131,10 +3235,96 @@ mod cass_query_tests {
             "-deprecated -beta",
             &CassQueryFilters::default(),
         );
-        assert_eq!(all_negative.keys().copied().collect::<Vec<_>>(), vec![0, 3]);
+        assert_eq!(
+            all_negative.keys().copied().collect::<Vec<_>>(),
+            vec![0, 3, 4, 5]
+        );
         for (msg_idx, score) in all_negative {
             assert_eq!(score.to_bits(), all_scores[&msg_idx].to_bits());
         }
+    }
+
+    #[test]
+    fn cass_regex_globs_match_whole_terms_and_fail_closed() {
+        assert_eq!(
+            CassWildcardPattern::Suffix("legacy".to_owned())
+                .to_regex()
+                .as_deref(),
+            Some(".*legacy")
+        );
+        assert_eq!(
+            CassWildcardPattern::Complex("a*ha".to_owned())
+                .to_regex()
+                .as_deref(),
+            Some("a.*ha")
+        );
+        assert_eq!(
+            CassWildcardPattern::Complex("*urr*nt".to_owned())
+                .to_regex()
+                .as_deref(),
+            Some(".*urr.*nt")
+        );
+
+        let (_directory, index) = cass_result_fixture();
+        let reader = index.reader().expect("open CASS regex reader");
+        reader.reload().expect("reload CASS regex reader");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+        let no_filters = CassQueryFilters::default();
+
+        for (raw_query, expected) in [
+            ("*legacy", vec![1]),
+            ("*deprecated", vec![1]),
+            ("*alpha", vec![0, 1, 4]),
+            ("*alpha*", vec![0, 1, 4, 5]),
+            ("a*ha", vec![0, 1]),
+            ("*urr*nt", vec![0, 2, 3]),
+            ("*pha*b*", vec![5]),
+            ("*legacy *deprecated", vec![1]),
+        ] {
+            assert_eq!(
+                cass_result_ids(&searcher, &fields, raw_query, &no_filters),
+                expected,
+                "regex-backed CASS result set for {raw_query:?}"
+            );
+        }
+
+        let claude_filter = CassQueryFilters {
+            agents: vec!["claude".to_owned()],
+            ..CassQueryFilters::default()
+        };
+        assert_eq!(
+            cass_result_ids(&searcher, &fields, "*active", &claude_filter),
+            vec![0, 3]
+        );
+
+        fn force_regex_construction_failure(
+            field: Field,
+            _pattern: &str,
+        ) -> SearchResult<RegexQuery> {
+            cass_regex_query_cached(field, "(")
+        }
+
+        let raw_query = "NOT *legacy";
+        let failed_build = cass_try_build_tantivy_query_from_tokens(
+            cass_parse_boolean_query(raw_query),
+            true,
+            &CassQueryFilters::default(),
+            &fields,
+            force_regex_construction_failure,
+        );
+        assert!(
+            failed_build.is_err(),
+            "the forced invalid regex must reach the root builder"
+        );
+        let fail_closed = cass_fail_closed_tantivy_query(raw_query, failed_build);
+        let hits = searcher
+            .search(&*fail_closed, &tantivy::collector::DocSetCollector)
+            .expect("search explicit match-none fallback");
+        assert!(
+            hits.is_empty(),
+            "a negated regex construction failure must not widen to AllQuery"
+        );
     }
 
     #[test]
