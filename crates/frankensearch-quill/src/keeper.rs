@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
-use frankensearch_core::SearchError;
+use frankensearch_core::{DocId, SearchError};
 #[cfg(feature = "durability")]
 use frankensearch_durability::{FileProtector, FileRecoveryOutcome, FileSourceWitness};
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
@@ -1428,6 +1428,22 @@ impl RecoveredSegment {
             .contains(self.manifest.tombstones.as_bytes(), global_docid)
     }
 
+    /// Materialize one live external identifier from the cached IDMAP layout.
+    ///
+    /// The lookup touches only this row's two offsets and identifier bytes. It
+    /// returns `None` for an out-of-range id, an IDMAP hole, or a tombstoned row.
+    #[must_use]
+    pub fn materialize_document_id(&self, global_docid: u32) -> Option<DocId> {
+        if !(self.manifest.docid_lo..self.manifest.docid_hi).contains(&u64::from(global_docid))
+            || self.is_tombstoned(global_docid)
+        {
+            return None;
+        }
+        let id_map = self.reader.section(SectionKind::IDMAP).ok().flatten()?;
+        self.id_lookup
+            .materialize_global_docid(id_map, global_docid)
+    }
+
     fn contains_identity_row(&self, global_docid: u32) -> bool {
         self.reader
             .section(SectionKind::IDMAP)
@@ -1710,6 +1726,23 @@ impl KeeperSnapshot {
             return false;
         };
         crate::argus::LiveDocs::is_live(segment, global_docid)
+    }
+
+    /// Materialize one live winner's external identifier via its IDMAP slice.
+    ///
+    /// Segment selection is logarithmic in the manifest segment count; the
+    /// selected segment performs constant-time checked offset reads without
+    /// reparsing the IDMAP span.
+    #[must_use]
+    pub fn materialize_document_id(&self, global_docid: u32) -> Option<DocId> {
+        let global_docid_u64 = u64::from(global_docid);
+        let insertion = self
+            .segments
+            .partition_point(|segment| segment.manifest.docid_lo <= global_docid_u64);
+        insertion
+            .checked_sub(1)
+            .and_then(|index| self.segments.get(index))
+            .and_then(|segment| segment.materialize_document_id(global_docid))
     }
 
     /// Resolve an external identifier against current sealed segments.
@@ -9283,6 +9316,11 @@ mod tests {
             assert!(original.is_live(0));
             assert!(!original.is_live(100));
             assert_eq!(
+                original.materialize_document_id(0),
+                Some(DocId::new("same"))
+            );
+            assert_eq!(original.materialize_document_id(100), None);
+            assert_eq!(
                 original
                     .resolve_document_id("same")
                     .expect("resolve through tombstoned newest segment"),
@@ -9320,6 +9358,8 @@ mod tests {
             assert_eq!(published.at_seal_doc_count(), 2);
             assert_eq!(published.tombstone_count(), 2);
             assert_eq!(published.doc_count(), 0);
+            assert_eq!(published.materialize_document_id(0), None);
+            assert_eq!(published.materialize_document_id(100), None);
             assert_eq!(
                 published.loaded_manifest().manifest.field_stats,
                 manifest.field_stats
@@ -9442,6 +9482,11 @@ mod tests {
         assert_eq!(clean.doc_count(), 1);
         assert!(!clean.is_live(50));
         assert!(clean.is_live(51));
+        assert_eq!(clean.materialize_document_id(50), None);
+        assert_eq!(
+            clean.materialize_document_id(51),
+            Some(DocId::new("present"))
+        );
         assert!(!crate::argus::LiveDocs::is_live(&clean.segments()[0], 50));
         assert!(crate::argus::LiveDocs::is_live(&clean.segments()[0], 51));
 

@@ -6623,6 +6623,26 @@ impl IdHashLookupPlan {
         self.document_id_bytes(id_map_bytes, ordinal).is_some()
     }
 
+    /// Materialize exactly one bound IDMAP row by global document id.
+    ///
+    /// This performs two checked offset reads and one UTF-8 slice lookup. The
+    /// complete IDMAP/IDHASH pair was validated before this plan was cached, so
+    /// winner materialization never reparses or rescans the section span.
+    #[must_use]
+    pub(crate) fn materialize_global_docid(
+        self,
+        id_map_bytes: &[u8],
+        global_docid: u32,
+    ) -> Option<DocId> {
+        if id_map_bytes.len() != self.id_map_len {
+            return None;
+        }
+        let ordinal = u64::from(global_docid).checked_sub(self.docid_lo)?;
+        let ordinal = usize::try_from(ordinal).ok()?;
+        let document_id = self.document_id_bytes(id_map_bytes, ordinal)?;
+        Some(DocId::new(std::str::from_utf8(document_id).ok()?))
+    }
+
     /// Probe the exact immutable section bytes from which this plan was built.
     ///
     /// The caller owns that identity binding: Keeper stores this plan beside
