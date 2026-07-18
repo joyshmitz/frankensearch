@@ -24,6 +24,7 @@ pub mod quiver;
 pub mod schema;
 pub mod scribe;
 pub mod segment;
+pub mod snippet;
 pub mod stats;
 pub mod tracing_conventions;
 
@@ -59,4 +60,5 @@ pub use segment::{
     PendingSegmentFile, SectionEntry, SectionInput, SectionKind, SegmentHeader, SegmentHeaderInput,
     SegmentLimits, SegmentReader,
 };
+pub use snippet::{DEFAULT_SNIPPET_MAX_CHARS, SnippetConfig, SnippetGenerator, SnippetTerm};
 pub use stats::{SegmentStats, SegmentStatsProvider};
