@@ -1,0 +1,21 @@
+[package]
+name = "frankensearch-quill-gauntlet-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+frankensearch-quill = { path = "../../frankensearch-quill" }
+libfuzzer-sys = "=0.4.13"
+
+[[bin]]
+name = "codec_bytes"
+path = "fuzz_targets/codec_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

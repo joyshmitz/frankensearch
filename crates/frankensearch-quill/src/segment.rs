@@ -1316,11 +1316,23 @@ mod tests {
     use std::error::Error;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use frankensearch_core::SearchError;
+
     use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldDescriptor};
 
     use super::*;
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    fn init_replay_tracing() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
 
     const MINIMAL_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
         id: 0,
@@ -1532,57 +1544,32 @@ mod tests {
         EncodedSegment::encode_with_limits_impl(header, &borrowed, SegmentLimits::default(), true)
     }
 
-    fn fixture_copy(bytes: &mut [u8], offset: usize, value: &[u8]) {
-        let end = offset.checked_add(value.len()).expect("fixture offset");
-        bytes
-            .get_mut(offset..end)
-            .expect("fixture range")
-            .copy_from_slice(value);
-    }
-
-    /// Assemble the pinned v1 bytes without invoking any production encoder,
-    /// header writer, table writer, alignment helper, or checksum function.
-    fn independently_assembled_pinned_fixture() -> Vec<u8> {
-        let mut bytes = vec![0_u8; 921];
-        fixture_copy(&mut bytes, 0, b"FSLXSEG\0\x01\0\0\0\x34\x01\0\0");
-
-        fixture_copy(&mut bytes, 16, &0x0123_4567_89ab_cdef_u64.to_le_bytes());
-        fixture_copy(&mut bytes, 24, &0xa312_ebf6_d136_07a5_u64.to_le_bytes());
-        fixture_copy(&mut bytes, 32, &100_u64.to_le_bytes());
-        fixture_copy(&mut bytes, 40, &107_u64.to_le_bytes());
-        fixture_copy(&mut bytes, 48, &5_u32.to_le_bytes());
-        fixture_copy(&mut bytes, 52, &0_u32.to_le_bytes());
-        fixture_copy(&mut bytes, 56, &1_726_000_123_i64.to_le_bytes());
-        fixture_copy(&mut bytes, 64, &0x0002_0001_u32.to_le_bytes());
-        fixture_copy(&mut bytes, 68, &9_u16.to_le_bytes());
-        fixture_copy(&mut bytes, 70, &0_u16.to_le_bytes());
-
-        let mut table_offset = 72;
-        for entry in PINNED_DEFAULT_ENTRIES {
-            fixture_copy(&mut bytes, table_offset, &entry.kind.raw().to_le_bytes());
-            fixture_copy(&mut bytes, table_offset + 2, &entry.flags.to_le_bytes());
-            fixture_copy(&mut bytes, table_offset + 4, &entry.offset.to_le_bytes());
-            fixture_copy(&mut bytes, table_offset + 12, &entry.len.to_le_bytes());
-            fixture_copy(&mut bytes, table_offset + 20, &entry.xxh3.to_le_bytes());
-            table_offset += 28;
+    /// Load the committed v1 fixture without invoking the production writer or
+    /// any checksum helper. The textual hex form keeps the durable bytes easy
+    /// to review while still freezing every byte across future format bumps.
+    fn pinned_v1_fixture() -> Result<Vec<u8>, Box<dyn Error>> {
+        let hex: String = include_str!("../tests/fixtures/fslx-v1-golden.hex")
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect();
+        if !hex.len().is_multiple_of(2) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pinned FSLX v1 fixture has an odd number of hex digits",
+            )
+            .into());
         }
-        fixture_copy(&mut bytes, 324, &0x13e9_953f_u32.to_le_bytes());
 
-        for (entry, payload) in PINNED_DEFAULT_ENTRIES.iter().zip(PINNED_DEFAULT_PAYLOADS) {
-            fixture_copy(
-                &mut bytes,
-                usize::try_from(entry.offset).expect("fixture offset fits usize"),
-                payload,
-            );
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks_exact(2) {
+            bytes.push(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?);
         }
-        fixture_copy(&mut bytes, 909, &0x21db_dd03_9fa7_9ed3_u64.to_le_bytes());
-        fixture_copy(&mut bytes, 917, &0xbc49_3767_u32.to_le_bytes());
-        bytes
+        Ok(bytes)
     }
 
     #[test]
-    fn reader_accepts_independently_assembled_pinned_v1_fixture() -> TestResult {
-        let bytes = independently_assembled_pinned_fixture();
+    fn reader_accepts_committed_pinned_v1_fixture() -> TestResult {
+        let bytes = pinned_v1_fixture()?;
         let reader = SegmentReader::from_bytes(&bytes, DEFAULT_SCHEMA)?;
 
         assert_eq!(
@@ -1632,7 +1619,7 @@ mod tests {
         assert_eq!(first.file_xxh3(), 0x21db_dd03_9fa7_9ed3);
         assert_eq!(trailer_crc, 0xbc49_3767);
         assert_eq!(first.section_entries(), &PINNED_DEFAULT_ENTRIES);
-        assert_eq!(first.as_bytes(), independently_assembled_pinned_fixture());
+        assert_eq!(first.as_bytes(), pinned_v1_fixture()?);
         assert_eq!(first.as_bytes(), second.as_bytes());
         assert_eq!(first.file_xxh3(), second.file_xxh3());
         assert_eq!(first.source_xxh3(), xxh3_64(first.as_bytes()));
@@ -1654,6 +1641,78 @@ mod tests {
         let borrowed = SegmentReader::from_bytes(first.as_bytes(), DEFAULT_SCHEMA)?;
         assert_eq!(borrowed.header(), reader.header());
         borrowed.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn every_segment_byte_class_flip_is_public_typed_and_never_panics() -> TestResult {
+        const SEED: u64 = 0x6d5a_56da_1b2c_3e4f;
+
+        init_replay_tracing();
+        let owned = fixture_sections(CONDITIONAL_SCHEMA, false);
+        let encoded = encode_owned(fixture_header(CONDITIONAL_SCHEMA), &owned)?;
+        let entries = encoded.section_entries().to_vec();
+        assert_eq!(entries.len(), 10, "fixture must cover every v1 section");
+        let golden = encoded.into_bytes();
+        let header_len =
+            usize::try_from(read_u32_at(&golden, 12).ok_or("corruption-sweep header length")?)?;
+        let header_crc_offset = FILE_PREFIX_LEN + header_len;
+        let trailer_start = golden.len() - TRAILER_LEN;
+        let mut cases = vec![
+            ("magic", 0),
+            ("format version", 8),
+            ("header length", 12),
+            ("fixed header", FILE_PREFIX_LEN + 8),
+            ("section table", table_entry_offset(0)),
+            ("header CRC", header_crc_offset),
+            ("alignment padding", header_crc_offset + HEADER_CRC_LEN),
+            ("file checksum", trailer_start),
+            ("trailer CRC", trailer_start + 8),
+        ];
+        for entry in entries {
+            cases.push(("section payload", usize::try_from(entry.offset)?));
+        }
+
+        for (region, offset) in cases.iter().copied() {
+            tracing::info!(
+                codec = "FSLX_CONTAINER",
+                seed = SEED,
+                case = offset,
+                region,
+                replay = "every_segment_byte_class_flip_is_public_typed_and_never_panics",
+                "starting byte-class corruption case"
+            );
+            let offset_u64 = u64::try_from(offset)?;
+            let bit = u32::try_from((SEED ^ offset_u64) & 7)?;
+            let mut mutated = golden.clone();
+            mutated[offset] ^= 1_u8 << bit;
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                SegmentReader::from_owned(mutated, CONDITIONAL_SCHEMA)
+                    .and_then(|reader| reader.verify())
+            }));
+            assert!(
+                result.is_ok(),
+                "seed={SEED:#x} offset={offset} region={region}: parser panicked"
+            );
+            let codec_error = match result.expect("byte-class parser result") {
+                Err(error) => error,
+                Ok(_) => panic!(
+                    "seed={SEED:#x} offset={offset} region={region}: byte-class mutation was accepted"
+                ),
+            };
+            let public_error: SearchError = codec_error.into();
+            assert!(
+                matches!(public_error, SearchError::IndexCorrupted { .. }),
+                "seed={SEED:#x} offset={offset} region={region}: mutation was not public typed corruption"
+            );
+        }
+
+        tracing::info!(
+            seed = SEED,
+            mutations = cases.len(),
+            "FSLX v1 byte-class corruption sweep passed"
+        );
         Ok(())
     }
 
@@ -2186,6 +2245,9 @@ mod tests {
 
     #[test]
     fn every_kib_torn_boundary_and_hostile_prefix_fails_without_panicking() -> TestResult {
+        const HOSTILE_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+        init_replay_tracing();
         let owned = fixture_sections(DEFAULT_SCHEMA, true);
         let encoded = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
         let bytes = encoded.as_bytes();
@@ -2221,8 +2283,15 @@ mod tests {
             Err(QuillError::Resource { .. })
         ));
 
-        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut state = HOSTILE_SEED;
         for case in 0..256 {
+            tracing::info!(
+                codec = "FSLX_CONTAINER",
+                seed = HOSTILE_SEED,
+                case,
+                replay = "every_kib_torn_boundary_and_hostile_prefix_fails_without_panicking",
+                "starting hostile-prefix case"
+            );
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
@@ -2240,7 +2309,10 @@ mod tests {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 SegmentReader::from_owned(input, DEFAULT_SCHEMA)
             }));
-            assert!(result.is_ok(), "hostile case {case} panicked");
+            assert!(
+                result.is_ok(),
+                "seed={HOSTILE_SEED:#x} hostile case {case} panicked"
+            );
             assert!(matches!(
                 result.expect("caught hostile result"),
                 Err(QuillError::IndexCorrupted { .. })

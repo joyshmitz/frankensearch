@@ -10616,6 +10616,16 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    fn init_replay_tracing() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
+
     const NUMERIC_TEST_FIELDS: [FieldDescriptor; 3] = [
         FieldDescriptor {
             id: 0,
@@ -10773,18 +10783,36 @@ mod tests {
 
     #[test]
     fn scalar_and_wide_match_every_width_and_shape() -> TestResult {
+        const BASE_SEED: u64 = 0x0123_4567_89ab_cdef;
+
+        init_replay_tracing();
         let mut counts: Vec<usize> = (0..=16).collect();
         counts.extend_from_slice(&[120, 127, 128]);
         for width in 0..=32 {
             for &count in &counts {
-                let expected = values(width, count, 0x0123_4567_89ab_cdef ^ count as u64);
+                let seed = BASE_SEED ^ u64::try_from(count)?;
+                tracing::info!(
+                    codec = "BITPACK_SIMD",
+                    seed,
+                    width,
+                    count,
+                    replay = "scalar_and_wide_match_every_width_and_shape",
+                    "starting scalar/SIMD parity case"
+                );
+                let expected = values(width, count, seed);
                 let packed = pack_lsb(&expected, width)?;
                 let mut scalar = vec![u32::MAX; count];
                 let mut wide = vec![u32::MAX; count];
                 unpack_scalar_into(&packed, width, &mut scalar)?;
                 unpack_wide_into(&packed, width, &mut wide)?;
-                assert_eq!(scalar, expected, "scalar width={width} count={count}");
-                assert_eq!(wide, expected, "wide width={width} count={count}");
+                assert_eq!(
+                    scalar, expected,
+                    "seed={seed:#x} scalar width={width} count={count}"
+                );
+                assert_eq!(
+                    wide, expected,
+                    "seed={seed:#x} wide width={width} count={count}"
+                );
             }
         }
         Ok(())
@@ -10792,9 +10820,21 @@ mod tests {
 
     #[test]
     fn wide_decode_is_independent_of_slice_alignment() -> TestResult {
+        const BASE_SEED: u64 = 0xa5a5_5a5a_dead_beef;
+
+        init_replay_tracing();
         for offset in 0..=31 {
             for width in 1..=32 {
-                let expected = values(width, 127, 0xa5a5_5a5a_dead_beef ^ offset as u64);
+                let seed = BASE_SEED ^ u64::try_from(offset)?;
+                tracing::info!(
+                    codec = "BITPACK_SIMD",
+                    seed,
+                    offset,
+                    width,
+                    replay = "wide_decode_is_independent_of_slice_alignment",
+                    "starting unaligned SIMD case"
+                );
+                let expected = values(width, 127, seed);
                 let packed = pack_lsb(&expected, width)?;
                 let mut storage = vec![0_u8; offset];
                 storage.extend_from_slice(&packed);
@@ -10802,7 +10842,10 @@ mod tests {
                 let input = &storage[offset..offset + packed.len()];
                 let mut actual = vec![0_u32; expected.len()];
                 unpack_wide_into(input, width, &mut actual)?;
-                assert_eq!(actual, expected, "offset={offset} width={width}");
+                assert_eq!(
+                    actual, expected,
+                    "seed={seed:#x} offset={offset} width={width}"
+                );
             }
         }
         Ok(())
@@ -10810,20 +10853,37 @@ mod tests {
 
     #[test]
     fn bitpack_rejects_truncation_overlong_payloads_bad_widths_and_padding() -> TestResult {
+        const TRUNCATION_SEED: u64 = 0xfeed_face_cafe_babe;
+        const PADDING_SEED: u64 = 0x55aa_aa55;
+
+        init_replay_tracing();
         for width in 1..=32 {
-            let expected = values(width, 127, 0xfeed_face_cafe_babe);
+            tracing::info!(
+                codec = "BITPACK",
+                seed = TRUNCATION_SEED,
+                width,
+                replay = "bitpack_rejects_truncation_overlong_payloads_bad_widths_and_padding",
+                "starting truncated-payload cases"
+            );
+            let expected = values(width, 127, TRUNCATION_SEED);
             let packed = pack_lsb(&expected, width)?;
             for cut in 0..packed.len() {
                 let mut scalar = vec![0_u32; expected.len()];
                 let mut wide = vec![0_u32; expected.len()];
-                assert!(matches!(
-                    unpack_scalar_into(&packed[..cut], width, &mut scalar),
-                    Err(BitpackError::LengthMismatch { .. })
-                ));
-                assert!(matches!(
-                    unpack_wide_into(&packed[..cut], width, &mut wide),
-                    Err(BitpackError::LengthMismatch { .. })
-                ));
+                assert!(
+                    matches!(
+                        unpack_scalar_into(&packed[..cut], width, &mut scalar),
+                        Err(BitpackError::LengthMismatch { .. })
+                    ),
+                    "seed={TRUNCATION_SEED:#x} scalar width={width} cut={cut}"
+                );
+                assert!(
+                    matches!(
+                        unpack_wide_into(&packed[..cut], width, &mut wide),
+                        Err(BitpackError::LengthMismatch { .. })
+                    ),
+                    "seed={TRUNCATION_SEED:#x} wide width={width} cut={cut}"
+                );
             }
         }
 
@@ -10850,7 +10910,15 @@ mod tests {
         ));
 
         for (width, count) in [(1, 1), (3, 3), (5, 7), (7, 9)] {
-            let expected = values(width, count, 0x55aa_aa55);
+            tracing::info!(
+                codec = "BITPACK",
+                seed = PADDING_SEED,
+                width,
+                count,
+                replay = "bitpack_rejects_truncation_overlong_payloads_bad_widths_and_padding",
+                "starting noncanonical-padding case"
+            );
+            let expected = values(width, count, PADDING_SEED);
             let mut noncanonical = pack_lsb(&expected, width)?;
             let used_bits = usize::from(width) * count % 8;
             assert_ne!(used_bits, 0);
@@ -10859,14 +10927,20 @@ mod tests {
             }
             let mut scalar = vec![0_u32; count];
             let mut wide = vec![0_u32; count];
-            assert!(matches!(
-                unpack_scalar_into(&noncanonical, width, &mut scalar),
-                Err(BitpackError::NonCanonicalPadding { .. })
-            ));
-            assert!(matches!(
-                unpack_wide_into(&noncanonical, width, &mut wide),
-                Err(BitpackError::NonCanonicalPadding { .. })
-            ));
+            assert!(
+                matches!(
+                    unpack_scalar_into(&noncanonical, width, &mut scalar),
+                    Err(BitpackError::NonCanonicalPadding { .. })
+                ),
+                "seed={PADDING_SEED:#x} scalar width={width} count={count}"
+            );
+            assert!(
+                matches!(
+                    unpack_wide_into(&noncanonical, width, &mut wide),
+                    Err(BitpackError::NonCanonicalPadding { .. })
+                ),
+                "seed={PADDING_SEED:#x} wide width={width} count={count}"
+            );
         }
 
         let mut overlong = pack_lsb(&[5], 3)?;
@@ -10926,9 +11000,20 @@ mod tests {
 
     #[test]
     fn randomized_posting_roundtrip_and_cursor_match_linear_oracle() -> TestResult {
+        const BASE_SEED: u64 = 0x6a09_e667_f3bc_c909;
         let boundary_counts = [0, 1, 2, 126, 127, 128, 129, 255, 256, 257, 511, 512];
+
+        init_replay_tracing();
         for case in 0_u64..48 {
-            let mut state = 0x6a09_e667_f3bc_c909 ^ case;
+            let seed = BASE_SEED ^ case;
+            tracing::info!(
+                codec = "POSTINGS",
+                seed,
+                case,
+                replay = "randomized_posting_roundtrip_and_cursor_match_linear_oracle",
+                "starting randomized posting case"
+            );
+            let mut state = seed;
             let count = if case < u64::try_from(boundary_counts.len())? {
                 boundary_counts[usize::try_from(case)?]
             } else {
@@ -10958,11 +11043,19 @@ mod tests {
             let encoded = EncodedPostingList::encode(&expected)?;
             assert_eq!(encoded, EncodedPostingList::encode(&expected)?);
             let list = encoded.posting_list()?;
-            assert_eq!(list.decode_all_bounded(count)?, expected, "case={case}");
+            assert_eq!(
+                list.decode_all_bounded(count)?,
+                expected,
+                "seed={seed:#x} case={case}"
+            );
 
             let mut cursor = list.cursor()?;
             for (ordinal, posting) in expected.iter().copied().enumerate() {
-                assert_eq!(cursor.current(), Some(posting), "case={case}");
+                assert_eq!(
+                    cursor.current(),
+                    Some(posting),
+                    "seed={seed:#x} case={case}"
+                );
                 assert_eq!(cursor.posting_ordinal(), Some(u32::try_from(ordinal)?));
                 cursor.next()?;
             }
@@ -10974,7 +11067,11 @@ mod tests {
                     .iter()
                     .copied()
                     .find(|posting| posting.doc_id >= target);
-                assert_eq!(list.cursor()?.advance(target)?, oracle, "case={case}");
+                assert_eq!(
+                    list.cursor()?.advance(target)?,
+                    oracle,
+                    "seed={seed:#x} case={case}"
+                );
             }
         }
         Ok(())
@@ -11624,8 +11721,19 @@ mod tests {
 
     #[test]
     fn randomized_positions_roundtrip_duplicates_and_large_u32_values() -> TestResult {
+        const BASE_SEED: u64 = 0x243f_6a88_85a3_08d3;
+
+        init_replay_tracing();
         for case in 0_u64..32 {
-            let mut state = 0x243f_6a88_85a3_08d3 ^ case;
+            let seed = BASE_SEED ^ case;
+            tracing::info!(
+                codec = "POSITIONS",
+                seed,
+                case,
+                replay = "randomized_positions_roundtrip_duplicates_and_large_u32_values",
+                "starting randomized positions case"
+            );
+            let mut state = seed;
             let count = if case == 0 {
                 0
             } else {
@@ -11672,7 +11780,7 @@ mod tests {
                 assert_eq!(
                     collect_positions(&list, u32::try_from(ordinal)?)?,
                     *expected,
-                    "case={case} ordinal={ordinal}"
+                    "seed={seed:#x} case={case} ordinal={ordinal}"
                 );
             }
         }
@@ -12003,12 +12111,26 @@ mod tests {
             })
         ));
 
-        let mut state = 0x1319_8a2e_0370_7344;
+        const SEED: u64 = 0x1319_8a2e_0370_7344;
+        init_replay_tracing();
+        let mut state = SEED;
         for len in 0..64 {
+            tracing::info!(
+                codec = "POSITIONS",
+                seed = SEED,
+                case = len,
+                replay = "positions_parser_rejects_structured_corruption_and_never_panics",
+                "starting hostile-byte case"
+            );
             let bytes: Vec<u8> = (0..len)
                 .map(|_| random_u32(&mut state).to_le_bytes()[0])
                 .collect();
-            let _ = PositionList::parse(&bytes, &two_posting_list);
+            let parsed =
+                std::panic::catch_unwind(|| PositionList::parse(&bytes, &two_posting_list));
+            assert!(
+                parsed.is_ok(),
+                "seed={SEED:#x} POSITIONS parser panic len={len}"
+            );
         }
         Ok(())
     }
@@ -12196,6 +12318,63 @@ mod tests {
             BlockMaxList::parse_with_fieldnorms(&overflow, &posting_list, |_| Some(4)),
             Err(BlockMaxError::VintOverflow { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn randomized_blockmax_mutations_are_typed_and_never_panic() -> TestResult {
+        const BASE_SEED: u64 = 0xb10c_4a58_f00d_5eed;
+
+        init_replay_tracing();
+        let encoded_postings = EncodedPostingList::encode(&sparse_postings(400, 100))?;
+        let posting_list = encoded_postings.posting_list()?;
+        let canonical = EncodedBlockMax::encode(&posting_list, fixture_fieldnorm)?;
+        let canonical_len = canonical.as_bytes().len();
+        let canonical_len_u64 = u64::try_from(canonical_len)?;
+
+        for case in 0_u64..512 {
+            let seed = BASE_SEED ^ case.wrapping_mul(0xa076_1d64_78bd_642f);
+            tracing::info!(
+                codec = "BLOCKMAX",
+                seed,
+                case,
+                replay = "randomized_blockmax_mutations_are_typed_and_never_panic",
+                "starting mutation case"
+            );
+            let mut state = seed;
+            let mut bytes = if case < canonical_len_u64 {
+                let mut bytes = canonical.as_bytes().to_vec();
+                let offset = usize::try_from(case)?;
+                let bit = random_u32(&mut state) & 7;
+                bytes[offset] ^= 1_u8 << bit;
+                bytes
+            } else {
+                let len = usize::try_from(random_u32(&mut state) % 257)?;
+                (0..len)
+                    .map(|_| random_u32(&mut state).to_le_bytes()[0])
+                    .collect()
+            };
+            if case >= canonical_len_u64 && case.is_multiple_of(17) {
+                bytes.push(random_u32(&mut state).to_le_bytes()[0]);
+            }
+
+            let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                BlockMaxList::parse_with_fieldnorms(&bytes, &posting_list, fixture_fieldnorm)
+            }));
+            assert!(
+                parsed.is_ok(),
+                "seed={seed:#x} case={case} len={}: BLOCKMAX parser panicked",
+                bytes.len()
+            );
+            let codec_result: Result<BlockMaxList<'_>, BlockMaxError> =
+                parsed.expect("caught BLOCKMAX parser result");
+            if case < canonical_len_u64 {
+                assert!(
+                    codec_result.is_err(),
+                    "seed={seed:#x} case={case}: mutated canonical BLOCKMAX byte was accepted"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -12422,8 +12601,17 @@ mod tests {
     #[allow(clippy::cast_precision_loss)]
     fn randomized_blockmax_bounds_dominate_seeded_oracle() -> TestResult {
         let boundary_counts = [1, 127, 128, 129, 255, 256, 400];
+
+        init_replay_tracing();
         for case in 0_u64..32 {
             let seed = 0xd1b5_4a32_d192_ed03 ^ case;
+            tracing::info!(
+                codec = "BLOCKMAX",
+                seed,
+                case,
+                replay = "randomized_blockmax_bounds_dominate_seeded_oracle",
+                "starting seeded score-bound case"
+            );
             let mut state = seed;
             let count = boundary_counts[usize::try_from(case)? % boundary_counts.len()];
             let mut doc_id = random_u32(&mut state) % 100;
@@ -12684,6 +12872,79 @@ mod tests {
         let empty = EncodedDocLenSection::encode(7, 7, &[], &[])?;
         assert!(empty.as_bytes().is_empty());
         assert_eq!(empty.section(&[])?.field_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn randomized_doclen_roundtrip_matches_quantization_oracle() -> TestResult {
+        const BASE_SEED: u64 = 0x8b8b_1e17_d0c1_ea55;
+        const FIELDS: [u16; 3] = [1, 4, 9];
+        const BOUNDARY_SPANS: [usize; 9] = [0, 1, 2, 127, 128, 129, 511, 512, 513];
+
+        init_replay_tracing();
+        for case in 0_u64..48 {
+            let seed = BASE_SEED ^ case.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            tracing::info!(
+                codec = "DOCLEN",
+                seed,
+                case,
+                replay = "randomized_doclen_roundtrip_matches_quantization_oracle",
+                "starting randomized roundtrip"
+            );
+            let mut state = seed;
+            let span = if case < u64::try_from(BOUNDARY_SPANS.len())? {
+                BOUNDARY_SPANS[usize::try_from(case)?]
+            } else {
+                usize::try_from(random_u32(&mut state) % 600)?
+            };
+            let docid_lo = u64::from(random_u32(&mut state) % 1_000_000);
+            let docid_hi = docid_lo
+                .checked_add(u64::try_from(span)?)
+                .ok_or("randomized DOCLEN docid range overflow")?;
+
+            let mut columns = Vec::with_capacity(FIELDS.len());
+            for field_index in 0..FIELDS.len() {
+                let mut lengths = Vec::with_capacity(span);
+                for ordinal in 0..span {
+                    let value = match (ordinal + field_index) % 29 {
+                        0 => None,
+                        1 => Some(0),
+                        2 => Some(u32::MAX),
+                        _ => Some(random_u32(&mut state)),
+                    };
+                    lengths.push(value);
+                }
+                columns.push(lengths);
+            }
+            let inputs: Vec<_> = FIELDS
+                .iter()
+                .copied()
+                .zip(&columns)
+                .map(|(field_ord, lengths)| DocLenFieldInput::new(field_ord, lengths))
+                .collect();
+
+            let encoded = EncodedDocLenSection::encode(docid_lo, docid_hi, &FIELDS, &inputs)?;
+            assert_eq!(
+                encoded,
+                EncodedDocLenSection::encode(docid_lo, docid_hi, &FIELDS, &inputs)?,
+                "seed={seed:#x} case={case}: non-deterministic bytes"
+            );
+            let section = encoded.section(&FIELDS)?;
+            for (&field_ord, lengths) in FIELDS.iter().zip(&columns) {
+                let field = section.field(field_ord).ok_or("randomized DOCLEN field")?;
+                for (ordinal, length) in lengths.iter().copied().enumerate() {
+                    let docid = docid_lo + u64::try_from(ordinal)?;
+                    let expected = length
+                        .map(crate::contract::fieldnorm_to_id)
+                        .unwrap_or(DOCLEN_HOLE_FIELDNORM_ID);
+                    assert_eq!(
+                        field.fieldnorm_id(docid),
+                        Some(expected),
+                        "seed={seed:#x} case={case} field={field_ord} ordinal={ordinal}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -13251,6 +13512,128 @@ mod tests {
     }
 
     #[test]
+    fn randomized_id_map_and_hash_roundtrip_holes_lengths_and_collisions() -> TestResult {
+        const BASE_SEED: u64 = 0x4f1b_bcdd_6a7e_2913;
+        const BOUNDARY_SPANS: [usize; 8] = [0, 1, 2, 23, 24, 25, 127, 128];
+
+        init_replay_tracing();
+        for case in 0_u64..32 {
+            let seed = BASE_SEED ^ case.wrapping_mul(0xd6e8_feb8_6659_fd93);
+            tracing::info!(
+                codec = "IDMAP_IDHASH",
+                seed,
+                case,
+                replay = "randomized_id_map_and_hash_roundtrip_holes_lengths_and_collisions",
+                "starting randomized roundtrip"
+            );
+            let mut state = seed;
+            let span = if case < u64::try_from(BOUNDARY_SPANS.len())? {
+                BOUNDARY_SPANS[usize::try_from(case)?]
+            } else {
+                usize::try_from(random_u32(&mut state) % 160)?
+            };
+            let docid_lo = u64::from(random_u32(&mut state) % 1_000_000);
+            let docid_hi = docid_lo
+                .checked_add(u64::try_from(span)?)
+                .ok_or("randomized IDMAP docid range overflow")?;
+
+            let mut document_ids = Vec::with_capacity(span);
+            for ordinal in 0..span {
+                if random_u32(&mut state).is_multiple_of(5) {
+                    document_ids.push(None);
+                    continue;
+                }
+                let mut document_id = format!("c{case:02x}-d{ordinal:03x}-");
+                let requested_len = match ordinal % 7 {
+                    0 => 24,
+                    1 => 25,
+                    2 => 256,
+                    _ => usize::try_from(8 + random_u32(&mut state) % 120)?,
+                };
+                let target_len = requested_len.max(document_id.len());
+                while document_id.len() < target_len {
+                    let letter = u8::try_from(random_u32(&mut state) % 26)? + b'a';
+                    document_id.push(char::from(letter));
+                }
+                document_ids.push(Some(document_id));
+            }
+
+            let inputs: Vec<_> = document_ids
+                .iter()
+                .enumerate()
+                .map(|(ordinal, document_id)| {
+                    document_id.as_deref().map(|document_id| {
+                        IdMapEntryInput::new(
+                            document_id,
+                            seed ^ u64::try_from(ordinal).unwrap_or(u64::MAX),
+                        )
+                    })
+                })
+                .collect();
+            let encoded_map = EncodedIdMapSection::encode(docid_lo, docid_hi, &inputs)?;
+            assert_eq!(
+                encoded_map,
+                EncodedIdMapSection::encode(docid_lo, docid_hi, &inputs)?,
+                "seed={seed:#x} case={case}: non-deterministic IDMAP bytes"
+            );
+            let id_map = encoded_map.section()?;
+            let encoded_hash = EncodedIdHashSection::encode(id_map)?;
+            let id_hash = encoded_hash.section(id_map)?;
+            let collision_hash = seed.rotate_left(17);
+            let encoded_collisions =
+                encode_id_hash_with_hasher(id_map, IdHashLimits::default(), |_| collision_hash)?;
+            let collisions = parse_id_hash_with_hasher(
+                encoded_collisions.as_bytes(),
+                id_map,
+                IdHashLimits::default(),
+                |_| collision_hash,
+            )?;
+
+            let mut present = 0_usize;
+            for (ordinal, expected) in document_ids.iter().enumerate() {
+                let docid = docid_lo + u64::try_from(ordinal)?;
+                match expected {
+                    Some(document_id) => {
+                        present += 1;
+                        let expected_content_hash = seed ^ u64::try_from(ordinal)?;
+                        assert_eq!(
+                            id_map.get(docid).map(IdMapEntry::document_id),
+                            Some(document_id.as_str()),
+                            "seed={seed:#x} case={case} ordinal={ordinal}: IDMAP lookup"
+                        );
+                        assert_eq!(
+                            id_map.get(docid).map(IdMapEntry::content_hash),
+                            Some(expected_content_hash),
+                            "seed={seed:#x} case={case} ordinal={ordinal}: IDMAP content hash"
+                        );
+                        assert_eq!(
+                            id_hash.lookup(document_id),
+                            Some(docid),
+                            "seed={seed:#x} case={case} ordinal={ordinal}: IDHASH lookup"
+                        );
+                        assert_eq!(
+                            collisions.lookup_with_hash(document_id, collision_hash),
+                            Some(docid),
+                            "seed={seed:#x} case={case} ordinal={ordinal}: collision lookup"
+                        );
+                    }
+                    None => assert_eq!(
+                        id_map.get(docid),
+                        None,
+                        "seed={seed:#x} case={case} ordinal={ordinal}: hole"
+                    ),
+                }
+            }
+            assert_eq!(
+                id_map.present_count(),
+                present,
+                "seed={seed:#x} case={case}: present count"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn id_hash_resolved_representatives_require_external_choice_then_canonical_order() -> TestResult
     {
         let inputs = [
@@ -13627,6 +14010,9 @@ mod tests {
 
     #[test]
     fn arbitrary_id_map_and_hash_bytes_never_panic() -> TestResult {
+        const SEED: u64 = 0x1d5a_91c3_e26f_5a17;
+
+        init_replay_tracing();
         let inputs = [
             Some(IdMapEntryInput::new("alpha", 1)),
             None,
@@ -13634,8 +14020,15 @@ mod tests {
         ];
         let encoded_map = EncodedIdMapSection::encode(10, 13, &inputs)?;
         let id_map = encoded_map.section()?;
-        let mut state = 0x1d5a_91c3_e26f_5a17;
+        let mut state = SEED;
         for case in 0..1_000 {
+            tracing::info!(
+                codec = "IDMAP_IDHASH",
+                seed = SEED,
+                case,
+                replay = "arbitrary_id_map_and_hash_bytes_never_panic",
+                "starting hostile-byte case"
+            );
             let length = usize::try_from(random_u32(&mut state) % 257)?;
             let bytes = (0..length)
                 .map(|_| random_u32(&mut state).to_le_bytes()[0])
@@ -13645,16 +14038,19 @@ mod tests {
                 std::panic::catch_unwind(|| IdMapSection::parse(&bytes, 100, 100 + span));
             assert!(
                 parsed_map.is_ok(),
-                "IDMAP parser panic case={case} len={length}"
+                "seed={SEED:#x} IDMAP parser panic case={case} len={length}"
             );
             let parsed_hash = std::panic::catch_unwind(|| IdHashSection::parse(&bytes, id_map));
             assert!(
                 parsed_hash.is_ok(),
-                "IDHASH parser panic case={case} len={length}"
+                "seed={SEED:#x} IDHASH parser panic case={case} len={length}"
             );
             if let Ok(Ok(section)) = parsed_hash {
                 let lookup = std::panic::catch_unwind(|| section.lookup("alpha"));
-                assert!(lookup.is_ok(), "IDHASH lookup panic case={case}");
+                assert!(
+                    lookup.is_ok(),
+                    "seed={SEED:#x} IDHASH lookup panic case={case}"
+                );
             }
         }
         Ok(())
@@ -14668,6 +15064,7 @@ mod tests {
 
     #[test]
     fn numeric_randomized_unsigned_ranges_match_brute_force() -> TestResult {
+        const SEED: u64 = 0x7f4a_7c15_d1b5_4a32;
         const BOUNDARIES: [u64; 6] = [
             0,
             1,
@@ -14676,7 +15073,14 @@ mod tests {
             (1_u64 << 63) + 1,
             u64::MAX,
         ];
-        let mut state = 0x7f4a_7c15_d1b5_4a32;
+        init_replay_tracing();
+        tracing::info!(
+            codec = "NUMERIC_U64",
+            seed = SEED,
+            replay = "numeric_randomized_unsigned_ranges_match_brute_force",
+            "starting randomized unsigned range suite"
+        );
+        let mut state = SEED;
         let mut values = BOUNDARIES.to_vec();
         for _ in 0..257 {
             values.push(
@@ -14748,7 +15152,16 @@ mod tests {
     #[test]
     fn numeric_randomized_ranges_match_brute_force() -> TestResult {
         const DOCS: usize = 257;
-        let mut state = 0xc3a5_c85c_97cb_3127;
+        const SEED: u64 = 0xc3a5_c85c_97cb_3127;
+
+        init_replay_tracing();
+        tracing::info!(
+            codec = "NUMERIC_I64",
+            seed = SEED,
+            replay = "numeric_randomized_ranges_match_brute_force",
+            "starting randomized signed range suite"
+        );
+        let mut state = SEED;
         let mut signed = Vec::with_capacity(DOCS);
         for ordinal in 0..DOCS {
             let high = u64::from(random_u32(&mut state));
@@ -14813,7 +15226,7 @@ mod tests {
                 .map(|entry| entry.docid())
                 .collect::<Vec<_>>();
             expected.sort_unstable();
-            assert_eq!(actual, expected, "range query {query}");
+            assert_eq!(actual, expected, "seed={SEED:#x} range query {query}");
         }
         Ok(())
     }
@@ -14989,8 +15402,18 @@ mod tests {
 
     #[test]
     fn arbitrary_numeric_bytes_never_panic() {
-        let mut state = 0x9f4c_72a1_15bd_e603;
+        const SEED: u64 = 0x9f4c_72a1_15bd_e603;
+
+        init_replay_tracing();
+        let mut state = SEED;
         for case in 0..1_000 {
+            tracing::info!(
+                codec = "NUMERIC",
+                seed = SEED,
+                case,
+                replay = "arbitrary_numeric_bytes_never_panic",
+                "starting hostile-byte case"
+            );
             let length = usize::try_from(random_u32(&mut state) % 257).unwrap_or(0);
             let bytes = (0..length)
                 .map(|_| random_u32(&mut state).to_le_bytes()[0])
@@ -15000,7 +15423,7 @@ mod tests {
             });
             assert!(
                 parsed.is_ok(),
-                "NUMERIC parser panic case={case} len={length}"
+                "seed={SEED:#x} NUMERIC parser panic case={case} len={length}"
             );
             if let Ok(Ok(section)) = parsed {
                 for field in section.fields() {
@@ -15017,7 +15440,10 @@ mod tests {
                             )
                         }
                     });
-                    assert!(ranged.is_ok(), "NUMERIC range panic case={case}");
+                    assert!(
+                        ranged.is_ok(),
+                        "seed={SEED:#x} NUMERIC range panic case={case}"
+                    );
                 }
             }
         }
@@ -15025,8 +15451,18 @@ mod tests {
 
     #[test]
     fn arbitrary_doclen_and_stats_bytes_never_panic() {
-        let mut state = 0x6d8f_3a51_c0de_f00d;
+        const SEED: u64 = 0x6d8f_3a51_c0de_f00d;
+
+        init_replay_tracing();
+        let mut state = SEED;
         for case in 0..1_000 {
+            tracing::info!(
+                codec = "DOCLEN_STATS",
+                seed = SEED,
+                case,
+                replay = "arbitrary_doclen_and_stats_bytes_never_panic",
+                "starting hostile-byte case"
+            );
             let length = usize::try_from(random_u32(&mut state) % 257).unwrap_or(0);
             let bytes: Vec<u8> = (0..length)
                 .map(|_| random_u32(&mut state).to_le_bytes()[0])
@@ -15036,30 +15472,46 @@ mod tests {
                 std::panic::catch_unwind(|| DocLenSection::parse(&bytes, 100, 100 + span, &[1, 2]));
             assert!(
                 doclen.is_ok(),
-                "DOCLEN parser panic case={case} len={length}"
+                "seed={SEED:#x} DOCLEN parser panic case={case} len={length}"
             );
             let stats_parse = std::panic::catch_unwind(|| StatsSection::parse(&bytes, &[1, 2], 3));
             assert!(
                 stats_parse.is_ok(),
-                "STATS parser panic case={case} len={length}"
+                "seed={SEED:#x} STATS parser panic case={case} len={length}"
             );
         }
     }
 
     #[test]
     fn arbitrary_bytes_never_panic_parser_or_cursor() {
-        let mut state = 0x91e1_0da5_c79e_7b1d;
+        const SEED: u64 = 0x91e1_0da5_c79e_7b1d;
+
+        init_replay_tracing();
+        let mut state = SEED;
         for case in 0..1_000 {
+            tracing::info!(
+                codec = "POSTINGS",
+                seed = SEED,
+                case,
+                replay = "arbitrary_bytes_never_panic_parser_or_cursor",
+                "starting hostile-byte case"
+            );
             let length = usize::try_from(random_u32(&mut state) % 257).unwrap_or(0);
             let bytes: Vec<u8> = (0..length)
                 .map(|_| random_u32(&mut state).to_le_bytes()[0])
                 .collect();
             let expected = random_u32(&mut state) % 300;
             let parsed = std::panic::catch_unwind(|| PostingList::parse(&bytes, expected));
-            assert!(parsed.is_ok(), "parser panic case={case} len={length}");
+            assert!(
+                parsed.is_ok(),
+                "seed={SEED:#x} parser panic case={case} len={length}"
+            );
             if let Ok(Ok(list)) = parsed {
                 let decoded = std::panic::catch_unwind(|| list.decode_all());
-                assert!(decoded.is_ok(), "cursor panic case={case} len={length}");
+                assert!(
+                    decoded.is_ok(),
+                    "seed={SEED:#x} cursor panic case={case} len={length}"
+                );
             }
         }
     }

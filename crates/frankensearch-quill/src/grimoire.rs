@@ -2576,6 +2576,16 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    fn init_replay_tracing() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
+
     const KEYWORD_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
         id: 0,
         name: "keyword",
@@ -2944,8 +2954,17 @@ mod tests {
 
     #[test]
     fn fixed_seed_term_sets_match_naive_lookup_iteration_and_prefixes() -> TestResult {
+        init_replay_tracing();
         for seed in 0..24_u64 {
-            let mut state = seed.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let case_seed = seed.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            tracing::info!(
+                codec = "TERMDICT",
+                seed = case_seed,
+                case = seed,
+                replay = "fixed_seed_term_sets_match_naive_lookup_iteration_and_prefixes",
+                "starting randomized dictionary case"
+            );
+            let mut state = case_seed;
             let mut keys = Vec::new();
             keys.push((0, Vec::new()));
             keys.push((0, vec![u8::try_from(seed)?; 256]));
@@ -3537,6 +3556,9 @@ mod tests {
 
     #[test]
     fn arbitrary_and_unaligned_bytes_never_panic() -> TestResult {
+        const BASE_SEED: u64 = 0x4d59_5df4_d0f3_3173;
+
+        init_replay_tracing();
         let valid_keys = sorted_numbered_keys(17);
         let (encoded, _, sections) = encode_fixture(KEYWORD_SCHEMA, &valid_keys)?;
         for shift in 0..32 {
@@ -3546,8 +3568,15 @@ mod tests {
             assert_eq!(dictionary.term_count(), 17);
         }
 
-        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        let mut state = BASE_SEED;
         for length in 0..=512 {
+            tracing::info!(
+                codec = "TERMDICT",
+                seed = BASE_SEED,
+                case = length,
+                replay = "arbitrary_and_unaligned_bytes_never_panic",
+                "starting hostile-byte case"
+            );
             let mut bytes = Vec::with_capacity(length);
             for _ in 0..length {
                 state ^= state >> 12;
@@ -3566,7 +3595,10 @@ mod tests {
                     },
                 );
             }));
-            assert!(result.is_ok(), "parser panicked for {length} hostile bytes");
+            assert!(
+                result.is_ok(),
+                "seed={BASE_SEED:#x} parser panicked for {length} hostile bytes"
+            );
         }
         Ok(())
     }
