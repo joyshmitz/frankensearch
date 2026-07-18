@@ -3435,13 +3435,28 @@ fn install_recovered_bytes(
     install_recovered_bytes_with_observer(admission, label, destination, bytes, &mut |_, _| Ok(()))
 }
 
+// Supported target matrix for durable Keeper recovery (bd-b188).
+//
+// - **Tier 1** (`linux`, `android`, `target_vendor = "apple"`): descriptor-
+//   bound installation with `renameat2(EXCHANGE)`, inode-verified rollback,
+//   and `renameat2(NOREPLACE)` retirement — the strongest no-replace
+//   semantics, exercised by the `recovered_byte_install_*` host tests and
+//   the CI ubuntu/macos lanes.
+// - **Tier 2** (every other unix, Windows, and targets with POSIX/NTFS hard
+//   links): the portable `std::fs` choreography in
+//   [`install_recovered_bytes_portable`] / [`retire_regular_artifact_portable`]
+//   — `create_new` collision probes, atomic no-replace hard-link install,
+//   quarantine-first retirement. Always compiled so the `portable_*` host
+//   tests pin the exact logic the fallback delegates to.
+// - **Tier 3** (filesystems without hard links, e.g. FAT32, and targets
+//   without the required file APIs, e.g. wasi): explicit typed
+//   `Unsupported` rejection — never a racy check-then-rename or
+//   copy-based fallback.
+
 /// Deterministic crash-window checkpoints in recovered-byte installation
 /// (bd-qxce). Every durable side effect boundary reports here so the crash
 /// matrix can suspend the choreography at each step and prove recovery.
-#[cfg(all(
-    feature = "durability",
-    any(target_os = "linux", target_os = "android", target_vendor = "apple")
-))]
+#[cfg(feature = "durability")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveredByteInstallCheckpoint {
     /// The recovered-byte temp file was written and fsynced.
@@ -3895,21 +3910,293 @@ fn install_recovered_bytes_with_observer(
 ))]
 fn install_recovered_bytes(
     admission: &WriterAdmissionInner,
-    _: &str,
+    label: &str,
     destination: &Path,
-    _: &[u8],
+    bytes: &[u8],
 ) -> Result<(), KeeperError> {
-    Err(KeeperError::Io {
-        operation: "install recovered bytes",
-        path: destination.to_path_buf(),
-        source: io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "no-replace recovered-byte installation is unsupported for {}",
-                admission.directory.display()
+    install_recovered_bytes_portable(admission, label, destination, bytes, &mut |_, _| Ok(()))
+}
+
+/// Tier-2 recovered-byte installation for platforms without descriptor-bound
+/// rename exchange (bd-b188), using only `std::fs` primitives. Always
+/// compiled so host tests exercise the same choreography the cfg-selected
+/// fallback delegates to outside linux/android/apple.
+///
+/// Choreography (same checkpoint contract as the descriptor-bound tier):
+/// 1. `create_new` temp probe — atomically collision-safe, never overwrites
+///    an occupied name (NOFOLLOW on unix; the cooperative LOCK contract
+///    covers symlink-race hardening elsewhere, matching tier 1's threat
+///    model).
+/// 2. write + file fsync; hard-link the temp into place with
+///    `std::fs::hard_link` — atomic and no-replace on both POSIX and NTFS.
+/// 3. An occupied destination is first retired to a probed no-replace
+///    quarantine name (the probe claims the name atomically; the rename then
+///    replaces only our own probe), keeping the corrupt authority available
+///    and never clobbering a foreign quarantine.
+/// 4. Directory fsync ordering preserved on unix; on targets without
+///    directory fsync the operation is skipped (file-level fsync already
+///    landed before the link).
+///
+/// Crash between retirement and link leaves the canonical name absent with
+/// the corrupt copy quarantined and the validated temp present — durable
+/// open re-runs recovery from the sidecar, so the choreography stays
+/// fail-closed. Filesystems without hard links report `Unsupported`
+/// explicitly (Tier 3) rather than degrading to racy copy fallbacks.
+#[cfg(feature = "durability")]
+#[allow(dead_code)] // called only on Tier-2 targets and by host tests
+fn install_recovered_bytes_portable(
+    admission: &WriterAdmissionInner,
+    label: &str,
+    destination: &Path,
+    bytes: &[u8],
+    observe: &mut impl FnMut(RecoveredByteInstallCheckpoint, &Path) -> io::Result<()>,
+) -> Result<(), KeeperError> {
+    admission.ensure_directory_identity()?;
+    if destination.parent() != Some(admission.directory.as_path()) {
+        return Err(KeeperError::Io {
+            operation: "validate recovered-byte destination",
+            path: destination.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repair destination is outside the admitted index directory",
             ),
+        });
+    }
+
+    // 1. Collision-safe temp probe (atomically claims its name).
+    let (temp_path, mut temp_file) = create_probed_file(
+        admission,
+        &format!(
+            ".tmp-repair-{label}-{:016x}",
+            admission.record.pid_start_nonce
+        ),
+    )?;
+    temp_file
+        .write_all(bytes)
+        .and_then(|()| temp_file.sync_all())
+        .map_err(|source| KeeperError::Io {
+            operation: "persist recovered-byte temp",
+            path: temp_path.clone(),
+            source,
+        })?;
+    observe(RecoveredByteInstallCheckpoint::TempSynced, &temp_path).map_err(|source| {
+        KeeperError::Io {
+            operation: "run recovered-byte install checkpoint",
+            path: temp_path.clone(),
+            source,
+        }
+    })?;
+
+    // 2. Retire an occupied canonical destination to a no-replace quarantine.
+    let destination_exists = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(KeeperError::Io {
+                    operation: "inspect recovered-byte destination",
+                    path: destination.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "recovered-byte destination is not a regular file",
+                    ),
+                });
+            }
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(KeeperError::Io {
+                operation: "inspect recovered-byte destination",
+                path: destination.to_path_buf(),
+                source: error,
+            });
+        }
+    };
+    observe(
+        RecoveredByteInstallCheckpoint::BeforeAtomicInstall,
+        &temp_path,
+    )
+    .map_err(|source| KeeperError::Io {
+        operation: "run recovered-byte install checkpoint",
+        path: temp_path.clone(),
+        source,
+    })?;
+    if destination_exists {
+        let (quarantine, quarantine_file) = create_probed_file(
+            admission,
+            &format!(
+                ".retired-repair-{label}-{:016x}",
+                admission.record.pid_start_nonce
+            ),
+        )?;
+        // The probe claimed the quarantine name atomically; the rename then
+        // replaces only our own probe file, never a foreign quarantine.
+        quarantine_file
+            .sync_all()
+            .map_err(|source| KeeperError::Io {
+                operation: "claim no-replace quarantine name",
+                path: quarantine.clone(),
+                source,
+            })?;
+        std::fs::rename(destination, &quarantine).map_err(|source| KeeperError::Io {
+            operation: "retire corrupt recovered-byte destination",
+            path: quarantine.clone(),
+            source,
+        })?;
+        observe(
+            RecoveredByteInstallCheckpoint::AfterCorruptRetirement,
+            &quarantine,
+        )
+        .map_err(|source| KeeperError::Io {
+            operation: "run recovered-byte install checkpoint",
+            path: quarantine.clone(),
+            source,
+        })?;
+    }
+
+    // 3. Atomically hard-link the validated temp into the canonical name
+    // (no-replace by construction on POSIX and NTFS).
+    if let Err(source) = std::fs::hard_link(&temp_path, destination) {
+        if destination_exists {
+            // Best-effort rollback: restore the retired corrupt authority so
+            // a failed install never loses the pre-existing bytes. The
+            // quarantine name is recomputed from the same probe sequence.
+            let quarantine_root = format!(
+                ".retired-repair-{label}-{:016x}",
+                admission.record.pid_start_nonce
+            );
+            let quarantine = (0..=u16::MAX)
+                .map(|suffix| {
+                    if suffix == 0 {
+                        admission.directory.join(&quarantine_root)
+                    } else {
+                        admission
+                            .directory
+                            .join(format!("{quarantine_root}.{suffix}"))
+                    }
+                })
+                .find(|candidate| candidate.exists());
+            if let Some(quarantine) = quarantine {
+                let _ = std::fs::rename(&quarantine, destination);
+                observe(RecoveredByteInstallCheckpoint::AfterRollback, destination).ok();
+            }
+        }
+        let kind = source.kind();
+        return Err(KeeperError::Io {
+            operation: "link recovered bytes into place",
+            path: destination.to_path_buf(),
+            source: if kind == io::ErrorKind::Unsupported || kind == io::ErrorKind::CrossesDevices {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "hard links unsupported on this filesystem; explicit Tier-3 rejection (no racy copy fallback)",
+                )
+            } else {
+                source
+            },
+        });
+    }
+    let _ = std::fs::remove_file(&temp_path);
+    observe(
+        RecoveredByteInstallCheckpoint::AfterAtomicInstall,
+        destination,
+    )
+    .map_err(|source| KeeperError::Io {
+        operation: "run recovered-byte install checkpoint",
+        path: destination.to_path_buf(),
+        source,
+    })?;
+
+    // 4. Post-install validation: the canonical name now holds exactly the
+    // validated recovered bytes.
+    let installed = std::fs::read(destination).map_err(|source| KeeperError::Io {
+        operation: "re-read installed recovered bytes",
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    if installed != bytes {
+        return Err(KeeperError::Io {
+            operation: "validate installed recovered bytes",
+            path: destination.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed recovered bytes diverge from the validated payload",
+            ),
+        });
+    }
+    sync_directory_best_effort(&admission.directory).map_err(|source| KeeperError::Io {
+        operation: "fsync recovered-byte install directory",
+        path: admission.directory.clone(),
+        source,
+    })?;
+    observe(
+        RecoveredByteInstallCheckpoint::FinalSynced,
+        &admission.directory,
+    )
+    .map_err(|source| KeeperError::Io {
+        operation: "run recovered-byte install checkpoint",
+        path: admission.directory.clone(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Atomically create a fresh collision-free child file inside the admitted
+/// directory with `create_new` (bd-b188): each attempt either claims the
+/// name or proves it occupied, so no occupied staging name is ever
+/// overwritten. Returns the claimed path and its open file.
+#[allow(dead_code)] // called only on Tier-2 targets and by host tests
+fn create_probed_file(
+    admission: &WriterAdmissionInner,
+    base: &str,
+) -> Result<(PathBuf, File), KeeperError> {
+    for collision in 0..=u16::MAX {
+        let name = if collision == 0 {
+            base.to_owned()
+        } else {
+            format!("{base}.{collision}")
+        };
+        safe_direct_child(&admission.directory, Path::new(&name))?;
+        let candidate = admission.directory.join(&name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(error) => {
+                return Err(KeeperError::Io {
+                    operation: "create collision-safe staging file",
+                    path: candidate,
+                    source: error,
+                });
+            }
+        }
+    }
+    Err(KeeperError::Io {
+        operation: "allocate collision-free staging name",
+        path: admission.directory.join(base),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "staging name suffix space is exhausted",
         ),
     })
+}
+
+/// fsync a directory where the platform supports it (unix). On targets
+/// without directory fsync this is a documented no-op: every file-level
+/// fsync in the choreography already landed before the final link.
+#[cfg(feature = "durability")]
+#[allow(dead_code)] // called only on Tier-2 targets and by host tests
+fn sync_directory_best_effort(directory: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(directory)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Ok(())
+    }
 }
 
 fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -4018,14 +4305,73 @@ fn retire_regular_artifact(
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    Err(KeeperError::Io {
-        operation: "retire writer artifact",
-        path: source.to_path_buf(),
-        source: io::Error::new(
-            io::ErrorKind::Unsupported,
-            "atomic no-replace retirement is unsupported on this platform",
-        ),
-    })
+    retire_regular_artifact_portable(admission, source, destination)
+}
+
+/// Tier-2 no-replace retirement for platforms without `renameat2(NOREPLACE)`
+/// (bd-b188), using only `std::fs`. Always compiled so host tests exercise
+/// the same logic the cfg-selected fallback delegates to.
+///
+/// The destination suffix is claimed atomically with `create_new` (never an
+/// occupied quarantine name), then the source is renamed over OUR OWN probe
+/// file — portable across POSIX and Windows, and collision-safe by
+/// construction. Returns `Ok(false)` when the source is absent.
+#[allow(dead_code)] // called only on Tier-2 targets and by host tests
+fn retire_regular_artifact_portable(
+    admission: &WriterAdmissionInner,
+    source: &Path,
+    destination: &Path,
+) -> Result<bool, KeeperError> {
+    admission.ensure_directory_identity()?;
+    if source.parent() != Some(admission.directory.as_path())
+        || destination.parent() != Some(admission.directory.as_path())
+    {
+        return Err(KeeperError::Io {
+            operation: "validate retirement paths",
+            path: source.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "retirement paths must be direct children of the admitted directory",
+            ),
+        });
+    }
+    match std::fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(KeeperError::Io {
+                operation: "retire writer artifact",
+                path: source.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "retirement source is not a regular file",
+                ),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(KeeperError::Io {
+                operation: "inspect retirement source",
+                path: source.to_path_buf(),
+                source: error,
+            });
+        }
+    }
+
+    let base = destination
+        .file_name()
+        .ok_or_else(|| KeeperError::UnsafeGarbagePath {
+            path: destination.to_path_buf(),
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let (probe, probe_file) = create_probed_file(admission, &base)?;
+    drop(probe_file);
+    std::fs::rename(source, &probe).map_err(|source_error| KeeperError::Io {
+        operation: "retire writer artifact over claimed probe",
+        path: probe,
+        source: source_error,
+    })?;
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -11754,6 +12100,158 @@ mod tests {
                 .count(),
             2
         );
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn portable_install_replaces_occupied_destination_and_quarantines_it() -> TestResult {
+        // Tier-2 choreography (bd-b188): occupied destination retires to a
+        // probed no-replace quarantine, recovered bytes install atomically,
+        // and a second install claims a fresh quarantine without clobbering.
+        let index = tempdir()?;
+        let admission = acquire_writer_admission(index.path())?;
+        let destination = index.path().join("MANIFEST");
+        std::fs::write(&destination, b"corrupt authority")?;
+
+        install_recovered_bytes_portable(
+            &admission,
+            "MANIFEST",
+            &destination,
+            b"first recovery",
+            &mut |_, _| Ok(()),
+        )?;
+        assert_eq!(std::fs::read(&destination)?, b"first recovery");
+
+        std::fs::write(&destination, b"second corrupt authority")?;
+        install_recovered_bytes_portable(
+            &admission,
+            "MANIFEST",
+            &destination,
+            b"second recovery",
+            &mut |_, _| Ok(()),
+        )?;
+        assert_eq!(std::fs::read(&destination)?, b"second recovery");
+
+        // Both quarantines survive: each install claimed a fresh no-replace
+        // name instead of overwriting the prior one.
+        let quarantines: Vec<_> = std::fs::read_dir(index.path())?
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(".retired-repair-MANIFEST-"))
+            .collect();
+        assert_eq!(quarantines.len(), 2, "expected two probed quarantines");
+        let retired: Vec<_> = quarantines
+            .iter()
+            .map(|name| std::fs::read(index.path().join(name)).expect("read quarantine"))
+            .collect();
+        assert!(retired.contains(&b"corrupt authority".to_vec()));
+        assert!(retired.contains(&b"second corrupt authority".to_vec()));
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn portable_install_into_absent_destination_and_retry_after_interruption() -> TestResult {
+        // Absent canonical authority: the temp hard-links straight into
+        // place. A stale temp from an interrupted earlier run is probed
+        // around, never overwritten (bd-b188 retry-after-interruption).
+        let index = tempdir()?;
+        let admission = acquire_writer_admission(index.path())?;
+        let destination = index.path().join("MANIFEST");
+        let stale_temp = index.path().join(format!(
+            ".tmp-repair-MANIFEST-{:016x}",
+            admission.record.pid_start_nonce
+        ));
+        std::fs::write(&stale_temp, b"interrupted prior repair")?;
+
+        install_recovered_bytes_portable(
+            &admission,
+            "MANIFEST",
+            &destination,
+            b"validated recovery",
+            &mut |_, _| Ok(()),
+        )?;
+        assert_eq!(std::fs::read(&destination)?, b"validated recovery");
+        assert_eq!(std::fs::read(&stale_temp)?, b"interrupted prior repair");
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn portable_install_reports_checkpoints_in_order() -> TestResult {
+        let index = tempdir()?;
+        let admission = acquire_writer_admission(index.path())?;
+        let destination = index.path().join("MANIFEST");
+        std::fs::write(&destination, b"corrupt authority")?;
+        let mut checkpoints = Vec::new();
+        install_recovered_bytes_portable(
+            &admission,
+            "MANIFEST",
+            &destination,
+            b"validated recovery",
+            &mut |checkpoint, _| {
+                checkpoints.push(checkpoint);
+                Ok(())
+            },
+        )?;
+        assert_eq!(
+            checkpoints,
+            vec![
+                RecoveredByteInstallCheckpoint::TempSynced,
+                RecoveredByteInstallCheckpoint::BeforeAtomicInstall,
+                RecoveredByteInstallCheckpoint::AfterCorruptRetirement,
+                RecoveredByteInstallCheckpoint::AfterAtomicInstall,
+                RecoveredByteInstallCheckpoint::FinalSynced,
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_retire_is_collision_safe_and_never_replaces() -> TestResult {
+        let index = tempdir()?;
+        let admission = acquire_writer_admission(index.path())?;
+        let source = index.path().join("corrupt.bin");
+        std::fs::write(&source, b"corrupt payload")?;
+        let destination = index.path().join("quarantine.bin");
+
+        // Absent destination: retires onto the base name.
+        assert!(retire_regular_artifact_portable(
+            &admission,
+            &source,
+            &destination
+        )?);
+        assert_eq!(std::fs::read(&destination)?, b"corrupt payload");
+        assert!(!source.exists());
+
+        // Occupied destination: the next retry claims a fresh suffixed probe
+        // and the occupied quarantine keeps its bytes.
+        std::fs::write(&source, b"second corrupt payload")?;
+        assert!(retire_regular_artifact_portable(
+            &admission,
+            &source,
+            &destination
+        )?);
+        assert_eq!(std::fs::read(&destination)?, b"corrupt payload");
+        let siblings: Vec<_> = std::fs::read_dir(index.path())?
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with("quarantine.bin."))
+            .collect();
+        assert_eq!(siblings.len(), 1, "expected one probed sibling quarantine");
+        assert_eq!(
+            std::fs::read(index.path().join(&siblings[0]))?,
+            b"second corrupt payload"
+        );
+
+        // Absent source reports no work.
+        assert!(!retire_regular_artifact_portable(
+            &admission,
+            &source,
+            &destination
+        )?);
         Ok(())
     }
 
