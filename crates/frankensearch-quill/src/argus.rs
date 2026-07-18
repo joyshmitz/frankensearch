@@ -123,6 +123,14 @@ pub enum ArgusError {
         /// Field ordinal supplied by snapshot STATS.
         stats_field: u16,
     },
+    /// A phrase term cursor was opened for a field other than its snapshot.
+    #[error("phrase term field {term_field} does not match snapshot field {stats_field}")]
+    PhraseTermFieldMismatch {
+        /// Field ordinal supplied when the phrase cursor was opened.
+        term_field: u16,
+        /// Field ordinal supplied by snapshot STATS.
+        stats_field: u16,
+    },
     /// A programmatic query supplied a non-finite or overflowing field boost.
     #[error("field {field_ord} has invalid boost bits 0x{boost_bits:08x}")]
     InvalidBoost {
@@ -138,6 +146,20 @@ pub enum ArgusError {
         field_ord: u16,
         /// Global Quill document id.
         global_docid: u32,
+    },
+    /// A phrase leaf was opened against a frequency-only posting cursor.
+    #[error("field {field_ord} has no positions for global docid {global_docid}")]
+    MissingPositions {
+        /// Stable schema field ordinal.
+        field_ord: u16,
+        /// Global Quill document id whose phrase positions were required.
+        global_docid: u32,
+    },
+    /// A phrase plan cannot describe an exact positional query.
+    #[error("invalid exact phrase: {reason}")]
+    InvalidPhrase {
+        /// Failed phrase-plan invariant.
+        reason: &'static str,
     },
     /// A cursor exposed internally inconsistent accessors.
     #[error("posting cursor invariant failed: {0}")]
@@ -655,6 +677,580 @@ impl<'a> TermScorer<'a> {
     }
 }
 
+/// One analyzed phrase term bound to its positioned posting cursor.
+///
+/// Terms must be supplied in non-decreasing analyzer-position order. Terms at
+/// the same position are treated as alternatives for matching while retaining
+/// their original order in the fixed phrase-weight calculation. The field
+/// ordinal is trusted lowering metadata and must come from the same posting-open
+/// operation as the cursor; the opaque cursor contract cannot recover it.
+pub struct PhraseTerm<'a> {
+    field_ord: u16,
+    position: u32,
+    cursor: Box<dyn PostingCursor + 'a>,
+    snapshot_doc_freq: u64,
+}
+
+impl<'a> PhraseTerm<'a> {
+    /// Bind one field, query position, and snapshot document frequency to a cursor.
+    ///
+    /// `field_ord` must be copied from the trusted posting-open path that
+    /// produced `cursor`; construction validates it against snapshot STATS.
+    #[must_use]
+    pub fn new<C>(field_ord: u16, position: u32, cursor: C, snapshot_doc_freq: u64) -> Self
+    where
+        C: PostingCursor + 'a,
+    {
+        Self {
+            field_ord,
+            position,
+            cursor: Box::new(cursor),
+            snapshot_doc_freq,
+        }
+    }
+
+    /// Stable schema field ordinal whose postings back this term.
+    #[must_use]
+    pub const fn field_ord(&self) -> u16 {
+        self.field_ord
+    }
+
+    /// Analyzer position retained from the parsed phrase.
+    #[must_use]
+    pub const fn position(&self) -> u32 {
+        self.position
+    }
+
+    /// Snapshot document frequency used in the phrase's fixed BM25 weight.
+    #[must_use]
+    pub const fn snapshot_doc_freq(&self) -> u64 {
+        self.snapshot_doc_freq
+    }
+}
+
+struct PhraseSlot<'a> {
+    position: u32,
+    alternatives: Vec<Box<dyn PostingCursor + 'a>>,
+    positions: Vec<u32>,
+    cost: u64,
+    size_hint: u32,
+}
+
+impl<'a> PhraseSlot<'a> {
+    fn new(position: u32, cursor: Box<dyn PostingCursor + 'a>) -> Self {
+        let cost = cursor.cost();
+        let size_hint = cursor.size_hint();
+        Self {
+            position,
+            alternatives: vec![cursor],
+            positions: Vec::new(),
+            cost,
+            size_hint,
+        }
+    }
+
+    fn push_alternative(&mut self, cursor: Box<dyn PostingCursor + 'a>) -> Result<(), ArgusError> {
+        self.alternatives
+            .try_reserve(1)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "phrase alternatives",
+                count: self.alternatives.len().saturating_add(1),
+            })?;
+        self.cost = self.cost.saturating_add(cursor.cost());
+        self.alternatives.push(cursor);
+        Ok(())
+    }
+
+    fn doc(&self) -> Option<u32> {
+        self.alternatives
+            .iter()
+            .filter_map(|cursor| cursor.doc())
+            .min()
+    }
+
+    fn seek(
+        &mut self,
+        target: u32,
+        fieldnorms: &dyn FieldNormReader,
+    ) -> Result<Option<u32>, ArgusError> {
+        for cursor in &mut self.alternatives {
+            let previous = cursor.doc();
+            if previous.is_some_and(|doc| doc < target) {
+                let moved = cursor.advance(target)?;
+                validate_phrase_cursor_after_move(cursor.as_ref(), fieldnorms, moved)?;
+                match (previous, moved) {
+                    (None, Some(_)) => {
+                        return Err(ArgusError::CursorInvariant(
+                            "exhausted phrase cursor resurrected during advance",
+                        ));
+                    }
+                    (_, Some(after)) if after < target => {
+                        return Err(ArgusError::CursorInvariant(
+                            "phrase advance landed below its requested target",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(self.doc())
+    }
+
+    fn next(&mut self, fieldnorms: &dyn FieldNormReader) -> Result<Option<u32>, ArgusError> {
+        let Some(previous) = self.doc() else {
+            return Ok(None);
+        };
+        for cursor in &mut self.alternatives {
+            if cursor.doc() == Some(previous) {
+                let moved = cursor.next()?;
+                validate_phrase_cursor_after_move(cursor.as_ref(), fieldnorms, moved)?;
+                if moved.is_some_and(|after| after <= previous) {
+                    return Err(ArgusError::CursorInvariant(
+                        "phrase next did not move to a strictly greater document",
+                    ));
+                }
+            }
+        }
+        let moved = self.doc();
+        if moved.is_some_and(|after| after <= previous) {
+            return Err(ArgusError::CursorInvariant(
+                "phrase slot did not move to a strictly greater document",
+            ));
+        }
+        Ok(moved)
+    }
+}
+
+/// Exact-adjacency phrase scorer over positioned posting cursors.
+///
+/// Candidate documents are intersected before positions are decoded. The
+/// scorer owns and reuses every positional scratch buffer, so advancing after
+/// warm-up performs no per-document allocation.
+pub struct PhraseScorer<'a> {
+    slots: Vec<PhraseSlot<'a>>,
+    fieldnorms: Box<dyn FieldNormReader + 'a>,
+    snapshot: Bm25FieldSnapshot,
+    weight: f32,
+    lead_slot: usize,
+    cost: u64,
+    size_hint: u32,
+    segment_num_docs: u32,
+    current: Option<u32>,
+    current_frequency: u32,
+    decode_scratch: Vec<u32>,
+    position_indices: Vec<usize>,
+}
+
+impl<'a> PhraseScorer<'a> {
+    /// Build and initially align one exact phrase scorer.
+    ///
+    /// Query terms must be ordered by non-decreasing analyzer position and
+    /// span at least two distinct positions. Equal-position terms form one OR
+    /// slot. Each term needs its own forward-only positioned cursor, including
+    /// repeated terms such as `a a b`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed positions, non-positioned cursors, field/domain
+    /// drift, invalid snapshot frequencies or boosts, and bounded allocation
+    /// failures.
+    pub fn new<F>(
+        terms: Vec<PhraseTerm<'a>>,
+        fieldnorms: F,
+        snapshot: Bm25FieldSnapshot,
+        field_boost: f32,
+    ) -> Result<Self, ArgusError>
+    where
+        F: FieldNormReader + 'a,
+    {
+        if terms.is_empty() {
+            return Err(ArgusError::InvalidPhrase {
+                reason: "an exact phrase requires positioned terms",
+            });
+        }
+        if fieldnorms.field_ord() != snapshot.field_ord() {
+            return Err(ArgusError::FieldMismatch {
+                fieldnorm_field: fieldnorms.field_ord(),
+                stats_field: snapshot.field_ord(),
+            });
+        }
+        if !field_boost.is_finite() {
+            return Err(ArgusError::InvalidBoost {
+                field_ord: snapshot.field_ord(),
+                boost_bits: field_boost.to_bits(),
+            });
+        }
+        let num_terms = u32::try_from(terms.len()).map_err(|_| ArgusError::InvalidPhrase {
+            reason: "phrase term count exceeds u32",
+        })?;
+        let phrase_work_factor = num_terms.checked_mul(10).ok_or(ArgusError::InvalidPhrase {
+            reason: "phrase term cost factor exceeds u32",
+        })?;
+
+        let mut slots: Vec<PhraseSlot<'a>> = Vec::new();
+        slots
+            .try_reserve_exact(terms.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "phrase position slots",
+                count: terms.len(),
+            })?;
+        let mut segment_num_docs = None;
+        let mut idf_sum = 0.0_f32;
+        for term in terms {
+            if term.field_ord != snapshot.field_ord() {
+                return Err(ArgusError::PhraseTermFieldMismatch {
+                    term_field: term.field_ord,
+                    stats_field: snapshot.field_ord(),
+                });
+            }
+            if term.snapshot_doc_freq > snapshot.doc_count() {
+                return Err(ArgusError::InvalidDocFrequency {
+                    doc_freq: term.snapshot_doc_freq,
+                    doc_count: snapshot.doc_count(),
+                });
+            }
+            let cursor_segment_num_docs = term.cursor.segment_num_docs();
+            if u64::from(cursor_segment_num_docs) > snapshot.doc_count() {
+                return Err(ArgusError::InvalidSnapshot {
+                    field_ord: snapshot.field_ord(),
+                    reason: "phrase segment num_docs exceeds snapshot physical document count",
+                });
+            }
+            if segment_num_docs
+                .replace(cursor_segment_num_docs)
+                .is_some_and(|previous| previous != cursor_segment_num_docs)
+            {
+                return Err(ArgusError::CursorInvariant(
+                    "phrase cursors belong to different segment domains",
+                ));
+            }
+            validate_phrase_cursor_state(term.cursor.as_ref(), &fieldnorms)?;
+            if term.cursor.doc().is_none()
+                && (term.cursor.size_hint() != 0 || term.cursor.cost() != 0)
+            {
+                return Err(ArgusError::CursorInvariant(
+                    "an initially empty phrase cursor must have zero size and runtime cost",
+                ));
+            }
+            if term.cursor.doc().is_some() && term.snapshot_doc_freq == 0 {
+                return Err(ArgusError::InvalidSnapshot {
+                    field_ord: snapshot.field_ord(),
+                    reason: "a non-empty phrase cursor cannot have zero snapshot doc_freq",
+                });
+            }
+            idf_sum += idf(term.snapshot_doc_freq, snapshot.doc_count());
+            if !idf_sum.is_finite() {
+                return Err(ArgusError::InvalidSnapshot {
+                    field_ord: snapshot.field_ord(),
+                    reason: "phrase IDF sum is not finite",
+                });
+            }
+
+            match slots.last_mut() {
+                Some(slot) if term.position < slot.position => {
+                    return Err(ArgusError::InvalidPhrase {
+                        reason: "phrase positions must be non-decreasing",
+                    });
+                }
+                Some(slot) if term.position == slot.position => {
+                    slot.push_alternative(term.cursor)?;
+                }
+                _ => slots.push(PhraseSlot::new(term.position, term.cursor)),
+            }
+        }
+        if slots.len() < 2 {
+            return Err(ArgusError::InvalidPhrase {
+                reason: "an exact phrase must span at least two positions",
+            });
+        }
+        if slots.iter().any(|slot| {
+            slot.alternatives
+                .iter()
+                .any(|cursor| cursor.doc().is_some())
+        }) && snapshot
+            .average_field_length()
+            .is_none_or(|average| average <= 0.0)
+        {
+            return Err(ArgusError::InvalidSnapshot {
+                field_ord: snapshot.field_ord(),
+                reason: "a scored phrase requires a positive raw average field length",
+            });
+        }
+
+        let segment_num_docs = segment_num_docs.unwrap_or(0);
+        for slot in &mut slots {
+            if slot.alternatives.len() > 1 {
+                slot.size_hint = estimate_union(
+                    slot.alternatives.iter().map(|cursor| cursor.size_hint()),
+                    segment_num_docs,
+                );
+            }
+        }
+        let lead_slot = slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, slot)| slot.cost)
+            .map_or(0, |(index, _)| index);
+        let mut cost_ordered_estimates = Vec::new();
+        cost_ordered_estimates
+            .try_reserve_exact(slots.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "phrase cost estimates",
+                count: slots.len(),
+            })?;
+        cost_ordered_estimates.extend(slots.iter().map(|slot| (slot.cost, slot.size_hint)));
+        cost_ordered_estimates.sort_by_key(|(cost, _)| *cost);
+        let candidate_estimate = estimate_intersection(
+            cost_ordered_estimates.into_iter().map(|(_, size)| size),
+            segment_num_docs,
+        );
+        let cost = u64::from(candidate_estimate) * u64::from(phrase_work_factor);
+        let size_hint = candidate_estimate / phrase_work_factor;
+        let mut position_indices = Vec::new();
+        position_indices
+            .try_reserve_exact(slots.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "phrase position indices",
+                count: slots.len(),
+            })?;
+        position_indices.resize(slots.len(), 0);
+
+        let mut weight = idf_sum * (1.0 + BM25_K1);
+        weight *= field_boost;
+        if !weight.is_finite() {
+            return Err(ArgusError::InvalidBoost {
+                field_ord: snapshot.field_ord(),
+                boost_bits: field_boost.to_bits(),
+            });
+        }
+        let mut scorer = Self {
+            slots,
+            fieldnorms: Box::new(fieldnorms),
+            snapshot,
+            weight,
+            lead_slot,
+            cost,
+            size_hint,
+            segment_num_docs,
+            current: None,
+            current_frequency: 0,
+            decode_scratch: Vec::new(),
+            position_indices,
+        };
+        scorer.align()?;
+        Ok(scorer)
+    }
+
+    fn doc(&self) -> Option<u32> {
+        self.current
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        if self.current.is_none() {
+            return Ok(None);
+        }
+        let fieldnorms = self.fieldnorms.as_ref();
+        self.slots[self.lead_slot].next(fieldnorms)?;
+        self.align()
+    }
+
+    fn seek(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        if self.current.is_some_and(|doc| doc >= target) {
+            return Ok(self.current);
+        }
+        let fieldnorms = self.fieldnorms.as_ref();
+        self.slots[self.lead_slot].seek(target, fieldnorms)?;
+        self.align()
+    }
+
+    fn align(&mut self) -> Result<Option<u32>, ArgusError> {
+        self.current = None;
+        self.current_frequency = 0;
+        loop {
+            let Some(mut target) = self.slots.iter().filter_map(PhraseSlot::doc).max() else {
+                return Ok(None);
+            };
+            loop {
+                let mut raised_target = false;
+                for slot in &mut self.slots {
+                    let Some(doc) = slot.seek(target, self.fieldnorms.as_ref())? else {
+                        return Ok(None);
+                    };
+                    if doc > target {
+                        target = doc;
+                        raised_target = true;
+                    }
+                }
+                if !raised_target && self.slots.iter().all(|slot| slot.doc() == Some(target)) {
+                    break;
+                }
+            }
+
+            let frequency = self.phrase_frequency(target)?;
+            if frequency != 0 {
+                self.current = Some(target);
+                self.current_frequency = frequency;
+                return Ok(self.current);
+            }
+            let fieldnorms = self.fieldnorms.as_ref();
+            self.slots[self.lead_slot].next(fieldnorms)?;
+        }
+    }
+
+    fn phrase_frequency(&mut self, doc: u32) -> Result<u32, ArgusError> {
+        for slot_index in 0..self.slots.len() {
+            self.decode_slot_positions(slot_index, doc)?;
+        }
+        self.position_indices.fill(0);
+        let first_position = self.slots[0].position;
+        let (slots, position_indices) = (&self.slots, &mut self.position_indices);
+        let mut frequency = 0_u32;
+        for &base in &slots[0].positions {
+            let mut matched = true;
+            for slot_index in 1..slots.len() {
+                let offset = slots[slot_index].position - first_position;
+                let Some(target) = base.checked_add(offset) else {
+                    matched = false;
+                    break;
+                };
+                let positions = &slots[slot_index].positions;
+                let position_index = &mut position_indices[slot_index];
+                while positions
+                    .get(*position_index)
+                    .is_some_and(|position| *position < target)
+                {
+                    *position_index += 1;
+                }
+                if positions.get(*position_index) != Some(&target) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                frequency = frequency
+                    .checked_add(1)
+                    .ok_or(ArgusError::CursorInvariant("phrase frequency exceeds u32"))?;
+            }
+        }
+        Ok(frequency)
+    }
+
+    fn decode_slot_positions(&mut self, slot_index: usize, doc: u32) -> Result<(), ArgusError> {
+        let (slots, decode_scratch) = (&mut self.slots, &mut self.decode_scratch);
+        let slot = &mut slots[slot_index];
+        slot.positions.clear();
+        for cursor in &slot.alternatives {
+            if cursor.doc() != Some(doc) {
+                continue;
+            }
+            let frequency = cursor.freq().ok_or(ArgusError::CursorInvariant(
+                "positioned phrase cursor has no frequency",
+            ))?;
+            let handle = cursor
+                .positions_handle()
+                .ok_or_else(|| ArgusError::MissingPositions {
+                    field_ord: self.snapshot.field_ord(),
+                    global_docid: doc,
+                })?;
+            handle.decode_into(decode_scratch)?;
+            let expected = usize::try_from(frequency)
+                .map_err(|_| ArgusError::CursorInvariant("phrase frequency does not fit usize"))?;
+            if decode_scratch.len() != expected {
+                return Err(ArgusError::CursorInvariant(
+                    "decoded phrase position count differs from term frequency",
+                ));
+            }
+            let required = slot.positions.len().saturating_add(decode_scratch.len());
+            slot.positions
+                .try_reserve(decode_scratch.len())
+                .map_err(|_| ArgusError::Allocation {
+                    resource: "phrase slot positions",
+                    count: required,
+                })?;
+            slot.positions.extend_from_slice(decode_scratch);
+        }
+        slot.positions.sort_unstable();
+        slot.positions.dedup();
+        if slot.positions.is_empty() {
+            return Err(ArgusError::CursorInvariant(
+                "phrase candidate has no decoded positions",
+            ));
+        }
+        Ok(())
+    }
+
+    fn score(&self) -> Result<f32, ArgusError> {
+        let doc = self.current.ok_or(ArgusError::CursorInvariant(
+            "cannot score an exhausted phrase scorer",
+        ))?;
+        if self.current_frequency == 0 {
+            return Err(ArgusError::CursorInvariant(
+                "current phrase match has zero frequency",
+            ));
+        }
+        let fieldnorm_id =
+            self.fieldnorms
+                .fieldnorm_id(doc)
+                .ok_or_else(|| ArgusError::MissingFieldnorm {
+                    field_ord: self.fieldnorms.field_ord(),
+                    global_docid: doc,
+                })?;
+        let frequency = self.current_frequency as f32;
+        let norm = self.snapshot.tf_cache[usize::from(fieldnorm_id)];
+        finite_score(self.weight * (frequency / (frequency + norm)), doc)
+    }
+}
+
+fn validate_phrase_cursor_after_move(
+    cursor: &dyn PostingCursor,
+    fieldnorms: &dyn FieldNormReader,
+    moved_doc: Option<u32>,
+) -> Result<(), ArgusError> {
+    if cursor.doc() != moved_doc {
+        return Err(ArgusError::CursorInvariant(
+            "phrase movement result disagrees with current document",
+        ));
+    }
+    validate_phrase_cursor_state(cursor, fieldnorms)
+}
+
+fn validate_phrase_cursor_state(
+    cursor: &dyn PostingCursor,
+    fieldnorms: &dyn FieldNormReader,
+) -> Result<(), ArgusError> {
+    let Some(doc) = cursor.doc() else {
+        if cursor.freq().is_some() || cursor.positions_handle().is_some() {
+            return Err(ArgusError::CursorInvariant(
+                "exhausted phrase cursor retained frequency or positions state",
+            ));
+        }
+        return Ok(());
+    };
+    if cursor.freq().is_none_or(|frequency| frequency == 0) {
+        return Err(ArgusError::CursorInvariant(
+            "positioned phrase cursor has no positive frequency",
+        ));
+    }
+    if cursor.positions_handle().is_none() {
+        return Err(ArgusError::MissingPositions {
+            field_ord: fieldnorms.field_ord(),
+            global_docid: doc,
+        });
+    }
+    if cursor.size_hint() == 0 || cursor.cost() == 0 {
+        return Err(ArgusError::CursorInvariant(
+            "a non-empty phrase cursor must have non-zero size and runtime cost",
+        ));
+    }
+    if fieldnorms.fieldnorm_id(doc).is_none() {
+        return Err(ArgusError::MissingFieldnorm {
+            field_ord: fieldnorms.field_ord(),
+            global_docid: doc,
+        });
+    }
+    Ok(())
+}
+
 fn validate_cursor_after_move(
     cursor: &dyn PostingCursor,
     fieldnorms: &dyn FieldNormReader,
@@ -736,6 +1332,7 @@ impl<'a> ScorerClause<'a> {
 enum ScorerNode<'a> {
     Empty,
     Term(TermScorer<'a>),
+    Phrase(PhraseScorer<'a>),
     Intersection(IntersectionScorer<'a>),
     Union(BufferedUnionScorer<'a>),
     RequiredOptional(RequiredOptionalScorer<'a>),
@@ -785,6 +1382,18 @@ impl<'a> ReferenceScorer<'a> {
         } else {
             Self {
                 node: ScorerNode::Term(term),
+            }
+        }
+    }
+
+    /// Wrap one exact-adjacency phrase leaf.
+    #[must_use]
+    pub fn phrase(phrase: PhraseScorer<'a>) -> Self {
+        if phrase.doc().is_none() {
+            Self::empty()
+        } else {
+            Self {
+                node: ScorerNode::Phrase(phrase),
             }
         }
     }
@@ -861,6 +1470,7 @@ impl<'a> ReferenceScorer<'a> {
         match &self.node {
             ScorerNode::Empty => None,
             ScorerNode::Term(scorer) => scorer.doc(),
+            ScorerNode::Phrase(scorer) => scorer.doc(),
             ScorerNode::Intersection(scorer) => scorer.doc(),
             ScorerNode::Union(scorer) => scorer.doc(),
             ScorerNode::RequiredOptional(scorer) => scorer.doc(),
@@ -874,6 +1484,7 @@ impl<'a> ReferenceScorer<'a> {
         match &self.node {
             ScorerNode::Empty => 0,
             ScorerNode::Term(scorer) => scorer.cost,
+            ScorerNode::Phrase(scorer) => scorer.cost,
             ScorerNode::Intersection(scorer) => scorer.cost(),
             ScorerNode::Union(scorer) => scorer.cost(),
             ScorerNode::RequiredOptional(scorer) => scorer.cost(),
@@ -887,6 +1498,7 @@ impl<'a> ReferenceScorer<'a> {
         match &self.node {
             ScorerNode::Empty => 0,
             ScorerNode::Term(scorer) => scorer.size_hint,
+            ScorerNode::Phrase(scorer) => scorer.size_hint,
             ScorerNode::Intersection(scorer) => scorer.size_hint(),
             ScorerNode::Union(scorer) => scorer.size_hint(),
             ScorerNode::RequiredOptional(scorer) => scorer.size_hint(),
@@ -900,6 +1512,7 @@ impl<'a> ReferenceScorer<'a> {
         match &self.node {
             ScorerNode::Empty => 0,
             ScorerNode::Term(scorer) => scorer.segment_num_docs,
+            ScorerNode::Phrase(scorer) => scorer.segment_num_docs,
             ScorerNode::Intersection(scorer) => scorer.segment_num_docs,
             ScorerNode::Union(scorer) => scorer.segment_num_docs,
             ScorerNode::RequiredOptional(scorer) => scorer.segment_num_docs,
@@ -920,6 +1533,7 @@ impl<'a> ReferenceScorer<'a> {
         match &mut self.node {
             ScorerNode::Empty => Ok(None),
             ScorerNode::Term(scorer) => scorer.next(),
+            ScorerNode::Phrase(scorer) => scorer.next(),
             ScorerNode::Intersection(scorer) => scorer.next(),
             ScorerNode::Union(scorer) => scorer.next(),
             ScorerNode::RequiredOptional(scorer) => scorer.next(),
@@ -936,6 +1550,7 @@ impl<'a> ReferenceScorer<'a> {
         match &mut self.node {
             ScorerNode::Empty => Ok(None),
             ScorerNode::Term(scorer) => scorer.seek(target),
+            ScorerNode::Phrase(scorer) => scorer.seek(target),
             ScorerNode::Intersection(scorer) => scorer.seek(target),
             ScorerNode::Union(scorer) => scorer.seek(target),
             ScorerNode::RequiredOptional(scorer) => scorer.seek(target),
@@ -947,6 +1562,14 @@ impl<'a> ReferenceScorer<'a> {
         match &mut self.node {
             ScorerNode::Empty => Ok(SeekDangerResult::SeekLowerBound(None)),
             ScorerNode::Term(scorer) => {
+                let result = if scorer.doc().is_some_and(|doc| doc < target) {
+                    scorer.seek(target)?
+                } else {
+                    scorer.doc()
+                };
+                classify_seek_result(target, result)
+            }
+            ScorerNode::Phrase(scorer) => {
                 let result = if scorer.doc().is_some_and(|doc| doc < target) {
                     scorer.seek(target)?
                 } else {
@@ -978,6 +1601,7 @@ impl<'a> ReferenceScorer<'a> {
         match &mut self.node {
             ScorerNode::Empty => Err(ArgusError::CursorInvariant("cannot score an empty scorer")),
             ScorerNode::Term(scorer) => scorer.score(),
+            ScorerNode::Phrase(scorer) => scorer.score(),
             ScorerNode::Intersection(scorer) => scorer.score(),
             ScorerNode::Union(scorer) => scorer.score(),
             ScorerNode::RequiredOptional(scorer) => scorer.score(),
@@ -1835,6 +2459,112 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct PositionedVecCursor {
+        postings: Vec<Posting>,
+        positions: Vec<Vec<u32>>,
+        index: usize,
+        cost: u64,
+        segment_num_docs: u32,
+    }
+
+    impl PositionedVecCursor {
+        fn new(rows: Vec<(u32, Vec<u32>)>, cost: u64, segment_num_docs: u32) -> Self {
+            let mut postings = Vec::with_capacity(rows.len());
+            let mut positions = Vec::with_capacity(rows.len());
+            for (doc, row_positions) in rows {
+                let frequency = u32::try_from(row_positions.len()).expect("fixture frequency fits");
+                postings.push(Posting::new(doc, frequency));
+                positions.push(row_positions);
+            }
+            Self {
+                postings,
+                positions,
+                index: 0,
+                cost,
+                segment_num_docs,
+            }
+        }
+
+        fn current(&self) -> Option<Posting> {
+            self.postings.get(self.index).copied()
+        }
+    }
+
+    impl PositionsReader for PositionedVecCursor {
+        fn decode_positions(
+            &self,
+            posting_ordinal: u32,
+            output: &mut Vec<u32>,
+        ) -> Result<(), ArgusError> {
+            let ordinal = usize::try_from(posting_ordinal).map_err(|_| {
+                ArgusError::CursorInvariant("test position ordinal does not fit usize")
+            })?;
+            if ordinal != self.index {
+                return Err(ArgusError::CursorInvariant(
+                    "test position handle is no longer current",
+                ));
+            }
+            let positions = self
+                .positions
+                .get(ordinal)
+                .ok_or(ArgusError::CursorInvariant(
+                    "test position ordinal is out of range",
+                ))?;
+            output
+                .try_reserve_exact(positions.len())
+                .map_err(|_| ArgusError::Allocation {
+                    resource: "test decoded positions",
+                    count: positions.len(),
+                })?;
+            output.extend_from_slice(positions);
+            Ok(())
+        }
+    }
+
+    impl PostingCursor for PositionedVecCursor {
+        fn doc(&self) -> Option<u32> {
+            self.current().map(|posting| posting.doc_id)
+        }
+
+        fn freq(&self) -> Option<u32> {
+            self.current().map(|posting| posting.freq)
+        }
+
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            self.current().and_then(|_| {
+                u32::try_from(self.index)
+                    .ok()
+                    .map(|ordinal| PositionsHandle::new(self, ordinal))
+            })
+        }
+
+        fn size_hint(&self) -> u32 {
+            u32::try_from(self.postings.len()).unwrap_or(u32::MAX)
+        }
+
+        fn cost(&self) -> u64 {
+            self.cost
+        }
+
+        fn segment_num_docs(&self) -> u32 {
+            self.segment_num_docs
+        }
+
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            if self.index < self.postings.len() {
+                self.index += 1;
+            }
+            Ok(self.doc())
+        }
+
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            let tail = self.postings.get(self.index..).unwrap_or_default();
+            self.index += tail.partition_point(|posting| posting.doc_id < target);
+            Ok(self.doc())
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum CursorFault {
         StickyNext,
@@ -1979,6 +2709,28 @@ mod tests {
         weight * (frequency / (frequency + norm))
     }
 
+    fn expected_phrase_score(
+        snapshot: &Bm25FieldSnapshot,
+        doc_freqs: &[u64],
+        fieldnorm_id: u8,
+        frequency: u32,
+        boost: f32,
+    ) -> f32 {
+        let average = snapshot
+            .average_field_length()
+            .expect("non-empty scored fixture");
+        let decoded = id_to_fieldnorm(fieldnorm_id);
+        let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * decoded as f32 / average);
+        let mut idf_sum = 0.0_f32;
+        for &doc_freq in doc_freqs {
+            idf_sum += idf(doc_freq, snapshot.doc_count());
+        }
+        let mut weight = idf_sum * (1.0 + BM25_K1);
+        weight *= boost;
+        let frequency = frequency as f32;
+        weight * (frequency / (frequency + norm))
+    }
+
     #[test]
     fn term_scorer_rejects_nonprogress_backward_seek_and_resurrection()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2064,6 +2816,617 @@ mod tests {
         let cursor = SealedPostingCursor::new(&list, 3)?;
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert!(PostingCursor::positions_handle(&cursor).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_scorer_reads_sealed_postings_and_positions() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let first_postings = [Posting::new(1, 2), Posting::new(2, 1), Posting::new(3, 1)];
+        let encoded_first_postings = EncodedPostingList::encode(&first_postings)?;
+        let first_posting_list = encoded_first_postings.posting_list()?;
+        let encoded_first_positions = EncodedPositionList::encode(&first_postings, &[0, 4, 0, 1])?;
+        let first_positions = encoded_first_positions.position_list(&first_posting_list)?;
+
+        let second_postings = [Posting::new(1, 2), Posting::new(2, 1), Posting::new(3, 1)];
+        let encoded_second_postings = EncodedPostingList::encode(&second_postings)?;
+        let second_posting_list = encoded_second_postings.posting_list()?;
+        let encoded_second_positions =
+            EncodedPositionList::encode(&second_postings, &[1, 5, 2, 2])?;
+        let second_positions = encoded_second_positions.position_list(&second_posting_list)?;
+
+        let lengths = [Some(8); 4];
+        let encoded_doclens =
+            EncodedDocLenSection::encode(0, 4, &[6], &[DocLenFieldInput::new(6, &lengths)])?;
+        let doclens = encoded_doclens.section(&[6])?;
+        let field = doclens.field(6).expect("field exists");
+        let snapshot = snapshot(6, 32, 4)?;
+        let mut phrase = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(
+                    6,
+                    0,
+                    SealedPostingCursor::with_positions(&first_positions, 4)?,
+                    3,
+                ),
+                PhraseTerm::new(
+                    6,
+                    1,
+                    SealedPostingCursor::with_positions(&second_positions, 4)?,
+                    3,
+                ),
+            ],
+            field,
+            snapshot.clone(),
+            1.0,
+        )?;
+
+        assert_eq!(phrase.doc(), Some(1));
+        let expected = expected_phrase_score(
+            &snapshot,
+            &[3, 3],
+            field.fieldnorm_id(1).expect("fieldnorm"),
+            2,
+            1.0,
+        );
+        assert_eq!(phrase.score()?.to_bits(), expected.to_bits());
+        assert_eq!(phrase.next()?, Some(3));
+        let expected = expected_phrase_score(
+            &snapshot,
+            &[3, 3],
+            field.fieldnorm_id(3).expect("fieldnorm"),
+            1,
+            1.0,
+        );
+        assert_eq!(phrase.score()?.to_bits(), expected.to_bits());
+        assert_eq!(phrase.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_scorer_filters_candidates_counts_frequency_and_seeks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(8); 8];
+        let encoded =
+            EncodedDocLenSection::encode(0, 8, &[5], &[DocLenFieldInput::new(5, &lengths)])?;
+        let section = encoded.section(&[5])?;
+        let field = section.field(5).expect("field exists");
+        let snapshot = snapshot(5, 64, 8)?;
+        let build = || {
+            let first = PositionedVecCursor::new(
+                vec![(1, vec![0, 4]), (2, vec![0]), (3, vec![2]), (5, vec![1])],
+                4,
+                8,
+            );
+            let second = PositionedVecCursor::new(
+                vec![(1, vec![1, 5]), (2, vec![2]), (3, vec![3]), (5, vec![0])],
+                4,
+                8,
+            );
+            PhraseScorer::new(
+                vec![
+                    PhraseTerm::new(5, 0, first, 4),
+                    PhraseTerm::new(5, 1, second, 4),
+                ],
+                field,
+                snapshot.clone(),
+                1.0,
+            )
+        };
+
+        let mut phrase = build()?;
+        assert_eq!(phrase.doc(), Some(1));
+        let candidate_estimate = estimate_intersection([4, 4].into_iter(), 8);
+        assert_eq!(phrase.cost, u64::from(candidate_estimate) * 20);
+        assert_eq!(phrase.size_hint, candidate_estimate / 20);
+        let expected = expected_phrase_score(
+            &snapshot,
+            &[4, 4],
+            field.fieldnorm_id(1).expect("fieldnorm"),
+            2,
+            1.0,
+        );
+        assert_eq!(phrase.score()?.to_bits(), expected.to_bits());
+        let decode_capacity = phrase.decode_scratch.capacity();
+        let position_capacities = phrase
+            .slots
+            .iter()
+            .map(|slot| slot.positions.capacity())
+            .collect::<Vec<_>>();
+        assert_eq!(phrase.next()?, Some(3));
+        assert_eq!(phrase.decode_scratch.capacity(), decode_capacity);
+        assert_eq!(
+            phrase
+                .slots
+                .iter()
+                .map(|slot| slot.positions.capacity())
+                .collect::<Vec<_>>(),
+            position_capacities
+        );
+        let expected = expected_phrase_score(
+            &snapshot,
+            &[4, 4],
+            field.fieldnorm_id(3).expect("fieldnorm"),
+            1,
+            1.0,
+        );
+        assert_eq!(phrase.score()?.to_bits(), expected.to_bits());
+        assert_eq!(phrase.next()?, None);
+        assert_eq!(phrase.next()?, None);
+
+        let mut phrase = build()?;
+        assert_eq!(phrase.seek(2)?, Some(3));
+        assert_eq!(phrase.seek(3)?, Some(3));
+        assert_eq!(phrase.seek(4)?, None);
+
+        let mut scorer = ReferenceScorer::phrase(build()?);
+        let winners = scorer.top_k(10, &AllLiveDocs)?;
+        assert_eq!(
+            winners
+                .iter()
+                .map(|winner| winner.global_docid)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_cost_estimate_follows_tantivy_child_cost_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(2); 12];
+        let encoded =
+            EncodedDocLenSection::encode(0, 12, &[4], &[DocLenFieldInput::new(4, &lengths)])?;
+        let section = encoded.section(&[4])?;
+        let field = section.field(4).expect("field exists");
+        let snapshot = snapshot(4, 24, 12)?;
+        let broad = PositionedVecCursor::new(
+            vec![
+                (0, vec![0]),
+                (1, vec![0]),
+                (2, vec![0]),
+                (3, vec![0]),
+                (4, vec![0]),
+            ],
+            5,
+            12,
+        );
+        let narrow = PositionedVecCursor::new(vec![(0, vec![1])], 1, 12);
+        let phrase = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(4, 0, broad, 5),
+                PhraseTerm::new(4, 1, narrow, 1),
+            ],
+            field,
+            snapshot,
+            1.0,
+        )?;
+
+        assert_eq!(estimate_intersection([5, 1].into_iter(), 12), 0);
+        assert_eq!(estimate_intersection([1, 5].into_iter(), 12), 1);
+        let scorer = ReferenceScorer::phrase(phrase);
+        assert_eq!(scorer.doc(), Some(0));
+        assert_eq!(scorer.cost(), 20);
+        assert_eq!(scorer.size_hint(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_scorer_handles_repeated_terms_same_position_or_and_query_gaps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(6); 16];
+        let encoded =
+            EncodedDocLenSection::encode(0, 16, &[2], &[DocLenFieldInput::new(2, &lengths)])?;
+        let section = encoded.section(&[2])?;
+        let field = section.field(2).expect("field exists");
+        let snapshot = snapshot(2, 96, 16)?;
+
+        let repeated_a = || PositionedVecCursor::new(vec![(7, vec![0, 1, 2])], 1, 16);
+        let repeated_b = PositionedVecCursor::new(vec![(7, vec![2, 3])], 1, 16);
+        let repeated = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(2, 0, repeated_a(), 1),
+                PhraseTerm::new(2, 1, repeated_a(), 1),
+                PhraseTerm::new(2, 2, repeated_b, 1),
+            ],
+            field,
+            snapshot.clone(),
+            1.0,
+        )?;
+        assert_eq!(repeated.doc(), Some(7));
+        let expected = expected_phrase_score(
+            &snapshot,
+            &[1, 1, 1],
+            field.fieldnorm_id(7).expect("fieldnorm"),
+            2,
+            1.0,
+        );
+        assert_eq!(repeated.score()?.to_bits(), expected.to_bits());
+
+        let alternative_x = PositionedVecCursor::new(vec![(8, vec![5]), (10, vec![1])], 2, 16);
+        let alternative_y = PositionedVecCursor::new(vec![(9, vec![10]), (10, vec![1])], 2, 16);
+        let following =
+            PositionedVecCursor::new(vec![(8, vec![6]), (9, vec![11]), (10, vec![2])], 3, 16);
+        let mut alternatives = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(2, 0, alternative_x, 2),
+                PhraseTerm::new(2, 0, alternative_y, 2),
+                PhraseTerm::new(2, 1, following, 3),
+            ],
+            field,
+            snapshot.clone(),
+            1.0,
+        )?;
+        for expected_doc in [8, 9, 10] {
+            assert_eq!(alternatives.doc(), Some(expected_doc));
+            let expected = expected_phrase_score(
+                &snapshot,
+                &[2, 2, 3],
+                field
+                    .fieldnorm_id(u64::from(expected_doc))
+                    .expect("fieldnorm"),
+                1,
+                1.0,
+            );
+            assert_eq!(alternatives.score()?.to_bits(), expected.to_bits());
+            alternatives.next()?;
+        }
+        assert_eq!(alternatives.doc(), None);
+
+        let gap_start = PositionedVecCursor::new(vec![(6, vec![10]), (11, vec![20])], 2, 16);
+        let gap_end = PositionedVecCursor::new(vec![(6, vec![12]), (11, vec![21])], 2, 16);
+        let mut gapped = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(2, 4, gap_start, 2),
+                PhraseTerm::new(2, 6, gap_end, 2),
+            ],
+            field,
+            snapshot,
+            1.0,
+        )?;
+        assert_eq!(gapped.doc(), Some(6));
+        assert_eq!(gapped.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_scorer_matches_tantivy_corpus_docs_ranks_and_score_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use frankensearch_lexical::tantivy_crate::{
+            Index, TantivyDocument, Term,
+            collector::{DocSetCollector, TopDocs},
+            doc,
+            query::PhraseQuery,
+            schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions},
+        };
+
+        let mut schema_builder = Schema::builder();
+        let indexing = TextFieldIndexing::default()
+            .set_tokenizer("default")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let body = schema_builder.add_text_field(
+            "body",
+            TextOptions::default().set_indexing_options(indexing),
+        );
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 15_000_000)?;
+        let corpus = [
+            "a b",
+            "a b a b",
+            "a x b",
+            "a only",
+            "b a",
+            "a b filler filler filler filler filler filler",
+        ];
+        for text in corpus {
+            writer.add_document(doc!(body => text))?;
+        }
+        writer.commit()?;
+        drop(writer);
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let query = PhraseQuery::new(vec![
+            Term::from_field_text(body, "a"),
+            Term::from_field_text(body, "b"),
+        ]);
+        let mut oracle_docset = searcher
+            .search(&query, &DocSetCollector)?
+            .into_iter()
+            .map(|address| {
+                assert_eq!(address.segment_ord, 0);
+                address.doc_id
+            })
+            .collect::<Vec<_>>();
+        oracle_docset.sort_unstable();
+        assert_eq!(oracle_docset, vec![0, 1, 5]);
+        let oracle_ranked = searcher
+            .search(&query, &TopDocs::with_limit(corpus.len()).order_by_score())?
+            .into_iter()
+            .map(|(score, address)| {
+                assert_eq!(address.segment_ord, 0);
+                (address.doc_id, score.to_bits())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            oracle_ranked
+                .iter()
+                .map(|(doc, _)| *doc)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 5]
+        );
+
+        let lengths = [Some(2), Some(4), Some(3), Some(2), Some(2), Some(8)];
+        let encoded =
+            EncodedDocLenSection::encode(0, 6, &[0], &[DocLenFieldInput::new(0, &lengths)])?;
+        let section = encoded.section(&[0])?;
+        let field = section.field(0).expect("field exists");
+        let snapshot = snapshot(0, 21, 6)?;
+        let a = PositionedVecCursor::new(
+            vec![
+                (0, vec![0]),
+                (1, vec![0, 2]),
+                (2, vec![0]),
+                (3, vec![0]),
+                (4, vec![1]),
+                (5, vec![0]),
+            ],
+            6,
+            6,
+        );
+        let b = PositionedVecCursor::new(
+            vec![
+                (0, vec![1]),
+                (1, vec![1, 3]),
+                (2, vec![2]),
+                (4, vec![0]),
+                (5, vec![1]),
+            ],
+            5,
+            6,
+        );
+        let phrase = PhraseScorer::new(
+            vec![PhraseTerm::new(0, 0, a, 6), PhraseTerm::new(0, 1, b, 5)],
+            field,
+            snapshot,
+            1.0,
+        )?;
+        let mut scorer = ReferenceScorer::phrase(phrase);
+        let quill_ranked = scorer
+            .top_k(corpus.len(), &AllLiveDocs)?
+            .into_iter()
+            .map(|hit| (hit.global_docid, hit.score.to_bits()))
+            .collect::<Vec<_>>();
+        assert_eq!(quill_ranked, oracle_ranked);
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_same_position_alternatives_are_reviewed_or_divergence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use frankensearch_lexical::tantivy_crate::{
+            Index, TantivyDocument, Term,
+            collector::DocSetCollector,
+            doc,
+            query::PhraseQuery,
+            schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions},
+            tokenizer::{PreTokenizedString, Token},
+        };
+
+        let mut schema_builder = Schema::builder();
+        let indexing = TextFieldIndexing::default()
+            .set_tokenizer("default")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let body = schema_builder.add_text_field(
+            "body",
+            TextOptions::default().set_indexing_options(indexing),
+        );
+        let index = Index::create_in_ram(schema_builder.build());
+        let token = |text: &str, position: usize, offset_from: usize, offset_to: usize| Token {
+            offset_from,
+            offset_to,
+            position,
+            text: text.to_owned(),
+            position_length: 1,
+        };
+        let docs = [
+            PreTokenizedString {
+                text: "a c".to_owned(),
+                tokens: vec![token("a", 0, 0, 1), token("c", 1, 2, 3)],
+            },
+            PreTokenizedString {
+                text: "b c".to_owned(),
+                tokens: vec![token("b", 0, 0, 1), token("c", 1, 2, 3)],
+            },
+            PreTokenizedString {
+                text: "a/b c".to_owned(),
+                tokens: vec![
+                    token("a", 0, 0, 3),
+                    token("b", 0, 0, 3),
+                    token("c", 1, 4, 5),
+                ],
+            },
+        ];
+        let mut writer = index.writer_with_num_threads::<TantivyDocument>(1, 15_000_000)?;
+        for text in docs {
+            writer.add_document(doc!(body => text))?;
+        }
+        writer.commit()?;
+        drop(writer);
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let oracle_query = PhraseQuery::new_with_offset(vec![
+            (0, Term::from_field_text(body, "a")),
+            (0, Term::from_field_text(body, "b")),
+            (1, Term::from_field_text(body, "c")),
+        ]);
+        let mut oracle_docids = searcher
+            .search(&oracle_query, &DocSetCollector)?
+            .into_iter()
+            .map(|address| {
+                assert_eq!(address.segment_ord, 0);
+                address.doc_id
+            })
+            .collect::<Vec<_>>();
+        oracle_docids.sort_unstable();
+        assert_eq!(oracle_docids, vec![2]);
+
+        let lengths = [Some(2), Some(2), Some(3)];
+        let encoded =
+            EncodedDocLenSection::encode(0, 3, &[0], &[DocLenFieldInput::new(0, &lengths)])?;
+        let section = encoded.section(&[0])?;
+        let field = section.field(0).expect("field exists");
+        let phrase = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(
+                    0,
+                    0,
+                    PositionedVecCursor::new(vec![(0, vec![0]), (2, vec![0])], 2, 3),
+                    2,
+                ),
+                PhraseTerm::new(
+                    0,
+                    0,
+                    PositionedVecCursor::new(vec![(1, vec![0]), (2, vec![0])], 2, 3),
+                    2,
+                ),
+                PhraseTerm::new(
+                    0,
+                    1,
+                    PositionedVecCursor::new(vec![(0, vec![1]), (1, vec![1]), (2, vec![1])], 3, 3),
+                    3,
+                ),
+            ],
+            field,
+            snapshot(0, 7, 3)?,
+            1.0,
+        )?;
+        let mut scorer = ReferenceScorer::phrase(phrase);
+        let mut quill_docids = scorer
+            .top_k(3, &AllLiveDocs)?
+            .into_iter()
+            .map(|hit| hit.global_docid)
+            .collect::<Vec<_>>();
+        quill_docids.sort_unstable();
+        assert_eq!(quill_docids, vec![0, 1, 2]);
+        assert_ne!(quill_docids, oracle_docids);
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_frequency_exceeds_u8_and_matches_u32_position_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(400); 16];
+        let encoded =
+            EncodedDocLenSection::encode(0, 16, &[9], &[DocLenFieldInput::new(9, &lengths)])?;
+        let section = encoded.section(&[9])?;
+        let field = section.field(9).expect("field exists");
+        let snapshot = snapshot(9, 6_400, 16)?;
+        let first = PositionedVecCursor::new(
+            vec![(11, (0..=300).collect()), (12, vec![u32::MAX - 1])],
+            2,
+            16,
+        );
+        let second =
+            PositionedVecCursor::new(vec![(11, (1..=301).collect()), (12, vec![u32::MAX])], 2, 16);
+        let mut phrase = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(9, 0, first, 2),
+                PhraseTerm::new(9, 1, second, 2),
+            ],
+            field,
+            snapshot.clone(),
+            1.0,
+        )?;
+
+        assert_eq!(phrase.doc(), Some(11));
+        let expected = expected_phrase_score(
+            &snapshot,
+            &[2, 2],
+            field.fieldnorm_id(11).expect("fieldnorm"),
+            301,
+            1.0,
+        );
+        assert_eq!(phrase.score()?.to_bits(), expected.to_bits());
+        assert_eq!(phrase.next()?, Some(12));
+        let expected = expected_phrase_score(
+            &snapshot,
+            &[2, 2],
+            field.fieldnorm_id(12).expect("fieldnorm"),
+            1,
+            1.0,
+        );
+        assert_eq!(phrase.score()?.to_bits(), expected.to_bits());
+        assert_eq!(phrase.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn phrase_constructor_rejects_missing_positions_and_invalid_slot_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(2); 4];
+        let encoded =
+            EncodedDocLenSection::encode(0, 4, &[3], &[DocLenFieldInput::new(3, &lengths)])?;
+        let section = encoded.section(&[3])?;
+        let field = section.field(3).expect("field exists");
+        let snapshot = snapshot(3, 8, 4)?;
+
+        let wrong_field = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(2, 0, PositionedVecCursor::new(vec![(0, vec![0])], 1, 4), 1),
+                PhraseTerm::new(3, 1, PositionedVecCursor::new(vec![(0, vec![1])], 1, 4), 1),
+            ],
+            field,
+            snapshot.clone(),
+            1.0,
+        );
+        assert!(matches!(
+            wrong_field,
+            Err(ArgusError::PhraseTermFieldMismatch {
+                term_field: 2,
+                stats_field: 3
+            })
+        ));
+
+        let missing_positions = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(3, 0, VecCursor::new(postings(&[0]), 1, 4), 1),
+                PhraseTerm::new(3, 1, PositionedVecCursor::new(vec![(0, vec![1])], 1, 4), 1),
+            ],
+            field,
+            snapshot.clone(),
+            1.0,
+        );
+        assert!(matches!(
+            missing_positions,
+            Err(ArgusError::MissingPositions {
+                field_ord: 3,
+                global_docid: 0
+            })
+        ));
+
+        let descending = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(3, 2, PositionedVecCursor::new(vec![(0, vec![2])], 1, 4), 1),
+                PhraseTerm::new(3, 1, PositionedVecCursor::new(vec![(0, vec![1])], 1, 4), 1),
+            ],
+            field,
+            snapshot.clone(),
+            1.0,
+        );
+        assert!(matches!(descending, Err(ArgusError::InvalidPhrase { .. })));
+
+        let one_slot = PhraseScorer::new(
+            vec![
+                PhraseTerm::new(3, 0, PositionedVecCursor::new(vec![(0, vec![0])], 1, 4), 1),
+                PhraseTerm::new(3, 0, PositionedVecCursor::new(vec![(0, vec![0])], 1, 4), 1),
+            ],
+            field,
+            snapshot,
+            1.0,
+        );
+        assert!(matches!(one_slot, Err(ArgusError::InvalidPhrase { .. })));
         Ok(())
     }
 

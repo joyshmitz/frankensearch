@@ -72,6 +72,16 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Decision: fix (bead: `bd-cass-wildcard-fst-anchors-t3f9`)
 - Reviewer: not required for a fix decision
 
+### DIV-003: same-position phrase terms are alternatives
+
+- Class: `QueryCanonicalization`
+- First seen: 2026-07-18 · `phrase_same_position_alternatives_are_reviewed_or_divergence`
+- Root cause: Quill groups analyzed phrase terms with the same query position into one OR slot, as required by the `HyphenDecompose` language contract. Pinned Tantivy instead puts every equal-offset term in its phrase intersection, so all of them must occur at that position.
+- Consumer impact: a phrase produced by an analyzer that emits alternatives at one position can match a document containing any one alternative in Quill, while Tantivy requires every alternative. Ordinary phrases with one term per position are unaffected. Quill's fixed phrase weight still sums IDF in original term order, including every alternative.
+- Fixture: `phrase_same_position_alternatives_are_reviewed_or_divergence`
+- Decision: accept
+- Reviewer: `/root/e45_algo_review` · 2026-07-18
+
 ---
 
 *Cross-references: comparator classes implemented in the gauntlet kernel (bead e0.5); auto-triage feeding this ledger (bd-quill-duel-shrinker); statistical gates consuming per-class pass rates (bead e6.6); G2 exit requires this register complete over two consecutive nightly runs (bead e6.8).*
