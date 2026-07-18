@@ -165,7 +165,7 @@ mod tests {
         assert!(matches!(
             error,
             SearchError::IndexCorrupted { path, detail }
-                if path == PathBuf::from("index/seg-1.fslx")
+                if path.as_path() == Path::new("index/seg-1.fslx")
                     && detail == "section checksum mismatch"
         ));
     }
