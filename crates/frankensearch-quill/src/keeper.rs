@@ -11959,6 +11959,139 @@ mod tests {
 
     #[cfg(all(unix, feature = "durability"))]
     #[test]
+    fn durable_open_rejects_hostile_sidecars_without_exhaustion() -> TestResult {
+        // bd-x7l7: hostile .fec sidecars must be typed rejections through the
+        // automatic Keeper recovery path — never a memory-exhaustion event.
+        // Case A: oversized sidecar. Case B: truncated sidecar. Case C:
+        // forged trailer counts. Each index is independent.
+        use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
+
+        let small_cap_protector = || {
+            FileProtector::new(
+                Arc::new(DefaultSymbolCodec),
+                DurabilityConfig {
+                    symbol_size: 256,
+                    repair_overhead: 2.0,
+                    max_repair_symbols: 64,
+                    ..DurabilityConfig::default()
+                },
+            )
+            .expect("small-cap protector")
+        };
+
+        // Build one healthy durable index per case.
+        let make_index = |label: &str| -> Result<
+            (tempfile::TempDir, std::path::PathBuf),
+            Box<dyn std::error::Error>,
+        > {
+            let index = tempdir()?;
+            let directory = index.path().to_path_buf();
+            let protector = test_file_protector();
+            run_with_test_cx(move |cx| async move {
+                let mut writer =
+                    KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, protector)
+                        .await
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                writer
+                    .publish(&cx, &durable_test_manifest(2, Vec::new()))
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                Ok::<(), io::Error>(())
+            })?;
+            let manifest_sidecar = index.path().join(format!("MANIFEST.fec.{label}"));
+            Ok((index, manifest_sidecar))
+        };
+
+        // Case A: oversized sidecar is rejected at the stat bound.
+        let (index, _unused) = make_index("oversized")?;
+        // Oversize BOTH manifest sidecars so every recovery path hits the
+        // bounded-read rejection (a valid MANIFEST.prev.fec would otherwise
+        // recover the previous slot and open successfully).
+        for sidecar in ["MANIFEST.fec", "MANIFEST.prev.fec"] {
+            std::fs::write(index.path().join(sidecar), vec![0xaa_u8; 64 * 1024])?;
+        }
+        // Corrupt both manifest slots so the automatic recovery path must
+        // engage the sidecar read.
+        for slot in ["MANIFEST", "MANIFEST.prev"] {
+            let slot_path = index.path().join(slot);
+            let mut bytes = std::fs::read(&slot_path)?;
+            bytes[16] ^= 0xff;
+            std::fs::write(&slot_path, &bytes)?;
+        }
+        let directory = index.path().to_path_buf();
+        let protector = small_cap_protector();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            match KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, protector).await {
+                Ok(_) => Err("oversized sidecar must not open".to_owned()),
+                Err(error) => {
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("exceeding"),
+                        "rejection must name the bound: {text}"
+                    );
+                    Ok(())
+                }
+            }
+        });
+        outcome.map_err(io::Error::other)?;
+
+        // Case B: truncated sidecar is a typed corruption error.
+        let (index, _unused) = make_index("truncated")?;
+        for sidecar in ["MANIFEST.fec", "MANIFEST.prev.fec"] {
+            let sidecar_path = index.path().join(sidecar);
+            let mut trailer = std::fs::read(&sidecar_path)?;
+            trailer.truncate(trailer.len() / 2);
+            std::fs::write(&sidecar_path, &trailer)?;
+        }
+        // Also corrupt both manifest slots so recovery actually engages.
+        for slot in ["MANIFEST", "MANIFEST.prev"] {
+            let slot_path = index.path().join(slot);
+            let mut bytes = std::fs::read(&slot_path)?;
+            bytes[16] ^= 0xff;
+            std::fs::write(&slot_path, &bytes)?;
+        }
+        let directory = index.path().to_path_buf();
+        let protector = small_cap_protector();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            match KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, protector).await {
+                Ok(_) => Err("truncated sidecar must not silently succeed".to_owned()),
+                Err(_) => Ok(()),
+            }
+        });
+        outcome.map_err(io::Error::other)?;
+
+        // Case C: forged trailer counts are rejected before allocation.
+        let (index, _unused) = make_index("forged")?;
+        for sidecar in ["MANIFEST.fec", "MANIFEST.prev.fec"] {
+            let sidecar_path = index.path().join(sidecar);
+            let mut trailer = std::fs::read(&sidecar_path)?;
+            // V2 layout: repair_symbol_count at offset 34; then fix the trailer CRC.
+            trailer[34..38].copy_from_slice(&1_000_000_u32.to_le_bytes());
+            let crc = crc32fast::hash(&trailer[..trailer.len() - 4]);
+            let end = trailer.len();
+            trailer[end - 4..].copy_from_slice(&crc.to_le_bytes());
+            std::fs::write(&sidecar_path, &trailer)?;
+        }
+        for slot in ["MANIFEST", "MANIFEST.prev"] {
+            let slot_path = index.path().join(slot);
+            let mut bytes = std::fs::read(&slot_path)?;
+            bytes[16] ^= 0xff;
+            std::fs::write(&slot_path, &bytes)?;
+        }
+        let directory = index.path().to_path_buf();
+        let protector = small_cap_protector();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            match KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, protector).await {
+                Ok(_) => Err("forged counts must not silently succeed".to_owned()),
+                Err(_) => Ok(()),
+            }
+        });
+        outcome.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
     fn unrecoverable_reconstructed_current_preserves_previous_authority() -> TestResult {
         let index = tempdir()?;
         let protector = test_file_protector();

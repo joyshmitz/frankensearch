@@ -550,7 +550,8 @@ impl FileProtector {
     /// Falls back to CRC32 verification for V1 trailers or when xxh3 hash is zero.
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn verify_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileVerifyResult> {
-        Self::verify_file_impl(path, sidecar_path).map(|(result, _)| result)
+        self.verify_file_impl(path, sidecar_path)
+            .map(|(result, _)| result)
     }
 
     /// Check whether a sidecar is bound to an externally verified source
@@ -565,7 +566,7 @@ impl FileProtector {
         sidecar_path: &Path,
         witness: FileSourceWitness,
     ) -> SearchResult<bool> {
-        let trailer_bytes = fs::read(sidecar_path)?;
+        let trailer_bytes = self.read_sidecar_bounded(sidecar_path)?;
         let decoded = deserialize_repair_trailer(&trailer_bytes)?;
         let header = &decoded.0;
 
@@ -576,12 +577,32 @@ impl FileProtector {
             && header.source_xxh3 == witness.source_xxh3)
     }
 
+    /// Read a repair sidecar with its byte size proven bounded *before*
+    /// allocation (bd-x7l7). A sidecar larger than the configuration-derived
+    /// hard cap is rejected as typed corruption instead of being slurped into
+    /// memory; within the cap, the trailer's own layout validation
+    /// (`deserialize_repair_trailer`) pins the exact expected size.
+    pub(crate) fn read_sidecar_bounded(&self, sidecar_path: &Path) -> SearchResult<Vec<u8>> {
+        let cap = sidecar_hard_cap(self.codec.config())?;
+        let len = fs::metadata(sidecar_path)?.len();
+        if len > cap {
+            return Err(SearchError::IndexCorrupted {
+                path: sidecar_path.to_path_buf(),
+                detail: format!(
+                    "repair sidecar is {len} bytes, exceeding the {cap}-byte durability limit"
+                ),
+            });
+        }
+        fs::read(sidecar_path).map_err(SearchError::Io)
+    }
+
     /// Like [`Self::verify_file`] but also returns the fully-decoded trailer. When
     /// verification finds corruption, [`Self::verify_and_repair_file`] hands this decode
     /// straight to repair so it does not re-read the sidecar, re-deserialize the trailer,
     /// and recompute the source CRC32 a second time (the residual `verify_file` +
     /// `recover_file_internal` re-verify left by the fe866683 standalone-repair reuse).
     fn verify_file_impl(
+        &self,
         path: &Path,
         sidecar_path: &Path,
     ) -> SearchResult<(FileVerifyResult, (RepairTrailerHeader, Vec<RepairSymbol>))> {
@@ -589,7 +610,7 @@ impl FileProtector {
         let len = file.metadata()?.len();
 
         // Read trailer first to get expected values
-        let trailer_bytes = fs::read(sidecar_path)?;
+        let trailer_bytes = self.read_sidecar_bounded(sidecar_path)?;
         let decoded = deserialize_repair_trailer(&trailer_bytes)?;
         // Header fields are Copy; take them so `decoded` can be returned unmoved.
         let source_xxh3 = decoded.0.source_xxh3;
@@ -658,7 +679,7 @@ impl FileProtector {
             Err(err) => return Err(SearchError::Io(err)),
         };
 
-        let trailer_bytes = fs::read(sidecar_path)?;
+        let trailer_bytes = self.read_sidecar_bounded(sidecar_path)?;
         let (header, trailer_symbols) = deserialize_repair_trailer(&trailer_bytes)?;
 
         if header.source_len == 0 {
@@ -816,7 +837,7 @@ impl FileProtector {
                 // Verify first - using mmap
                 let len = file.metadata()?.len();
                 let (healthy, decoded_trailer) = if len == 0 {
-                    let trailer_bytes = fs::read(sidecar_path)?;
+                    let trailer_bytes = self.read_sidecar_bounded(sidecar_path)?;
                     let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
                     let header = &decoded_trailer.0;
                     (
@@ -827,7 +848,7 @@ impl FileProtector {
                     )
                 } else {
                     let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
-                    let trailer_bytes = fs::read(sidecar_path)?;
+                    let trailer_bytes = self.read_sidecar_bounded(sidecar_path)?;
                     let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
                     let header = &decoded_trailer.0;
                     let actual_crc32 = crc32fast::hash(&mmap);
@@ -850,7 +871,7 @@ impl FileProtector {
             match decoded_trailer {
                 Some(decoded_trailer) => decoded_trailer,
                 None => {
-                    let trailer_bytes = fs::read(sidecar_path)?;
+                    let trailer_bytes = self.read_sidecar_bounded(sidecar_path)?;
                     deserialize_repair_trailer(&trailer_bytes)?
                 }
             }
@@ -886,11 +907,23 @@ impl FileProtector {
             let len = file.metadata()?.len();
             if len > 0 {
                 if len == header.source_len {
-                    // Bit-rot case: length matches but verification failed.
-                    // Feeding corrupted source symbols to an erasure codec (which expects
-                    // valid symbols or erasures) usually prevents recovery or produces
-                    // garbage. We skip loading source symbols to avoid OOM on large files
-                    // and rely entirely on repair symbols.
+                    // Same-length bitrot contract (bd-x7l7, enforced here and
+                    // pinned by `same_length_bitrot_contract_across_repair_overhead`):
+                    // the source is reconstructed from REPAIR SYMBOLS ONLY.
+                    // Erasure-codec equations built from corrupted source
+                    // symbols would poison the solve, and no per-symbol
+                    // checksum exists to identify the corrupt ones, so every
+                    // source symbol is treated as an erasure. Recovery is
+                    // therefore possible only when
+                    // `repair_symbol_count >= k_source` — guaranteed for
+                    // sidecars written under a valid `DurabilityConfig`
+                    // (`repair_overhead >= 1.0` is enforced at construction),
+                    // and reported as a typed `Unrecoverable` when the
+                    // budget fell short anyway (e.g. trimmed by the
+                    // `max_repair_symbols` guardrail). The decoded payload
+                    // is always re-validated against the trailer CRC32 and
+                    // xxh3 witnesses before acceptance, so a poisoned decode
+                    // fails closed and no unverified byte is published.
                     warn!(
                         path = %logical_path.display(),
                         recovery_source = %source_path.display(),
@@ -1022,7 +1055,7 @@ impl FileProtector {
 
         // Verify once, retaining the decoded trailer. On corruption, hand it straight to repair
         // so it does not re-mmap the source, recompute its CRC32, and re-deserialize the sidecar.
-        let verified_decode = match Self::verify_file_impl(path, &sidecar) {
+        let verified_decode = match self.verify_file_impl(path, &sidecar) {
             Ok((verify, _)) if verify.healthy => {
                 return Ok(HealthCheckResult {
                     path: path.to_path_buf(),
@@ -1441,6 +1474,35 @@ fn normalize_recovered_data(
         data.truncate(expected_len);
     }
     Ok(data)
+}
+
+/// Configuration-derived hard upper bound on one repair sidecar's byte size
+/// (bd-x7l7): fixed trailer framing plus the configured maximum number of
+/// repair symbols at the configured symbol size. Everything above this cap is
+/// structurally impossible for a sidecar this configuration could have
+/// written, so it is rejected before any allocation happens.
+fn sidecar_hard_cap(config: &DurabilityConfig) -> SearchResult<u64> {
+    let per_symbol = u64::from(config.symbol_size)
+        .checked_add(8)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "symbol_size".to_owned(),
+            value: config.symbol_size.to_string(),
+            reason: "symbol size plus length prefix overflows u64".to_owned(),
+        })?;
+    let symbols = u64::from(config.max_repair_symbols)
+        .checked_mul(per_symbol)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "max_repair_symbols".to_owned(),
+            value: config.max_repair_symbols.to_string(),
+            reason: "repair sidecar cap overflows u64".to_owned(),
+        })?;
+    symbols
+        .checked_add(crate::repair_trailer::MIN_TRAILER_BYTES as u64)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "max_repair_symbols".to_owned(),
+            value: config.max_repair_symbols.to_string(),
+            reason: "repair sidecar cap overflows u64".to_owned(),
+        })
 }
 
 fn source_symbols_from_bytes(
@@ -2609,7 +2671,7 @@ mod e2e_tests {
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
     use fsqlite_types::cx::Cx;
 
-    use super::{FileHealth, FileProtector, RepairPipelineConfig};
+    use super::{FileHealth, FileProtector, FileRecoveryOutcome, RepairPipelineConfig};
     use crate::config::DurabilityConfig;
     use crate::fsvi_protector::{FsviProtector, FsviVerifyResult};
     use crate::metrics::DurabilityMetrics;
@@ -3201,5 +3263,278 @@ mod e2e_tests {
         let path = std::path::Path::new("/nonexistent/dir/file.bin");
         let result = super::write_durable(path, b"data");
         assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // bd-x7l7: bounded sidecar reads + same-length bitrot contract
+    // ------------------------------------------------------------------
+
+    /// Mock codec that honors `repair_overhead`: emits `ceil(k * overhead)`
+    /// repair copies, each duplicating one source symbol (mirroring
+    /// `MockRepairCodec`'s decode contract).
+    #[derive(Debug)]
+    struct OverheadAwareMockCodec;
+
+    impl SymbolCodec for OverheadAwareMockCodec {
+        fn encode(
+            &self,
+            _cx: &Cx,
+            source_data: &[u8],
+            symbol_size: u32,
+            repair_overhead: f64,
+        ) -> fsqlite_error::Result<CodecEncodeResult> {
+            let symbol_size_usize = usize::try_from(symbol_size).unwrap_or(1);
+            let mut source_symbols = Vec::new();
+            let mut repair_symbols = Vec::new();
+            let mut esi: u32 = 0;
+            for chunk in source_data.chunks(symbol_size_usize) {
+                let mut data = chunk.to_vec();
+                if data.len() < symbol_size_usize {
+                    data.resize(symbol_size_usize, 0);
+                }
+                source_symbols.push((esi, data.clone()));
+                repair_symbols.push((esi + 1_000_000, data));
+                esi = esi.saturating_add(1);
+            }
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let requested = (f64::from(esi) * repair_overhead).ceil().max(0.0) as usize;
+            repair_symbols.truncate(requested);
+            Ok(CodecEncodeResult {
+                source_symbols,
+                repair_symbols,
+                k_source: esi,
+            })
+        }
+
+        fn decode(
+            &self,
+            _cx: &Cx,
+            symbols: &[(u32, Vec<u8>)],
+            k_source: u32,
+            _symbol_size: u32,
+        ) -> fsqlite_error::Result<CodecDecodeResult> {
+            let mut reconstructed = Vec::new();
+            for source_esi in 0..k_source {
+                let primary = symbols
+                    .iter()
+                    .find(|(esi, _)| *esi == source_esi)
+                    .map(|(_, data)| data.clone());
+                let fallback = symbols
+                    .iter()
+                    .find(|(esi, _)| *esi == source_esi + 1_000_000)
+                    .map(|(_, data)| data.clone());
+                match primary.or(fallback) {
+                    Some(data) => reconstructed.extend_from_slice(&data),
+                    None => {
+                        return Ok(CodecDecodeResult::Failure {
+                            reason: fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
+                            symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                            k_required: k_source,
+                        });
+                    }
+                }
+            }
+            Ok(CodecDecodeResult::Success {
+                data: reconstructed,
+                symbols_used: k_source,
+                peeled_count: k_source,
+                inactivated_count: 0,
+            })
+        }
+    }
+
+    fn overhead_protector(repair_overhead: f64) -> FileProtector {
+        FileProtector::new(
+            Arc::new(OverheadAwareMockCodec),
+            DurabilityConfig {
+                symbol_size: 256,
+                repair_overhead,
+                ..DurabilityConfig::default()
+            },
+        )
+        .expect("protector")
+    }
+
+    fn flip_one_byte(path: &std::path::Path) {
+        let mut bytes = std::fs::read(path).expect("read source");
+        bytes[0] ^= 0xff;
+        std::fs::write(path, bytes).expect("rewrite corrupt source");
+    }
+
+    /// Contract (bd-x7l7, enforced + documented at the recovery site): a
+    /// same-length-corrupt source is reconstructed from REPAIR SYMBOLS ONLY,
+    /// because erasure-codec equations built from corrupted source symbols
+    /// would poison the solve. Recovery therefore requires
+    /// `repair_symbol_count >= k_source`. Two mechanisms enforce it:
+    /// construction (`DurabilityConfig::validate` rejects
+    /// `repair_overhead < 1.0`) and a typed `Unrecoverable` when a sidecar's
+    /// repair budget fell short anyway (e.g. trimmed by the
+    /// `max_repair_symbols` guardrail). No unverified byte is ever
+    /// published — the decoded payload is always re-validated against the
+    /// trailer CRC32 and xxh3 witnesses before acceptance, and the corrupt
+    /// source is left untouched on failure.
+    #[test]
+    fn same_length_bitrot_contract_across_repair_overhead() {
+        let payload: Vec<u8> = (0..700).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        // 700 bytes / 256-byte symbols -> k_source = 3.
+
+        // Construction enforcement: overhead below 1.0 is invalid config.
+        let rejected = FileProtector::new(
+            Arc::new(OverheadAwareMockCodec),
+            DurabilityConfig {
+                symbol_size: 256,
+                repair_overhead: 0.5,
+                ..DurabilityConfig::default()
+            },
+        );
+        assert!(
+            rejected.is_err(),
+            "repair_overhead < 1.0 must be rejected at construction"
+        );
+
+        // Recovery side: any valid overhead recovers with exact bytes.
+        for (overhead, max_repair_symbols, expect_recovered) in [
+            (1.0, 250_000, true),
+            (1.25, 250_000, true),
+            // Guardrail trimmed the budget below k_source: typed
+            // Unrecoverable, never wrong bytes.
+            (2.0, 2, false),
+        ] {
+            let protector = FileProtector::new(
+                Arc::new(OverheadAwareMockCodec),
+                DurabilityConfig {
+                    symbol_size: 256,
+                    repair_overhead: overhead,
+                    max_repair_symbols,
+                    ..DurabilityConfig::default()
+                },
+            )
+            .expect("protector");
+            let path = temp_path(&format!("bitrot-contract-{overhead}-{max_repair_symbols}"));
+            std::fs::write(&path, &payload).expect("write payload");
+            protector.protect_file(&path).expect("protect");
+            let sidecar = FileProtector::sidecar_path(&path);
+            flip_one_byte(&path);
+
+            let outcome = protector
+                .recover_file_bytes(&path, &sidecar)
+                .expect("recovery path completes");
+            if expect_recovered {
+                let FileRecoveryOutcome::Recovered { bytes, .. } = outcome else {
+                    panic!("overhead {overhead} must recover, got {outcome:?}");
+                };
+                assert_eq!(
+                    bytes, payload,
+                    "overhead {overhead}: recovered bytes must be exact"
+                );
+            } else {
+                let FileRecoveryOutcome::Unrecoverable { .. } = outcome else {
+                    panic!("capped budget must be typed-unrecoverable, got {outcome:?}");
+                };
+            }
+            // Fail-closed: the corrupt source is never rewritten by recovery.
+            let on_disk = std::fs::read(&path).expect("read source after recovery");
+            assert_eq!(on_disk.len(), payload.len());
+            assert_ne!(
+                on_disk, payload,
+                "corrupt source must remain untouched (overhead {overhead})"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_sidecar_is_rejected_before_allocation() {
+        // A tiny configured cap: 42 + 16 * (256 + 8) = 4,266 bytes.
+        let protector = FileProtector::new(
+            Arc::new(OverheadAwareMockCodec),
+            DurabilityConfig {
+                symbol_size: 256,
+                max_repair_symbols: 16,
+                ..DurabilityConfig::default()
+            },
+        )
+        .expect("protector");
+        let path = temp_path("oversized-sidecar");
+        std::fs::write(&path, b"payload").expect("write payload");
+        let sidecar = FileProtector::sidecar_path(&path);
+        std::fs::write(&sidecar, vec![0xaa_u8; 1024 * 1024]).expect("write hostile sidecar");
+
+        let error = protector
+            .recover_file_bytes(&path, &sidecar)
+            .expect_err("oversized sidecar is a typed rejection");
+        let SearchError::IndexCorrupted { detail, .. } = error else {
+            panic!("expected IndexCorrupted, got {error:?}");
+        };
+        assert!(
+            detail.contains("exceeding"),
+            "rejection must name the bound: {detail}"
+        );
+    }
+
+    fn patch_trailer_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        let crc = crc32fast::hash(&bytes[..bytes.len() - 4]);
+        let end = bytes.len();
+        bytes[end - 4..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn hostile_trailer_counts_are_typed_errors_not_allocations() {
+        let payload = vec![42_u8; 700];
+        let path = temp_path("hostile-counts");
+        std::fs::write(&path, &payload).expect("write payload");
+        let protector = overhead_protector(2.0);
+        protector.protect_file(&path).expect("protect");
+        let sidecar = FileProtector::sidecar_path(&path);
+        flip_one_byte(&path);
+
+        // k_source = u32::MAX: the layout equation rejects it before any
+        // decode allocation can be driven by the hostile count.
+        let mut forged = std::fs::read(&sidecar).expect("read sidecar");
+        patch_trailer_u32(&mut forged, 10, u32::MAX);
+        std::fs::write(&sidecar, &forged).expect("write forged sidecar");
+        let error = protector
+            .recover_file_bytes(&path, &sidecar)
+            .expect_err("hostile k_source is a typed rejection");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { .. }),
+            "expected IndexCorrupted, got {error:?}"
+        );
+
+        // repair_symbol_count inflated beyond the payload: same story.
+        // First restore the original sidecar, then forge the count.
+        let protector = overhead_protector(2.0);
+        protector.protect_file(&path).expect("re-protect");
+        let mut forged = std::fs::read(&sidecar).expect("read sidecar");
+        patch_trailer_u32(&mut forged, 34, 1_000_000);
+        std::fs::write(&sidecar, &forged).expect("write forged sidecar");
+        let error = protector
+            .recover_file_bytes(&path, &sidecar)
+            .expect_err("hostile repair_symbol_count is a typed rejection");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { .. }),
+            "expected IndexCorrupted, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_sidecar_is_a_typed_error() {
+        let payload = vec![42_u8; 700];
+        let path = temp_path("truncated-sidecar");
+        std::fs::write(&path, &payload).expect("write payload");
+        let protector = overhead_protector(2.0);
+        protector.protect_file(&path).expect("protect");
+        let sidecar = FileProtector::sidecar_path(&path);
+        flip_one_byte(&path);
+        let mut trailer = std::fs::read(&sidecar).expect("read sidecar");
+        trailer.truncate(trailer.len() / 2);
+        std::fs::write(&sidecar, &trailer).expect("write truncated sidecar");
+        let error = protector
+            .recover_file_bytes(&path, &sidecar)
+            .expect_err("truncated sidecar is a typed rejection");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { .. }),
+            "expected IndexCorrupted, got {error:?}"
+        );
     }
 }

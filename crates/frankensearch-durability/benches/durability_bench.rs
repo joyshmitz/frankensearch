@@ -633,13 +633,19 @@ fn bench_symbol_build(c: &mut Criterion) {
             "symbol build diverged at {size_mb}MB"
         );
 
-        group.throughput(criterion::Throughput::Bytes(u64::from(size_mb) * 1024 * 1024));
+        group.throughput(criterion::Throughput::Bytes(
+            u64::from(size_mb) * 1024 * 1024,
+        ));
         group.bench_with_input(BenchmarkId::new("zero_init_old", size_mb), &(), |b, ()| {
             b.iter(|| black_box(build_symbols_old(black_box(&source), symbol_size)));
         });
-        group.bench_with_input(BenchmarkId::new("direct_copy_new", size_mb), &(), |b, ()| {
-            b.iter(|| black_box(build_symbols_new(black_box(&source), symbol_size)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("direct_copy_new", size_mb),
+            &(),
+            |b, ()| {
+                b.iter(|| black_box(build_symbols_new(black_box(&source), symbol_size)));
+            },
+        );
     }
     group.finish();
 }
@@ -653,6 +659,7 @@ fn bench_symbol_build(c: &mut Criterion) {
 // repaired output (asserted). Re-corrupts each iteration (repair is destructive), so the timed region
 // includes the same corrupt-write cost in both arms — the delta is the eliminated second verify.
 #[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::needless_pass_by_ref_mut)] // `c` is mutated only under the `bench-internals` gate
 fn bench_verify_repair_reuse(c: &mut Criterion) {
     #[cfg(feature = "bench-internals")]
     {
@@ -679,7 +686,9 @@ fn bench_verify_repair_reuse(c: &mut Criterion) {
             if reuse {
                 protector.verify_and_repair_file(&file).expect("vr");
             } else {
-                protector.verify_and_repair_file_no_reuse(&file).expect("vr");
+                protector
+                    .verify_and_repair_file_no_reuse(&file)
+                    .expect("vr");
             }
             std::fs::read(&file).expect("read repaired")
         };

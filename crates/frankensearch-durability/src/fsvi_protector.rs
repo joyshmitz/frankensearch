@@ -164,7 +164,7 @@ impl FsviProtector {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // Validate the sidecar payload before declaring repairable.
-                let trailer_bytes = fs::read(&sidecar_path).map_err(SearchError::Io)?;
+                let trailer_bytes = self.protector.read_sidecar_bounded(&sidecar_path)?;
                 let _ = deserialize_repair_trailer(&trailer_bytes)?;
                 let repairable = self.protector.is_repairable(fsvi_path, &sidecar_path)?;
                 warn!(
@@ -187,7 +187,7 @@ impl FsviProtector {
         };
 
         // Read sidecar trailer to get expected hash
-        let trailer_bytes = fs::read(&sidecar_path).map_err(SearchError::Io)?;
+        let trailer_bytes = self.protector.read_sidecar_bounded(&sidecar_path)?;
         let (header, _) = deserialize_repair_trailer(&trailer_bytes)?;
 
         if header.source_xxh3 != 0 && actual_hash == header.source_xxh3 {

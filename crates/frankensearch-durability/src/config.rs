@@ -12,7 +12,10 @@ pub struct DurabilityConfig {
     pub symbol_size: u32,
     /// Maximum block size used by the upstream codec implementation.
     pub max_block_size: u32,
-    /// Repair overhead multiplier (`1.20` = 20% repair symbols).
+    /// Repair overhead multiplier (`1.20` = 20% repair symbols). Must be at
+    /// least `1.0`: same-length bitrot recovery reconstructs from repair
+    /// symbols alone (source symbols are treated as erasures), so the repair
+    /// budget must cover all `k_source` source symbols (bd-x7l7 contract).
     pub repair_overhead: f64,
     /// Hard cap for generated repair symbols per payload.
     pub max_repair_symbols: u32,

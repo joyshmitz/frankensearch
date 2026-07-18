@@ -9,7 +9,7 @@ pub const REPAIR_TRAILER_VERSION: u16 = 2;
 
 const FIXED_HEADER_BYTES: usize = 4 + 2 + 4 + 4 + 8 + 4 + 8 + 4;
 const TRAILER_CRC_BYTES: usize = 4;
-const MIN_TRAILER_BYTES: usize = FIXED_HEADER_BYTES + TRAILER_CRC_BYTES;
+pub(crate) const MIN_TRAILER_BYTES: usize = FIXED_HEADER_BYTES + TRAILER_CRC_BYTES;
 const LENGTH_PREFIX_BYTES: usize = 8;
 
 /// Header metadata stored before serialized repair symbols.
@@ -143,6 +143,37 @@ pub fn deserialize_repair_trailer(
         ));
     }
 
+    // Hostile-count hardening (bd-x7l7): every downstream decode allocation
+    // is driven by the declared counts, so they must prove internally
+    // consistent *before* any allocation happens. `k_source` must tile the
+    // source exactly, and because every repair symbol payload is exactly
+    // `symbol_size` bytes the complete payload size is fully determined by
+    // the header — any deviation means a forged or truncated sidecar.
+    if header.source_len > 0 {
+        let expected_k = header.source_len.div_ceil(u64::from(header.symbol_size));
+        if u64::from(header.k_source) != expected_k {
+            return Err(trailer_corruption(
+                "repair trailer k_source does not tile source_len",
+            ));
+        }
+    }
+    let per_symbol_bytes = u64::from(header.symbol_size)
+        .checked_add(LENGTH_PREFIX_BYTES as u64)
+        .ok_or_else(|| trailer_corruption("repair trailer symbol size overflows"))?;
+    let cursor_bytes = u64::try_from(cursor)
+        .map_err(|_| trailer_corruption("repair trailer cursor overflows u64"))?;
+    let payload_bytes = u64::try_from(payload.len())
+        .map_err(|_| trailer_corruption("repair trailer payload overflows u64"))?;
+    let expected_payload_len = u64::from(header.repair_symbol_count)
+        .checked_mul(per_symbol_bytes)
+        .and_then(|symbols_bytes| cursor_bytes.checked_add(symbols_bytes))
+        .ok_or_else(|| trailer_corruption("repair trailer declared size overflows"))?;
+    if expected_payload_len != payload_bytes {
+        return Err(trailer_corruption(
+            "repair trailer byte size is inconsistent with declared counts",
+        ));
+    }
+
     let mut symbols = Vec::new();
     while cursor < payload.len() {
         if payload.len() - cursor < LENGTH_PREFIX_BYTES {
@@ -253,9 +284,9 @@ mod tests {
     #[test]
     fn trailer_roundtrip() {
         let header = RepairTrailerHeader {
-            symbol_size: 4096,
-            k_source: 10,
-            source_len: 123_456,
+            symbol_size: 4,
+            k_source: 2,
+            source_len: 7,
             source_crc32: 0xABCD_EF01,
             source_xxh3: 0,
             repair_symbol_count: 2,
@@ -263,7 +294,7 @@ mod tests {
         let symbols = vec![
             RepairSymbol {
                 esi: 11,
-                data: vec![1, 2, 3],
+                data: vec![1, 2, 3, 0],
             },
             RepairSymbol {
                 esi: 12,
