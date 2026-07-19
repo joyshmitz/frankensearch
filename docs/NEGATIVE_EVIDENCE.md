@@ -15602,3 +15602,52 @@ local Cargo fallback was used.
 **Decision: HOLD.** Restore `keeper.rs` exactly and retain only this evidence.
 Leave `bd-quill-e3-keeper-ndtk.5` `in_progress`, add no PERF_LEDGER win, and do
 not claim the flat CPU/physical-byte acceptance criterion.
+
+### 2026-07-19 — SapphireHill — HOLD follow-up: bulk STOREDMETA gap-offset emission accelerates every size but worsens concat scaling (`bd-quill-e3-keeper-ndtk.5`)
+
+This one-lever candidate replaced STOREDMETA's scalar four-byte append for every
+burned-tail hole and stored field with a byte-identical bulk emitter. The helper
+seeded one little-endian `u32` and geometrically duplicated the initialized range
+with `Vec::extend_from_within`; the enclosing concat path had already validated
+the exact output layout and reserved the complete section. At 16 sources and
+five stored fields this removed roughly 4.9 million tiny `Vec` extension calls
+without changing offset values, presence bits, blobs, or validation order.
+
+A focused scalar-oracle test covered counts 0/1/2/3, doubling boundaries around
+64 and 1024, and the production-sized 65,472/65,473 gaps for values `0`,
+`0x01020304`, and `u32::MAX`. It passed strict-remotely alongside both existing
+STOREDMETA concat equivalence tests. The complete strict-remote Quill library
+suite then passed on `ovh-a` (378 passed, 1 ignored, 0 failed). Crate-scoped
+`clippy -D warnings` reached Quill and stopped only on the four pre-existing
+peer-owned `index.rs` findings; the candidate-owned `quiver.rs` produced no
+lint. The exact file also passed `rustfmt --check`.
+
+Exactly one canonical timed run used the same worker, release profile, fixture,
+and exact physical-byte denominators as the preceding rows:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| Variant | 2-source median (ns/B) | 4-source median (ns/B) | 8-source median (ns/B) | 16-source median (ns/B) | max/min spread |
+|---|---:|---:|---:|---:|---:|
+| Bulk repeated STOREDMETA gap offsets | 2.2721 ms (0.827660) | 4.6591 ms (0.640205) | 10.327 ms (0.631455) | 52.131 ms (1.509162) | **2.389973x — FAIL** |
+
+The bulk emitter improved every absolute median, and Criterion reported roughly
+22-40% reductions versus its same-worker cached baseline. It accelerated the
+4/8-source cases much more than the 16-source case, however, so the normalized
+spread worsened to 2.389973x: 77.0% above the predeclared `1.35x` ceiling and
+worse than the restored control's 1.787130x. Tiny gap-offset appends are real
+overhead but are not the dominant 16-source scaling defect. The remote command
+exited 0 and emitted all four complete measurements. The subsequent local
+Criterion artifact retrieval warning (`No space left on device`) occurred after
+timing and does not invalidate remote stdout. No second run, worker reroute, or
+local Cargo fallback was used.
+
+**Decision: HOLD.** Restore `quiver.rs` exactly (SHA-256
+`31ce9e287f6c78f3684bfe93760c08c507e3404b37d55e64d14eb49276014554`) and
+retain only this evidence. Leave `bd-quill-e3-keeper-ndtk.5` `in_progress`, add
+no PERF_LEDGER win, and do not claim the flat CPU/physical-byte acceptance
+criterion.
