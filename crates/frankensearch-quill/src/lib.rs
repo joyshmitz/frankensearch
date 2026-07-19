@@ -16,6 +16,7 @@
 pub mod argus;
 pub mod config;
 pub mod contract;
+pub mod delta;
 pub mod error;
 pub mod grimoire;
 pub mod index;

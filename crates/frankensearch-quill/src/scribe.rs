@@ -730,6 +730,8 @@ enum Bucket {
     Many(Vec<u32>),
 }
 
+pub(crate) const TERM_BUCKET_BYTES_ESTIMATE: usize = 8 + std::mem::size_of::<Bucket>() + 8;
+
 /// Per-shard composite-key term interner.
 ///
 /// Keys are `(field_ord, term bytes)`, stored once in the arena as the
@@ -775,63 +777,89 @@ impl<S: BuildHasher> TermInterner<S> {
         }
     }
 
-    fn hash_key(&self, key: &[u8]) -> u64 {
+    fn hash_parts(&self, field_ord: u16, term: &[u8]) -> u64 {
         let mut h = self.hasher.build_hasher();
-        h.write(key);
+        h.write(&field_ord.to_be_bytes());
+        h.write(term);
         h.finish()
+    }
+
+    fn matches(&self, id: u32, field_ord: u16, term: &[u8]) -> bool {
+        let key = self.arena.resolve(self.spans[id as usize]);
+        key.len() == FIELD_PREFIX_BYTES + term.len()
+            && key[..FIELD_PREFIX_BYTES] == field_ord.to_be_bytes()
+            && key[FIELD_PREFIX_BYTES..] == *term
+    }
+
+    fn find_in_bucket(&self, hash: u64, field_ord: u16, term: &[u8]) -> Option<u32> {
+        match self.buckets.get(&hash)? {
+            Bucket::One(id) => self.matches(*id, field_ord, term).then_some(*id),
+            Bucket::Many(ids) => ids
+                .iter()
+                .copied()
+                .find(|id| self.matches(*id, field_ord, term)),
+        }
+    }
+
+    /// Find an existing composite term without mutating the interner.
+    pub(crate) fn find(&self, field_ord: u16, term: &[u8]) -> Option<u32> {
+        let hash = self.hash_parts(field_ord, term);
+        self.find_in_bucket(hash, field_ord, term)
     }
 
     /// Intern `(field_ord, term)`, returning the dense local id.
     ///
     /// Hot path: existing terms cost one hash + one arena compare and perform
-    /// zero allocations (the composite key is assembled in a reused scratch
-    /// buffer).
+    /// zero allocations (the prefix and term bytes are hashed directly;
+    /// composite-key scratch is populated only for a new term).
     ///
     /// # Panics
     /// Panics if the number of distinct terms exceeds `u32` — unreachable
     /// under the shard budget.
     pub fn intern(&mut self, field_ord: u16, term: &[u8]) -> u32 {
+        self.intern_accounted(field_ord, term).0
+    }
+
+    /// Intern a term and return its exact increment to [`Self::bytes_used`].
+    ///
+    /// The delta segment uses the increment to keep its seal check O(1). The
+    /// normal Scribe path needs only the dense id and uses [`Self::intern`].
+    pub(crate) fn intern_accounted(&mut self, field_ord: u16, term: &[u8]) -> (u32, usize) {
+        let hash = self.hash_parts(field_ord, term);
+        if let Some(id) = self.find_in_bucket(hash, field_ord, term) {
+            return (id, 0);
+        }
+
         self.key_scratch.clear();
         self.key_scratch.extend_from_slice(&field_ord.to_be_bytes());
         self.key_scratch.extend_from_slice(term);
-        let hash = self.hash_key(&self.key_scratch);
-
-        if let Some(bucket) = self.buckets.get(&hash) {
-            match bucket {
-                Bucket::One(id) => {
-                    if self.arena.resolve(self.spans[*id as usize]) == self.key_scratch.as_slice() {
-                        return *id;
-                    }
-                }
-                Bucket::Many(ids) => {
-                    for id in ids {
-                        if self.arena.resolve(self.spans[*id as usize])
-                            == self.key_scratch.as_slice()
-                        {
-                            return *id;
-                        }
-                    }
-                }
-            }
-        }
 
         // New term: copy the composite key into the arena, assign the next id.
         let span = self.arena.push(&self.key_scratch);
         let id = u32::try_from(self.spans.len()).expect("term id space exceeds u32");
         self.spans.push(span);
-        match self.buckets.entry(hash) {
+        let bucket_bytes = match self.buckets.entry(hash) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(Bucket::One(id));
+                TERM_BUCKET_BYTES_ESTIMATE
             }
             std::collections::hash_map::Entry::Occupied(mut o) => match o.get_mut() {
                 Bucket::One(existing) => {
                     let existing = *existing;
                     *o.get_mut() = Bucket::Many(vec![existing, id]);
+                    2 * std::mem::size_of::<u32>()
                 }
-                Bucket::Many(ids) => ids.push(id),
+                Bucket::Many(ids) => {
+                    ids.push(id);
+                    std::mem::size_of::<u32>()
+                }
             },
-        }
-        id
+        };
+        let added_bytes = FIELD_PREFIX_BYTES
+            .saturating_add(term.len())
+            .saturating_add(std::mem::size_of::<ArenaSpan>())
+            .saturating_add(bucket_bytes);
+        (id, added_bytes)
     }
 
     /// Number of distinct interned terms.
@@ -887,7 +915,6 @@ impl<S: BuildHasher> TermInterner<S> {
     /// [`Self::bytes_reserved`] for RSS diagnostics.
     #[must_use]
     pub fn bytes_used(&self) -> usize {
-        const BUCKET_ESTIMATE: usize = 8 + std::mem::size_of::<Bucket>() + 8;
         let collision_ids = self
             .buckets
             .values()
@@ -898,14 +925,13 @@ impl<S: BuildHasher> TermInterner<S> {
             .sum::<usize>();
         self.arena.bytes_used()
             + self.spans.len() * std::mem::size_of::<ArenaSpan>()
-            + self.buckets.len() * BUCKET_ESTIMATE
+            + self.buckets.len() * TERM_BUCKET_BYTES_ESTIMATE
             + collision_ids
     }
 
     /// Complete retained interner allocation for RSS/reuse diagnostics.
     #[must_use]
     pub fn bytes_reserved(&self) -> usize {
-        const BUCKET_ESTIMATE: usize = 8 + std::mem::size_of::<Bucket>() + 8;
         let collision_ids = self
             .buckets
             .values()
@@ -921,7 +947,11 @@ impl<S: BuildHasher> TermInterner<S> {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<ArenaSpan>()),
             )
-            .saturating_add(self.buckets.capacity().saturating_mul(BUCKET_ESTIMATE))
+            .saturating_add(
+                self.buckets
+                    .capacity()
+                    .saturating_mul(TERM_BUCKET_BYTES_ESTIMATE),
+            )
             .saturating_add(self.key_scratch.capacity())
             .saturating_add(collision_ids)
     }
@@ -5557,6 +5587,28 @@ mod tests {
             .map(|id| interner.composite_key(*id).to_vec())
             .collect();
         assert!(keys.windows(2).all(|w| w[0] < w[1]), "strict byte order");
+    }
+
+    #[test]
+    fn collision_bucket_growth_reports_exact_live_byte_increments() {
+        let mut interner: TermInterner<ConstBuild> =
+            TermInterner::with_hasher(ConstBuild::default());
+        let mut ids = Vec::new();
+        for (field_ord, term) in [(0, b"alpha".as_slice()), (1, b"beta"), (2, b"gamma")] {
+            let before = interner.bytes_used();
+            let (id, added_bytes) = interner.intern_accounted(field_ord, term);
+            assert_eq!(interner.bytes_used() - before, added_bytes);
+            ids.push(id);
+        }
+        assert_eq!(interner.find(0, b"alpha"), Some(ids[0]));
+        assert_eq!(interner.find(1, b"beta"), Some(ids[1]));
+        assert_eq!(interner.find(2, b"gamma"), Some(ids[2]));
+
+        let before_duplicate = interner.bytes_used();
+        let (duplicate, duplicate_bytes) = interner.intern_accounted(1, b"beta");
+        assert_eq!(duplicate, ids[1]);
+        assert_eq!(duplicate_bytes, 0);
+        assert_eq!(interner.bytes_used(), before_duplicate);
     }
 
     #[test]
