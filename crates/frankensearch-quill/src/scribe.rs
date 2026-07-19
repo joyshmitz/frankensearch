@@ -601,7 +601,7 @@ pub struct ArenaSpan {
 /// Not a general allocator: append-only between resets, no per-item free.
 /// [`reset`](Self::reset) retains every standard chunk at full capacity so a
 /// steady-state flush cycle performs zero global allocations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ByteArena {
     chunks: Vec<Vec<u8>>,
     chunk_size: usize,
@@ -724,7 +724,7 @@ impl Default for ByteArena {
 
 /// Collision bucket: hash → term id(s). The `Many` arm is exercised only on
 /// 64-bit hash collisions (or by tests injecting a degenerate hasher).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Bucket {
     One(u32),
     Many(Vec<u32>),
@@ -742,7 +742,7 @@ pub(crate) const TERM_BUCKET_BYTES_ESTIMATE: usize = 8 + std::mem::size_of::<Buc
 /// durable hashing elsewhere in Quill is xxh3 by contract, FSLX §2). Tests
 /// inject a constant hasher to force every key through the `Many`
 /// verification path.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TermInterner<S: BuildHasher = ahash::RandomState> {
     arena: ByteArena,
     spans: Vec<ArenaSpan>,

@@ -11032,9 +11032,12 @@ impl StatsSection {
 pub struct SnapshotFieldStats {
     /// Stable schema field ordinal.
     pub field_ord: u16,
-    /// Checked sum of the live segments' at-seal token numerators.
+    /// Checked snapshot token numerator under the BM25 lifecycle contract.
+    ///
+    /// Keeper rows remain at-seal until compaction; Delta-local tombstones are
+    /// excluded immediately.
     pub total_tokens: u64,
-    /// Checked sum of at-seal segment document counts.
+    /// Keeper at-seal rows plus live Delta rows used as BM25 `N`.
     pub doc_count: u64,
 }
 

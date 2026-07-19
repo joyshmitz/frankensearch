@@ -116,12 +116,12 @@ pub enum ArgusError {
         /// Failed invariant.
         reason: &'static str,
     },
-    /// Snapshot term frequency exceeded the snapshot's physical document count.
+    /// Snapshot term frequency exceeded the snapshot's BM25 document count.
     #[error("term doc_freq {doc_freq} exceeds snapshot N {doc_count}")]
     InvalidDocFrequency {
         /// Snapshot-level term document frequency.
         doc_freq: u64,
-        /// Snapshot-level physical document count.
+        /// Snapshot-level BM25 document count.
         doc_count: u64,
     },
     /// A scorer bound statistics and field lengths from different fields.
@@ -509,13 +509,18 @@ impl Bm25FieldSnapshot {
         self.stats.field_ord
     }
 
-    /// Snapshot physical document count used as BM25 `N`.
+    /// Snapshot lifecycle population used as BM25 `N`.
+    ///
+    /// Composite views count Keeper's at-seal rows plus live Delta rows.
     #[must_use]
     pub const fn doc_count(&self) -> u64 {
         self.stats.doc_count
     }
 
-    /// Snapshot token numerator, including tombstoned documents until merge.
+    /// Snapshot token numerator under the same lifecycle as [`Self::doc_count`].
+    ///
+    /// Keeper tombstones remain until compaction; Delta tombstones are excluded
+    /// immediately because those rows are never sealed.
     #[must_use]
     pub const fn total_tokens(&self) -> u64 {
         self.stats.total_tokens
@@ -562,10 +567,11 @@ impl<'a> TermScorer<'a> {
     /// Build a term scorer from snapshot-level statistics and segment-local
     /// cursor state.
     ///
-    /// `snapshot_doc_freq` is the sum across every live segment and therefore
-    /// includes tombstoned postings until compaction. Runtime cost, size hint,
-    /// and segment `num_docs` come from the cursor so exact required-clause
-    /// ordering cannot drift from its storage implementation.
+    /// `snapshot_doc_freq` follows the same lifecycle population: Keeper
+    /// postings include tombstones until compaction, while Delta postings count
+    /// only live rows. Runtime cost, size hint, and segment `num_docs` come from
+    /// the cursor so exact required-clause ordering cannot drift from its
+    /// storage implementation.
     ///
     /// # Errors
     ///
@@ -601,7 +607,7 @@ impl<'a> TermScorer<'a> {
         if u64::from(segment_num_docs) > snapshot.doc_count() {
             return Err(ArgusError::InvalidSnapshot {
                 field_ord: snapshot.field_ord(),
-                reason: "segment num_docs exceeds snapshot physical document count",
+                reason: "segment num_docs exceeds snapshot BM25 document count",
             });
         }
         if !field_boost.is_finite() {
@@ -971,7 +977,7 @@ impl<'a> PhraseScorer<'a> {
             if u64::from(cursor_segment_num_docs) > snapshot.doc_count() {
                 return Err(ArgusError::InvalidSnapshot {
                     field_ord: snapshot.field_ord(),
-                    reason: "phrase segment num_docs exceeds snapshot physical document count",
+                    reason: "phrase segment num_docs exceeds snapshot BM25 document count",
                 });
             }
             if segment_num_docs

@@ -38,7 +38,10 @@ pub use grimoire::{
     TermDictionaryError, TermDictionaryLimits, TermInput, TermMatch, TermMetadata, TermRef,
     TermScratch, TermSectionLengths,
 };
-pub use index::{QuillHit, QuillIndex, QuillIndexError, QuillSearchResult};
+pub use index::{
+    QuillHit, QuillIndex, QuillIndexError, QuillSearchResult, QuillSearchSnapshot, SnapshotError,
+    SnapshotPublisher,
+};
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
     ConcatMergeError, CurrentPointer, CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES,

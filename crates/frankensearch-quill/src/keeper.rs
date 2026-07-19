@@ -8249,7 +8249,7 @@ fn open_existing_manifest_temp(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
-fn validate_manifest_successor(
+pub(crate) fn validate_manifest_successor(
     previous: &Manifest,
     proposed: &Manifest,
 ) -> Result<(), KeeperError> {

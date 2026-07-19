@@ -74,6 +74,7 @@ frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
 # was unsatisfiable under that patch and deadlocked am's whole graph
 # (cargo resolution EXIT 101). [bd-3h229]
 asupersync = { version = ">=0.3.9, <0.4", default-features = false, features = ["proc-macros"] }
+arc-swap = "=1.9.2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

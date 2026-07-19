@@ -1,7 +1,8 @@
 //! Lease-bounded mutable storage for Quill's searchable delta segment.
 //!
-//! This module owns storage invariants only. Epoch publication, Argus cursor
-//! adapters, scoring, and FSLX sealing are separate E5 milestones.
+//! This module owns mutable storage invariants and the immutable freeze
+//! boundary. Composite publication lives in `index`; Argus cursor adapters,
+//! scoring integration, and FSLX sealing remain separate E5 milestones.
 
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -452,6 +453,38 @@ impl<T: Copy + Default> TypedChainArena<T> {
         })
     }
 
+    /// Copy only the active initialized slots into an immutable epoch arena.
+    ///
+    /// Mutable arenas retain reset-reusable blocks and relocated slot ranges.
+    /// Carrying those inactive allocations into every published snapshot would
+    /// keep prior generations' peak footprint alive after a seal. Block indices
+    /// remain stable while starts are rebased into one compact owned slot slab.
+    fn snapshot_copy(&self) -> Self {
+        let mut blocks = Vec::with_capacity(self.active_blocks);
+        let active_slots = self.blocks[..self.active_blocks]
+            .iter()
+            .map(|block| block.len)
+            .sum();
+        let mut slots = Vec::with_capacity(active_slots);
+        for block in &self.blocks[..self.active_blocks] {
+            let start = slots.len();
+            slots.extend_from_slice(&self.slots[block.start..block.start + block.len]);
+            blocks.push(BlockMeta {
+                start,
+                len: block.len,
+                limit: block.len,
+                reserved: block.len,
+                next: block.next,
+            });
+        }
+        Self {
+            resource: self.resource,
+            blocks,
+            slots,
+            active_blocks: self.active_blocks,
+        }
+    }
+
     fn reset(&mut self) {
         for block in &mut self.blocks[..self.active_blocks] {
             block.len = 0;
@@ -546,7 +579,7 @@ struct FieldLayout {
     positions: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FieldNormColumn {
     raw_lengths: Vec<u32>,
     fieldnorm_ids: Vec<u8>,
@@ -583,6 +616,85 @@ pub struct DeltaSegment {
     tombstone_words: Vec<u64>,
     tombstone_count: usize,
     logical_bytes_used: usize,
+}
+
+/// Immutable, owner-isolated copy of one published delta generation.
+///
+/// Publication deliberately deep-copies the mutable shard state. Readers can
+/// then retain this value behind an [`std::sync::Arc`] without observing later
+/// appends, tombstones, or arena reuse by the writer. The copy receives a fresh
+/// owner identity so a posting handle from either side cannot resolve positions
+/// through the other side's arenas.
+#[derive(Debug)]
+pub struct DeltaSnapshot {
+    segment: DeltaSegment,
+    keeper_generation: u64,
+}
+
+impl DeltaSnapshot {
+    /// Read-only view of the frozen delta generation.
+    #[must_use]
+    pub const fn segment(&self) -> &DeltaSegment {
+        &self.segment
+    }
+
+    /// Keeper MANIFEST generation this delta epoch was derived from.
+    #[must_use]
+    pub const fn keeper_generation(&self) -> u64 {
+        self.keeper_generation
+    }
+
+    /// Compile-time schema carried by this generation.
+    #[must_use]
+    pub const fn schema(&self) -> SchemaDescriptor {
+        self.segment.schema()
+    }
+
+    /// Inclusive global lease base.
+    #[must_use]
+    pub const fn lease_base(&self) -> u64 {
+        self.segment.lease_base()
+    }
+
+    /// Exclusive global lease end.
+    #[must_use]
+    pub const fn lease_end(&self) -> u64 {
+        self.segment.lease_end()
+    }
+
+    /// Number of visible rows after applying delta-local tombstones.
+    #[must_use]
+    pub fn live_document_count(&self) -> usize {
+        self.segment.live_document_count()
+    }
+
+    /// Exact live token numerator for one indexed string field.
+    #[must_use]
+    pub fn live_total_tokens(&self, field_ord: u16) -> Option<u64> {
+        self.segment.live_total_tokens(field_ord)
+    }
+
+    /// Look up one immutable composite `(field, term)` key.
+    #[must_use]
+    pub fn find_term(&self, field_ord: u16, term: &[u8]) -> Option<DeltaTerm<'_>> {
+        self.segment.find_term(field_ord, term)
+    }
+
+    /// Ordered live rows for snapshot composition and later cursor lowering.
+    #[must_use]
+    pub fn live_documents(&self) -> DeltaLiveDocuments<'_> {
+        self.segment.live_documents()
+    }
+
+    /// Covering Q1 interval of every physically allocated row in this epoch.
+    ///
+    /// Tombstoned rows remain part of the interval because their docids were
+    /// allocated and therefore cannot collide with a sealed Keeper range.
+    pub(crate) fn occupied_docid_range(&self) -> Option<(u64, u64)> {
+        let first = u64::from(*self.segment.document_docids.first()?);
+        let last = u64::from(*self.segment.document_docids.last()?);
+        Some((first, last + 1))
+    }
 }
 
 impl DeltaSegment {
@@ -700,6 +812,43 @@ impl DeltaSegment {
     #[must_use]
     pub const fn budget_bytes(&self) -> usize {
         self.budget_bytes
+    }
+
+    /// Freeze the current generation for lock-free epoch publication.
+    ///
+    /// The returned snapshot owns independent arenas and sidecars. Subsequent
+    /// writes or resets of this mutable segment cannot change the snapshot,
+    /// and owner-bound posting handles cannot cross the freeze boundary.
+    /// `keeper_generation` binds the epoch to the MANIFEST view current at the
+    /// batch boundary; composite publication rejects a stale witness.
+    #[must_use]
+    pub fn freeze(&self, keeper_generation: u64) -> DeltaSnapshot {
+        DeltaSnapshot {
+            segment: Self {
+                schema: self.schema,
+                lease_base: self.lease_base,
+                lease_end: self.lease_end,
+                next_docid_floor: self.next_docid_floor,
+                budget_bytes: self.budget_bytes,
+                owner_id: NEXT_DELTA_OWNER_ID.fetch_add(1, Ordering::Relaxed),
+                generation: self.generation,
+                fields: self.fields.clone(),
+                terms: self.terms.clone(),
+                chains: self.chains.clone(),
+                posting_arena: self.posting_arena.snapshot_copy(),
+                position_arena: self.position_arena.snapshot_copy(),
+                document_docids: self.document_docids.clone(),
+                document_ids: self.document_ids.clone(),
+                document_term_offsets: self.document_term_offsets.clone(),
+                document_term_ids: self.document_term_ids.clone(),
+                fieldnorms: self.fieldnorms.clone(),
+                live_ids: self.live_ids.clone(),
+                tombstone_words: self.tombstone_words.clone(),
+                tombstone_count: self.tombstone_count,
+                logical_bytes_used: self.logical_bytes_used,
+            },
+            keeper_generation,
+        }
     }
 
     /// Apply one complete document. A budget crossing accepts the entire row
@@ -1298,9 +1447,9 @@ impl DeltaSegment {
         }
     }
 
-    /// Clear a sealed generation while retaining allocations for the next
-    /// aligned lease. Rust's borrow rules prevent reset while a term view lives;
-    /// immutable epoch ownership is added by E5.2.
+    /// Clear a sealed generation while retaining writer allocations for the
+    /// next aligned lease. Rust's borrow rules prevent reset while a term view
+    /// lives; published [`DeltaSnapshot`] epochs own independent compact copies.
     ///
     /// # Errors
     ///
@@ -1874,6 +2023,101 @@ mod tests {
         let mut stale_generation = right_term.postings().next().expect("right posting");
         stale_generation.generation = stale_generation.generation.wrapping_add(1);
         assert!(right_term.positions(stale_generation).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_snapshot_is_immutable_and_rejects_cross_owner_postings() -> Result<(), DeltaError> {
+        let mut delta = DeltaSegment::new(TEST_SCHEMA, 0, usize::MAX)?;
+        apply_positioned(&mut delta, 0, "first", b"term", &[1, 4])?;
+        let frozen = delta.freeze(7);
+
+        assert_eq!(frozen.keeper_generation(), 7);
+        assert_ne!(delta.owner_id, frozen.segment.owner_id);
+        {
+            let mutable_term = delta.find_term(1, b"term").expect("mutable term");
+            let mutable_posting = mutable_term.postings().next().expect("mutable posting");
+            let frozen_term = frozen.find_term(1, b"term").expect("frozen term");
+            let frozen_posting = frozen_term.postings().next().expect("frozen posting");
+
+            assert_eq!(
+                mutable_term
+                    .positions(mutable_posting)
+                    .expect("mutable owner positions")
+                    .collect::<Vec<_>>(),
+                [1, 4]
+            );
+            assert_eq!(
+                frozen_term
+                    .positions(frozen_posting)
+                    .expect("frozen owner positions")
+                    .collect::<Vec<_>>(),
+                [1, 4]
+            );
+            assert!(frozen_term.positions(mutable_posting).is_none());
+            assert!(mutable_term.positions(frozen_posting).is_none());
+        }
+
+        apply_positioned(&mut delta, 1, "second", b"term", &[9])?;
+        assert_eq!(delta.physical_document_count(), 2);
+        assert_eq!(delta.live_document_count(), 2);
+        assert_eq!(frozen.segment().physical_document_count(), 1);
+        assert_eq!(frozen.live_document_count(), 1);
+        assert_eq!(
+            frozen
+                .find_term(1, b"term")
+                .expect("held frozen term")
+                .live_doc_freq(),
+            1
+        );
+        assert_eq!(frozen.live_total_tokens(1), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_empty_epoch_drops_reset_retained_chain_storage() -> Result<(), DeltaError> {
+        let mut delta = DeltaSegment::new(TEST_SCHEMA, 0, usize::MAX)?;
+        for docid in 0..260 {
+            apply_positioned(
+                &mut delta,
+                docid,
+                &format!("doc-{docid}"),
+                b"term",
+                &[docid],
+            )?;
+        }
+        assert!(!delta.posting_arena.slots.is_empty());
+        assert!(!delta.position_arena.slots.is_empty());
+
+        let populated = delta.freeze(8);
+        let populated_term = populated.find_term(1, b"term").expect("frozen term");
+        let populated_postings = populated_term.postings().collect::<Vec<_>>();
+        assert_eq!(populated_postings.len(), 260);
+        for (expected_docid, posting) in (0_u32..260).zip(populated_postings) {
+            assert_eq!(posting.global_docid, expected_docid);
+            assert_eq!(
+                populated_term
+                    .positions(posting)
+                    .expect("frozen multi-block position")
+                    .collect::<Vec<_>>(),
+                [expected_docid]
+            );
+        }
+
+        delta.reset_after_seal(0)?;
+        assert_eq!(delta.posting_arena.active_blocks, 0);
+        assert_eq!(delta.position_arena.active_blocks, 0);
+        assert!(
+            !delta.posting_arena.slots.is_empty(),
+            "the mutable writer should retain reusable capacity"
+        );
+
+        let frozen = delta.freeze(9);
+        assert!(frozen.segment.posting_arena.blocks.is_empty());
+        assert!(frozen.segment.posting_arena.slots.is_empty());
+        assert!(frozen.segment.position_arena.blocks.is_empty());
+        assert!(frozen.segment.position_arena.slots.is_empty());
+        assert_eq!(frozen.live_document_count(), 0);
         Ok(())
     }
 

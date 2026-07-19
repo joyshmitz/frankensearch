@@ -1,13 +1,16 @@
-//! Shipping scalar Quill index orchestration.
+//! Shipping Quill index orchestration and process-local snapshot publication.
 //!
 //! This module deliberately joins the already-final Scribe, FSLX, Keeper,
-//! parser, cursor, scorer, and collector boundaries without introducing a
-//! searchable delta.  Documents become visible only after a MANIFEST publish.
+//! parser, cursor, scorer, and collector boundaries. The scalar writer still
+//! searches sealed segments only; immutable Delta epochs and their composite
+//! statistics are published here for the E5 cursor integration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use frankensearch_core::IndexableDocument;
@@ -23,11 +26,13 @@ use crate::argus::{
     TopDocsCollector,
 };
 use crate::config::QuillConfig;
+use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
 use crate::grimoire::{ByteSpan, TermDictionary, TermDictionaryError, TermSectionLengths};
 use crate::keeper::{
     CURRENT_ENGINE_VERSION, KeeperError, KeeperSnapshot, KeeperWriter, Manifest,
     ManifestFieldStats, ManifestSegment, RecoveredSegment, TombstoneSet,
+    validate_manifest_successor,
 };
 use crate::query::{
     DefaultQueryParser, Query, QueryDiagnostic, QueryParserConfigError, canonicalize_query,
@@ -36,7 +41,7 @@ use crate::quiver::{
     DocLenCodecError, DocLenSection, PositionCodecError, PositionList, Posting, PostingCodecError,
     PostingList, SnapshotFieldStats,
 };
-use crate::schema::{DEFAULT_SCHEMA, SchemaDescriptor};
+use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
     AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, FlushDocumentInput, FlushError,
     FlushMode, FlushSegmentInput, IndexedFieldValue, StoredFieldValue, flush_accumulator_with_mode,
@@ -86,6 +91,9 @@ pub enum QuillIndexError {
     /// Exhaustive scorer construction or collection failed.
     #[error(transparent)]
     Argus(#[from] ArgusError),
+    /// Composite process-local snapshot construction or publication failed.
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotError),
     /// Canonical metadata serialization failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -124,6 +132,667 @@ pub struct QuillSearchResult {
     pub diagnostics: Vec<QueryDiagnostic>,
 }
 
+/// Typed failure from process-local Keeper plus Delta snapshot composition.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// A Delta epoch was frozen against a different schema.
+    #[error("delta schema {actual} does not match Keeper schema {expected}")]
+    SchemaMismatch {
+        /// Keeper schema name.
+        expected: &'static str,
+        /// Delta schema name.
+        actual: &'static str,
+    },
+    /// A Delta epoch was frozen against a different Keeper generation.
+    #[error(
+        "delta lease starting at {lease_base} belongs to Keeper generation {actual}, expected {expected}"
+    )]
+    KeeperGenerationMismatch {
+        /// Generation carried by the composite Keeper snapshot.
+        expected: u64,
+        /// Generation witnessed when the Delta epoch was frozen.
+        actual: u64,
+        /// Delta lease identifying the stale epoch.
+        lease_base: u64,
+    },
+    /// A Delta epoch's physical covering interval intersects a sealed range.
+    #[error(
+        "delta occupied range [{delta_lo}, {delta_hi}) overlaps Keeper segment {segment_id:#018x} range [{keeper_lo}, {keeper_hi})"
+    )]
+    KeeperDeltaDocidOverlap {
+        /// Inclusive first physically allocated Delta docid.
+        delta_lo: u64,
+        /// Exclusive Delta covering upper bound.
+        delta_hi: u64,
+        /// Conflicting sealed segment identity.
+        segment_id: u64,
+        /// Inclusive sealed covering lower bound.
+        keeper_lo: u64,
+        /// Exclusive sealed covering upper bound.
+        keeper_hi: u64,
+    },
+    /// Two independently published shards claimed overlapping Q1 leases.
+    #[error("delta leases [{first_base}, {first_end}) and [{second_base}, {second_end}) overlap")]
+    OverlappingDeltaLeases {
+        /// First inclusive lease base.
+        first_base: u64,
+        /// First exclusive lease end.
+        first_end: u64,
+        /// Second inclusive lease base.
+        second_base: u64,
+        /// Second exclusive lease end.
+        second_end: u64,
+    },
+    /// A complete publication attempted to replace a newer Keeper generation.
+    #[error("Keeper generation regressed from current {current} to proposed {proposed}")]
+    KeeperGenerationRegression {
+        /// Currently published durable generation.
+        current: u64,
+        /// Stale proposed generation.
+        proposed: u64,
+    },
+    /// One generation number named two different durable MANIFEST images.
+    #[error("Keeper generation {generation} identifies two different MANIFEST images")]
+    KeeperGenerationCollision {
+        /// Reused generation number.
+        generation: u64,
+    },
+    /// A forward complete publication was not a valid Keeper successor.
+    #[error("invalid Keeper snapshot transition: {detail}")]
+    KeeperTransition {
+        /// Underlying Keeper transition rejection.
+        detail: String,
+    },
+    /// A non-genesis Keeper snapshot omitted an indexed field's statistics.
+    #[error("Keeper snapshot has no field statistics for indexed field {field_ord}")]
+    MissingKeeperFieldStats {
+        /// Missing schema field ordinal.
+        field_ord: u16,
+    },
+    /// A schema-compatible Delta failed to expose one indexed field's tokens.
+    #[error("delta snapshot has no live token statistics for indexed field {field_ord}")]
+    MissingDeltaFieldStats {
+        /// Missing schema field ordinal.
+        field_ord: u16,
+    },
+    /// One checked composite counter exceeded its u64 representation.
+    #[error("composite snapshot {counter} overflowed")]
+    CounterOverflow {
+        /// Stable name of the counter being aggregated.
+        counter: &'static str,
+    },
+    /// A per-shard publication named no current Delta slot.
+    #[error("delta shard {shard} is outside the published shard count {shard_count}")]
+    ShardOutOfBounds {
+        /// Requested zero-based shard slot.
+        shard: usize,
+        /// Current number of published shard slots.
+        shard_count: usize,
+    },
+    /// The process-local publication epoch cannot advance further.
+    #[error("process-local snapshot epoch exhausted")]
+    EpochExhausted,
+    /// A bounded publication sidecar could not be allocated.
+    #[error("unable to allocate {additional} entries for {resource}")]
+    Allocation {
+        /// Stable allocation purpose.
+        resource: &'static str,
+        /// Requested additional element count.
+        additional: usize,
+    },
+}
+
+/// One immutable, internally consistent process-local search view.
+///
+/// The Keeper component retains sealed segments and MANIFEST tombstones. Each
+/// Delta component is an owner-isolated frozen epoch. BM25 statistics use the
+/// hybrid lifecycle contract: sealed tombstones remain in Keeper's at-seal
+/// counts until compaction, while Delta-local tombstones are excluded
+/// immediately because those rows will never be sealed.
+pub struct QuillSearchSnapshot {
+    snapshot_epoch: u64,
+    keeper: Arc<KeeperSnapshot>,
+    deltas: Box<[Arc<DeltaSnapshot>]>,
+    field_stats: Box<[SnapshotFieldStats]>,
+    bm25_doc_count: u64,
+    live_doc_count: u64,
+}
+
+impl QuillSearchSnapshot {
+    fn compose(
+        snapshot_epoch: u64,
+        keeper: Arc<KeeperSnapshot>,
+        deltas: Vec<Arc<DeltaSnapshot>>,
+    ) -> Result<Self, SnapshotError> {
+        let schema = keeper.schema();
+        let manifest = &keeper.loaded_manifest().manifest;
+        let keeper_generation = manifest.generation;
+        for delta in &deltas {
+            if delta.schema() != schema {
+                return Err(SnapshotError::SchemaMismatch {
+                    expected: schema.name,
+                    actual: delta.schema().name,
+                });
+            }
+            if delta.keeper_generation() != keeper_generation {
+                return Err(SnapshotError::KeeperGenerationMismatch {
+                    expected: keeper_generation,
+                    actual: delta.keeper_generation(),
+                    lease_base: delta.lease_base(),
+                });
+            }
+            if let Some((delta_lo, delta_hi)) = delta.occupied_docid_range() {
+                for segment in &manifest.segments {
+                    if delta_lo < segment.docid_hi && segment.docid_lo < delta_hi {
+                        return Err(SnapshotError::KeeperDeltaDocidOverlap {
+                            delta_lo,
+                            delta_hi,
+                            segment_id: segment.segment_id,
+                            keeper_lo: segment.docid_lo,
+                            keeper_hi: segment.docid_hi,
+                        });
+                    }
+                }
+            }
+        }
+        for (index, first) in deltas.iter().enumerate() {
+            for second in &deltas[index + 1..] {
+                if first.lease_base() < second.lease_end()
+                    && second.lease_base() < first.lease_end()
+                {
+                    return Err(SnapshotError::OverlappingDeltaLeases {
+                        first_base: first.lease_base(),
+                        first_end: first.lease_end(),
+                        second_base: second.lease_base(),
+                        second_end: second.lease_end(),
+                    });
+                }
+            }
+        }
+
+        let delta_live_doc_count = deltas.iter().try_fold(0_u64, |total, delta| {
+            let count = u64::try_from(delta.live_document_count()).map_err(|_| {
+                SnapshotError::CounterOverflow {
+                    counter: "live Delta document count",
+                }
+            })?;
+            total
+                .checked_add(count)
+                .ok_or(SnapshotError::CounterOverflow {
+                    counter: "live Delta document count",
+                })
+        })?;
+        let bm25_doc_count = keeper
+            .at_seal_doc_count()
+            .checked_add(delta_live_doc_count)
+            .ok_or(SnapshotError::CounterOverflow {
+                counter: "BM25 document count",
+            })?;
+        let live_doc_count = keeper.doc_count().checked_add(delta_live_doc_count).ok_or(
+            SnapshotError::CounterOverflow {
+                counter: "live document count",
+            },
+        )?;
+
+        let field_stats = composite_field_stats(
+            schema,
+            manifest,
+            keeper.segments().is_empty(),
+            &deltas,
+            bm25_doc_count,
+        )?;
+
+        Ok(Self {
+            snapshot_epoch,
+            keeper,
+            deltas: deltas.into_boxed_slice(),
+            field_stats,
+            bm25_doc_count,
+            live_doc_count,
+        })
+    }
+
+    /// Monotone process-local publication epoch.
+    #[must_use]
+    pub const fn snapshot_epoch(&self) -> u64 {
+        self.snapshot_epoch
+    }
+
+    /// Durable MANIFEST generation paired with every Delta epoch in this view.
+    #[must_use]
+    pub fn keeper_generation(&self) -> u64 {
+        self.keeper.loaded_manifest().manifest.generation
+    }
+
+    /// Pinned immutable Keeper component.
+    #[must_use]
+    pub fn keeper_snapshot(&self) -> &KeeperSnapshot {
+        &self.keeper
+    }
+
+    /// Number of frozen shard epochs in this view.
+    #[must_use]
+    pub fn delta_count(&self) -> usize {
+        self.deltas.len()
+    }
+
+    /// Snapshot-global BM25 `N`: Keeper at-seal rows plus live Delta rows.
+    #[must_use]
+    pub const fn bm25_doc_count(&self) -> u64 {
+        self.bm25_doc_count
+    }
+
+    /// Public live rows across Keeper tombstones and Delta-local tombstones.
+    #[must_use]
+    pub const fn live_doc_count(&self) -> u64 {
+        self.live_doc_count
+    }
+
+    /// Checked composite BM25 statistics for one indexed string field.
+    #[must_use]
+    pub fn bm25_field_stats(&self, field_ord: u16) -> Option<SnapshotFieldStats> {
+        self.field_stats
+            .binary_search_by_key(&field_ord, |row| row.field_ord)
+            .ok()
+            .and_then(|index| self.field_stats.get(index))
+            .copied()
+    }
+
+    /// Keeper physical document frequency plus live Delta document frequency.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed dictionary, allocation, or checked-counter failures.
+    pub fn bm25_doc_freq(&self, field_ord: u16, term: &[u8]) -> Result<u64, QuillIndexError> {
+        if self.bm25_field_stats(field_ord).is_none() {
+            return Err(invalid_state(format!(
+                "snapshot has no BM25 statistics for field {field_ord}"
+            )));
+        }
+        let mut total = snapshot_doc_freq(&self.keeper, self.keeper.schema(), field_ord, term)?;
+        for delta in &self.deltas {
+            let delta_doc_freq = delta
+                .find_term(field_ord, term)
+                .map_or(0, |found| found.live_doc_freq());
+            total = total
+                .checked_add(u64::try_from(delta_doc_freq).map_err(|_| {
+                    SnapshotError::CounterOverflow {
+                        counter: "live Delta document frequency",
+                    }
+                })?)
+                .ok_or(SnapshotError::CounterOverflow {
+                    counter: "snapshot document frequency",
+                })?;
+        }
+        Ok(total)
+    }
+}
+
+fn composite_field_stats(
+    schema: SchemaDescriptor,
+    manifest: &Manifest,
+    genesis_without_segments: bool,
+    deltas: &[Arc<DeltaSnapshot>],
+    bm25_doc_count: u64,
+) -> Result<Box<[SnapshotFieldStats]>, SnapshotError> {
+    let indexed_field_count = schema
+        .fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+        .count();
+    let mut field_stats = Vec::new();
+    field_stats
+        .try_reserve_exact(indexed_field_count)
+        .map_err(|_| SnapshotError::Allocation {
+            resource: "composite field statistics",
+            additional: indexed_field_count,
+        })?;
+    for field in schema
+        .fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+    {
+        let sealed_total_tokens = manifest
+            .field_stats
+            .iter()
+            .find(|row| row.field_ord == field.id)
+            .map(|row| row.total_tokens)
+            .or_else(|| genesis_without_segments.then_some(0))
+            .ok_or(SnapshotError::MissingKeeperFieldStats {
+                field_ord: field.id,
+            })?;
+        let total_tokens = deltas
+            .iter()
+            .try_fold(sealed_total_tokens, |total, delta| {
+                let delta_tokens = delta.live_total_tokens(field.id).ok_or(
+                    SnapshotError::MissingDeltaFieldStats {
+                        field_ord: field.id,
+                    },
+                )?;
+                total
+                    .checked_add(delta_tokens)
+                    .ok_or(SnapshotError::CounterOverflow {
+                        counter: "field token count",
+                    })
+            })?;
+        field_stats.push(SnapshotFieldStats {
+            field_ord: field.id,
+            total_tokens,
+            doc_count: bm25_doc_count,
+        });
+    }
+    Ok(field_stats.into_boxed_slice())
+}
+
+fn manifest_document_counts(manifest: &Manifest) -> Result<(u64, u64), SnapshotError> {
+    manifest
+        .segments
+        .iter()
+        .try_fold((0_u64, 0_u64), |(at_seal, live), segment| {
+            let at_seal = at_seal.checked_add(u64::from(segment.doc_count)).ok_or(
+                SnapshotError::CounterOverflow {
+                    counter: "Keeper at-seal document count",
+                },
+            )?;
+            let live = live
+                .checked_add(u64::from(segment.live_doc_count()))
+                .ok_or(SnapshotError::CounterOverflow {
+                    counter: "Keeper live document count",
+                })?;
+            Ok((at_seal, live))
+        })
+}
+
+fn validate_complete_keeper_transition(
+    current: &Manifest,
+    proposed: &Manifest,
+) -> Result<(), SnapshotError> {
+    if proposed.generation < current.generation {
+        return Err(SnapshotError::KeeperGenerationRegression {
+            current: current.generation,
+            proposed: proposed.generation,
+        });
+    }
+    if proposed.generation == current.generation {
+        return if proposed == current {
+            Ok(())
+        } else {
+            Err(SnapshotError::KeeperGenerationCollision {
+                generation: proposed.generation,
+            })
+        };
+    }
+    validate_manifest_successor(current, proposed).map_err(|error| {
+        SnapshotError::KeeperTransition {
+            detail: error.to_string(),
+        }
+    })
+}
+
+struct PreparedSealedPublication {
+    snapshot_epoch: u64,
+    expected_keeper_generation: u64,
+    expected_schema_id: u64,
+    expected_docid_high_watermark: u64,
+    schema: SchemaDescriptor,
+    field_stats: Box<[SnapshotFieldStats]>,
+    bm25_doc_count: u64,
+    live_doc_count: u64,
+}
+
+/// Lock-free publisher for one authoritative Keeper plus all-Delta view.
+///
+/// Readers call [`Self::load`] once and retain that `Arc` for the whole query.
+/// Per-shard updates use compare-and-swap so concurrent shard writers cannot
+/// lose one another's epochs. A seal transition must use
+/// [`Self::publish_complete`] to replace Keeper and every Delta in one swap.
+pub struct SnapshotPublisher {
+    current: ArcSwap<QuillSearchSnapshot>,
+}
+
+impl SnapshotPublisher {
+    /// Construct the first process-local view at epoch zero.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale generations, schema drift, overlapping leases, missing
+    /// field statistics, allocation failure, and checked-counter overflow.
+    pub fn new(
+        keeper: Arc<KeeperSnapshot>,
+        deltas: Vec<Arc<DeltaSnapshot>>,
+    ) -> Result<Self, SnapshotError> {
+        let initial = Arc::new(QuillSearchSnapshot::compose(0, keeper, deltas)?);
+        Ok(Self {
+            current: ArcSwap::new(initial),
+        })
+    }
+
+    /// Clone the current immutable view without taking a reader lock.
+    #[must_use]
+    pub fn load(&self) -> Arc<QuillSearchSnapshot> {
+        self.current.load_full()
+    }
+
+    fn prepare_sealed_manifest(
+        &self,
+        schema: SchemaDescriptor,
+        proposed: &Manifest,
+    ) -> Result<PreparedSealedPublication, SnapshotError> {
+        let current = self.current.load_full();
+        validate_complete_keeper_transition(&current.keeper.loaded_manifest().manifest, proposed)?;
+        let snapshot_epoch = current
+            .snapshot_epoch()
+            .checked_add(1)
+            .ok_or(SnapshotError::EpochExhausted)?;
+        let (bm25_doc_count, live_doc_count) = manifest_document_counts(proposed)?;
+        let field_stats = composite_field_stats(
+            schema,
+            proposed,
+            proposed.segments.is_empty(),
+            &[],
+            bm25_doc_count,
+        )?;
+        Ok(PreparedSealedPublication {
+            snapshot_epoch,
+            expected_keeper_generation: proposed.generation,
+            expected_schema_id: proposed.schema_id,
+            expected_docid_high_watermark: proposed.docid_high_watermark,
+            schema,
+            field_stats,
+            bm25_doc_count,
+            live_doc_count,
+        })
+    }
+
+    fn prepare_equivalent_sealed_successor(
+        &self,
+    ) -> Result<PreparedSealedPublication, SnapshotError> {
+        let current = self.current.load_full();
+        if !current.deltas.is_empty() {
+            return Err(SnapshotError::KeeperTransition {
+                detail: "concat merge cannot discard active Delta epochs".to_owned(),
+            });
+        }
+        let snapshot_epoch = current
+            .snapshot_epoch()
+            .checked_add(1)
+            .ok_or(SnapshotError::EpochExhausted)?;
+        let manifest = &current.keeper.loaded_manifest().manifest;
+        let expected_keeper_generation =
+            manifest
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| SnapshotError::KeeperTransition {
+                    detail: "Keeper MANIFEST generation exhausted".to_owned(),
+                })?;
+        let mut field_stats = Vec::new();
+        field_stats
+            .try_reserve_exact(current.field_stats.len())
+            .map_err(|_| SnapshotError::Allocation {
+                resource: "concat-merge field statistics",
+                additional: current.field_stats.len(),
+            })?;
+        field_stats.extend_from_slice(&current.field_stats);
+        Ok(PreparedSealedPublication {
+            snapshot_epoch,
+            expected_keeper_generation,
+            expected_schema_id: manifest.schema_id,
+            expected_docid_high_watermark: manifest.docid_high_watermark,
+            schema: current.keeper.schema(),
+            field_stats: field_stats.into_boxed_slice(),
+            bm25_doc_count: current.bm25_doc_count,
+            live_doc_count: current.live_doc_count,
+        })
+    }
+
+    fn install_prepared_sealed(
+        &self,
+        keeper: Arc<KeeperSnapshot>,
+        prepared: PreparedSealedPublication,
+    ) -> Arc<QuillSearchSnapshot> {
+        let manifest = &keeper.loaded_manifest().manifest;
+        assert_eq!(
+            manifest.generation, prepared.expected_keeper_generation,
+            "Keeper installed an unexpected MANIFEST generation after publication"
+        );
+        assert_eq!(
+            manifest.schema_id, prepared.expected_schema_id,
+            "Keeper installed an unexpected schema after publication"
+        );
+        assert_eq!(
+            manifest.docid_high_watermark, prepared.expected_docid_high_watermark,
+            "Keeper installed an unexpected Q1 watermark after publication"
+        );
+        assert!(
+            keeper.schema() == prepared.schema,
+            "Keeper installed a schema descriptor that differs from the prepared publication"
+        );
+        assert_eq!(
+            keeper.at_seal_doc_count(),
+            prepared.bm25_doc_count,
+            "Keeper at-seal count differs from the prepared publication"
+        );
+        assert_eq!(
+            keeper.doc_count(),
+            prepared.live_doc_count,
+            "Keeper live count differs from the prepared publication"
+        );
+        for expected in &prepared.field_stats {
+            let actual_total_tokens = manifest
+                .field_stats
+                .iter()
+                .find(|row| row.field_ord == expected.field_ord)
+                .map(|row| row.total_tokens)
+                .or_else(|| manifest.segments.is_empty().then_some(0));
+            assert_eq!(
+                actual_total_tokens,
+                Some(expected.total_tokens),
+                "Keeper field statistics differ from the prepared publication"
+            );
+        }
+
+        let next = Arc::new(QuillSearchSnapshot {
+            snapshot_epoch: prepared.snapshot_epoch,
+            keeper,
+            deltas: Box::default(),
+            field_stats: prepared.field_stats,
+            bm25_doc_count: prepared.bm25_doc_count,
+            live_doc_count: prepared.live_doc_count,
+        });
+        self.current.store(Arc::clone(&next));
+        next
+    }
+
+    /// Atomically replace Keeper and every shard Delta in one publication.
+    ///
+    /// This is the seal boundary: callers supply a complete authoritative set,
+    /// already quiesced against batch writers. The method retries only to keep
+    /// the local epoch monotone if another publication wins the CAS first.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same composition failures as [`Self::new`], or epoch
+    /// exhaustion.
+    pub fn publish_complete(
+        &self,
+        mut keeper: Arc<KeeperSnapshot>,
+        mut deltas: Vec<Arc<DeltaSnapshot>>,
+    ) -> Result<Arc<QuillSearchSnapshot>, SnapshotError> {
+        loop {
+            let current = self.current.load_full();
+            validate_complete_keeper_transition(
+                &current.keeper.loaded_manifest().manifest,
+                &keeper.loaded_manifest().manifest,
+            )?;
+            let epoch = current
+                .snapshot_epoch()
+                .checked_add(1)
+                .ok_or(SnapshotError::EpochExhausted)?;
+            let next = Arc::new(QuillSearchSnapshot::compose(epoch, keeper, deltas)?);
+            let previous = self.current.compare_and_swap(&current, Arc::clone(&next));
+            if Arc::ptr_eq(&current, &previous) {
+                return Ok(next);
+            }
+            keeper = Arc::clone(&next.keeper);
+            deltas = clone_delta_arcs(&next.deltas)?;
+        }
+    }
+
+    /// Atomically replace one shard's frozen Delta epoch.
+    ///
+    /// Concurrent shard publications are merged through a compare-and-swap
+    /// retry; each retry starts from the latest complete composite view.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown shard slot and all ordinary composition failures.
+    pub fn publish_delta(
+        &self,
+        shard: usize,
+        mut delta: Arc<DeltaSnapshot>,
+    ) -> Result<Arc<QuillSearchSnapshot>, SnapshotError> {
+        loop {
+            let current = self.current.load_full();
+            if shard >= current.deltas.len() {
+                return Err(SnapshotError::ShardOutOfBounds {
+                    shard,
+                    shard_count: current.deltas.len(),
+                });
+            }
+            let epoch = current
+                .snapshot_epoch()
+                .checked_add(1)
+                .ok_or(SnapshotError::EpochExhausted)?;
+            let mut deltas = clone_delta_arcs(&current.deltas)?;
+            deltas[shard] = delta;
+            let next = Arc::new(QuillSearchSnapshot::compose(
+                epoch,
+                Arc::clone(&current.keeper),
+                deltas,
+            )?);
+            let previous = self.current.compare_and_swap(&current, Arc::clone(&next));
+            if Arc::ptr_eq(&current, &previous) {
+                return Ok(next);
+            }
+            delta = Arc::clone(&next.deltas[shard]);
+        }
+    }
+}
+
+fn clone_delta_arcs(
+    deltas: &[Arc<DeltaSnapshot>],
+) -> Result<Vec<Arc<DeltaSnapshot>>, SnapshotError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(deltas.len())
+        .map_err(|_| SnapshotError::Allocation {
+            resource: "Delta snapshot table",
+            additional: deltas.len(),
+        })?;
+    cloned.extend(deltas.iter().cloned());
+    Ok(cloned)
+}
+
 #[derive(Debug)]
 struct PendingIdentity {
     doc_ord: u32,
@@ -138,12 +807,13 @@ struct StagedFlush {
     next_seal_seq: u64,
 }
 
-/// Scalar, delta-free Quill writer and committed reader view.
+/// Scalar Quill writer plus committed and process-local reader views.
 pub struct QuillIndex {
     config: QuillConfig,
     schema: SchemaDescriptor,
     parser: DefaultQueryParser,
     backend: IndexBackend,
+    published_snapshot: SnapshotPublisher,
     accumulator: ColumnarAccumulator,
     identities: Vec<PendingIdentity>,
     uncommitted_ids: BTreeSet<String>,
@@ -363,11 +1033,14 @@ impl QuillIndex {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+        let published_snapshot =
+            SnapshotPublisher::new(Arc::new(backend.snapshot().clone()), Vec::new())?;
         Ok(Self {
             config,
             schema,
             parser,
             backend,
+            published_snapshot,
             accumulator,
             identities: Vec::new(),
             uncommitted_ids: BTreeSet::new(),
@@ -386,6 +1059,16 @@ impl QuillIndex {
     #[must_use]
     pub const fn snapshot(&self) -> &KeeperSnapshot {
         self.backend.snapshot()
+    }
+
+    /// Current process-local Keeper plus Delta snapshot.
+    ///
+    /// Readers should pin this `Arc` once and retain it for the complete query.
+    /// The scalar search implementation consumes only its Keeper component
+    /// until E5.3 supplies Delta cursor adapters.
+    #[must_use]
+    pub fn search_snapshot(&self) -> Arc<QuillSearchSnapshot> {
+        self.published_snapshot.load()
     }
 
     /// Durable index directory, or `None` for an owned-buffer index.
@@ -548,6 +1231,9 @@ impl QuillIndex {
             .as_ref()
             .expect("nonempty pending segments have a retained MANIFEST proposal")
             .clone();
+        let prepared_publication = self
+            .published_snapshot
+            .prepare_sealed_manifest(self.schema, &manifest)?;
         let commit_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_COMMIT,
@@ -587,6 +1273,10 @@ impl QuillIndex {
                         *snapshot = published;
                     }
                 }
+                self.published_snapshot.install_prepared_sealed(
+                    Arc::new(self.backend.snapshot().clone()),
+                    prepared_publication,
+                );
                 record_snapshot_fields(&open_span, self.backend.snapshot());
                 Ok::<(), QuillIndexError>(())
             }
@@ -633,6 +1323,9 @@ impl QuillIndex {
             .next_seal_seq
             .checked_add(1)
             .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+        let prepared_publication = self
+            .published_snapshot
+            .prepare_equivalent_sealed_successor()?;
         match &mut self.backend {
             IndexBackend::Durable(writer) => {
                 writer
@@ -659,6 +1352,10 @@ impl QuillIndex {
                 *snapshot = successor;
             }
         }
+        self.published_snapshot.install_prepared_sealed(
+            Arc::new(self.backend.snapshot().clone()),
+            prepared_publication,
+        );
         self.next_seal_seq = next_seal_seq;
         Ok(self.backend.snapshot())
     }
@@ -909,13 +1606,15 @@ impl QuillIndex {
         offset: usize,
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
+        let published = self.published_snapshot.load();
+        let snapshot = published.keeper_snapshot();
         let query_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_QUERY,
             phase = "query",
             query_len = query.len(),
-            segment_count = self.backend.snapshot().segments().len(),
-            doc_count = self.backend.snapshot().doc_count(),
+            segment_count = snapshot.segments().len(),
+            doc_count = snapshot.doc_count(),
             limit,
             offset,
             exact_count,
@@ -956,7 +1655,6 @@ impl QuillIndex {
             );
             parsed
         };
-        let snapshot = self.backend.snapshot();
         let mut collector = if exact_count {
             TopDocsCollector::with_exact_count(limit, offset)?
         } else {
@@ -1033,14 +1731,16 @@ impl QuillIndex {
     /// Returns typed cancellation, parse/lowering, cursor, or allocation
     /// failures.
     pub fn collect_docids(&self, cx: &Cx, query: &str) -> Result<Vec<u32>, QuillIndexError> {
+        let published = self.published_snapshot.load();
+        let snapshot = published.keeper_snapshot();
         let query_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_QUERY,
             phase = "query",
             collector = "docset",
             query_len = query.len(),
-            segment_count = self.backend.snapshot().segments().len(),
-            doc_count = self.backend.snapshot().doc_count(),
+            segment_count = snapshot.segments().len(),
+            doc_count = snapshot.doc_count(),
             result_count = tracing::field::Empty,
             duration_us = tracing::field::Empty,
         );
@@ -1068,7 +1768,6 @@ impl QuillIndex {
             parse_span.record("result_count", 1_u64);
             parsed
         };
-        let snapshot = self.backend.snapshot();
         let mut collector = DocSetCollector::new();
         for segment in snapshot.segments() {
             check_cancel(cx, "collect_docids")?;
@@ -1721,15 +2420,21 @@ fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
 mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
-    #[cfg(feature = "durability")]
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use asupersync::runtime::yield_now;
+    use asupersync::types::Budget;
+    use asupersync::{LabConfig, LabRuntime};
     #[cfg(feature = "durability")]
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig};
 
     use super::*;
+    use crate::contract::fieldnorm_to_id;
+    use crate::delta::{DeltaFieldNorm, DeltaSegment, DeltaTermPosting};
     use crate::keeper::ConcatMergeError;
     use crate::quiver::{StatsSection, aggregate_field_stats};
+    use crate::schema::FSFS_CHUNK_SCHEMA;
 
     const CONCAT_MERGE_QUERIES: [&str; 4] =
         ["rust", "python", "rust OR python", "\"rust ownership\""];
@@ -1780,6 +2485,69 @@ mod tests {
                 .with_title("Python guide")
                 .with_metadata("cluster", "data"),
         ]
+    }
+
+    fn apply_alpha_delta(
+        delta: &mut DeltaSegment,
+        global_docid: u32,
+        document_id: &str,
+        content_frequency: u32,
+    ) {
+        let positions = (0..content_frequency).collect::<Vec<_>>();
+        let fieldnorms = [
+            DeltaFieldNorm {
+                field_ord: ID_FIELD,
+                raw_length: 1,
+                fieldnorm_id: fieldnorm_to_id(1),
+            },
+            DeltaFieldNorm {
+                field_ord: CONTENT_FIELD,
+                raw_length: content_frequency,
+                fieldnorm_id: fieldnorm_to_id(content_frequency),
+            },
+            DeltaFieldNorm {
+                field_ord: TITLE_FIELD,
+                raw_length: 0,
+                fieldnorm_id: fieldnorm_to_id(0),
+            },
+        ];
+        let postings = [
+            DeltaTermPosting {
+                field_ord: ID_FIELD,
+                term: document_id.as_bytes(),
+                frequency: 1,
+                positions: None,
+            },
+            DeltaTermPosting {
+                field_ord: CONTENT_FIELD,
+                term: b"alpha",
+                frequency: content_frequency,
+                positions: Some(&positions),
+            },
+        ];
+        delta
+            .apply_document(
+                global_docid,
+                frankensearch_core::DocId::from(document_id),
+                &fieldnorms,
+                &postings,
+            )
+            .expect("apply Delta fixture document");
+    }
+
+    fn alpha_snapshot_tuple(snapshot: &QuillSearchSnapshot) -> (u64, u64, u64, u64, u64) {
+        let stats = snapshot
+            .bm25_field_stats(CONTENT_FIELD)
+            .expect("content snapshot statistics");
+        (
+            snapshot.snapshot_epoch(),
+            snapshot.live_doc_count(),
+            stats.doc_count,
+            stats.total_tokens,
+            snapshot
+                .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                .expect("alpha document frequency"),
+        )
     }
 
     async fn concat_merge_fixture_index(cx: &Cx) -> QuillIndex {
@@ -2042,6 +2810,537 @@ mod tests {
             },
         )
         .expect("valid test durability configuration")
+    }
+
+    #[test]
+    fn snapshot_publication_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<DeltaSnapshot>();
+        assert_send_sync::<QuillSearchSnapshot>();
+        assert_send_sync::<SnapshotPublisher>();
+    }
+
+    #[test]
+    fn composite_snapshot_uses_keeper_at_seal_and_live_delta_statistics() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let sealed_documents = [
+                IndexableDocument::new("sealed-live", "alpha"),
+                IndexableDocument::new("sealed-deleted", "alpha"),
+            ];
+            index
+                .index_documents(&cx, &sealed_documents)
+                .await
+                .expect("accumulate sealed fixtures");
+            index.commit(&cx).await.expect("commit sealed fixtures");
+
+            let committed = index.snapshot().clone();
+            let mut tombstoned_manifest = committed.next_manifest().expect("next manifest");
+            assert!(
+                committed
+                    .delete_document(&mut tombstoned_manifest, "sealed-deleted")
+                    .expect("stage sealed delete")
+            );
+            let tombstoned = committed
+                .publish_owned_segments(&tombstoned_manifest, Vec::new())
+                .expect("publish tombstone-only successor");
+            assert_eq!(tombstoned.at_seal_doc_count(), 2);
+            assert_eq!(tombstoned.doc_count(), 1);
+            assert_eq!(
+                snapshot_doc_freq(&tombstoned, DEFAULT_SCHEMA, CONTENT_FIELD, b"alpha")
+                    .expect("sealed alpha df"),
+                2,
+                "sealed tombstones remain in BM25 df until compaction"
+            );
+
+            let generation = tombstoned.loaded_manifest().manifest.generation;
+            let first_base = u64::from(DOC_ORDS_PER_LEASE);
+            let second_base = first_base * 2;
+            let mut first = DeltaSegment::new(DEFAULT_SCHEMA, first_base, usize::MAX)
+                .expect("first Delta shard");
+            apply_alpha_delta(
+                &mut first,
+                u32::try_from(first_base).expect("first Delta docid"),
+                "delta-a",
+                2,
+            );
+            let mut second = DeltaSegment::new(DEFAULT_SCHEMA, second_base, usize::MAX)
+                .expect("second Delta shard");
+            apply_alpha_delta(
+                &mut second,
+                u32::try_from(second_base).expect("second Delta docid"),
+                "delta-b",
+                3,
+            );
+
+            let snapshot = QuillSearchSnapshot::compose(
+                11,
+                Arc::new(tombstoned),
+                vec![
+                    Arc::new(first.freeze(generation)),
+                    Arc::new(second.freeze(generation)),
+                ],
+            )
+            .expect("compose Keeper plus Delta snapshot");
+            assert_eq!(snapshot.snapshot_epoch(), 11);
+            assert_eq!(snapshot.bm25_doc_count(), 4);
+            assert_eq!(snapshot.live_doc_count(), 3);
+            assert_eq!(
+                snapshot
+                    .bm25_field_stats(CONTENT_FIELD)
+                    .expect("content stats"),
+                SnapshotFieldStats {
+                    field_ord: CONTENT_FIELD,
+                    total_tokens: 7,
+                    doc_count: 4,
+                }
+            );
+            assert_eq!(
+                snapshot
+                    .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                    .expect("composite alpha df"),
+                4
+            );
+        });
+    }
+
+    #[test]
+    fn three_delta_upserts_contribute_one_live_bm25_row() {
+        run_with_cx(|cx| async move {
+            let keeper =
+                Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+            let generation = keeper.loaded_manifest().manifest.generation;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+            apply_alpha_delta(&mut delta, 0, "same-id", 1);
+            apply_alpha_delta(&mut delta, 1, "same-id", 2);
+            apply_alpha_delta(&mut delta, 2, "same-id", 3);
+            assert_eq!(delta.physical_document_count(), 3);
+            assert_eq!(delta.live_document_count(), 1);
+            assert_eq!(
+                delta
+                    .find_term(CONTENT_FIELD, b"alpha")
+                    .expect("alpha Delta term")
+                    .live_doc_freq(),
+                1
+            );
+
+            let snapshot =
+                QuillSearchSnapshot::compose(0, keeper, vec![Arc::new(delta.freeze(generation))])
+                    .expect("compose repeated-upsert snapshot");
+            assert_eq!(alpha_snapshot_tuple(&snapshot), (0, 1, 1, 3, 1));
+            let pre_stats = snapshot
+                .bm25_field_stats(CONTENT_FIELD)
+                .expect("pre-seal content stats");
+            let pre_df = snapshot
+                .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                .expect("pre-seal alpha df");
+            let mut pre_scorer = ReferenceScorer::term(
+                TermScorer::new(
+                    OwnedPostingCursor {
+                        postings: vec![Posting::new(2, 3)],
+                        positions: None,
+                        cursor: 0,
+                        segment_num_docs: 1,
+                    },
+                    OwnedFieldNorms {
+                        field_ord: CONTENT_FIELD,
+                        docid_lo: 2,
+                        values: vec![fieldnorm_to_id(3)],
+                    },
+                    Bm25FieldSnapshot::new(pre_stats).expect("pre-seal BM25 snapshot"),
+                    pre_df,
+                    1.0,
+                )
+                .expect("pre-seal term scorer"),
+            );
+
+            let mut sealed = QuillIndex::in_memory(deterministic_config()).expect("sealed index");
+            sealed
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new("same-id", "alpha alpha alpha")],
+                )
+                .await
+                .expect("accumulate final logical upsert row");
+            sealed
+                .commit(&cx)
+                .await
+                .expect("seal final logical upsert row");
+            let keeper = sealed.snapshot();
+            let post_stats = snapshot_field(keeper, CONTENT_FIELD).expect("post-seal stats");
+            let post_df = snapshot_doc_freq(keeper, DEFAULT_SCHEMA, CONTENT_FIELD, b"alpha")
+                .expect("post-seal alpha df");
+            assert_eq!(pre_stats, post_stats);
+            assert_eq!(pre_df, post_df);
+
+            let mut post_scorer = lower_term(
+                &keeper.segments()[0],
+                keeper,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"alpha",
+                1.0,
+            )
+            .expect("post-seal term scorer");
+            assert_eq!(
+                pre_scorer.score().expect("pre-seal score").to_bits(),
+                post_scorer.score().expect("post-seal score").to_bits(),
+                "the final live upsert must keep bit-identical BM25 across seal"
+            );
+        });
+    }
+
+    #[test]
+    fn snapshot_composition_rejects_stale_schema_and_lease_drift() {
+        let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+        let generation = keeper.loaded_manifest().manifest.generation;
+
+        let stale = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
+            .expect("stale Delta")
+            .freeze(generation + 1);
+        let Err(error) =
+            QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::new(stale)])
+        else {
+            panic!("stale Delta generation was accepted");
+        };
+        assert!(matches!(
+            error,
+            SnapshotError::KeeperGenerationMismatch { .. }
+        ));
+
+        let wrong_schema = DeltaSegment::new(FSFS_CHUNK_SCHEMA, 0, usize::MAX)
+            .expect("wrong-schema Delta")
+            .freeze(generation);
+        let Err(error) =
+            QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::new(wrong_schema)])
+        else {
+            panic!("wrong-schema Delta was accepted");
+        };
+        assert!(matches!(error, SnapshotError::SchemaMismatch { .. }));
+
+        let first = Arc::new(
+            DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
+                .expect("first overlapping Delta")
+                .freeze(generation),
+        );
+        let second = Arc::new(
+            DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
+                .expect("second overlapping Delta")
+                .freeze(generation),
+        );
+        let Err(error) =
+            QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::clone(&first), second])
+        else {
+            panic!("overlapping Delta leases were accepted");
+        };
+        assert!(matches!(
+            error,
+            SnapshotError::OverlappingDeltaLeases { .. }
+        ));
+
+        let publisher = SnapshotPublisher::new(keeper, vec![first]).expect("snapshot publisher");
+        let replacement = Arc::new(
+            DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
+                .expect("replacement Delta")
+                .freeze(generation),
+        );
+        assert!(matches!(
+            publisher.publish_delta(1, replacement),
+            Err(SnapshotError::ShardOutOfBounds {
+                shard: 1,
+                shard_count: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn snapshot_composition_rejects_keeper_delta_occupied_range_overlap() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            index
+                .index_documents(&cx, &[IndexableDocument::new("sealed", "alpha")])
+                .await
+                .expect("accumulate sealed row");
+            index.commit(&cx).await.expect("commit sealed row");
+
+            let keeper = Arc::new(index.snapshot().clone());
+            let generation = keeper.loaded_manifest().manifest.generation;
+            let segment = &keeper.loaded_manifest().manifest.segments[0];
+            assert_eq!((segment.docid_lo, segment.docid_hi), (0, 1));
+
+            let mut overlapping =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("overlapping Delta");
+            apply_alpha_delta(&mut overlapping, 0, "duplicate-docid", 1);
+            let Err(error) = QuillSearchSnapshot::compose(
+                0,
+                Arc::clone(&keeper),
+                vec![Arc::new(overlapping.freeze(generation))],
+            ) else {
+                panic!("occupied Keeper/Delta docid overlap was accepted");
+            };
+            assert_eq!(
+                error,
+                SnapshotError::KeeperDeltaDocidOverlap {
+                    delta_lo: 0,
+                    delta_hi: 1,
+                    segment_id: segment.segment_id,
+                    keeper_lo: 0,
+                    keeper_hi: 1,
+                }
+            );
+
+            let mut continuation =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("same-lease Delta");
+            apply_alpha_delta(&mut continuation, 1, "nonoverlapping-docid", 1);
+            QuillSearchSnapshot::compose(
+                0,
+                keeper,
+                vec![Arc::new(continuation.freeze(generation))],
+            )
+            .expect("actual same-lease continuation range does not overlap Keeper");
+        });
+    }
+
+    #[test]
+    fn failed_complete_publications_leave_the_current_epoch_unchanged() {
+        run_with_cx(|cx| async move {
+            let genesis = Arc::new(
+                KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper snapshot"),
+            );
+            let genesis_generation = genesis.loaded_manifest().manifest.generation;
+            let snapshot_source = SnapshotPublisher::new(Arc::clone(&genesis), Vec::new())
+                .expect("genesis publisher");
+
+            let mut first = QuillIndex::in_memory(deterministic_config()).expect("first index");
+            first
+                .index_documents(&cx, &[IndexableDocument::new("first", "alpha")])
+                .await
+                .expect("accumulate first successor");
+            first.commit(&cx).await.expect("publish first successor");
+            let successor = Arc::new(first.snapshot().clone());
+
+            let before = snapshot_source.load();
+            let stale_delta = Arc::new(
+                DeltaSegment::new(DEFAULT_SCHEMA, DOC_ORDS_PER_LEASE.into(), usize::MAX)
+                    .expect("stale Delta")
+                    .freeze(genesis_generation),
+            );
+            assert!(matches!(
+                snapshot_source.publish_complete(Arc::clone(&successor), vec![stale_delta]),
+                Err(SnapshotError::KeeperGenerationMismatch { .. })
+            ));
+            assert!(Arc::ptr_eq(&before, &snapshot_source.load()));
+            assert_eq!(alpha_snapshot_tuple(&before), (0, 0, 0, 0, 0));
+
+            let accepted = snapshot_source
+                .publish_complete(Arc::clone(&successor), Vec::new())
+                .expect("publish valid Keeper successor");
+            assert_eq!(alpha_snapshot_tuple(&accepted), (1, 1, 1, 1, 1));
+
+            let Err(rollback) = snapshot_source.publish_complete(genesis, Vec::new()) else {
+                panic!("stale Keeper rollback was accepted");
+            };
+            assert_eq!(
+                rollback,
+                SnapshotError::KeeperGenerationRegression {
+                    current: successor.loaded_manifest().manifest.generation,
+                    proposed: genesis_generation,
+                }
+            );
+            assert!(Arc::ptr_eq(&accepted, &snapshot_source.load()));
+
+            let mut second = QuillIndex::in_memory(deterministic_config()).expect("second index");
+            second
+                .index_documents(&cx, &[IndexableDocument::new("second", "beta")])
+                .await
+                .expect("accumulate colliding successor");
+            second
+                .commit(&cx)
+                .await
+                .expect("publish colliding successor fixture");
+            let collision = Arc::new(second.snapshot().clone());
+            let Err(collision) = snapshot_source.publish_complete(collision, Vec::new()) else {
+                panic!("same-generation divergent MANIFEST was accepted");
+            };
+            assert_eq!(
+                collision,
+                SnapshotError::KeeperGenerationCollision {
+                    generation: successor.loaded_manifest().manifest.generation,
+                }
+            );
+            assert!(Arc::ptr_eq(&accepted, &snapshot_source.load()));
+        });
+    }
+
+    #[test]
+    fn publisher_retains_a_held_epoch_until_its_last_reader_drops() {
+        let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+        let generation = keeper.loaded_manifest().manifest.generation;
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+        let publisher = SnapshotPublisher::new(
+            Arc::clone(&keeper),
+            vec![Arc::new(delta.freeze(generation))],
+        )
+        .expect("snapshot publisher");
+        let held = publisher.load();
+        let weak = Arc::downgrade(&held);
+
+        apply_alpha_delta(&mut delta, 0, "new", 1);
+        let next_epoch = publisher
+            .publish_delta(0, Arc::new(delta.freeze(generation)))
+            .expect("publish next Delta epoch");
+        assert_eq!(alpha_snapshot_tuple(&held), (0, 0, 0, 0, 0));
+        assert_eq!(alpha_snapshot_tuple(&next_epoch), (1, 1, 1, 1, 1));
+        assert_eq!(alpha_snapshot_tuple(&publisher.load()), (1, 1, 1, 1, 1));
+        assert!(weak.upgrade().is_some());
+
+        drop(held);
+        assert!(
+            weak.upgrade().is_none(),
+            "the old composite must retire after its final reader Arc drops"
+        );
+    }
+
+    #[test]
+    fn labruntime_readers_observe_only_complete_composite_epochs() {
+        let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+        let generation = keeper.loaded_manifest().manifest.generation;
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+        let publisher = Arc::new(
+            SnapshotPublisher::new(
+                Arc::clone(&keeper),
+                vec![Arc::new(delta.freeze(generation))],
+            )
+            .expect("snapshot publisher"),
+        );
+        apply_alpha_delta(&mut delta, 0, "new", 1);
+        let next_delta = Arc::new(delta.freeze(generation));
+        let reader_saw_old = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::new(AtomicBool::new(false));
+
+        let mut lab = LabRuntime::new(LabConfig::new(0xe5_2002).max_steps(100_000));
+        let region = lab.state.create_root_region(Budget::INFINITE);
+
+        let reader_publisher = Arc::clone(&publisher);
+        let reader_started = Arc::clone(&reader_saw_old);
+        let reader_done = Arc::clone(&writer_done);
+        let (reader, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                assert_eq!(
+                    alpha_snapshot_tuple(&reader_publisher.load()),
+                    (0, 0, 0, 0, 0)
+                );
+                reader_started.store(true, Ordering::SeqCst);
+                while !reader_done.load(Ordering::SeqCst) {
+                    let observed = alpha_snapshot_tuple(&reader_publisher.load());
+                    assert!(
+                        observed == (0, 0, 0, 0, 0) || observed == (1, 1, 1, 1, 1),
+                        "reader observed a torn composite tuple: {observed:?}"
+                    );
+                    yield_now().await;
+                }
+                assert_eq!(
+                    alpha_snapshot_tuple(&reader_publisher.load()),
+                    (1, 1, 1, 1, 1)
+                );
+            })
+            .expect("create snapshot reader task");
+
+        let writer_publisher = Arc::clone(&publisher);
+        let writer_started = Arc::clone(&reader_saw_old);
+        let writer_finished = Arc::clone(&writer_done);
+        let (writer, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while !writer_started.load(Ordering::SeqCst) {
+                    yield_now().await;
+                }
+                writer_publisher
+                    .publish_delta(0, next_delta)
+                    .expect("publish complete Delta epoch");
+                writer_finished.store(true, Ordering::SeqCst);
+            })
+            .expect("create snapshot writer task");
+
+        lab.scheduler.lock().schedule(reader, 0);
+        lab.step_for_test();
+        assert!(reader_saw_old.load(Ordering::SeqCst));
+        lab.scheduler.lock().schedule(writer, 0);
+        let report = lab.run_until_quiescent_with_report();
+
+        assert!(report.quiescent, "LabRuntime must reach quiescence");
+        assert!(report.oracle_report.all_passed(), "oracles must pass");
+        assert!(report.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn delta_and_equivalent_sealed_term_have_identical_score_bits() {
+        run_with_cx(|cx| async move {
+            let keeper = Arc::new(
+                KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper snapshot"),
+            );
+            let generation = keeper.loaded_manifest().manifest.generation;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+            apply_alpha_delta(&mut delta, 0, "doc", 1);
+            let composite =
+                QuillSearchSnapshot::compose(0, keeper, vec![Arc::new(delta.freeze(generation))])
+                    .expect("pre-seal composite snapshot");
+            let pre_stats = composite
+                .bm25_field_stats(CONTENT_FIELD)
+                .expect("pre-seal content stats");
+            let pre_df = composite
+                .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                .expect("pre-seal alpha df");
+            let mut pre_scorer = ReferenceScorer::term(
+                TermScorer::new(
+                    OwnedPostingCursor {
+                        postings: vec![Posting::new(0, 1)],
+                        positions: None,
+                        cursor: 0,
+                        segment_num_docs: 1,
+                    },
+                    OwnedFieldNorms {
+                        field_ord: CONTENT_FIELD,
+                        docid_lo: 0,
+                        values: vec![fieldnorm_to_id(1)],
+                    },
+                    Bm25FieldSnapshot::new(pre_stats).expect("pre-seal BM25 snapshot"),
+                    pre_df,
+                    1.0,
+                )
+                .expect("pre-seal term scorer"),
+            );
+
+            let mut sealed = QuillIndex::in_memory(deterministic_config()).expect("sealed index");
+            sealed
+                .index_documents(&cx, &[IndexableDocument::new("doc", "alpha")])
+                .await
+                .expect("accumulate equivalent sealed document");
+            sealed.commit(&cx).await.expect("seal equivalent document");
+            let keeper = sealed.snapshot();
+            let post_stats = snapshot_field(keeper, CONTENT_FIELD).expect("post-seal stats");
+            let post_df = snapshot_doc_freq(keeper, DEFAULT_SCHEMA, CONTENT_FIELD, b"alpha")
+                .expect("post-seal alpha df");
+            assert_eq!(pre_stats, post_stats);
+            assert_eq!(pre_df, post_df);
+
+            let mut post_scorer = lower_term(
+                &keeper.segments()[0],
+                keeper,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"alpha",
+                1.0,
+            )
+            .expect("post-seal term scorer");
+            assert_eq!(
+                pre_scorer.score().expect("pre-seal score").to_bits(),
+                post_scorer.score().expect("post-seal score").to_bits(),
+                "BM25 score must be bit-identical across the seal boundary"
+            );
+        });
     }
 
     #[test]
