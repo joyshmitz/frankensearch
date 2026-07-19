@@ -14,6 +14,7 @@ use std::hint::black_box;
 
 use ahash::AHashMap;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 /// Minimal stand-in for `SearchHitPayload` carrying the fields the fusion reads.
 #[derive(Clone)]
@@ -237,6 +238,53 @@ fn bench(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("borrow_ahash", &id), &(), |bch, ()| {
             bch.iter(|| black_box(fuse_borrow_ahash(black_box(&payloads))));
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above CANNOT decide these levers: criterion runs them as
+        // separate benchmarks minutes apart, so worker drift between them is not
+        // cancelled. The paired sampler runs both arms in ONE routine in alternating
+        // rounds and takes the median per-round ratio; gate on the median against the
+        // A/A null's observed spread, not on cv. Two independent levers (borrow_sip,
+        // borrow_ahash) against the same clone_sip base get one null + two levers.
+        let clone_sip = || {
+            black_box(fuse_clone_sip(black_box(&payloads)));
+        };
+        let borrow_sip = || {
+            black_box(fuse_borrow_sip(black_box(&payloads)));
+        };
+        let borrow_ahash = || {
+            black_box(fuse_borrow_ahash(black_box(&payloads)));
+        };
+        let null = paired_median_ratio(41, 8, clone_sip, clone_sip);
+        let sip_lever = paired_median_ratio(41, 8, clone_sip, borrow_sip);
+        let ahash_lever = paired_median_ratio(41, 8, clone_sip, borrow_ahash);
+        eprintln!(
+            "[null]  expand_fuse {id}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] expand_fuse {id}: borrow_sip median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            sip_lever.median,
+            sip_lever.p5,
+            sip_lever.p95,
+            if sip_lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        eprintln!(
+            "[lever] expand_fuse {id}: borrow_ahash median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            ahash_lever.median,
+            ahash_lever.p5,
+            ahash_lever.p95,
+            if ahash_lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

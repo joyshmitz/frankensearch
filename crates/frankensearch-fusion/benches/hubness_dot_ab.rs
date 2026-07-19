@@ -41,6 +41,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 use frankensearch_fusion::compute_query_hubness;
 use frankensearch_index::dot_product_f32_f32;
 use rayon::prelude::*;
@@ -197,6 +198,60 @@ fn bench(c: &mut Criterion) {
             bch.iter(|| black_box(dot_scalar(black_box(&lhs), black_box(&rhs))));
         });
         group.finish();
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above run as separate benchmarks minutes apart, so worker
+        // drift between them is not cancelled. The paired sampler runs both arms in ONE
+        // routine in alternating rounds; gate on the median against the A/A null's
+        // observed spread. Base is the ORIGINAL scalar dot; one null+lever pair per
+        // candidate kernel.
+        let mut scalar = || {
+            black_box(dot_scalar(black_box(&lhs), black_box(&rhs)));
+        };
+        let mut multiacc = || {
+            black_box(dot_multiacc(black_box(&lhs), black_box(&rhs)));
+        };
+        let null = paired_median_ratio(41, 8, scalar, scalar);
+        let lever = paired_median_ratio(41, 8, scalar, multiacc);
+        eprintln!(
+            "[null]  hubness_dot_micro d384: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] hubness_dot_micro d384: multiacc/scalar median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut scalar = || {
+            black_box(dot_scalar(black_box(&lhs), black_box(&rhs)));
+        };
+        let mut simd = || {
+            black_box(dot_simd(black_box(&lhs), black_box(&rhs)));
+        };
+        let null = paired_median_ratio(41, 8, scalar, scalar);
+        let lever = paired_median_ratio(41, 8, scalar, simd);
+        eprintln!(
+            "[null]  hubness_dot_micro d384: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] hubness_dot_micro d384: simd/scalar median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
 
     // ── Macro: the full O(docs·queries·dim) hubness build ─────────────────────────────────────
@@ -303,6 +358,146 @@ fn bench(c: &mut Criterion) {
             });
         });
         g.finish();
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above run as separate benchmarks minutes apart, so worker
+        // drift between them is not cancelled. The paired sampler runs both arms in ONE
+        // routine in alternating rounds; gate on the median against the A/A null's
+        // observed spread. One null+lever pair per comparison: the inner-dot levers
+        // (multiacc, simd vs scalar), the outer-loop lever (simd_par vs simd), and the
+        // shipped entry point vs its simd_par mirror.
+        let mut scalar_build = || {
+            black_box(hubness_with(
+                black_box(&doc_vecs),
+                black_box(&query_sample),
+                kq,
+                dot_scalar,
+            ));
+        };
+        let mut multiacc_build = || {
+            black_box(hubness_with(
+                black_box(&doc_vecs),
+                black_box(&query_sample),
+                kq,
+                dot_multiacc,
+            ));
+        };
+        let null = paired_median_ratio(41, 8, scalar_build, scalar_build);
+        let lever = paired_median_ratio(41, 8, scalar_build, multiacc_build);
+        eprintln!(
+            "[null]  hubness_build {id}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] hubness_build {id}: multiacc/scalar median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut scalar_build = || {
+            black_box(hubness_with(
+                black_box(&doc_vecs),
+                black_box(&query_sample),
+                kq,
+                dot_scalar,
+            ));
+        };
+        let mut simd_build = || {
+            black_box(hubness_with(
+                black_box(&doc_vecs),
+                black_box(&query_sample),
+                kq,
+                dot_simd,
+            ));
+        };
+        let null = paired_median_ratio(41, 8, scalar_build, scalar_build);
+        let lever = paired_median_ratio(41, 8, scalar_build, simd_build);
+        eprintln!(
+            "[null]  hubness_build {id}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] hubness_build {id}: simd/scalar median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut simd_build = || {
+            black_box(hubness_with(
+                black_box(&doc_vecs),
+                black_box(&query_sample),
+                kq,
+                dot_simd,
+            ));
+        };
+        let mut simd_par_build = || {
+            black_box(hubness_par(
+                black_box(&doc_vecs),
+                black_box(&query_sample),
+                kq,
+                dot_simd,
+            ));
+        };
+        let null = paired_median_ratio(41, 8, simd_build, simd_build);
+        let lever = paired_median_ratio(41, 8, simd_build, simd_par_build);
+        eprintln!(
+            "[null]  hubness_build {id}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] hubness_build {id}: simd_par/simd median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut simd_par_build = || {
+            black_box(hubness_par(
+                black_box(&doc_vecs),
+                black_box(&query_sample),
+                kq,
+                dot_simd,
+            ));
+        };
+        let mut shipped_build = || {
+            black_box(compute_query_hubness(
+                black_box(&doc_vecs),
+                black_box(&query_sample),
+                kq,
+            ));
+        };
+        let null = paired_median_ratio(41, 8, simd_par_build, simd_par_build);
+        let lever = paired_median_ratio(41, 8, simd_par_build, shipped_build);
+        eprintln!(
+            "[null]  hubness_build {id}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] hubness_build {id}: shipped/simd_par median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
 }
 

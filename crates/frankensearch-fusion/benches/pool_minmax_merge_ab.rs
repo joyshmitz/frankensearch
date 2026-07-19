@@ -310,6 +310,86 @@ fn bench(c: &mut Criterion) {
                 });
             },
         );
+
+        // ── DECIDABILITY (bd-zgq6): top10 regression-guard and dispatch-overhead pairs ──
+        //
+        // Same alternating-round paired sampler + A/A null control as the limit_all block
+        // above; one null+lever pair per remaining comparison.
+        let mut top10_orig = || {
+            black_box(pool_minmax_fuse(
+                black_box(&lex),
+                black_box(&sem),
+                10,
+                0,
+                &cfg,
+            ));
+        };
+        let mut top10_merge = || {
+            black_box(pool_minmax_fuse_merge(
+                black_box(&lex),
+                black_box(&sem),
+                10,
+                0,
+                &cfg,
+            ));
+        };
+        let null = paired_median_ratio(41, 8, top10_orig, top10_orig);
+        let lever = paired_median_ratio(41, 8, top10_orig, top10_merge);
+        eprintln!(
+            "[null]  top10/{pool}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] top10/{pool}: merge/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut dispatch_direct = || {
+            black_box(rrf_fuse_with_graph_merge_unique(
+                black_box(&lex),
+                black_box(&sem),
+                &[],
+                0.0,
+                all,
+                0,
+                &cfg,
+            ));
+        };
+        let mut dispatch_strategy = || {
+            black_box(fuse_by_strategy(
+                black_box(FusionStrategy::Rrf),
+                black_box(&lex),
+                black_box(&sem),
+                &[],
+                0.0,
+                all,
+                0,
+                &cfg,
+            ));
+        };
+        let null = paired_median_ratio(41, 8, dispatch_direct, dispatch_direct);
+        let lever = paired_median_ratio(41, 8, dispatch_direct, dispatch_strategy);
+        eprintln!(
+            "[null]  dispatch/{pool}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] dispatch/{pool}: strategy/direct median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

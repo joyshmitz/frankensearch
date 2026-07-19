@@ -11,9 +11,9 @@
 
 use std::hint::black_box;
 
-use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
 use frankensearch_core::{ScoreSource, ScoredResult};
 use frankensearch_fusion::NqcDenseWeight;
+use frankensearch_fusion::bench_support::{PairedRatio, paired_median_ratio};
 use frankensearch_fusion::sync_searcher::{
     bench_nqc_cv_collect, bench_nqc_cv_ilp, bench_nqc_cv_iter, bench_nqc_empty_weight_early,
     bench_nqc_empty_weight_orig,

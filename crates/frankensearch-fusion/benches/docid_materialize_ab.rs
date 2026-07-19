@@ -20,6 +20,7 @@ use std::hint::black_box;
 
 use compact_str::CompactString;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 /// Borrowed winner: mirrors `FusedHitScratch<'a>` (Copy fields + `doc_id: &str`).
 #[derive(Clone, Copy)]
@@ -157,6 +158,64 @@ fn bench(c: &mut Criterion) {
                 black_box(out)
             });
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above run as separate benchmarks minutes apart, so worker
+        // drift between them is not cancelled. The paired sampler runs both arms in ONE
+        // routine in alternating rounds; gate on the median against the A/A null's
+        // observed spread. Base is the pre-landing `string` arm; one null+lever pair
+        // per candidate (`compact`, `packed`).
+        let mut string_build = || {
+            let out: Vec<FusedHitString> = black_box(&ws).iter().map(to_string).collect();
+            black_box(out);
+        };
+        let mut compact_build = || {
+            let out: Vec<FusedHitCompact> = black_box(&ws).iter().map(to_compact).collect();
+            black_box(out);
+        };
+        let null = paired_median_ratio(41, 8, string_build, string_build);
+        let lever = paired_median_ratio(41, 8, string_build, compact_build);
+        eprintln!(
+            "[null]  docid_materialize n{n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] docid_materialize n{n}: compact/string median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut string_build = || {
+            let out: Vec<FusedHitString> = black_box(&ws).iter().map(to_string).collect();
+            black_box(out);
+        };
+        let mut packed_build = || {
+            let out: Vec<FusedHitPacked> = black_box(&ws).iter().map(to_packed).collect();
+            black_box(out);
+        };
+        let null = paired_median_ratio(41, 8, string_build, string_build);
+        let lever = paired_median_ratio(41, 8, string_build, packed_build);
+        eprintln!(
+            "[null]  docid_materialize n{n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] docid_materialize n{n}: packed/string median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

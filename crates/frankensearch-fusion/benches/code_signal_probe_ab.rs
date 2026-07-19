@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 /// Reference tokenizer (the current `code_structure_sidecar::tokenize`, ASCII
 /// fast path + Unicode fallback).
@@ -163,6 +164,49 @@ fn bench(c: &mut Criterion) {
                 black_box(acc)
             });
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above CANNOT decide this lever: criterion runs them as
+        // separate benchmarks minutes apart, so worker drift between them is not
+        // cancelled. The paired sampler runs both arms in ONE routine in alternating
+        // rounds and takes the median per-round ratio; gate on the median against the
+        // A/A null's observed spread, not on cv.
+        let old = || {
+            let mut acc = 0usize;
+            for s in black_box(&sigs) {
+                if let Some(t) = old_match(black_box(&query), s) {
+                    acc += t.len();
+                }
+            }
+            black_box(acc);
+        };
+        let new = || {
+            let mut acc = 0usize;
+            for s in black_box(&sigs) {
+                if let Some(t) = new_match(black_box(&query), s) {
+                    acc += t.len();
+                }
+            }
+            black_box(acc);
+        };
+        let null = paired_median_ratio(41, 8, old, old);
+        let lever = paired_median_ratio(41, 8, old, new);
+        eprintln!(
+            "[null]  code_signal_probe {id}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] code_signal_probe {id}: new median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

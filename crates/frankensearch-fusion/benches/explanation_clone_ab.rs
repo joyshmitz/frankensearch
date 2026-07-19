@@ -22,6 +22,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::explanation::{
     ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
 };
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 /// A representative populated `HitExplanation` (a hybrid hit: lexical + semantic
 /// components with a few matched terms, plus a rank movement) — the shape the
@@ -89,6 +90,43 @@ fn bench(c: &mut Criterion) {
                 black_box(out)
             });
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above CANNOT decide this lever: criterion runs them as
+        // separate benchmarks minutes apart, so worker drift between them is not
+        // cancelled. The paired sampler runs both arms in ONE routine in alternating
+        // rounds and takes the median per-round ratio; gate on the median against the
+        // A/A null's observed spread, not on cv.
+        let value_deep_clone = || {
+            let out: Vec<Option<HitExplanation>> =
+                black_box(&values).iter().map(|v| Some(v.clone())).collect();
+            black_box(out);
+        };
+        let arc_clone = || {
+            let out: Vec<Option<Arc<HitExplanation>>> = black_box(&arcs)
+                .iter()
+                .map(|a| Some(Arc::clone(a)))
+                .collect();
+            black_box(out);
+        };
+        let null = paired_median_ratio(41, 8, value_deep_clone, value_deep_clone);
+        let lever = paired_median_ratio(41, 8, value_deep_clone, arc_clone);
+        eprintln!(
+            "[null]  explanation_clone n {n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] explanation_clone n {n}: arc_clone median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

@@ -12,6 +12,7 @@ use std::hint::black_box;
 
 use compact_str::CompactString;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 #[derive(PartialEq, Eq, Debug)]
 struct Token {
@@ -219,6 +220,52 @@ fn bench(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("compact", &id), &(), |b, ()| {
             b.iter(|| black_box(tokenize_compact(black_box(&text))));
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above CANNOT decide these levers: criterion runs them as
+        // separate benchmarks minutes apart, so worker drift between them is not
+        // cancelled. The paired sampler runs both arms in ONE routine in alternating
+        // rounds and takes the median per-round ratio; gate on the median against the
+        // A/A null's observed spread, not on cv.
+        let char_path = || {
+            black_box(tokenize_char(black_box(&text)));
+        };
+        let fast_path = || {
+            black_box(tokenize_fast(black_box(&text)));
+        };
+        let compact_path = || {
+            black_box(tokenize_compact(black_box(&text)));
+        };
+        let null = paired_median_ratio(41, 8, char_path, char_path);
+        let lever_fast = paired_median_ratio(41, 8, char_path, fast_path);
+        let lever_compact = paired_median_ratio(41, 8, char_path, compact_path);
+        eprintln!(
+            "[null]  tokenize_ascii {id}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] tokenize_ascii {id}: fast median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever_fast.median,
+            lever_fast.p5,
+            lever_fast.p95,
+            if lever_fast.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        eprintln!(
+            "[lever] tokenize_ascii {id}: compact median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever_compact.median,
+            lever_compact.p5,
+            lever_compact.p95,
+            if lever_compact.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

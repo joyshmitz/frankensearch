@@ -13,6 +13,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::types::{ScoreSource, ScoredResult, VectorHit};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 use frankensearch_fusion::rrf::{RrfConfig, RrfTiebreak, rrf_fuse};
 
 fn lexical(doc_id: String, score: f32) -> ScoredResult {
@@ -118,6 +119,70 @@ fn bench(c: &mut Criterion) {
     });
     g.finish();
 
+    // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+    //
+    // The criterion arms above CANNOT decide these levers: criterion runs them as
+    // separate benchmarks minutes apart, so worker drift between them is not
+    // cancelled. The paired sampler runs both arms in ONE routine in alternating
+    // rounds and takes the median per-round ratio; gate on the median against the
+    // A/A null's observed spread, not on cv.
+    let fuse_default = || {
+        black_box(rrf_fuse(
+            black_box(&lex),
+            black_box(&sem),
+            limit,
+            0,
+            &default,
+        ));
+    };
+    let fuse_weighted = || {
+        black_box(rrf_fuse(
+            black_box(&lex),
+            black_box(&sem),
+            limit,
+            0,
+            &weighted,
+        ));
+    };
+    let fuse_hash = || {
+        black_box(rrf_fuse(
+            black_box(&lex),
+            black_box(&sem),
+            limit,
+            0,
+            &hash_tb,
+        ));
+    };
+    let null = paired_median_ratio(41, 8, fuse_default, fuse_default);
+    let lever_weighted = paired_median_ratio(41, 8, fuse_default, fuse_weighted);
+    let lever_hash = paired_median_ratio(41, 8, fuse_default, fuse_hash);
+    eprintln!(
+        "[null]  rrf_config_cost/realistic: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        null.median, null.p5, null.p95, null.rounds
+    );
+    eprintln!(
+        "[lever] rrf_config_cost/realistic: tier_weighted median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        lever_weighted.median,
+        lever_weighted.p5,
+        lever_weighted.p95,
+        if lever_weighted.decidable_against(&null) {
+            "DECIDABLE"
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
+    );
+    eprintln!(
+        "[lever] rrf_config_cost/realistic: hash_tiebreak median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        lever_hash.median,
+        lever_hash.p5,
+        lever_hash.p95,
+        if lever_hash.decidable_against(&null) {
+            "DECIDABLE"
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
+    );
+
     // Tiebreak-stressed: n exact ties. Measures the hash tiebreak's worst case vs legacy.
     let (tlex, tsem) = build_tied(n);
     let tlimit = tlex.len() + tsem.len();
@@ -145,6 +210,43 @@ fn bench(c: &mut Criterion) {
         });
     });
     gt.finish();
+
+    // ── DECIDABILITY: paired sampler + A/A null control (tie-heavy inputs) ──
+    let fuse_tied_default = || {
+        black_box(rrf_fuse(
+            black_box(&tlex),
+            black_box(&tsem),
+            tlimit,
+            0,
+            &default,
+        ));
+    };
+    let fuse_tied_hash = || {
+        black_box(rrf_fuse(
+            black_box(&tlex),
+            black_box(&tsem),
+            tlimit,
+            0,
+            &hash_tb,
+        ));
+    };
+    let null = paired_median_ratio(41, 8, fuse_tied_default, fuse_tied_default);
+    let lever = paired_median_ratio(41, 8, fuse_tied_default, fuse_tied_hash);
+    eprintln!(
+        "[null]  rrf_config_cost/tie_heavy: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        null.median, null.p5, null.p95, null.rounds
+    );
+    eprintln!(
+        "[lever] rrf_config_cost/tie_heavy: hash_tiebreak median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        lever.median,
+        lever.p5,
+        lever.p95,
+        if lever.decidable_against(&null) {
+            "DECIDABLE"
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
+    );
 }
 
 criterion_group!(benches, bench);

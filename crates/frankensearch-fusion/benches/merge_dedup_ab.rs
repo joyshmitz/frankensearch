@@ -13,6 +13,7 @@ use std::hint::black_box;
 
 use ahash::AHashSet;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 /// Faithful stand-in for `FusedCandidate`: only `doc_id` allocates on clone;
 /// every other field is `Copy` (matches the real struct's clone cost).
@@ -107,6 +108,36 @@ fn bench(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("ahash", &id), &(), |bch, ()| {
             bch.iter(|| black_box(merge_ahash(black_box(&head), black_box(&tail))));
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above run as separate benchmarks minutes apart, so worker
+        // drift between them is not cancelled. The paired sampler runs both arms in ONE
+        // routine in alternating rounds; gate on the median against the A/A null's
+        // observed spread.
+        let mut sip = || {
+            black_box(merge_sip(black_box(&head), black_box(&tail)));
+        };
+        let mut ahash = || {
+            black_box(merge_ahash(black_box(&head), black_box(&tail)));
+        };
+        let null = paired_median_ratio(41, 8, sip, sip);
+        let lever = paired_median_ratio(41, 8, sip, ahash);
+        eprintln!(
+            "[null]  merge_dedup h{h}_t{t}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] merge_dedup h{h}_t{t}: ahash/sip median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

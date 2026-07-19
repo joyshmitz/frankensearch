@@ -15,6 +15,7 @@ use std::hint::black_box;
 
 use ahash::{AHashMap, AHashSet};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 struct VHit {
     score: f32,
@@ -99,6 +100,36 @@ fn bench(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("ahash", &id), &(), |b, ()| {
             b.iter(|| black_box(run_ahash(black_box(&fast), black_box(&quality))));
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above run as separate benchmarks minutes apart, so worker
+        // drift between them is not cancelled. The paired sampler runs both arms in ONE
+        // routine in alternating rounds; gate on the median against the A/A null's
+        // observed spread.
+        let mut sip = || {
+            black_box(run_sip(black_box(&fast), black_box(&quality)));
+        };
+        let mut ahash = || {
+            black_box(run_ahash(black_box(&fast), black_box(&quality)));
+        };
+        let null = paired_median_ratio(41, 8, sip, sip);
+        let lever = paired_median_ratio(41, 8, sip, ahash);
+        eprintln!(
+            "[null]  sync_hash n{n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] sync_hash n{n}: ahash/sip median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

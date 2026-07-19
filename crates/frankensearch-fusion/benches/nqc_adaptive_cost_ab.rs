@@ -5,8 +5,9 @@
 //! - CAND: maintain the exact rolling multiset in sorted order on each observation, then copy
 //!   that order into the 64-query snapshot without sorting.
 //! Before timing, the harness proves every returned weight bit-identical across warm-up,
-//! eviction, duplicates, signed zero, and ignored non-finite observations. Timings use paired
-//! AB/BA rounds against an ORIG/ORIG A/A null floor.
+//! eviction, duplicates, signed zero, and ignored non-finite observations. Timings use the
+//! shared alternating-round paired sampler (`bench_support::paired_median_ratio`) against an
+//! ORIG/ORIG A/A null floor.
 //!
 //! Run with:
 //! ```bash
@@ -20,9 +21,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use frankensearch_fusion::AdaptiveNqcDenseWeight;
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 const PROFILE_ROUNDS: usize = 41;
-const PAIRED_ROUND_PAIRS: usize = 41;
 const INNER: usize = 4096;
 
 /// Production default config ([`AdaptiveNqcDenseWeight::production_default`]).
@@ -49,44 +50,9 @@ impl CvStream {
     }
 }
 
-#[derive(Clone, Copy)]
-struct RatioDistribution {
-    median: f64,
-    p5: f64,
-    p95: f64,
-    round_pairs: usize,
-}
-impl RatioDistribution {
-    fn null_contains_one(self) -> bool {
-        self.p5 <= 1.0 && 1.0 <= self.p95
-    }
-    fn verdict_against(self, null: Self) -> &'static str {
-        if !null.null_contains_one() {
-            "BIASED_NULL_UNDECIDABLE"
-        } else if self.median < null.p5 {
-            "CANDIDATE_FASTER"
-        } else if self.median > null.p95 {
-            "CANDIDATE_SLOWER"
-        } else {
-            "INSIDE_NULL_FLOOR"
-        }
-    }
-}
-
 fn percentile(sorted: &[Duration], pct: usize) -> Duration {
     sorted[((sorted.len() - 1) * pct + 50) / 100]
 }
-fn ratio_distribution(mut samples: Vec<f64>) -> RatioDistribution {
-    samples.sort_unstable_by(f64::total_cmp);
-    let index = |pct: usize| ((samples.len() - 1) * pct + 50) / 100;
-    RatioDistribution {
-        median: samples[index(50)],
-        p5: samples[index(5)],
-        p95: samples[index(95)],
-        round_pairs: samples.len(),
-    }
-}
-
 /// One timed batch of INNER adaptive weightings (lookup + observe + periodic snapshot).
 fn time_adaptive(adaptive: &mut AdaptiveNqcDenseWeight, stream: &mut CvStream) -> Duration {
     let started = Instant::now();
@@ -125,36 +91,6 @@ fn median_ns_adaptive(adaptive: &mut AdaptiveNqcDenseWeight) -> (f64, f64) {
     (
         percentile(&samples, 50).as_secs_f64() * 1e9 / INNER as f64,
         percentile(&samples, 95).as_secs_f64() * 1e9 / INNER as f64,
-    )
-}
-
-fn paired_ratio(lever: bool) -> RatioDistribution {
-    let mut original = warm_adaptive(true);
-    let mut compared = warm_adaptive(!lever);
-    let mut a_stream = CvStream::new(0x0F0F_0F0F_0F0F_0F0F);
-    let mut b_stream = CvStream::new(0x0F0F_0F0F_0F0F_0F0F);
-    let mut sample = |record: bool| {
-        // AB then BA; ORIG=periodic full sort, CAND=incremental order (or ORIG for null).
-        let ab_a = time_adaptive(&mut original, &mut a_stream);
-        let ab_b = time_adaptive(&mut compared, &mut b_stream);
-        let ba_b = time_adaptive(&mut compared, &mut b_stream);
-        let ba_a = time_adaptive(&mut original, &mut a_stream);
-        if record {
-            let ab = ab_b.as_secs_f64() / ab_a.as_secs_f64();
-            let ba = ba_b.as_secs_f64() / ba_a.as_secs_f64();
-            Some((ab * ba).sqrt())
-        } else {
-            black_box((ab_a, ab_b, ba_b, ba_a));
-            None
-        }
-    };
-    for _ in 0..3 {
-        let _ = sample(false);
-    }
-    ratio_distribution(
-        (0..PAIRED_ROUND_PAIRS)
-            .map(|_| sample(true).expect("round"))
-            .collect(),
     )
 }
 
@@ -210,20 +146,41 @@ fn main() {
         candidate_p95 - original_p95
     );
 
-    let null = paired_ratio(false);
-    let lever = paired_ratio(true);
+    // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+    //
+    // Separate profile runs cannot decide this lever: worker drift between them is not
+    // cancelled. The paired sampler runs both arms in ONE routine in alternating rounds and
+    // takes the median per-round ratio; gate on the median against the A/A null's observed
+    // spread. Null = ORIG vs ORIG (periodic full sort both arms).
+    let paired = |lever: bool| {
+        let mut original = warm_adaptive(true);
+        let mut compared = warm_adaptive(!lever);
+        let mut a_stream = CvStream::new(0x0F0F_0F0F_0F0F_0F0F);
+        let mut b_stream = CvStream::new(0x0F0F_0F0F_0F0F_0F0F);
+        let base = || {
+            black_box(time_adaptive(&mut original, &mut a_stream));
+        };
+        let cand = || {
+            black_box(time_adaptive(&mut compared, &mut b_stream));
+        };
+        paired_median_ratio(41, 8, base, cand)
+    };
+    let null = paired(false);
+    let lever = paired(true);
     eprintln!(
-        "[paired] null_original_original median={:.4} p5={:.4} p95={:.4} ({} pairs)",
-        null.median, null.p5, null.p95, null.round_pairs
+        "[null]  nqc_adaptive_cost: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        null.median, null.p5, null.p95, null.rounds
     );
     eprintln!(
-        "[paired] incremental_vs_original median={:.4} p5={:.4} p95={:.4} ({} pairs)",
-        lever.median, lever.p5, lever.p95, lever.round_pairs
-    );
-    eprintln!(
-        "[verdict] {} candidate_original_ratio={:.4}x (<1 = incremental order is faster)",
-        lever.verdict_against(null),
-        lever.median
+        "[lever] nqc_adaptive_cost: incremental_order median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        lever.median,
+        lever.p5,
+        lever.p95,
+        if lever.decidable_against(&null) {
+            "DECIDABLE"
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
     );
     eprintln!(
         "[context] candidate saves ~{:.1} ns/query = {:.4}% of a 500us search",

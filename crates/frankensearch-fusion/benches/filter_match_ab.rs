@@ -12,6 +12,7 @@ use std::hint::black_box;
 use std::path::Path;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 enum Clause {
     PathContains(String), // already ASCII-lowercase (as produced by parse)
@@ -94,6 +95,59 @@ fn bench(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("new", &id), &(), |b, ()| {
             b.iter(|| black_box(run_new(black_box(&ext_filter), black_box(&d))));
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above run as separate benchmarks minutes apart, so worker
+        // drift between them is not cancelled. The paired sampler runs both arms in ONE
+        // routine in alternating rounds; gate on the median against the A/A null's
+        // observed spread. One null+lever pair per filter comparison.
+        let mut path_old = || {
+            black_box(run_old(black_box(&path_filter), black_box(&d)));
+        };
+        let mut path_new = || {
+            black_box(run_new(black_box(&path_filter), black_box(&d)));
+        };
+        let null = paired_median_ratio(41, 8, path_old, path_old);
+        let lever = paired_median_ratio(41, 8, path_old, path_new);
+        eprintln!(
+            "[null]  filter_match path_n{n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] filter_match path_n{n}: new/old median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut ext_old = || {
+            black_box(run_old(black_box(&ext_filter), black_box(&d)));
+        };
+        let mut ext_new = || {
+            black_box(run_new(black_box(&ext_filter), black_box(&d)));
+        };
+        let null = paired_median_ratio(41, 8, ext_old, ext_old);
+        let lever = paired_median_ratio(41, 8, ext_old, ext_new);
+        eprintln!(
+            "[null]  filter_match ext_n{n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] filter_match ext_n{n}: new/old median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

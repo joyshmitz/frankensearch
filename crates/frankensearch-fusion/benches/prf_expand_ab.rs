@@ -21,6 +21,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 const DIM: usize = 384;
 
@@ -147,6 +148,41 @@ fn bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("in_place", n), &feedback, |bch, fb| {
             bch.iter(|| black_box(in_place(black_box(&original), fb, alpha)));
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above CANNOT decide this lever: criterion runs them as
+        // separate benchmarks minutes apart, so worker drift between them is not
+        // cancelled. The paired sampler runs both arms in ONE routine in alternating
+        // rounds and takes the median per-round ratio; gate on the median against the
+        // A/A null's observed spread, not on cv.
+        let two_buf = || {
+            black_box(two_buffer(
+                black_box(&original),
+                black_box(&feedback),
+                alpha,
+            ));
+        };
+        let in_pl = || {
+            black_box(in_place(black_box(&original), black_box(&feedback), alpha));
+        };
+        let null = paired_median_ratio(41, 8, two_buf, two_buf);
+        let lever = paired_median_ratio(41, 8, two_buf, in_pl);
+        eprintln!(
+            "[null]  prf_expand n {n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] prf_expand n {n}: in_place median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     group.finish();
 }

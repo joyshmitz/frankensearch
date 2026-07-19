@@ -34,6 +34,7 @@ use std::time::Duration;
 use ahash::{AHashMap, AHashSet};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::{DocumentGraph, EdgeType, VectorHit};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 use frankensearch_fusion::{SmoothConfig, neighbor_smooth};
 
 /// A pool of `pool` candidates with heavy-tailed cosine scores, and an M-nearest `Similar`
@@ -379,6 +380,95 @@ fn bench(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("nonmutual_v3", pool), &(), |b, ()| {
             b.iter(|| black_box(smooth_v3(black_box(&hits), black_box(&graph), &smooth)));
         });
+
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──
+        //
+        // The criterion arms above run as separate benchmarks minutes apart, so worker
+        // drift between them is not cancelled. The paired sampler runs both arms in ONE
+        // routine in alternating rounds; gate on the median against the A/A null's
+        // observed spread. One null+lever pair per comparison: the mutual lever (v3 and
+        // the v2 stepping-stone) and the non-mutual regression guard.
+        let mut mutual_orig = || {
+            black_box(neighbor_smooth(
+                black_box(&hits),
+                black_box(&graph),
+                &mutual,
+            ));
+        };
+        let mut mutual_v3 = || {
+            black_box(smooth_v3(black_box(&hits), black_box(&graph), &mutual));
+        };
+        let null = paired_median_ratio(41, 8, mutual_orig, mutual_orig);
+        let lever = paired_median_ratio(41, 8, mutual_orig, mutual_v3);
+        eprintln!(
+            "[null]  neighbor_smooth_recip mutual/{pool}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] neighbor_smooth_recip mutual/{pool}: v3/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut mutual_orig = || {
+            black_box(neighbor_smooth(
+                black_box(&hits),
+                black_box(&graph),
+                &mutual,
+            ));
+        };
+        let mut mutual_v2 = || {
+            black_box(smooth_v2(black_box(&hits), black_box(&graph), &mutual));
+        };
+        let null = paired_median_ratio(41, 8, mutual_orig, mutual_orig);
+        let lever = paired_median_ratio(41, 8, mutual_orig, mutual_v2);
+        eprintln!(
+            "[null]  neighbor_smooth_recip mutual/{pool}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] neighbor_smooth_recip mutual/{pool}: v2/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+        let mut nonmutual_orig = || {
+            black_box(neighbor_smooth(
+                black_box(&hits),
+                black_box(&graph),
+                &smooth,
+            ));
+        };
+        let mut nonmutual_v3 = || {
+            black_box(smooth_v3(black_box(&hits), black_box(&graph), &smooth));
+        };
+        let null = paired_median_ratio(41, 8, nonmutual_orig, nonmutual_orig);
+        let lever = paired_median_ratio(41, 8, nonmutual_orig, nonmutual_v3);
+        eprintln!(
+            "[null]  neighbor_smooth_recip nonmutual/{pool}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] neighbor_smooth_recip nonmutual/{pool}: v3/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
     }
     g.finish();
 }

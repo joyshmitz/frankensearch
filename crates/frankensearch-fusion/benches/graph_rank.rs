@@ -518,7 +518,10 @@ fn bench_graph_rank(c: &mut Criterion) {
             "{id}: flat_upper/shipped result counts diverged"
         );
         for (p, f) in prod_out.iter().zip(&upper_out) {
-            assert_eq!(p.doc_id, f.doc_id, "{id}: flat_upper CSR reordered the ranking");
+            assert_eq!(
+                p.doc_id, f.doc_id,
+                "{id}: flat_upper CSR reordered the ranking"
+            );
             assert_eq!(
                 p.score.to_bits(),
                 f.score.to_bits(),

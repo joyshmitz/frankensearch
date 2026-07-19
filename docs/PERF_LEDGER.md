@@ -6004,3 +6004,89 @@ worker despite the `ovh-a` hint, so its result is used only for correctness and 
 **Decision: KEEP.** The earlier July 14 run stopped during a cold dependency update and produced no timing; this
 completed retry supersedes that INVALID/HOLD. The production implementation and reproducible comparator were
 already retained by `375e4237`, so this closeout changes only the evidence ledgers.
+
+## 2026-07-18 — A/A null-control retrofit across 20 paired A/B benches (`bd-zgq6`, HazyStork)
+
+Commit `26dbfa8` (rrf_recip_ab reference) plus the batch retrofit lands the shared
+alternating-round `paired_median_ratio` sampler (41 rounds × 8 inner, A/A null control with
+p5/p95 spread gate) in every remaining paired A/B bench in `frankensearch-fusion`: rrf_recip_ab,
+neighbor_smooth_recip_ab, hubness_dot_ab, pool_minmax_merge_ab, merge_dedup_ab, filter_match_ab,
+sync_hash_ab, docid_materialize_ab, metadata_clone_ab, explanation_clone_ab, code_signal_probe_ab,
+expand_fuse_ab, negation_normalize_ab, normalize_signal_ab, nqc_adaptive_cost_ab, nqc_cv_cost_ab,
+prf_expand_ab, rrf_config_cost_ab, scoredresult_box_ab, tokenize_ascii_ab. Each bench now prints
+`[null]` and `[lever]` rows with an explicit `DECIDABLE` / `INSIDE NULL FLOOR (not decidable)`
+verdict; nqc_adaptive_cost's hand-rolled AB/BA machinery was replaced by the shared sampler, and
+nqc_cv_cost was already converted upstream.
+
+Authoritative run: one full sweep of all 20 benches, `--profile release`, executed on `thinkstation1`
+(Threadripper PRO 5975WX) — `rch exec` fell back to local execution for this sweep, so the host is
+recorded as-is rather than a pinned fleet worker; the A/A null is calibrated per-machine by design,
+and any fleet re-run supersedes by the same rule. Self-time is N/A (the claim covers each whole
+measured routine, not a subframe). CV% is N/A by construction: the gate is median-of-rounds against
+the null spread, not CV (`cv<5%` is unattainable on this fleet). Binary SHA-256 for each converted
+bench (release deps on the executing host):
+
+| bench | binary SHA-256 (first 16) |
+|---|---|
+| rrf_recip_ab | `630c99876c37985d` |
+| neighbor_smooth_recip_ab | `380a5c1486e91b3c` |
+| hubness_dot_ab | `48fe542a7389d31f` |
+| pool_minmax_merge_ab | `b3887942694d4169` |
+| merge_dedup_ab | `3490323f7d51b6ef` |
+| filter_match_ab | `104a360362ef385e` |
+| sync_hash_ab | `c7350844b3c19e45` |
+| docid_materialize_ab | `ad4ef5265aa5e1df` |
+| metadata_clone_ab | `f43c68b0380186cc` |
+| explanation_clone_ab | `81e7f55af4f46ec6` |
+| code_signal_probe_ab | `55428876b8845d11` |
+| expand_fuse_ab | `a70a65cd578e6535` |
+| negation_normalize_ab | `a2d7edc54459357c` |
+| normalize_signal_ab | `05201f4b80ae7239` |
+| nqc_adaptive_cost_ab | `652910a17e3a4c68` |
+| nqc_cv_cost_ab | `8dfbd0421b71118a` |
+| prf_expand_ab | `37936c0bbce5d396` |
+| rrf_config_cost_ab | `fbe163c59374f6bf` |
+| scoredresult_box_ab | `bd6996bcb313999c` |
+| tokenize_ascii_ab | `d2307f5488bb3bdf` |
+
+Re-decided verdicts (lever median vs its own A/A null spread; `<1` = lever faster):
+
+| bench / param | lever median | verdict vs null floor |
+|---|---|---|
+| rrf_recip n10k, n100k (LUT) | 0.6656, 0.6665 | **DECIDABLE WIN** ~1.50× |
+| neighbor_smooth_recip v3/ORIG (6 cells) | 0.985–1.032 | **INSIDE NULL FLOOR** (not decidable) |
+| neighbor_smooth_recip v2/ORIG mutual (3 cells) | 1.205–1.223 | **DECIDABLE REGRESSION** (v2 ~1.2× slower) |
+| hubness_dot multiacc, simd, simd_par (all cells) | 0.096–0.389 | **DECIDABLE WIN** ~2.6–10× |
+| hubness_dot shipped/simd_par (2 build cells) | 0.995, 0.949 | **INSIDE NULL FLOOR** (not decidable) |
+| pool_minmax_merge limit_all/top10 n1000 | 0.408, 0.275 | **DECIDABLE WIN** ~2.5–3.6× |
+| pool_minmax_merge small-n + dispatch cells | 0.89–1.01 | **INSIDE NULL FLOOR** (not decidable) |
+| merge_dedup ahash/sip (3 cells) | 0.702–0.802 | **DECIDABLE WIN** ~1.25–1.42× |
+| filter_match ext (3 cells) | 0.620–0.632 | **DECIDABLE WIN** ~1.6× |
+| filter_match path (3 cells) | 0.989–1.006 | **INSIDE NULL FLOOR** (strict tie) |
+| sync_hash ahash/sip (3 cells) | 0.408–0.504 | **DECIDABLE WIN** ~2.0–2.4× |
+| docid_materialize compact/packed (4 cells) | 0.400–0.448 | **DECIDABLE WIN** ~2.2–2.5× |
+| metadata_clone arc_clone (2 cells) | 0.004, 0.006 | **DECIDABLE WIN** ~165–250× |
+| explanation_clone arc_clone (2 cells) | 0.012, 0.015 | **DECIDABLE WIN** ~66–83× |
+| code_signal_probe streaming (3 cells) | 0.540–0.585 | **DECIDABLE WIN** ~1.7–1.8× |
+| expand_fuse borrow_sip (3 cells) | 0.554–0.571 | **DECIDABLE WIN** ~1.75–1.8× |
+| expand_fuse borrow_ahash (3 cells) | 0.370–0.374 | **DECIDABLE WIN** ~2.7× |
+| negation_normalize fast | 0.0085 | **DECIDABLE WIN** ~118× |
+| normalize_signal new n192, n1536 | 1.145, 1.154 | **DECIDABLE REGRESSION** (new ~14% slower) |
+| nqc_adaptive_cost incremental_order | 0.285 | **DECIDABLE WIN** ~3.5× |
+| nqc_cv populated/reuse, empty, alloc, ilp (14 cells) | 0.002–0.86 | **DECIDABLE WIN** ~1.2–600× |
+| nqc_cv sample_builder q32, q256 | 1.040, 1.036 | **INSIDE NULL FLOOR**; q4096 1.038 **DECIDABLE REGRESSION** |
+| prf_expand in_place n3, n8, n20 | 1.011, 1.020, 1.105 | n3/n8 **INSIDE NULL FLOOR**; n20 **DECIDABLE REGRESSION** |
+| rrf_config_cost tier_weighted, hash_tiebreak (realistic) | 0.996, 0.954 | **INSIDE NULL FLOOR** |
+| rrf_config_cost hash_tiebreak (tie_heavy) | 1.062 | **DECIDABLE REGRESSION** (~6% slower under max ties) |
+| scoredresult_box boxed n10k, n100k | 0.892, 0.784 | **INSIDE NULL FLOOR** (n10k), **DECIDABLE WIN** (n100k) |
+| tokenize_ascii fast (3 cells) | 0.765–0.832 | **DECIDABLE WIN** ~1.2–1.3× |
+| tokenize_ascii compact (5800) | 0.968 | **INSIDE NULL FLOOR**; (29k, 116k) 0.773, 0.726 **DECIDABLE WIN** |
+
+Ledger consequences: every prior row resting on a lever median that sits INSIDE its own A/A null
+spread is **not decidable** on this harness and must not be cited as a win or a reject — notably
+neighbor_smooth_recip v3, filter_match/path, rrf_config_cost (realistic arms), scoredresult_box at
+n10k, pool_minmax small-n/dispatch, hubness_dot shipped-vs-simd_par, prf_expand n3/n8, and
+rrf_config tier_weighted/hash_tiebreak realistic. Two regressions are newly decidable:
+normalize_signal's single-pass rewrite is ~14% SLOWER at n192/n1536, and neighbor_smooth_recip's
+v2 mutual is ~1.2× slower — both warrant follow-up before any KEEP claim. Any future KEEP/REJECT
+row for these benches must quote the lever median AND its null p5/p95 from the same run.

@@ -23,6 +23,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use frankensearch_fusion::bench_support::paired_median_ratio;
 use frankensearch_fusion::searcher::{
     bench_normalize_for_negation_match_fast, bench_normalize_for_negation_match_reference,
 };
@@ -282,5 +283,35 @@ fn main() {
     eprintln!(
         "[gate-summary] decision={}",
         if gate_pass { "KEEP" } else { "HOLD" }
+    );
+
+    // ── DECIDABILITY: shared alternating-round paired sampler + A/A null control ──
+    //
+    // Same measurement as the bespoke [paired]/[gate] block above, expressed through
+    // the shared `paired_median_ratio` sampler (bd-zgq6) so this bench reports the
+    // common [null]/[lever] rows. The closures mirror exactly what `time_arm` times:
+    // one `run_arm` pass over the ASCII corpus per iteration.
+    let reference = || {
+        black_box(run_arm(black_box(&ascii), Arm::Reference));
+    };
+    let fast = || {
+        black_box(run_arm(black_box(&ascii), Arm::Fast));
+    };
+    let null = paired_median_ratio(41, 8, reference, reference);
+    let lever = paired_median_ratio(41, 8, reference, fast);
+    eprintln!(
+        "[null]  negation_normalize ascii: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        null.median, null.p5, null.p95, null.rounds
+    );
+    eprintln!(
+        "[lever] negation_normalize ascii: fast median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        lever.median,
+        lever.p5,
+        lever.p95,
+        if lever.decidable_against(&null) {
+            "DECIDABLE"
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
     );
 }
