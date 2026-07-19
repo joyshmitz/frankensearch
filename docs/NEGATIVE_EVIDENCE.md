@@ -15486,13 +15486,25 @@ tombstones) and reported exact physical byte counts of 2,745,208 / 7,277,512 /
 | Restored control (`quiver.rs` SHA-256 `7216c6dbd2d5aa36dda5529f708cba834d8e2ef756747c9074fbaf9bef0404ac`) | 3.4676 ms (1.263147) | 8.1796 ms (1.123956) | 18.485 ms (1.130285) | 69.385 ms (2.008655) | **1.787130x — FAIL** |
 | Direct STOREDMETA assembly (eliminate span-sized value materialization and copy each source field blob once) | 2.3012 ms (0.838261) | 4.7021 ms (0.646114) | 10.403 ms (0.636103) | 52.949 ms (1.532842) | **2.409741x — FAIL** |
 | Direct IDMAP final-buffer emission (eliminate temporary `Vec<u32>` offsets and `Vec<u64>` hashes) | 2.9945 ms (1.090810) | 6.8508 ms (0.941366) | 15.150 ms (0.926363) | 46.527 ms (1.346929) | **1.453997x — FAIL** |
+| Combined direct IDMAP + STOREDMETA final-buffer emission | 1.7533 ms (0.638677) | 3.1664 ms (0.435094) | 6.7024 ms (0.409825) | 30.372 ms (0.879252) | **2.145429x — FAIL** |
 
 The IDMAP candidate passed the exact monolithic-byte oracle remotely before its
 timed run. It improved the absolute 16-source median by about 32.9% versus the
 fresh control, but improved the smaller fan-ins enough that normalized spread
 still missed the contract by 7.7%. The STOREDMETA candidate widened spread even
-further. Both speculative source cuts were reverted; the IDMAP revert was
-verified byte-for-byte by the restored control hash above and `rustfmt --check`.
+further.
+
+A strict-remote `perf` profile of the committed 16-source path then attributed
+about 51% of sampled child cost to the small `Vec<u8>` append-heavy assembly
+paths, with page faults/copying dominant and XXH3 hashing retaining an expected
+roughly 14.6% linear floor. The combined candidate therefore pre-sized and wrote
+both canonical output buffers directly. It passed all 14 concat unit/oracle
+tests plus crate-scoped `clippy -D warnings`, and improved every absolute median
+by roughly 49-64%. It nevertheless improved 2/4/8 sources much more than 16,
+yielding a 2.145429x normalized spread. The gate therefore rejects it despite
+the absolute speedup. All three speculative source cuts were reverted; the
+final `quiver.rs` matches the landed correctness checkpoint byte-for-byte
+(SHA-256 `31ce9e287f6c78f3684bfe93760c08c507e3404b37d55e64d14eb49276014554`).
 
 The remote benchmark commands exited 0 and emitted all measurements. Local
 Criterion artifact retrieval subsequently warned `No space left on device`; that
