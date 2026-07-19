@@ -15513,3 +15513,47 @@ post-measurement rsync failure does not invalidate the complete remote stdout.
 **Decision: HOLD.** Keep `bd-quill-e3-keeper-ndtk.5` `in_progress`; do not claim
 flat CPU/byte or close the Bead. The correctness checkpoint may land separately,
 but no measured perf candidate from this dig is retained.
+
+### 2026-07-19 — SapphireHill — HOLD follow-up: one-pass final FSLX assembly still misses the concat spread gate (`bd-quill-e3-keeper-ndtk.5`)
+
+The next single-lever candidate removed the remaining large intermediate-to-final
+copy: an exact-reserved `SegmentAssembler` emitted IDMAP and STOREDMETA directly
+into their final FSLX offsets, while retaining the existing canonical writer as a
+byte oracle. IDHASH was built from the validated conceptual concat domain before
+NUMERIC/STOREDMETA/STATS, preserving the incumbent collision, probe-budget,
+allocation, and error-order behavior without materializing a merged IDMAP.
+
+The final candidate passed the complete strict-remote Quill library suite on
+`ovh-a` (380 passed, 1 ignored, 0 failed). New checks covered complete FSLX byte
+identity, short/long/out-of-order assembler writes, and exact IDHASH equality
+between concat-domain and monolithic IDMAP construction across holes and duplicate
+physical identifiers. The all-targets clippy gate reached the crate with no
+finding in the three candidate-owned files, then stopped on pre-existing peer-owned
+warnings in `index.rs` and `query.rs`; those unrelated dirty files were not edited.
+
+Exactly one canonical timed run used the same worker, release profile, fixture,
+and exact physical-byte denominators as the table above:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| Variant | 2-source median (ns/B) | 4-source median (ns/B) | 8-source median (ns/B) | 16-source median (ns/B) | max/min spread |
+|---|---:|---:|---:|---:|---:|
+| Exact-reserve one-pass FSLX assembly | 1.6128 ms (0.587496) | 2.7231 ms (0.374180) | 4.9666 ms (0.303688) | 23.707 ms (0.686304) | **2.259897x — FAIL** |
+
+The candidate improved every absolute median by about 53-73% versus the restored
+control, including a 65.8% reduction at 16 sources. It nevertheless accelerated
+8 sources most and left the 16-source cache/page-fault cliff visible, so normalized
+spread exceeded the predeclared `1.35x` ceiling by 67.4%. The remote command exited
+0 and emitted all four complete measurements. The subsequent local Criterion
+artifact retrieval warning (`No space left on device`) occurred after timing and
+does not invalidate remote stdout. No second run, worker reroute, or local Cargo
+fallback was used.
+
+**Decision: HOLD.** Revert all speculative changes in `keeper.rs`, `quiver.rs`,
+and `segment.rs`; retain only this negative-evidence row. Leave
+`bd-quill-e3-keeper-ndtk.5` `in_progress`, add no PERF_LEDGER win, and do not claim
+the flat CPU/physical-byte acceptance criterion.
