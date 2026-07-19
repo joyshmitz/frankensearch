@@ -16,6 +16,7 @@ use frankensearch_core::DocId;
 use thiserror::Error;
 
 use crate::contract::{BM25_K1, compute_tf_cache, idf};
+use crate::delta::{DeltaPosting, DeltaPostings, DeltaSnapshot, DeltaTerm};
 use crate::quiver::{
     DocLenField, NumericCodecError, NumericDocIdSet, NumericField, NumericValue,
     PositionCodecError, PostingCodecError, SnapshotFieldStats,
@@ -454,6 +455,224 @@ impl PositionsReader for SealedPostingCursor<'_> {
             output.push(position?);
         }
         Ok(())
+    }
+}
+
+/// Allocation-free cursor over one immutable Delta term chain.
+///
+/// Physical postings remain append-ordered in the frozen generation. The
+/// adapter validates that ordering while skipping rows superseded or deleted
+/// by the Delta-local identity overlay. A cursor starts on its first live row,
+/// exactly like the sealed adapter.
+pub struct DeltaPostingCursor<'a> {
+    term: Option<DeltaTerm<'a>>,
+    remaining: Option<DeltaPostings<'a>>,
+    current: Option<DeltaPosting<'a>>,
+    current_ordinal: Option<u32>,
+    next_ordinal: u32,
+    last_physical_doc: Option<u32>,
+    size_hint: u32,
+    cost: u64,
+    segment_num_docs: u32,
+}
+
+impl<'a> DeltaPostingCursor<'a> {
+    /// Open one live-only `(field, term)` cursor in a frozen Delta generation.
+    ///
+    /// A missing term produces a fused empty cursor with the generation's live
+    /// segment cardinality. No posting or position row is materialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invariant failure if a generation exceeds the durable
+    /// `u32` cursor domain or its first posting violates ascending order.
+    pub fn new(
+        delta: &'a DeltaSnapshot,
+        field_ord: u16,
+        term_bytes: &[u8],
+    ) -> Result<Self, ArgusError> {
+        let term = delta.find_term(field_ord, term_bytes);
+        let live_doc_freq = term.map_or(0, DeltaTerm::live_doc_freq);
+        let size_hint = u32::try_from(live_doc_freq).map_err(|_| {
+            ArgusError::CursorInvariant("Delta live document frequency exceeds u32")
+        })?;
+        let physical_doc_freq = term.map_or(0, DeltaTerm::physical_doc_freq);
+        let cost = if live_doc_freq == 0 {
+            0
+        } else {
+            u64::try_from(physical_doc_freq).map_err(|_| {
+                ArgusError::CursorInvariant("Delta physical document frequency exceeds u64")
+            })?
+        };
+        let segment_num_docs = u32::try_from(delta.live_document_count())
+            .map_err(|_| ArgusError::CursorInvariant("Delta live document count exceeds u32"))?;
+        let remaining = term.map(DeltaTerm::postings);
+        let mut cursor = Self {
+            term,
+            remaining,
+            current: None,
+            current_ordinal: None,
+            next_ordinal: 0,
+            last_physical_doc: None,
+            size_hint,
+            cost,
+            segment_num_docs,
+        };
+        cursor.pull_next_live()?;
+        Ok(cursor)
+    }
+
+    fn pull_next_live(&mut self) -> Result<Option<u32>, ArgusError> {
+        let Some(term) = self.term else {
+            self.current = None;
+            self.current_ordinal = None;
+            return Ok(None);
+        };
+        let Some(remaining) = self.remaining.as_mut() else {
+            self.current = None;
+            self.current_ordinal = None;
+            return Ok(None);
+        };
+        loop {
+            let Some(posting) = remaining.next() else {
+                self.current = None;
+                self.current_ordinal = None;
+                return Ok(None);
+            };
+            if self
+                .last_physical_doc
+                .is_some_and(|previous| posting.global_docid <= previous)
+            {
+                return Err(ArgusError::CursorInvariant(
+                    "Delta term postings are not strictly docid-ascending",
+                ));
+            }
+            self.last_physical_doc = Some(posting.global_docid);
+            let ordinal = self.next_ordinal;
+            self.next_ordinal =
+                self.next_ordinal
+                    .checked_add(1)
+                    .ok_or(ArgusError::CursorInvariant(
+                        "Delta posting ordinal exceeds u32",
+                    ))?;
+            if !term.is_live(posting) {
+                continue;
+            }
+            self.current = Some(posting);
+            self.current_ordinal = Some(ordinal);
+            return Ok(Some(posting.global_docid));
+        }
+    }
+}
+
+impl PostingCursor for DeltaPostingCursor<'_> {
+    fn doc(&self) -> Option<u32> {
+        self.current.map(|posting| posting.global_docid)
+    }
+
+    fn freq(&self) -> Option<u32> {
+        self.current.map(|posting| posting.frequency)
+    }
+
+    fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+        self.current.filter(|posting| posting.has_positions())?;
+        self.current_ordinal
+            .map(|ordinal| PositionsHandle::new(self, ordinal))
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.size_hint
+    }
+
+    fn cost(&self) -> u64 {
+        self.cost
+    }
+
+    fn segment_num_docs(&self) -> u32 {
+        self.segment_num_docs
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        if self.current.is_none() {
+            return Ok(None);
+        }
+        self.pull_next_live()
+    }
+
+    fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        if self.doc().is_none_or(|doc| doc >= target) {
+            return Ok(self.doc());
+        }
+        loop {
+            let moved = self.pull_next_live()?;
+            if moved.is_none_or(|doc| doc >= target) {
+                return Ok(moved);
+            }
+        }
+    }
+}
+
+impl PositionsReader for DeltaPostingCursor<'_> {
+    fn decode_positions(
+        &self,
+        posting_ordinal: u32,
+        output: &mut Vec<u32>,
+    ) -> Result<(), ArgusError> {
+        if self.current_ordinal != Some(posting_ordinal) {
+            return Err(ArgusError::CursorInvariant(
+                "positions handle no longer identifies the current Delta posting",
+            ));
+        }
+        let term = self.term.ok_or(ArgusError::CursorInvariant(
+            "empty Delta cursor cannot resolve positions",
+        ))?;
+        let posting = self.current.ok_or(ArgusError::CursorInvariant(
+            "exhausted Delta cursor cannot resolve positions",
+        ))?;
+        let expected = usize::try_from(posting.frequency)
+            .map_err(|_| ArgusError::CursorInvariant("Delta position count does not fit usize"))?;
+        let positions = term.positions(posting).ok_or(ArgusError::CursorInvariant(
+            "positioned Delta cursor has no current position run",
+        ))?;
+        output
+            .try_reserve_exact(expected)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "decoded Delta positions",
+                count: expected,
+            })?;
+        let initial_len = output.len();
+        output.extend(positions);
+        if output.len().saturating_sub(initial_len) != expected {
+            return Err(ArgusError::CursorInvariant(
+                "Delta position run disagrees with posting frequency",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Borrowed fieldnorm view paired with one frozen Delta generation.
+#[derive(Clone, Copy)]
+pub struct DeltaFieldNorms<'a> {
+    delta: &'a DeltaSnapshot,
+    field_ord: u16,
+}
+
+impl<'a> DeltaFieldNorms<'a> {
+    /// Bind one indexed string field in an immutable Delta generation.
+    #[must_use]
+    pub const fn new(delta: &'a DeltaSnapshot, field_ord: u16) -> Self {
+        Self { delta, field_ord }
+    }
+}
+
+impl FieldNormReader for DeltaFieldNorms<'_> {
+    fn field_ord(&self) -> u16 {
+        self.field_ord
+    }
+
+    fn fieldnorm_id(&self, global_docid: u32) -> Option<u8> {
+        self.delta.live_fieldnorm_id(self.field_ord, global_docid)
     }
 }
 

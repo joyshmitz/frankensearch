@@ -1,9 +1,9 @@
 //! Shipping Quill index orchestration and process-local snapshot publication.
 //!
 //! This module deliberately joins the already-final Scribe, FSLX, Keeper,
-//! parser, cursor, scorer, and collector boundaries. The scalar writer still
-//! searches sealed segments only; immutable Delta epochs and their composite
-//! statistics are published here for the E5 cursor integration.
+//! parser, cursor, scorer, and collector boundaries. Immutable Delta epochs,
+//! their composite statistics, and their scorer adapters are assembled here;
+//! the later seal and mixed-state beads wire them into the public writer loop.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,8 @@ use crate::argus::{
     PositionsHandle, PositionsReader, PostingCursor, ReferenceScorer, ScorerClause, TermScorer,
     TopDocsCollector,
 };
+#[cfg(test)]
+use crate::argus::{DeltaFieldNorms, DeltaPostingCursor};
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
@@ -374,6 +376,12 @@ impl QuillSearchSnapshot {
     #[must_use]
     pub fn delta_count(&self) -> usize {
         self.deltas.len()
+    }
+
+    /// Immutable shard epochs paired with this Keeper generation.
+    #[must_use]
+    pub fn delta_snapshots(&self) -> &[Arc<DeltaSnapshot>] {
+        &self.deltas
     }
 
     /// Snapshot-global BM25 `N`: Keeper at-seal rows plus live Delta rows.
@@ -2082,9 +2090,9 @@ enum QueryLoweringMode {
 }
 
 fn lower_boolean(
-    clauses: Vec<ScorerClause<'static>>,
+    clauses: Vec<ScorerClause<'_>>,
     mode: QueryLoweringMode,
-) -> Result<ReferenceScorer<'static>, QuillIndexError> {
+) -> Result<ReferenceScorer<'_>, QuillIndexError> {
     match mode {
         QueryLoweringMode::Scored => ReferenceScorer::boolean(clauses),
         QueryLoweringMode::Unscored => ReferenceScorer::boolean_unscored(clauses),
@@ -2235,13 +2243,66 @@ fn lower_term(
     let doc_freq = snapshot_doc_freq(snapshot, schema, field_ord, term)?;
     let cursor = open_owned_cursor(segment, schema, field_ord, term, false)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
+    build_term_scorer(cursor, norms, stats, doc_freq, boost)
+}
+
+fn build_term_scorer<'a, C, F>(
+    cursor: C,
+    fieldnorms: F,
+    stats: SnapshotFieldStats,
+    snapshot_doc_freq: u64,
+    boost: f32,
+) -> Result<ReferenceScorer<'a>, QuillIndexError>
+where
+    C: PostingCursor + 'a,
+    F: FieldNormReader + 'a,
+{
     Ok(ReferenceScorer::term(TermScorer::new(
         cursor,
-        norms,
+        fieldnorms,
         Bm25FieldSnapshot::new(stats)?,
-        doc_freq,
+        snapshot_doc_freq,
         boost,
     )?))
+}
+
+#[cfg(test)]
+fn lower_composite_sealed_term(
+    segment: &RecoveredSegment,
+    snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    term: &[u8],
+    boost: f32,
+) -> Result<ReferenceScorer<'static>, QuillIndexError> {
+    let stats = snapshot.bm25_field_stats(field_ord).ok_or_else(|| {
+        invalid_state(format!("snapshot has no field statistics for {field_ord}"))
+    })?;
+    let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
+    let cursor = open_owned_cursor(segment, schema, field_ord, term, false)?;
+    let norms = owned_fieldnorms(segment, schema, field_ord)?;
+    build_term_scorer(cursor, norms, stats, doc_freq, boost)
+}
+
+#[cfg(test)]
+fn lower_delta_term<'a>(
+    delta: &'a DeltaSnapshot,
+    snapshot: &QuillSearchSnapshot,
+    field_ord: u16,
+    term: &[u8],
+    boost: f32,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    let stats = snapshot.bm25_field_stats(field_ord).ok_or_else(|| {
+        invalid_state(format!("snapshot has no field statistics for {field_ord}"))
+    })?;
+    let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
+    build_term_scorer(
+        DeltaPostingCursor::new(delta, field_ord, term)?,
+        DeltaFieldNorms::new(delta, field_ord),
+        stats,
+        doc_freq,
+        boost,
+    )
 }
 
 fn snapshot_field(
@@ -2433,7 +2494,9 @@ mod tests {
     use crate::contract::fieldnorm_to_id;
     use crate::delta::{DeltaFieldNorm, DeltaSegment, DeltaTermPosting};
     use crate::keeper::ConcatMergeError;
-    use crate::quiver::{StatsSection, aggregate_field_stats};
+    use crate::quiver::{
+        EncodedPositionList, EncodedPostingList, StatsSection, aggregate_field_stats,
+    };
     use crate::schema::FSFS_CHUNK_SCHEMA;
 
     const CONCAT_MERGE_QUERIES: [&str; 4] =
@@ -2925,9 +2988,9 @@ mod tests {
                 1
             );
 
-            let snapshot =
-                QuillSearchSnapshot::compose(0, keeper, vec![Arc::new(delta.freeze(generation))])
-                    .expect("compose repeated-upsert snapshot");
+            let frozen = Arc::new(delta.freeze(generation));
+            let snapshot = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
+                .expect("compose repeated-upsert snapshot");
             assert_eq!(alpha_snapshot_tuple(&snapshot), (0, 1, 1, 3, 1));
             let pre_stats = snapshot
                 .bm25_field_stats(CONTENT_FIELD)
@@ -2935,25 +2998,9 @@ mod tests {
             let pre_df = snapshot
                 .bm25_doc_freq(CONTENT_FIELD, b"alpha")
                 .expect("pre-seal alpha df");
-            let mut pre_scorer = ReferenceScorer::term(
-                TermScorer::new(
-                    OwnedPostingCursor {
-                        postings: vec![Posting::new(2, 3)],
-                        positions: None,
-                        cursor: 0,
-                        segment_num_docs: 1,
-                    },
-                    OwnedFieldNorms {
-                        field_ord: CONTENT_FIELD,
-                        docid_lo: 2,
-                        values: vec![fieldnorm_to_id(3)],
-                    },
-                    Bm25FieldSnapshot::new(pre_stats).expect("pre-seal BM25 snapshot"),
-                    pre_df,
-                    1.0,
-                )
-                .expect("pre-seal term scorer"),
-            );
+            let mut pre_scorer = lower_delta_term(&frozen, &snapshot, CONTENT_FIELD, b"alpha", 1.0)
+                .expect("pre-seal Delta term scorer");
+            assert_eq!(pre_scorer.doc(), Some(2));
 
             let mut sealed = QuillIndex::in_memory(deterministic_config()).expect("sealed index");
             sealed
@@ -2989,6 +3036,212 @@ mod tests {
                 "the final live upsert must keep bit-identical BM25 across seal"
             );
         });
+    }
+
+    #[test]
+    fn delta_cursor_matches_sealed_advance_positions_and_safe_impact_bound() {
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+        apply_alpha_delta(&mut delta, 0, "replaced", 300);
+        apply_alpha_delta(&mut delta, 1, "kept", 2);
+        apply_alpha_delta(&mut delta, 2, "replaced", 3);
+        apply_alpha_delta(&mut delta, 3, "deleted", 4);
+        assert_eq!(delta.delete_delta_id("deleted"), Some(3));
+        let frozen = delta.freeze(0);
+
+        let postings = [Posting::new(1, 2), Posting::new(2, 3)];
+        let encoded_postings = EncodedPostingList::encode(&postings).expect("sealed postings");
+        let posting_list = encoded_postings
+            .posting_list()
+            .expect("sealed posting list");
+        let encoded_positions =
+            EncodedPositionList::encode(&postings, &[0, 1, 0, 1, 2]).expect("sealed positions");
+        let position_list = encoded_positions
+            .position_list(&posting_list)
+            .expect("sealed position list");
+        let mut sealed = crate::argus::SealedPostingCursor::with_positions(&position_list, 2)
+            .expect("sealed cursor");
+        let mut live =
+            DeltaPostingCursor::new(&frozen, CONTENT_FIELD, b"alpha").expect("live Delta cursor");
+        let live_norms = DeltaFieldNorms::new(&frozen, CONTENT_FIELD);
+
+        assert_eq!(live.size_hint(), 2);
+        assert_eq!(live.cost(), 4);
+        assert_eq!(live.segment_num_docs(), 2);
+        assert_eq!(live_norms.fieldnorm_id(0), None);
+        assert_eq!(live_norms.fieldnorm_id(1), Some(fieldnorm_to_id(2)));
+        assert_eq!(live.doc(), sealed.doc());
+        assert_eq!(live.freq(), sealed.freq());
+        let mut delta_positions = Vec::new();
+        let mut sealed_positions = Vec::new();
+        live.positions_handle()
+            .expect("Delta positions")
+            .decode_into(&mut delta_positions)
+            .expect("decode Delta positions");
+        sealed
+            .positions_handle()
+            .expect("sealed positions")
+            .decode_into(&mut sealed_positions)
+            .expect("decode sealed positions");
+        assert_eq!(delta_positions, sealed_positions);
+
+        for target in [0, 1, 2, 2] {
+            assert_eq!(
+                live.advance(target).expect("advance Delta cursor"),
+                sealed.advance(target).expect("advance sealed cursor")
+            );
+            assert_eq!(live.doc(), sealed.doc());
+            assert_eq!(live.freq(), sealed.freq());
+        }
+        live.positions_handle()
+            .expect("advanced Delta positions")
+            .decode_into(&mut delta_positions)
+            .expect("decode advanced Delta positions");
+        sealed
+            .positions_handle()
+            .expect("advanced sealed positions")
+            .decode_into(&mut sealed_positions)
+            .expect("decode advanced sealed positions");
+        assert_eq!(delta_positions, sealed_positions);
+        assert_eq!(
+            live.next().expect("exhaust Delta cursor"),
+            sealed.next().expect("exhaust sealed cursor")
+        );
+        assert_eq!(live.next().expect("fused Delta cursor"), None);
+        assert_eq!(
+            live.advance(u32::MAX)
+                .expect("advance exhausted Delta cursor"),
+            None
+        );
+
+        let mut missing = DeltaPostingCursor::new(&frozen, CONTENT_FIELD, b"missing")
+            .expect("missing-term Delta cursor");
+        assert_eq!(missing.doc(), None);
+        assert_eq!(missing.freq(), None);
+        assert!(missing.positions_handle().is_none());
+        assert_eq!(missing.size_hint(), 0);
+        assert_eq!(missing.cost(), 0);
+        assert_eq!(missing.segment_num_docs(), 2);
+        assert_eq!(missing.next().expect("fused missing-term cursor"), None);
+
+        let mut all_dead =
+            DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("all-dead Delta shard");
+        apply_alpha_delta(&mut all_dead, 0, "dead", 1);
+        assert_eq!(all_dead.delete_delta_id("dead"), Some(0));
+        let all_dead = all_dead.freeze(0);
+        let mut all_dead_cursor = DeltaPostingCursor::new(&all_dead, CONTENT_FIELD, b"alpha")
+            .expect("all-dead term cursor");
+        assert_eq!(all_dead_cursor.doc(), None);
+        assert_eq!(all_dead_cursor.size_hint(), 0);
+        assert_eq!(all_dead_cursor.cost(), 0);
+        assert_eq!(all_dead_cursor.next().expect("fused all-dead cursor"), None);
+        assert!(
+            all_dead
+                .find_term(CONTENT_FIELD, b"alpha")
+                .expect("physical all-dead term")
+                .block_max()
+                .is_none()
+        );
+
+        let impact = frozen
+            .find_term(CONTENT_FIELD, b"alpha")
+            .expect("alpha term")
+            .block_max()
+            .expect("live term impact bound");
+        assert_eq!(impact.max_frequency(), u32::MAX);
+        for average in [0.25_f32, 2.5, 1_000.0] {
+            let bound = impact
+                .score_upper_bound(average, 1.0)
+                .expect("finite non-negative score bound");
+            let cache = crate::contract::compute_tf_cache(average);
+            for (frequency, fieldnorm_id) in
+                [(2_u32, fieldnorm_to_id(2)), (3_u32, fieldnorm_to_id(3))]
+            {
+                let frequency = frequency as f32;
+                let score = frequency / (frequency + cache[usize::from(fieldnorm_id)]);
+                assert!(
+                    bound >= score,
+                    "avgdl={average} bound={bound} live_score={score}"
+                );
+            }
+        }
+        assert_eq!(impact.score_upper_bound(2.5, -1.0), None);
+    }
+
+    #[test]
+    fn delta_advance_matches_sealed_cursor_across_multiblock_tombstone_boundaries() {
+        const TOMBSTONED: [u32; 10] = [0, 1, 2, 63, 64, 127, 128, 129, 258, 259];
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+        let mut sealed_postings = Vec::new();
+        let mut sealed_positions = Vec::new();
+        for docid in 0_u32..260 {
+            let frequency = docid % 5 + 1;
+            let document_id = format!("doc-{docid}");
+            apply_alpha_delta(&mut delta, docid, &document_id, frequency);
+            if !TOMBSTONED.contains(&docid) {
+                sealed_postings.push(Posting::new(docid, frequency));
+                sealed_positions.extend(0..frequency);
+            }
+        }
+        for docid in TOMBSTONED {
+            assert_eq!(delta.delete_delta_id(&format!("doc-{docid}")), Some(docid));
+        }
+        let frozen = delta.freeze(0);
+        let encoded_postings =
+            EncodedPostingList::encode(&sealed_postings).expect("sealed postings");
+        let posting_list = encoded_postings
+            .posting_list()
+            .expect("sealed posting list");
+        let encoded_positions = EncodedPositionList::encode(&sealed_postings, &sealed_positions)
+            .expect("sealed positions");
+        let position_list = encoded_positions
+            .position_list(&posting_list)
+            .expect("sealed position list");
+        let segment_num_docs = u32::try_from(sealed_postings.len()).expect("fixture fits u32");
+
+        for target in (0_u32..=260).chain(std::iter::once(u32::MAX)) {
+            let mut live =
+                DeltaPostingCursor::new(&frozen, CONTENT_FIELD, b"alpha").expect("Delta cursor");
+            let mut sealed =
+                crate::argus::SealedPostingCursor::with_positions(&position_list, segment_num_docs)
+                    .expect("sealed cursor");
+            assert_eq!(
+                live.advance(target).expect("advance Delta cursor"),
+                sealed.advance(target).expect("advance sealed cursor"),
+                "target={target}"
+            );
+            assert_eq!(live.freq(), sealed.freq(), "target={target}");
+            if live.doc().is_some() {
+                let mut live_positions = Vec::new();
+                let mut oracle_positions = Vec::new();
+                live.positions_handle()
+                    .expect("Delta position handle")
+                    .decode_into(&mut live_positions)
+                    .expect("decode Delta positions");
+                sealed
+                    .positions_handle()
+                    .expect("sealed position handle")
+                    .decode_into(&mut oracle_positions)
+                    .expect("decode sealed positions");
+                assert_eq!(live_positions, oracle_positions, "target={target}");
+            }
+        }
+
+        let mut live =
+            DeltaPostingCursor::new(&frozen, CONTENT_FIELD, b"alpha").expect("Delta cursor");
+        let mut sealed =
+            crate::argus::SealedPostingCursor::with_positions(&position_list, segment_num_docs)
+                .expect("sealed cursor");
+        loop {
+            assert_eq!(live.doc(), sealed.doc());
+            assert_eq!(live.freq(), sealed.freq());
+            if live.doc().is_none() {
+                break;
+            }
+            assert_eq!(
+                live.next().expect("next Delta cursor"),
+                sealed.next().expect("next sealed cursor")
+            );
+        }
     }
 
     #[test]
@@ -3284,34 +3537,18 @@ mod tests {
             let generation = keeper.loaded_manifest().manifest.generation;
             let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
             apply_alpha_delta(&mut delta, 0, "doc", 1);
-            let composite =
-                QuillSearchSnapshot::compose(0, keeper, vec![Arc::new(delta.freeze(generation))])
-                    .expect("pre-seal composite snapshot");
+            let frozen = Arc::new(delta.freeze(generation));
+            let composite = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
+                .expect("pre-seal composite snapshot");
             let pre_stats = composite
                 .bm25_field_stats(CONTENT_FIELD)
                 .expect("pre-seal content stats");
             let pre_df = composite
                 .bm25_doc_freq(CONTENT_FIELD, b"alpha")
                 .expect("pre-seal alpha df");
-            let mut pre_scorer = ReferenceScorer::term(
-                TermScorer::new(
-                    OwnedPostingCursor {
-                        postings: vec![Posting::new(0, 1)],
-                        positions: None,
-                        cursor: 0,
-                        segment_num_docs: 1,
-                    },
-                    OwnedFieldNorms {
-                        field_ord: CONTENT_FIELD,
-                        docid_lo: 0,
-                        values: vec![fieldnorm_to_id(1)],
-                    },
-                    Bm25FieldSnapshot::new(pre_stats).expect("pre-seal BM25 snapshot"),
-                    pre_df,
-                    1.0,
-                )
-                .expect("pre-seal term scorer"),
-            );
+            let mut pre_scorer =
+                lower_delta_term(&frozen, &composite, CONTENT_FIELD, b"alpha", 1.0)
+                    .expect("pre-seal Delta term scorer");
 
             let mut sealed = QuillIndex::in_memory(deterministic_config()).expect("sealed index");
             sealed
@@ -3340,6 +3577,164 @@ mod tests {
                 post_scorer.score().expect("post-seal score").to_bits(),
                 "BM25 score must be bit-identical across the seal boundary"
             );
+        });
+    }
+
+    #[test]
+    fn delta_and_sealed_term_cursors_have_rank_exact_corpus_parity() {
+        run_with_cx(|cx| async move {
+            let keeper = Arc::new(
+                KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper snapshot"),
+            );
+            let generation = keeper.loaded_manifest().manifest.generation;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta shard");
+            for (docid, document_id, frequency) in [(0, "one", 1), (1, "three", 3), (2, "two", 2)] {
+                apply_alpha_delta(&mut delta, docid, document_id, frequency);
+            }
+            let frozen = Arc::new(delta.freeze(generation));
+            let composite = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
+                .expect("pre-seal composite snapshot");
+            let mut pre = lower_delta_term(&frozen, &composite, CONTENT_FIELD, b"alpha", 1.0)
+                .expect("pre-seal Delta scorer");
+
+            let mut sealed = QuillIndex::in_memory(deterministic_config()).expect("sealed index");
+            sealed
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("one", "alpha"),
+                        IndexableDocument::new("three", "alpha alpha alpha"),
+                        IndexableDocument::new("two", "alpha alpha"),
+                    ],
+                )
+                .await
+                .expect("accumulate equivalent corpus");
+            sealed.commit(&cx).await.expect("seal equivalent corpus");
+            let sealed_snapshot = sealed.snapshot();
+            let mut post = lower_term(
+                &sealed_snapshot.segments()[0],
+                sealed_snapshot,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"alpha",
+                1.0,
+            )
+            .expect("post-seal scorer");
+
+            let collect_rows = |scorer: &mut ReferenceScorer<'_>| {
+                let mut rows = Vec::new();
+                while let Some(docid) = scorer.doc() {
+                    rows.push((docid, scorer.score().expect("score current row").to_bits()));
+                    scorer.next().expect("advance scorer");
+                }
+                rows
+            };
+            let pre_rows = collect_rows(&mut pre);
+            let post_rows = collect_rows(&mut post);
+            assert_eq!(
+                pre_rows, post_rows,
+                "per-doc score bits must survive sealing"
+            );
+
+            let mut pre_rank = pre_rows;
+            let mut post_rank = post_rows;
+            let best_first = |left: &(u32, u32), right: &(u32, u32)| {
+                f32::from_bits(right.1)
+                    .total_cmp(&f32::from_bits(left.1))
+                    .then_with(|| left.0.cmp(&right.0))
+            };
+            pre_rank.sort_by(best_first);
+            post_rank.sort_by(best_first);
+            assert_eq!(pre_rank, post_rank, "RankExact order must survive sealing");
+        });
+    }
+
+    #[test]
+    fn mixed_sealed_and_delta_leaves_share_composite_bm25_statistics() {
+        run_with_cx(|cx| async move {
+            let mut mixed = QuillIndex::in_memory(deterministic_config()).expect("mixed index");
+            mixed
+                .index_documents(&cx, &[IndexableDocument::new("sealed", "alpha")])
+                .await
+                .expect("accumulate sealed row");
+            mixed.commit(&cx).await.expect("commit sealed row");
+            let keeper = Arc::new(mixed.snapshot().clone());
+            let generation = keeper.loaded_manifest().manifest.generation;
+            let delta_base = u64::from(DOC_ORDS_PER_LEASE);
+            let delta_docid = u32::try_from(delta_base).expect("second lease fits u32");
+            let mut delta =
+                DeltaSegment::new(DEFAULT_SCHEMA, delta_base, usize::MAX).expect("Delta shard");
+            apply_alpha_delta(&mut delta, delta_docid, "delta", 3);
+            let frozen = Arc::new(delta.freeze(generation));
+            let composite =
+                QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::clone(&frozen)])
+                    .expect("mixed composite snapshot");
+            assert_eq!(composite.bm25_doc_count(), 2);
+            assert_eq!(
+                composite
+                    .bm25_field_stats(CONTENT_FIELD)
+                    .expect("content stats")
+                    .total_tokens,
+                4
+            );
+            assert_eq!(
+                composite
+                    .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                    .expect("composite alpha df"),
+                2
+            );
+
+            let mut mixed_sealed = lower_composite_sealed_term(
+                &keeper.segments()[0],
+                &composite,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"alpha",
+                1.0,
+            )
+            .expect("mixed sealed scorer");
+            let mixed_sealed_score = mixed_sealed.score().expect("score sealed leaf");
+            let mut mixed_delta =
+                lower_delta_term(&frozen, &composite, CONTENT_FIELD, b"alpha", 1.0)
+                    .expect("mixed Delta scorer");
+            let mixed_delta_score = mixed_delta.score().expect("score Delta leaf");
+
+            let mut all_sealed =
+                QuillIndex::in_memory(deterministic_config()).expect("all-sealed index");
+            all_sealed
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("sealed", "alpha"),
+                        IndexableDocument::new("delta", "alpha alpha alpha"),
+                    ],
+                )
+                .await
+                .expect("accumulate equivalent all-sealed rows");
+            all_sealed
+                .commit(&cx)
+                .await
+                .expect("commit equivalent all-sealed rows");
+            let all_sealed_snapshot = all_sealed.snapshot();
+            let mut oracle = lower_term(
+                &all_sealed_snapshot.segments()[0],
+                all_sealed_snapshot,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"alpha",
+                1.0,
+            )
+            .expect("all-sealed oracle scorer");
+            assert_eq!(
+                mixed_sealed_score.to_bits(),
+                oracle.score().expect("score first oracle row").to_bits()
+            );
+            assert_eq!(oracle.next().expect("advance oracle"), Some(1));
+            assert_eq!(
+                mixed_delta_score.to_bits(),
+                oracle.score().expect("score second oracle row").to_bits()
+            );
+            assert!(mixed_delta_score > mixed_sealed_score);
         });
     }
 

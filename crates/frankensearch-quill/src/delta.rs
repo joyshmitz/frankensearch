@@ -1,8 +1,8 @@
 //! Lease-bounded mutable storage for Quill's searchable delta segment.
 //!
 //! This module owns mutable storage invariants and the immutable freeze
-//! boundary. Composite publication lives in `index`; Argus cursor adapters,
-//! scoring integration, and FSLX sealing remain separate E5 milestones.
+//! boundary. Composite publication lives in `index`, allocation-free cursor
+//! adapters live in `argus`, and FSLX sealing remains a separate E5 milestone.
 
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -233,6 +233,53 @@ impl DeltaPosting<'_> {
     #[must_use]
     pub const fn has_positions(self) -> bool {
         self.has_positions
+    }
+}
+
+/// Conservative whole-term impact envelope for a live Delta cursor.
+///
+/// Delta postings are append-only within one generation. The envelope keeps
+/// the greatest frequency and smallest fieldnorm ever appended for the term.
+/// A later upsert or delete may therefore make it looser, but never unsafe for
+/// `MaxScore` or block-max pruning over the remaining live rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaBlockMax {
+    max_frequency_code: u8,
+    min_fieldnorm_id: u8,
+}
+
+impl DeltaBlockMax {
+    /// Conservatively decoded greatest term frequency.
+    #[must_use]
+    pub const fn max_frequency(self) -> u32 {
+        crate::contract::block_max_frequency_from_code(self.max_frequency_code)
+    }
+
+    /// Smallest quantized fieldnorm observed for this term.
+    #[must_use]
+    pub const fn min_fieldnorm_id(self) -> u8 {
+        self.min_fieldnorm_id
+    }
+
+    /// Conservative BM25 tf-factor for one live-snapshot average length.
+    #[must_use]
+    pub fn tf_factor_upper_bound(self, live_avgdl: f32) -> Option<f32> {
+        crate::contract::block_max_tf_factor(
+            self.max_frequency_code,
+            self.min_fieldnorm_id,
+            live_avgdl,
+        )
+    }
+
+    /// Apply a non-negative `idf * (1 + k1) * boost` term weight.
+    #[must_use]
+    pub fn score_upper_bound(self, live_avgdl: f32, nonnegative_weight: f32) -> Option<f32> {
+        crate::contract::block_max_score(
+            self.max_frequency_code,
+            self.min_fieldnorm_id,
+            live_avgdl,
+            nonnegative_weight,
+        )
     }
 }
 
@@ -585,11 +632,25 @@ struct FieldNormColumn {
     fieldnorm_ids: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct TermChain {
     postings: ChainState,
     positions: ChainState,
     last_docid: Option<u32>,
+    max_frequency_code: u8,
+    min_fieldnorm_id: u8,
+}
+
+impl Default for TermChain {
+    fn default() -> Self {
+        Self {
+            postings: ChainState::default(),
+            positions: ChainState::default(),
+            last_docid: None,
+            max_frequency_code: 0,
+            min_fieldnorm_id: u8::MAX,
+        }
+    }
 }
 
 /// One mutable, lease-bounded delta generation.
@@ -672,6 +733,21 @@ impl DeltaSnapshot {
     #[must_use]
     pub fn live_total_tokens(&self, field_ord: u16) -> Option<u64> {
         self.segment.live_total_tokens(field_ord)
+    }
+
+    /// Physical fieldnorm byte for one row in this frozen generation.
+    #[must_use]
+    pub fn fieldnorm_id(&self, field_ord: u16, global_docid: u32) -> Option<u8> {
+        self.segment.fieldnorm_id(field_ord, global_docid)
+    }
+
+    /// Live-only fieldnorm byte for one visible row in this generation.
+    #[must_use]
+    pub fn live_fieldnorm_id(&self, field_ord: u16, global_docid: u32) -> Option<u8> {
+        if self.segment.is_tombstoned(global_docid) {
+            return None;
+        }
+        self.segment.fieldnorm_id(field_ord, global_docid)
     }
 
     /// Look up one immutable composite `(field, term)` key.
@@ -959,6 +1035,10 @@ impl DeltaSegment {
 
         let mut added_bytes = 0_usize;
         for (posting, planned_term) in postings.iter().zip(&mut document_terms) {
+            let field_index = self
+                .field_index(posting.field_ord)
+                .expect("validated indexed-string field has a fieldnorm column");
+            let fieldnorm_id = fieldnorms[field_index].fieldnorm_id;
             let (term_index, term_bytes) = if *planned_term == NEW_TERM_SENTINEL {
                 self.terms.intern_accounted(posting.field_ord, posting.term)
             } else {
@@ -995,6 +1075,13 @@ impl DeltaSegment {
                 },
             ));
             chain.last_docid = Some(global_docid);
+            chain.max_frequency_code =
+                chain
+                    .max_frequency_code
+                    .max(crate::contract::block_max_frequency_to_code(
+                        posting.frequency,
+                    ));
+            chain.min_fieldnorm_id = chain.min_fieldnorm_id.min(fieldnorm_id);
         }
 
         self.document_docids.push(global_docid);
@@ -1558,8 +1645,33 @@ impl<'a> DeltaTerm<'a> {
     #[must_use]
     pub fn live_doc_freq(self) -> usize {
         self.postings()
-            .filter(|posting| !self.delta.is_tombstoned(posting.global_docid))
+            .filter(|posting| self.is_live(*posting))
             .count()
+    }
+
+    /// Conservative whole-term impact envelope for future pruning paths.
+    ///
+    /// Returns `None` when every physical posting has been superseded or
+    /// deleted. Otherwise the bound may include tombstoned historical maxima,
+    /// which only makes it more conservative.
+    #[must_use]
+    pub fn block_max(self) -> Option<DeltaBlockMax> {
+        if self.live_doc_freq() == 0 {
+            return None;
+        }
+        let chain = &self.delta.chains[self.term_index as usize];
+        Some(DeltaBlockMax {
+            max_frequency_code: chain.max_frequency_code,
+            min_fieldnorm_id: chain.min_fieldnorm_id,
+        })
+    }
+
+    /// Whether an owner-bound posting remains visible in this generation.
+    pub(crate) fn is_live(self, posting: DeltaPosting<'a>) -> bool {
+        posting.term_index == self.term_index
+            && posting.owner_id == self.delta.owner_id
+            && posting.generation == self.delta.generation
+            && !self.delta.is_tombstoned(posting.global_docid)
     }
 
     /// Iterate physical postings in global-docid order.
