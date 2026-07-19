@@ -15557,3 +15557,48 @@ fallback was used.
 and `segment.rs`; retain only this negative-evidence row. Leave
 `bd-quill-e3-keeper-ndtk.5` `in_progress`, add no PERF_LEDGER win, and do not claim
 the flat CPU/physical-byte acceptance criterion.
+
+### 2026-07-19 — SapphireHill — HOLD follow-up: removing the redundant post-encode checksum replay does not flatten concat scaling (`bd-quill-e3-keeper-ndtk.5`)
+
+This single-lever candidate retained the structural `SegmentReader::from_bytes`
+reopen of the freshly encoded merged FSLX image, but removed the immediately
+following `SegmentReader::verify()` replay. The canonical encoder had just
+computed every section XXH3 witness and the complete file-prefix witness from
+those same immutable bytes; the replay therefore reread every section and then
+the full file a second time before owned or durable publication. The hypothesis
+was that avoiding those two full-output reads would remove the 16-source
+working-set cliff while preserving framing, section-layout, and trailer-CRC
+validation.
+
+The complete strict-remote Quill library suite passed on `ovh-a` (377 passed,
+1 ignored, 0 failed). Crate-scoped `clippy -D warnings` reached Quill and stopped
+only on four pre-existing peer-owned warnings in `index.rs`; the candidate-owned
+`keeper.rs` produced no lint. The remote workspace-wide format check likewise
+reported only unrelated pre-existing files. UBS found no candidate-specific
+issue among its whole-file heuristic inventory.
+
+Exactly one canonical timed run used the same worker, release profile, fixture,
+and exact physical-byte denominators as the preceding rows:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| Variant | 2-source median (ns/B) | 4-source median (ns/B) | 8-source median (ns/B) | 16-source median (ns/B) | max/min spread |
+|---|---:|---:|---:|---:|---:|
+| Structural reopen without eager checksum replay | 3.3043 ms (1.203661) | 7.8243 ms (1.075134) | 17.382 ms (1.062841) | 66.842 ms (1.935037) | **1.820627x — FAIL** |
+
+The cut improved absolute medians by only about 3.7-6.0% versus the restored
+control and slightly worsened normalized spread from 1.787130x to 1.820627x.
+The 16-source result remains 34.9% above the predeclared `1.35x` ceiling, so the
+redundant checksum replay is not the dominant scaling defect. The remote command
+exited 0 and emitted all four complete measurements. The subsequent local
+Criterion artifact retrieval warning (`No space left on device`) occurred after
+timing and does not invalidate remote stdout. No second run, worker reroute, or
+local Cargo fallback was used.
+
+**Decision: HOLD.** Restore `keeper.rs` exactly and retain only this evidence.
+Leave `bd-quill-e3-keeper-ndtk.5` `in_progress`, add no PERF_LEDGER win, and do
+not claim the flat CPU/physical-byte acceptance criterion.
