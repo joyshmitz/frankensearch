@@ -13,8 +13,8 @@ const TANTIVY_CHECKSUM_SHA256: &str =
     "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
 const QUIVER_DIFFERENTIAL_FIXTURE_ID: &str = "quiver-postings-bitpack-scalar-wide-v1";
 const Q1_FIXTURE_CATALOG_SHA256: [u8; 32] = [
-    0x9b, 0x59, 0x99, 0xd8, 0x3f, 0xc5, 0x38, 0xeb, 0x39, 0xae, 0x12, 0xf1, 0xe8, 0x35, 0x32, 0xd4,
-    0x55, 0x0b, 0x4d, 0x89, 0x01, 0xfa, 0xf4, 0x9f, 0x93, 0x13, 0x70, 0xd8, 0xa7, 0xee, 0xa9, 0x3d,
+    0x32, 0x04, 0xe3, 0x59, 0xee, 0x73, 0x23, 0xc7, 0x46, 0x51, 0xd7, 0xd8, 0x95, 0xbf, 0x5f, 0xdf,
+    0x8a, 0xf6, 0xe9, 0x4d, 0x9b, 0x5c, 0xb1, 0x28, 0x93, 0x37, 0x3e, 0xcc, 0x59, 0x53, 0x94, 0xa4,
 ];
 
 /// Committed provenance contract for the shipping Tantivy oracle adapter.
@@ -59,13 +59,13 @@ impl OracleVersionContract {
     }
 }
 
-/// One future Q1 fixture. `stub` is deliberately not a passing state.
+/// One Q1 obligation with an honest executable-or-deferred state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Q1FixtureStub {
+pub struct Q1Fixture {
     pub id: String,
     pub status: String,
-    pub future_enforcement: String,
+    pub enforcement: String,
     pub assertion: String,
 }
 
@@ -75,7 +75,7 @@ pub struct Q1FixtureStub {
 pub struct Q1FixtureCatalog {
     pub schema_version: u32,
     pub source_contract: String,
-    pub fixtures: Vec<Q1FixtureStub>,
+    pub fixtures: Vec<Q1Fixture>,
     pub internal_differentials: Vec<InternalDifferentialFixture>,
 }
 
@@ -116,18 +116,18 @@ pub fn oracle_version_contract() -> Result<OracleVersionContract, GauntletError>
     Ok(contract)
 }
 
-/// Parse and validate all seven pending Q1 stubs and the live Quiver fixture.
+/// Parse and validate the complete Q1 ownership catalog and live differentials.
 ///
 /// # Errors
 ///
-/// Returns an error when IDs are missing, duplicated, reordered, or accidentally
-/// promoted from `stub` before executable enforcement exists, or when the
-/// registered Quiver differential is not executable.
+/// Returns an error when IDs are missing, duplicated, reordered, assigned an
+/// unknown status, or when a full normative Q1 obligation is falsely marked
+/// executable before its downstream owner closes it.
 pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
     let catalog: Q1FixtureCatalog = serde_json::from_str(Q1_FIXTURE_CATALOG_JSON)?;
     let catalog_hash = Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes());
-    const EXPECTED: [&str; 7] = [
-        "Q1-OB1", "Q1-OB2a", "Q1-OB2b", "Q1-OB3", "Q1-OB4", "Q1-OB5", "Q1-OB6",
+    const EXPECTED: [&str; 8] = [
+        "Q1-OB1", "Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3", "Q1-OB4", "Q1-OB5", "Q1-OB6",
     ];
     let ids = catalog
         .fixtures
@@ -144,10 +144,14 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
         || ids != EXPECTED
         || unique.len() != EXPECTED.len()
         || catalog.fixtures.iter().any(|fixture| {
-            fixture.status != "stub"
-                || fixture.future_enforcement.is_empty()
+            !matches!(fixture.status.as_str(), "executable" | "deferred")
+                || fixture.enforcement.is_empty()
                 || fixture.assertion.is_empty()
         })
+        || catalog
+            .fixtures
+            .iter()
+            .any(|fixture| fixture.status == "executable")
         || internal.len() != 1
         || internal[0].id != QUIVER_DIFFERENTIAL_FIXTURE_ID
         || internal[0].status != "executable"
@@ -156,11 +160,111 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
         || internal[0].assertion.is_empty()
     {
         return Err(GauntletError::InvalidContract {
-            reason: "fixture catalog must contain seven ordered Q1 stubs and the executable Quiver differential"
+            reason: "fixture catalog must contain eight ordered deferred normative Q1 rows and the executable Quiver differential"
                 .to_owned(),
         });
     }
     Ok(catalog)
+}
+
+/// Execute the bounded Q1 sub-fixtures owned by the scalar G1a checkpoint.
+///
+/// Downstream merge, compaction, and multi-shard obligations remain explicit
+/// `deferred` rows rather than receiving false-green placeholder assertions.
+///
+/// # Errors
+///
+/// Returns a contract error if interval validation, lease disjointness,
+/// boundary cutting, burn accounting, or watermark monotonicity regresses.
+pub fn run_q1_live_fixtures() -> Result<Vec<String>, GauntletError> {
+    use frankensearch_quill::scribe::{DOCID_LEASE_BLOCK, DocIdAllocator};
+    use frankensearch_quill::{
+        CURRENT_ENGINE_VERSION, DEFAULT_SCHEMA, Manifest, ManifestSegment, TombstoneSet,
+    };
+
+    let schema_id = DEFAULT_SCHEMA
+        .schema_id()
+        .map_err(|error| GauntletError::InvalidContract {
+            reason: format!("default schema is invalid while running Q1 fixtures: {error}"),
+        })?;
+    let segment = |segment_id, seal_seq, docid_lo, docid_hi| ManifestSegment {
+        segment_id,
+        seal_seq,
+        file_len: 1,
+        file_xxh3: segment_id,
+        docid_lo,
+        docid_hi,
+        doc_count: 1,
+        tombstones: TombstoneSet::new(),
+    };
+    let mut manifest = Manifest {
+        generation: 2,
+        docid_high_watermark: 2 * DOCID_LEASE_BLOCK,
+        schema_id,
+        engine_version: CURRENT_ENGINE_VERSION,
+        flags: 0,
+        last_publish_unix_s: 0,
+        segments: vec![
+            segment(1, 1, 0, 1),
+            segment(2, 2, DOCID_LEASE_BLOCK, DOCID_LEASE_BLOCK + 1),
+        ],
+        field_stats: Vec::new(),
+    };
+    manifest
+        .validate()
+        .map_err(|error| GauntletError::InvalidContract {
+            reason: format!("Q1-OB1 valid disjoint intervals failed: {error}"),
+        })?;
+    manifest.segments[1].docid_lo = 0;
+    if manifest.validate().is_ok() {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1-OB1 admitted overlapping segment intervals".to_owned(),
+        });
+    }
+
+    let mut allocator = DocIdAllocator::open(0, 2).map_err(q1_allocator_error)?;
+    let first = allocator.alloc_batch(0, 10).map_err(q1_allocator_error)?;
+    let second = allocator.alloc_batch(1, 10).map_err(q1_allocator_error)?;
+    if first.spans()[0].global_end() > second.spans()[0].global_first() {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1-OB5 granted overlapping concurrent leases".to_owned(),
+        });
+    }
+    let lease_batch =
+        u32::try_from(DOCID_LEASE_BLOCK).map_err(|_| GauntletError::InvalidContract {
+            reason: "Q1 lease block does not fit the batch-allocation contract".to_owned(),
+        })?;
+    let boundary = allocator
+        .alloc_batch(0, lease_batch)
+        .map_err(q1_allocator_error)?;
+    if !boundary.crossed_lease() {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1-OB5 did not cut an allocation at lease exhaustion".to_owned(),
+        });
+    }
+    let burn = allocator.end_session();
+    if burn.total_burned == 0 || burn.final_watermark < 2 * DOCID_LEASE_BLOCK {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1-OB5 failed burn accounting or watermark monotonicity".to_owned(),
+        });
+    }
+    let mut next = DocIdAllocator::open(burn.final_watermark, 1).map_err(q1_allocator_error)?;
+    let next_batch = next.alloc_batch(0, 1).map_err(q1_allocator_error)?;
+    if next_batch.spans()[0].global_first() < burn.final_watermark {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1-OB5 reused a burned document-id tail".to_owned(),
+        });
+    }
+    Ok(vec![
+        "Q1-OB1/manifest-overlap".to_owned(),
+        "Q1-OB5/allocator-boundary".to_owned(),
+    ])
+}
+
+fn q1_allocator_error(error: impl std::fmt::Display) -> GauntletError {
+    GauntletError::InvalidContract {
+        reason: format!("Q1 live allocator fixture failed: {error}"),
+    }
 }
 
 fn is_lower_hex(value: &str, width: usize) -> bool {
@@ -238,18 +342,25 @@ mod tests {
     }
 
     #[test]
-    fn q1_catalog_has_seven_stubs_and_one_executable_internal_differential() {
+    fn q1_catalog_keeps_full_obligations_deferred_and_runs_owned_subfixtures() {
         let catalog = q1_fixture_catalog().expect("valid Q1 catalog");
         assert_eq!(
             Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes()).as_slice(),
             Q1_FIXTURE_CATALOG_SHA256
         );
-        assert_eq!(catalog.fixtures.len(), 7);
-        assert!(
+        assert_eq!(catalog.fixtures.len(), 8);
+        assert_eq!(
             catalog
                 .fixtures
                 .iter()
-                .all(|fixture| fixture.status == "stub")
+                .filter(|fixture| fixture.status == "executable")
+                .map(|fixture| fixture.id.as_str())
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            run_q1_live_fixtures().expect("live Q1 fixtures"),
+            ["Q1-OB1/manifest-overlap", "Q1-OB5/allocator-boundary"]
         );
         assert_eq!(catalog.internal_differentials.len(), 1);
         assert_eq!(catalog.internal_differentials[0].id, FIXTURE_ID);

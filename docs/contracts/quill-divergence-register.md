@@ -95,6 +95,16 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Decision: accept
 - Reviewer: PeachStone (author) · second-agent sign-off requested via agent mail 2026-07-18
 
+### DIV-005: non-finite query boosts recover or fail closed
+
+- Class: `QueryCanonicalization`
+- First seen: 2026-07-18 · `overflowing_boost_recovers_without_nonfinite_score`
+- Root cause: the pinned grammar parses digit-only boosts as `f64`, can retain positive infinity, and later casts the factor to `f32`. Quill's parser and Argus scoring boundary instead require finite non-negative `f32` weights so result ordering, serialization, and exact-score comparisons never admit NaN or infinity.
+- Consumer impact: a syntactically valid factor too large for finite `f32` is diagnosed and the branch executes unboosted instead of producing infinite oracle scores. Finite factors are unchanged. If individually finite nested factors overflow only when multiplied, Quill rejects the query deterministically rather than executing a non-finite scorer; matching semantics are otherwise unchanged.
+- Fixture: `overflowing_boost_recovers_without_nonfinite_score` (parser recovery and syntax-key pin); `malformed_scoring_inputs_fail_without_reaching_idf_assertion` (Argus finite-score boundary)
+- Decision: accept
+- Reviewer: `/root/g1a_parser_dedup_review` · 2026-07-18
+
 ---
 
 *Cross-references: comparator classes implemented in the gauntlet kernel (bead e0.5); auto-triage feeding this ledger (bd-quill-duel-shrinker); statistical gates consuming per-class pass rates (bead e6.6); G2 exit requires this register complete over two consecutive nightly runs (bead e6.8).*

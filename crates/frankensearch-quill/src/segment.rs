@@ -430,6 +430,56 @@ impl EncodedSegment {
         self.write_temp_with_observer(directory, |_, _| Ok(()))
     }
 
+    /// Write the canonical temp, or adopt an exact synced temp from a prior attempt.
+    ///
+    /// A differing same-name artifact is preserved and rejected. This method is
+    /// crate-private because only a retained `KeeperWriter` may establish that
+    /// retrying the temp is serialized with every other directory mutation.
+    pub(crate) fn write_temp_retryable(
+        &self,
+        directory: &Path,
+    ) -> Result<PendingSegmentFile, QuillError> {
+        let path = directory.join(format!(".tmp-segment-{:016x}", self.header.segment_id));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(&self.bytes)?;
+                file.flush()?;
+                file.sync_all()?;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&path)?;
+                if !metadata.file_type().is_file() || metadata.len() != self.file_len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "existing segment temp is not the exact expected regular file",
+                    )
+                    .into());
+                }
+                let existing = fs::read(&path)?;
+                if existing.as_slice() != self.bytes.as_slice() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "existing segment temp differs from the staged FSLX bytes",
+                    )
+                    .into());
+                }
+                OpenOptions::new().read(true).open(&path)?.sync_all()?;
+            }
+            Err(source) => return Err(source.into()),
+        }
+        Ok(self.pending_file(path))
+    }
+
+    fn pending_file(&self, path: PathBuf) -> PendingSegmentFile {
+        PendingSegmentFile {
+            path,
+            segment_id: self.header.segment_id,
+            file_len: self.file_len(),
+            file_xxh3: self.file_xxh3,
+            source_xxh3: self.source_xxh3,
+        }
+    }
+
     pub(crate) fn write_temp_with_observer<O>(
         &self,
         directory: &Path,
@@ -448,13 +498,7 @@ impl EncodedSegment {
         observe(SegmentWriteCheckpoint::TempWritten, &path)?;
         file.sync_all()?;
         observe(SegmentWriteCheckpoint::TempSynced, &path)?;
-        Ok(PendingSegmentFile {
-            path,
-            segment_id: self.header.segment_id,
-            file_len: self.file_len(),
-            file_xxh3: self.file_xxh3,
-            source_xxh3: self.source_xxh3,
-        })
+        Ok(self.pending_file(path))
     }
 }
 
@@ -665,6 +709,12 @@ impl<B: AsRef<[u8]>> SegmentReader<B> {
     #[must_use]
     pub fn file_len(&self) -> u64 {
         u64::try_from(self.source.as_ref().len()).unwrap_or(u64::MAX)
+    }
+
+    /// Borrow the complete canonical FSLX image backing this reader.
+    #[must_use]
+    pub fn source_bytes(&self) -> &[u8] {
+        self.source.as_ref()
     }
 
     /// xxh3-64 over the file prefix before the trailer, stored in the trailer.
@@ -2102,6 +2152,49 @@ mod tests {
             reader.verify(),
             Err(QuillError::IndexCorrupted { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn retryable_temp_adopts_exact_existing_bytes() -> TestResult {
+        let directory = tempfile::tempdir()?.keep();
+        let owned = fixture_sections(DEFAULT_SCHEMA, true);
+        let encoded = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
+        let first = encoded.write_temp(&directory)?;
+        let temp_path = first.path().to_path_buf();
+        let expected = fs::read(&temp_path)?;
+
+        let retry = encoded.write_temp_retryable(&directory)?;
+
+        assert_eq!(retry.path(), temp_path);
+        assert_eq!(retry.segment_id(), first.segment_id());
+        assert_eq!(retry.file_len(), first.file_len());
+        assert_eq!(retry.file_xxh3(), first.file_xxh3());
+        assert_eq!(retry.source_xxh3(), first.source_xxh3());
+        assert_eq!(fs::read(&temp_path)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn retryable_temp_rejects_and_preserves_differing_bytes() -> TestResult {
+        let directory = tempfile::tempdir()?.keep();
+        let owned = fixture_sections(DEFAULT_SCHEMA, true);
+        let encoded = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
+        let pending = encoded.write_temp(&directory)?;
+        let temp_path = pending.path().to_path_buf();
+        let mut differing = fs::read(&temp_path)?;
+        let changed = differing
+            .last_mut()
+            .ok_or("encoded segment fixture must not be empty")?;
+        *changed ^= 0x80;
+        fs::write(&temp_path, &differing)?;
+
+        assert!(matches!(
+            encoded.write_temp_retryable(&directory),
+            Err(QuillError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(&temp_path)?, differing);
         Ok(())
     }
 

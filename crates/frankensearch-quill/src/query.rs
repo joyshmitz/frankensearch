@@ -200,22 +200,22 @@ impl Query {
 pub struct QueryCanonicalizationReport {
     /// Exact-duplicate `MustNot` clauses removed (exclusion is idempotent).
     pub must_not_duplicates_removed: usize,
-    /// Exact-duplicate match-only (`Range`/`Set`/`Glob`/`All`) `Must` clauses
-    /// removed (constant-score filters; a `Term`/`Phrase` `Must` is scoring
-    /// and is always retained).
+    /// Reserved for score-neutral positive-filter cleanup. Positive branches
+    /// are currently all retained because ancestor boosts affect their score.
     pub filter_duplicates_removed: usize,
-    /// Exact-duplicate field entries removed from `Term`/`Phrase` expansions
-    /// (an exact `(field_id, boost)` repeat would double-score one branch).
+    /// Reserved for score-neutral field expansion cleanup. Duplicate scoring
+    /// field branches are intentionally retained, so this is currently zero.
     pub duplicate_fields_removed: usize,
-    /// Boolean nodes whose children were re-ordered into the deterministic
-    /// canonical order.
+    /// Boolean nodes whose occurrence groups were put into the deterministic
+    /// `Must`, `Should`, `MustNot` order while preserving construction order
+    /// within every group.
     pub boolean_levels_sorted: usize,
-    /// Glob nodes whose field list was sorted/deduplicated.
+    /// Glob nodes whose field list was sorted while retaining duplicates.
     pub glob_fields_canonicalized: usize,
 }
 
 /// Rank used to group canonical Boolean children: required, optional,
-/// excluded. Within one group, children order by their structural key.
+/// excluded. Within one group, construction order is preserved.
 const fn occur_rank(occur: Occur) -> u8 {
     match occur {
         Occur::Must => 0,
@@ -224,18 +224,9 @@ const fn occur_rank(occur: Occur) -> u8 {
     }
 }
 
-/// Whether a query branch is a constant-score filter: it cannot contribute
-/// BM25 score, so an exact duplicate under `Must` is removable.
-fn is_match_only_filter(query: &Query) -> bool {
-    match query {
-        Query::All | Query::Range { .. } | Query::Set { .. } | Query::Glob { .. } => true,
-        // A Boost wrapper around a filter multiplies a constant score and
-        // remains a filter for dedup purposes only when the factor is one.
-        Query::Boost { query, factor } => {
-            factor.to_bits() == 1.0_f32.to_bits() && is_match_only_filter(query)
-        }
-        Query::Empty | Query::Term { .. } | Query::Phrase { .. } | Query::Boolean { .. } => false,
-    }
+fn push_framed_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&bytes.len().to_be_bytes());
+    out.extend_from_slice(bytes);
 }
 
 fn push_query_field_key(out: &mut Vec<u8>, field: QueryField) {
@@ -255,7 +246,7 @@ fn push_query_value_key(out: &mut Vec<u8>, value: &QueryValue) {
         }
         QueryValue::Str(text) => {
             out.push(2);
-            out.extend_from_slice(text.as_bytes());
+            push_framed_bytes(out, text.as_bytes());
         }
     }
 }
@@ -286,11 +277,11 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
         Query::All => out.push(1),
         Query::Term { fields, text } => {
             out.push(2);
+            out.extend_from_slice(&fields.len().to_be_bytes());
             for field in fields {
                 push_query_field_key(&mut out, *field);
             }
-            out.push(0xFF);
-            out.extend_from_slice(text.as_bytes());
+            push_framed_bytes(&mut out, text.as_bytes());
         }
         Query::Phrase {
             fields,
@@ -299,14 +290,14 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
             prefix,
         } => {
             out.push(3);
+            out.extend_from_slice(&fields.len().to_be_bytes());
             for field in fields {
                 push_query_field_key(&mut out, *field);
             }
-            out.push(0xFF);
+            out.extend_from_slice(&terms.len().to_be_bytes());
             for term in terms {
                 out.extend_from_slice(&term.position.to_be_bytes());
-                out.extend_from_slice(term.text.as_bytes());
-                out.push(0);
+                push_framed_bytes(&mut out, term.text.as_bytes());
             }
             out.extend_from_slice(&slop.to_be_bytes());
             out.push(u8::from(*prefix));
@@ -318,10 +309,11 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
                 Some(BooleanOperator::And) => 1,
                 Some(BooleanOperator::Or) => 2,
             });
+            out.extend_from_slice(&clauses.len().to_be_bytes());
             for clause in clauses {
                 out.push(occur_rank(clause.occur));
-                out.extend_from_slice(&canonical_sort_key(&clause.query));
-                out.push(0xFE);
+                let child = canonical_sort_key(&clause.query);
+                push_framed_bytes(&mut out, &child);
             }
         }
         Query::Range {
@@ -337,23 +329,24 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
         Query::Set { field_id, values } => {
             out.push(6);
             out.extend_from_slice(&field_id.to_be_bytes());
+            out.extend_from_slice(&values.len().to_be_bytes());
             for value in values {
                 push_query_value_key(&mut out, value);
-                out.push(0xFD);
             }
         }
         Query::Glob { field_ids, pattern } => {
             out.push(7);
+            out.extend_from_slice(&field_ids.len().to_be_bytes());
             for field_id in field_ids {
                 out.extend_from_slice(&field_id.to_be_bytes());
             }
-            out.push(0xFF);
-            out.extend_from_slice(pattern.as_bytes());
+            push_framed_bytes(&mut out, pattern.as_bytes());
         }
         Query::Boost { query, factor } => {
             out.push(8);
             out.extend_from_slice(&factor.to_bits().to_be_bytes());
-            out.extend_from_slice(&canonical_sort_key(query));
+            let child = canonical_sort_key(query);
+            push_framed_bytes(&mut out, &child);
         }
     }
     out
@@ -362,22 +355,22 @@ fn canonical_sort_key(query: &Query) -> Vec<u8> {
 /// Canonicalize a parsed query tree for deterministic planning and
 /// score-neutral deduplication (bd-quill-duel-ast-dedup-7hsu).
 ///
-/// The pass is recursive (bottom-up) and applies four score-neutral rules:
+/// The pass is recursive (bottom-up) and applies three score-neutral rules:
 ///
-/// 1. **Deterministic order**: Boolean children are sorted by
-///    `(occur, structural key)` so one input always plans identically. BM25
-///    sum-union scoring is commutative over clauses, and rank-safe pruning
-///    (e4.4) makes evaluation order invisible, so this changes no score.
+/// 1. **Deterministic occurrence groups**: Boolean children are stably grouped
+///    as `Must`, `Should`, `MustNot`. Construction order within each group is
+///    retained because `f32` score accumulation is not associative and the
+///    oracle exposes that order in exact score bits.
 /// 2. **`MustNot` dedup**: exact-duplicate exclusion clauses collapse to
 ///    one; exclusion is idempotent.
-/// 3. **Match-only `Must` dedup**: exact-duplicate constant-score filters
-///    (`Range`/`Set`/`Glob`/`All`, or factor-1 boosts of them) collapse.
-///    Scoring clauses — `Term`, `Phrase`, and every `Should` — are never
-///    removed: Lucene/Tantivy do not dedup scoring clauses, so duplicate
-///    terms must keep their repeated contribution for oracle conformance.
-/// 4. **Field-list hygiene**: exact duplicate `(field_id, boost)` entries
-///    are removed from `Term`/`Phrase` expansions (preserving contract
-///    order), and `Glob` field ids are sorted and deduplicated.
+/// 3. **Field-list ordering**: `Glob` field ids are sorted without removing
+///    duplicates. `Term`/`Phrase` expansions retain exact duplicate branches
+///    because each branch contributes to the score.
+///
+/// Every positive branch is retained, including `All`: an ancestor boost can
+/// make apparently unit-score children contribute independently. The scorer
+/// owns the narrower effective-unit-`All` collapse because it sees cumulative
+/// boosts during lowering.
 ///
 /// Clause-level repetition caps are unnecessary here: `MAX_QUERY_LENGTH`
 /// already bounds the source, and this pass only rewrites structure.
@@ -409,64 +402,27 @@ fn canonicalize_query_inner(query: &mut Query, report: &mut QueryCanonicalizatio
                 seen_must_not.push(key);
                 true
             });
-            // Match-only Must dedup: constant-score filters only; scoring
-            // clauses are never removed (oracle conformance).
-            let mut seen_filters = Vec::new();
-            clauses.retain(|clause| {
-                if clause.occur != Occur::Must || !is_match_only_filter(&clause.query) {
-                    return true;
-                }
-                let key = canonical_sort_key(&clause.query);
-                if seen_filters.contains(&key) {
-                    report.filter_duplicates_removed += 1;
-                    return false;
-                }
-                seen_filters.push(key);
-                true
-            });
-            // Deterministic order: group by occur rank, structural key within.
-            let before: Vec<Vec<u8>> = clauses
+            // Group occurrences stably. Argus constructs separate required
+            // and optional aggregates in this order, but the relative order of
+            // score-bearing clauses inside either aggregate is observable via
+            // non-associative f32 addition and must not be canonicalized away.
+            let before = clauses
                 .iter()
-                .map(|clause| (occur_rank(clause.occur), canonical_sort_key(&clause.query)))
-                .map(|(rank, key)| {
-                    let mut composite = vec![rank];
-                    composite.extend_from_slice(&key);
-                    composite
-                })
-                .collect();
-            clauses.sort_by_cached_key(|clause| {
-                let mut composite = vec![occur_rank(clause.occur)];
-                composite.extend_from_slice(&canonical_sort_key(&clause.query));
-                composite
-            });
-            let after: Vec<Vec<u8>> = clauses
+                .map(|clause| clause.occur)
+                .collect::<Vec<_>>();
+            clauses.sort_by_key(|clause| occur_rank(clause.occur));
+            let after = clauses
                 .iter()
-                .map(|clause| {
-                    let mut composite = vec![occur_rank(clause.occur)];
-                    composite.extend_from_slice(&canonical_sort_key(&clause.query));
-                    composite
-                })
-                .collect();
+                .map(|clause| clause.occur)
+                .collect::<Vec<_>>();
             if before != after {
                 report.boolean_levels_sorted += 1;
             }
         }
-        Query::Term { fields, .. } | Query::Phrase { fields, .. } => {
-            let mut seen = Vec::new();
-            fields.retain(|field| {
-                let key = (field.field_id, field.boost.to_bits());
-                if seen.contains(&key) {
-                    report.duplicate_fields_removed += 1;
-                    return false;
-                }
-                seen.push(key);
-                true
-            });
-        }
+        Query::Term { .. } | Query::Phrase { .. } => {}
         Query::Glob { field_ids, .. } => {
             let original = field_ids.clone();
             field_ids.sort_unstable();
-            field_ids.dedup();
             if *field_ids != original {
                 report.glob_fields_canonicalized += 1;
             }
@@ -661,13 +617,16 @@ impl DefaultQueryParser {
             tokens,
             cursor: 0,
             diagnostics,
-            dropped_fragments: 0,
             lowered_atoms: Vec::new(),
             field_scopes: Vec::new(),
         };
         grammar.recover_leading_binary_operators();
         let mut parsed = grammar.parse_expression(0);
         grammar.recover_trailing_tokens();
+        if let Some(node) = parsed.as_mut() {
+            rewrite_parser_syntax(node);
+            trim_parser_dropped(&mut node.query, &node.dedup_key);
+        }
         repair_root_all_negative(&mut parsed, &mut grammar);
 
         ParsedQuery {
@@ -738,11 +697,32 @@ fn emit_diagnostic(diagnostics: &mut Vec<QueryDiagnostic>, diagnostic: QueryDiag
     diagnostics.push(diagnostic);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomDelimiter {
+    None,
+    SingleQuotes,
+    DoubleQuotes,
+}
+
+impl AtomDelimiter {
+    const fn from_quote(delimiter: char) -> Self {
+        match delimiter {
+            '\'' => Self::SingleQuotes,
+            '"' => Self::DoubleQuotes,
+            _ => Self::None,
+        }
+    }
+
+    const fn is_quoted(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AtomToken {
     raw: String,
     field: Option<String>,
-    quoted: bool,
+    delimiter: AtomDelimiter,
     slop: u32,
     prefix: bool,
     boost: Option<String>,
@@ -768,49 +748,129 @@ struct SetToken {
     byte_offset: usize,
 }
 
-fn range_dedup_key(token: &RangeToken) -> String {
-    format!(
-        "range:{:?}:{}:{}:{}:{}:{:?}",
-        token.field,
-        token.lower,
-        token.upper,
-        token.lower_inclusive,
-        token.upper_inclusive,
-        boost_dedup_key(token.boost.as_deref())
-    )
-}
-
-fn set_dedup_key(token: &SetToken) -> String {
-    format!(
-        "set:{:?}:{:?}:{:?}",
-        token.field,
-        token.values,
-        boost_dedup_key(token.boost.as_deref())
-    )
-}
-
-fn atom_dedup_key(atom: &AtomToken) -> String {
-    let boost = boost_dedup_key(atom.boost.as_deref());
-    format!(
-        "{:?}|{}|{}|{}|{}|{:?}",
-        atom.field, atom.raw, atom.quoted, atom.slop, atom.prefix, boost
-    )
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BoostDedupKey {
-    Identity,
-    Factor(u32),
+enum SyntaxKey {
+    Atom {
+        field: Option<String>,
+        raw: String,
+        delimiter: AtomDelimiter,
+        slop: u32,
+        prefix: bool,
+    },
+    Range {
+        field: Option<String>,
+        lower: String,
+        upper: String,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
+    Set {
+        field: Option<String>,
+        values: Vec<String>,
+    },
+    Regex {
+        field: Option<String>,
+        pattern: String,
+    },
+    LoweredAway(Box<Self>),
+    Boolean(Vec<(Option<Occur>, Self)>),
+    Boost {
+        query: Box<Self>,
+        factor_bits: u64,
+    },
 }
 
-fn boost_dedup_key(raw: Option<&str>) -> BoostDedupKey {
-    raw.map_or(BoostDedupKey::Identity, |raw| {
-        match parse_boost_factor(raw) {
-            Some(factor) if factor.to_bits() == 1.0_f32.to_bits() => BoostDedupKey::Identity,
-            Some(factor) => BoostDedupKey::Factor(factor.to_bits()),
-            None => BoostDedupKey::Identity,
+fn take_syntax_key(slot: &mut SyntaxKey) -> SyntaxKey {
+    std::mem::replace(slot, SyntaxKey::Boolean(Vec::new()))
+}
+
+fn boost_syntax_key(query: SyntaxKey, raw: Option<&str>) -> SyntaxKey {
+    let Some(raw) = raw else {
+        return query;
+    };
+    let Some(factor) = raw.parse::<f64>().ok().filter(|factor| *factor >= 0.0) else {
+        return query;
+    };
+    if parse_boost_factor(raw).is_none() {
+        return query;
+    }
+    if (factor - 1.0).abs() <= f64::EPSILON {
+        query
+    } else {
+        SyntaxKey::Boost {
+            query: Box::new(query),
+            factor_bits: factor.to_bits(),
         }
-    })
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn empty_query_for_syntax(syntax: &SyntaxKey) -> Query {
+    if let SyntaxKey::LoweredAway(inner) = syntax {
+        return empty_query_for_syntax(inner);
+    }
+    let SyntaxKey::Boost { query, factor_bits } = syntax else {
+        return Query::Empty;
+    };
+    let inner = empty_query_for_syntax(query);
+    // Tantivy parses boost syntax as f64, then lowers it to the f32 scoring
+    // domain. Preserve that intentional narrowing, including overflow to
+    // infinity, for differential parity.
+    let factor = f64::from_bits(*factor_bits) as f32;
+    if factor.to_bits() == 1.0_f32.to_bits() {
+        inner
+    } else {
+        Query::Boost {
+            query: Box::new(inner),
+            factor,
+        }
+    }
+}
+
+fn mark_syntax_lowered_away(syntax: SyntaxKey) -> SyntaxKey {
+    match syntax {
+        SyntaxKey::Boost { query, factor_bits } => SyntaxKey::Boost {
+            query: Box::new(mark_syntax_lowered_away(*query)),
+            factor_bits,
+        },
+        syntax => SyntaxKey::LoweredAway(Box::new(syntax)),
+    }
+}
+
+fn range_dedup_key(token: &RangeToken) -> SyntaxKey {
+    boost_syntax_key(
+        SyntaxKey::Range {
+            field: token.field.clone(),
+            lower: token.lower.clone(),
+            upper: token.upper.clone(),
+            lower_inclusive: token.lower != "*" && token.lower_inclusive,
+            upper_inclusive: token.upper != "*" && token.upper_inclusive,
+        },
+        token.boost.as_deref(),
+    )
+}
+
+fn set_dedup_key(token: &SetToken) -> SyntaxKey {
+    boost_syntax_key(
+        SyntaxKey::Set {
+            field: token.field.clone(),
+            values: token.values.clone(),
+        },
+        token.boost.as_deref(),
+    )
+}
+
+fn atom_dedup_key(atom: &AtomToken) -> SyntaxKey {
+    boost_syntax_key(
+        SyntaxKey::Atom {
+            field: atom.field.clone(),
+            raw: atom.raw.clone(),
+            delimiter: atom.delimiter,
+            slop: atom.slop,
+            prefix: atom.prefix,
+        },
+        atom.boost.as_deref(),
+    )
 }
 
 fn atom_cache_key(atom: &AtomToken) -> Option<String> {
@@ -847,6 +907,12 @@ enum LexToken {
     Atom(AtomToken),
     Range(RangeToken),
     Set(SetToken),
+    UnsupportedRegex {
+        byte_offset: usize,
+        field: Option<String>,
+        pattern: String,
+        boost: Option<String>,
+    },
     Dropped(usize),
     And(usize),
     Or(usize),
@@ -869,7 +935,11 @@ impl LexToken {
             Self::Atom(atom) => atom.byte_offset,
             Self::Range(token) => token.byte_offset,
             Self::Set(token) => token.byte_offset,
-            Self::Dropped(offset)
+            Self::UnsupportedRegex {
+                byte_offset: offset,
+                ..
+            }
+            | Self::Dropped(offset)
             | Self::And(offset)
             | Self::Or(offset)
             | Self::Not(offset)
@@ -887,6 +957,7 @@ impl LexToken {
             Self::Atom(_)
                 | Self::Range(_)
                 | Self::Set(_)
+                | Self::UnsupportedRegex { .. }
                 | Self::Dropped(_)
                 | Self::Not(_)
                 | Self::Plus(_)
@@ -980,12 +1051,17 @@ fn lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<LexToken> {
             let raw = unescape_fragment(raw).0;
             if is_regex_fragment(&raw) {
                 emit_regex_diagnostic(diagnostics, cursor);
-                tokens.push(LexToken::Dropped(cursor));
+                tokens.push(unsupported_regex_token(
+                    cursor,
+                    Some(unescape_field_name(field)),
+                    &raw,
+                    boost,
+                ));
             } else {
                 tokens.push(LexToken::Atom(AtomToken {
                     raw,
                     field: Some(unescape_field_name(field)),
-                    quoted: false,
+                    delimiter: AtomDelimiter::None,
                     slop: 0,
                     prefix: false,
                     boost: boost.map(str::to_owned),
@@ -1092,7 +1168,7 @@ fn lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<LexToken> {
         let (raw, raw_was_escaped) = unescape_fragment(raw);
         if is_regex_fragment(&raw) {
             emit_regex_diagnostic(diagnostics, cursor);
-            tokens.push(LexToken::Dropped(cursor));
+            tokens.push(unsupported_regex_token(cursor, None, &raw, boost));
             cursor = end;
             continue;
         }
@@ -1105,7 +1181,7 @@ fn lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<LexToken> {
                 _ => LexToken::Atom(AtomToken {
                     raw,
                     field,
-                    quoted: false,
+                    delimiter: AtomDelimiter::None,
                     slop: 0,
                     prefix: false,
                     boost: None,
@@ -1116,7 +1192,7 @@ fn lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<LexToken> {
             LexToken::Atom(AtomToken {
                 raw,
                 field,
-                quoted: false,
+                delimiter: AtomDelimiter::None,
                 slop: 0,
                 prefix: false,
                 boost: boost.map(str::to_owned),
@@ -1556,6 +1632,22 @@ fn is_regex_fragment(raw: &str) -> bool {
     raw.starts_with('/')
 }
 
+fn unsupported_regex_token(
+    byte_offset: usize,
+    field: Option<String>,
+    raw: &str,
+    boost: Option<&str>,
+) -> LexToken {
+    let pattern = raw.strip_prefix('/').unwrap_or(raw);
+    let pattern = pattern.strip_suffix('/').unwrap_or(pattern);
+    LexToken::UnsupportedRegex {
+        byte_offset,
+        field,
+        pattern: pattern.replace("\\/", "/"),
+        boost: boost.map(str::to_owned),
+    }
+}
+
 fn emit_regex_diagnostic(diagnostics: &mut Vec<QueryDiagnostic>, byte_offset: usize) {
     emit_diagnostic(
         diagnostics,
@@ -1572,7 +1664,7 @@ fn operator_atom(raw: &str, byte_offset: usize) -> LexToken {
     LexToken::Atom(AtomToken {
         raw: raw.to_owned(),
         field: None,
-        quoted: false,
+        delimiter: AtomDelimiter::None,
         slop: 0,
         prefix: false,
         boost: None,
@@ -1698,7 +1790,7 @@ fn lex_quoted(
         AtomToken {
             raw,
             field,
-            quoted: true,
+            delimiter: AtomDelimiter::from_quote(delimiter),
             slop: parsed_suffix.slop,
             prefix: parsed_suffix.prefix,
             boost: parsed_suffix.boost.map(str::to_owned),
@@ -1856,7 +1948,7 @@ struct ParsedNode {
     query: Query,
     occur: Option<Occur>,
     from_not: bool,
-    dedup_key: String,
+    dedup_key: SyntaxKey,
 }
 
 struct Grammar {
@@ -1864,7 +1956,6 @@ struct Grammar {
     tokens: Vec<LexToken>,
     cursor: usize,
     diagnostics: Vec<QueryDiagnostic>,
-    dropped_fragments: usize,
     lowered_atoms: Vec<(String, Option<Query>)>,
     field_scopes: Vec<String>,
 }
@@ -1899,7 +1990,6 @@ impl Grammar {
     }
 
     fn parse_or(&mut self, depth: usize) -> Option<ParsedNode> {
-        let dropped_before = self.dropped_fragments;
         let mut nodes = Vec::new();
         let mut syntactic_operands = 0;
         let mut explicit_or = false;
@@ -1939,8 +2029,7 @@ impl Grammar {
             }
         }
 
-        let dropped = self.dropped_fragments > dropped_before;
-        combine_or(nodes, syntactic_operands, dropped, explicit_or)
+        combine_or(nodes, syntactic_operands, explicit_or)
     }
 
     fn parse_and(&mut self, depth: usize) -> Option<ParsedNode> {
@@ -2015,12 +2104,12 @@ impl Grammar {
             return None;
         };
         for _ in 1..not_count {
-            let dedup_key = std::mem::take(&mut node.dedup_key);
+            let dedup_key = take_syntax_key(&mut node.dedup_key);
             node.query = Query::Boolean {
                 clauses: vec![BooleanClause::new(Occur::MustNot, node.query)],
                 operator: None,
             };
-            node.dedup_key = negative_boolean_dedup_key(&dedup_key);
+            node.dedup_key = negative_boolean_dedup_key(dedup_key);
         }
         if not_count != 0 {
             if occur.is_some() {
@@ -2045,7 +2134,7 @@ impl Grammar {
                 if atom.field.is_none() {
                     atom.field = self.field_scopes.last().cloned();
                 }
-                let dedup_key = atom_dedup_key(&atom);
+                let mut dedup_key = atom_dedup_key(&atom);
                 let cache_key = atom_cache_key(&atom);
                 if let Some(cache_key) = cache_key.as_ref() {
                     if let Some(index) = self
@@ -2055,9 +2144,10 @@ impl Grammar {
                     {
                         let cached = self.lowered_atoms[index].1.clone();
                         if cached.is_none() {
-                            self.dropped_fragments += 1;
+                            dedup_key = mark_syntax_lowered_away(dedup_key);
                         }
-                        return cached.map(|query| ParsedNode {
+                        let query = cached.unwrap_or_else(|| empty_query_for_syntax(&dedup_key));
+                        return Some(ParsedNode {
                             query,
                             occur: None,
                             from_not: false,
@@ -2069,7 +2159,11 @@ impl Grammar {
                 if let Some(cache_key) = cache_key {
                     self.lowered_atoms.push((cache_key, query.clone()));
                 }
-                query.map(|query| ParsedNode {
+                if query.is_none() {
+                    dedup_key = mark_syntax_lowered_away(dedup_key);
+                }
+                let query = query.unwrap_or_else(|| empty_query_for_syntax(&dedup_key));
+                Some(ParsedNode {
                     query,
                     occur: None,
                     from_not: false,
@@ -2081,8 +2175,13 @@ impl Grammar {
                 if token.field.is_none() {
                     token.field = self.field_scopes.last().cloned();
                 }
-                let dedup_key = range_dedup_key(&token);
-                self.lower_range(&token).map(|query| ParsedNode {
+                let mut dedup_key = range_dedup_key(&token);
+                let lowered = self.lower_range(&token);
+                if lowered.is_none() {
+                    dedup_key = mark_syntax_lowered_away(dedup_key);
+                }
+                let query = lowered.unwrap_or_else(|| empty_query_for_syntax(&dedup_key));
+                Some(ParsedNode {
                     query,
                     occur: None,
                     from_not: false,
@@ -2094,9 +2193,35 @@ impl Grammar {
                 if token.field.is_none() {
                     token.field = self.field_scopes.last().cloned();
                 }
-                let dedup_key = set_dedup_key(&token);
-                self.lower_set(&token).map(|query| ParsedNode {
+                let mut dedup_key = set_dedup_key(&token);
+                let lowered = self.lower_set(&token);
+                if lowered.is_none() {
+                    dedup_key = mark_syntax_lowered_away(dedup_key);
+                }
+                let query = lowered.unwrap_or_else(|| empty_query_for_syntax(&dedup_key));
+                Some(ParsedNode {
                     query,
+                    occur: None,
+                    from_not: false,
+                    dedup_key,
+                })
+            }
+            LexToken::UnsupportedRegex {
+                mut field,
+                pattern,
+                boost,
+                ..
+            } => {
+                self.cursor += 1;
+                if field.is_none() {
+                    field = self.field_scopes.last().cloned();
+                }
+                let dedup_key = mark_syntax_lowered_away(boost_syntax_key(
+                    SyntaxKey::Regex { field, pattern },
+                    boost.as_deref(),
+                ));
+                Some(ParsedNode {
+                    query: empty_query_for_syntax(&dedup_key),
                     occur: None,
                     from_not: false,
                     dedup_key,
@@ -2104,7 +2229,6 @@ impl Grammar {
             }
             LexToken::Dropped(_) => {
                 self.cursor += 1;
-                self.dropped_fragments += 1;
                 None
             }
             LexToken::LeftParen { byte_offset, field } => {
@@ -2144,12 +2268,9 @@ impl Grammar {
                 };
                 parsed.map(|mut node| {
                     if let Some((boost, close_offset)) = group_boost {
-                        let boost_key = boost_dedup_key(boost.as_deref());
                         node.query =
                             self.apply_raw_boost(node.query, boost.as_deref(), close_offset, None);
-                        if !matches!(boost_key, BoostDedupKey::Identity) {
-                            node.dedup_key = format!("group:{}:{boost_key:?}", node.dedup_key);
-                        }
+                        node.dedup_key = boost_syntax_key(node.dedup_key, boost.as_deref());
                     }
                     node
                 })
@@ -2166,7 +2287,7 @@ impl Grammar {
     }
 
     fn lower_atom(&mut self, atom: &AtomToken) -> Option<Query> {
-        if !atom.quoted && atom.raw == "*" {
+        if !atom.delimiter.is_quoted() && atom.raw == "*" {
             if atom.field.is_none() {
                 return Some(self.apply_boost(Query::All, atom));
             }
@@ -2218,10 +2339,7 @@ impl Grammar {
             };
             field_queries.push(query);
         }
-        let Some(query) = merge_field_queries(field_queries) else {
-            self.dropped_fragments += 1;
-            return None;
-        };
+        let query = merge_field_queries(field_queries)?;
         Some(self.apply_boost(query, atom))
     }
 
@@ -2242,7 +2360,6 @@ impl Grammar {
         if (lower_invalid && upper_invalid)
             || matches!((&lower, &upper), (Bound::Unbounded, Bound::Unbounded))
         {
-            self.dropped_fragments += 1;
             self.push_diagnostic(QueryDiagnostic {
                 kind: QueryDiagnosticKind::DroppedFragment,
                 message: "typed range without a usable bound dropped".to_owned(),
@@ -2592,7 +2709,6 @@ impl Grammar {
         byte_offset: usize,
         fragment: Option<String>,
     ) {
-        self.dropped_fragments += 1;
         self.push_diagnostic(QueryDiagnostic {
             kind,
             message: message.to_owned(),
@@ -2625,7 +2741,7 @@ impl Grammar {
 }
 
 fn wrap_direct_negative_or_operand(node: &mut ParsedNode) {
-    let dedup_key = std::mem::take(&mut node.dedup_key);
+    let dedup_key = take_syntax_key(&mut node.dedup_key);
     let query = std::mem::replace(&mut node.query, Query::Empty);
     node.query = Query::Boolean {
         clauses: vec![BooleanClause::new(Occur::MustNot, query)],
@@ -2633,11 +2749,11 @@ fn wrap_direct_negative_or_operand(node: &mut ParsedNode) {
     };
     node.occur = None;
     node.from_not = false;
-    node.dedup_key = negative_boolean_dedup_key(&dedup_key);
+    node.dedup_key = negative_boolean_dedup_key(dedup_key);
 }
 
 fn wrap_not_for_and(node: &mut ParsedNode) {
-    let dedup_key = std::mem::take(&mut node.dedup_key);
+    let dedup_key = take_syntax_key(&mut node.dedup_key);
     let query = std::mem::replace(&mut node.query, Query::Empty);
     node.query = Query::Boolean {
         clauses: vec![BooleanClause::new(Occur::MustNot, query)],
@@ -2645,28 +2761,11 @@ fn wrap_not_for_and(node: &mut ParsedNode) {
     };
     node.occur = None;
     node.from_not = false;
-    node.dedup_key = negative_boolean_dedup_key(&dedup_key);
+    node.dedup_key = negative_boolean_dedup_key(dedup_key);
 }
 
-fn negative_boolean_dedup_key(child: &str) -> String {
-    format!(
-        "{:?}:{:?}",
-        Option::<BooleanOperator>::None,
-        [(Occur::MustNot, child)]
-    )
-}
-
-/// Whether a lowered node is a negation wrapper: exactly one MustNot child.
-/// Exclusion is idempotent, so identical wrappers may merge at combine time
-/// (bd-quill-duel-ast-dedup).
-fn is_negation_wrapper(query: &Query) -> bool {
-    matches!(
-        query,
-        Query::Boolean {
-            clauses,
-            operator: None,
-        } if clauses.len() == 1 && clauses[0].occur == Occur::MustNot
-    )
+fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
+    SyntaxKey::Boolean(vec![(Some(Occur::MustNot), child)])
 }
 
 fn combine_and(nodes: Vec<ParsedNode>, syntactic_operands: usize) -> Option<ParsedNode> {
@@ -2675,14 +2774,12 @@ fn combine_and(nodes: Vec<ParsedNode>, syntactic_operands: usize) -> Option<Pars
         Occur::Must,
         Some(BooleanOperator::And),
         syntactic_operands,
-        false,
     )
 }
 
 fn combine_or(
     nodes: Vec<ParsedNode>,
     syntactic_operands: usize,
-    dropped: bool,
     explicit_or: bool,
 ) -> Option<ParsedNode> {
     combine_boolean(
@@ -2690,7 +2787,6 @@ fn combine_or(
         Occur::Should,
         explicit_or.then_some(BooleanOperator::Or),
         syntactic_operands,
-        dropped,
     )
 }
 
@@ -2699,39 +2795,24 @@ fn combine_boolean(
     default_occur: Occur,
     operator: Option<BooleanOperator>,
     syntactic_operands: usize,
-    dropped: bool,
 ) -> Option<ParsedNode> {
     let mut clauses = Vec::with_capacity(nodes.len() + 1);
     let mut keys = Vec::with_capacity(nodes.len());
     for node in nodes {
+        let syntax_occur = node.occur.or(match operator {
+            Some(BooleanOperator::And) => Some(Occur::Must),
+            Some(BooleanOperator::Or) => Some(Occur::Should),
+            None => None,
+        });
         let occur = node.occur.unwrap_or(default_occur);
-        // Only idempotent occurrences merge (bd-quill-duel-ast-dedup): in a
-        // BM25 sum-union, (A OR A) scores A twice, so merging positive
-        // clauses would diverge from the oracle. Lone MustNot clauses and
-        // negation wrappers exclude the same documents once or twice
-        // identically, so they may merge. Score-affecting cursor sharing is
-        // deferred to the query planner (e4.4+), where duplicate scoring
-        // clauses can share one cursor and multiply its contribution —
-        // score-identical and probe-cheap.
-        let mergeable = occur == Occur::MustNot || is_negation_wrapper(&node.query);
-        if !mergeable
-            || !keys.iter().any(|(candidate_occur, candidate_key)| {
-                *candidate_occur == occur && candidate_key == &node.dedup_key
-            })
-        {
-            keys.push((occur, node.dedup_key));
-            clauses.push(BooleanClause::new(occur, node.query));
-        }
+        keys.push((syntax_occur, node.dedup_key));
+        clauses.push(BooleanClause::new(occur, node.query));
     }
     if clauses.is_empty() {
         return None;
     }
 
-    if clauses.len() == 1
-        && !dropped
-        && clauses[0].occur == default_occur
-        && (syntactic_operands == 1 || default_occur == Occur::Should)
-    {
+    if clauses.len() == 1 && syntactic_operands == 1 && clauses[0].occur != Occur::MustNot {
         let clause = clauses.pop()?;
         let (_, dedup_key) = keys.pop()?;
         return Some(ParsedNode {
@@ -2742,13 +2823,120 @@ fn combine_boolean(
         });
     }
 
-    let dedup_key = format!("{operator:?}:{keys:?}");
+    let dedup_key = SyntaxKey::Boolean(keys);
     Some(ParsedNode {
         query: Query::Boolean { clauses, operator },
         occur: None,
         from_not: false,
         dedup_key,
     })
+}
+
+/// Mirror `tantivy-query-grammar`'s parser-AST rewrite while the raw syntax
+/// identity is still paired with the lowered query tree.
+///
+/// The pinned grammar recurses only through Boolean clauses, so duplicates
+/// beneath a non-identity boost deliberately survive. At each visited Boolean
+/// it retains the first exact `(Option<Occur>, child)` pair and then flattens a
+/// singleton child whose outer occurrence is implicit, transferring the
+/// child's explicit occurrence to the parent clause.
+fn rewrite_parser_syntax(node: &mut ParsedNode) {
+    rewrite_parser_syntax_inner(&mut node.query, &mut node.dedup_key);
+}
+
+fn rewrite_parser_syntax_inner(query: &mut Query, syntax: &mut SyntaxKey) {
+    let SyntaxKey::Boolean(keys) = syntax else {
+        return;
+    };
+    let Query::Boolean { clauses, .. } = query else {
+        debug_assert!(false, "Boolean syntax key must pair with a Boolean query");
+        return;
+    };
+    if clauses.len() != keys.len() {
+        debug_assert_eq!(clauses.len(), keys.len());
+        return;
+    }
+
+    for (clause, (_, child_key)) in clauses.iter_mut().zip(keys.iter_mut()) {
+        rewrite_parser_syntax_inner(&mut clause.query, child_key);
+    }
+
+    let mut index = 0;
+    while index < keys.len() {
+        if keys[..index].contains(&keys[index]) {
+            keys.remove(index);
+            clauses.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+
+    for (key, outer_clause) in keys.iter_mut().zip(clauses.iter_mut()) {
+        let (outer_occur, child_key) = key;
+        if outer_occur.is_none()
+            && let SyntaxKey::Boolean(inner_keys) = child_key
+            && let Query::Boolean {
+                clauses: inner_clauses,
+                ..
+            } = &mut outer_clause.query
+            && inner_keys.len() == 1
+            && inner_clauses.len() == 1
+        {
+            let (inner_occur, inner_key) = inner_keys.remove(0);
+            let inner_clause = inner_clauses.remove(0);
+            *outer_occur = inner_occur;
+            *child_key = inner_key;
+            *outer_clause = inner_clause;
+        }
+    }
+}
+
+/// Mirror Tantivy's post-lowering `trim_ast` for parser leaves that failed
+/// semantic lowering. Intentional match-none leaves remain executable; only
+/// syntax explicitly tagged `LoweredAway` disappears. A boost is a
+/// boundary even when its child failed lowering.
+fn trim_parser_dropped(query: &mut Query, syntax: &SyntaxKey) -> bool {
+    if matches!(syntax, SyntaxKey::LoweredAway(_)) {
+        return true;
+    }
+    if let SyntaxKey::Boost {
+        query: child_key, ..
+    } = syntax
+    {
+        if let Query::Boost {
+            query: child_query, ..
+        } = query
+        {
+            let _ = trim_parser_dropped(child_query, child_key);
+            return false;
+        }
+        return trim_parser_dropped(query, child_key);
+    }
+    let SyntaxKey::Boolean(keys) = syntax else {
+        return false;
+    };
+    let Query::Boolean { clauses, .. } = query else {
+        debug_assert!(false, "Boolean syntax key must pair with a Boolean query");
+        return false;
+    };
+    if clauses.len() != keys.len() {
+        debug_assert_eq!(clauses.len(), keys.len());
+        return false;
+    }
+
+    let original = std::mem::take(clauses);
+    clauses.reserve(original.len());
+    for (mut clause, (_, child_key)) in original.into_iter().zip(keys) {
+        if !trim_parser_dropped(&mut clause.query, child_key) {
+            clauses.push(clause);
+        }
+    }
+    if clauses.is_empty() {
+        *query = Query::Empty;
+        true
+    } else {
+        false
+    }
 }
 
 fn repair_root_all_negative(node: &mut Option<ParsedNode>, grammar: &mut Grammar) {
@@ -5193,23 +5381,34 @@ mod tests {
 
     #[test]
     fn boosts_groups_and_scopes_canonicalize_before_dedup() {
-        // Conformance contract (bd-quill-duel-ast-dedup-7hsu): scoring
-        // duplicates are RETAINED because the oracle's BM25 sum-union scores
-        // (A OR A) twice. Only MustNot clauses and negation wrappers merge —
-        // exclusion is idempotent. Boost/group/scope recovery still
-        // canonicalizes before that merge decision.
-        for raw in ["(rust) rust", "rust rust^1", "rust^2 rust^2.0"] {
+        // The pinned Tantivy grammar removes identical syntactic children
+        // before field expansion. Parentheses disappear at leaf parsing,
+        // identity boosts disappear before the rewrite, and boost equality is
+        // based on parsed f64 values.
+        for raw in [
+            "rust rust",
+            "(rust) rust",
+            "rust rust^1",
+            "rust^2 rust^2.0",
+            "rust OR rust",
+        ] {
+            let Query::Boolean { clauses, .. } = parser().parse(raw).query else {
+                panic!("{raw:?} must retain the rewritten root clause");
+            };
+            assert_eq!(clauses.len(), 1, "{raw:?} must score one clause");
+        }
+
+        // Syntax identity precedes analysis: case and quote delimiter remain
+        // distinct even when the analyzer produces the same lowercase term.
+        for raw in ["Rust rust", "\"rust\" rust", "'rust' \"rust\""] {
             let Query::Boolean { clauses, .. } = &parser().parse(raw).query else {
                 panic!("{raw:?} must retain both scoring clauses");
             };
-            assert_eq!(
-                clauses.len(),
-                2,
-                "{raw:?}: scoring duplicates are never merged"
-            );
+            assert_eq!(clauses.len(), 2, "{raw:?}");
             assert_eq!(clauses[0].query, clauses[1].query, "{raw:?}");
         }
-        // Idempotent exclusions DO merge.
+        // Occurrence is part of the syntax key, and duplicate exclusions merge
+        // exactly as duplicate positive clauses do.
         let merged = parser().parse("-rust -rust").query;
         let count_must_not = |query: &Query| match query {
             Query::Boolean { clauses, .. } => clauses
@@ -5250,11 +5449,11 @@ mod tests {
         }));
 
         let invalid = parser().parse("rust rust^scientific1e2");
-        // The invalid boost is rejected, the atom survives as a scoring Term,
-        // and scoring duplicates are retained (bd-quill-duel-ast-dedup-7hsu).
+        // The invalid boost is rejected and erased from the syntax tree, so
+        // the surviving atom deduplicates with its bare sibling.
         assert!(matches!(
             invalid.query,
-            Query::Boolean { .. } | Query::Term { .. }
+            Query::Boolean { ref clauses, .. } if clauses.len() == 1
         ));
         assert!(
             invalid
@@ -5286,6 +5485,138 @@ mod tests {
     }
 
     #[test]
+    fn parser_syntax_rewrite_stops_at_non_identity_boosts() {
+        let Query::Boost { query, factor } = parser().parse("(rust rust)^2").query else {
+            panic!("the group boost must survive");
+        };
+        assert_eq!(factor.to_bits(), 2.0_f32.to_bits());
+        let Query::Boolean { clauses, .. } = *query else {
+            panic!("the boosted group must retain its Boolean syntax boundary");
+        };
+        assert_eq!(clauses.len(), 2, "rewrite_ast does not enter Boost");
+        assert_eq!(clauses[0].query, clauses[1].query);
+
+        let Query::Boolean { clauses, .. } = parser().parse("(rust rust)^2 rust^2").query else {
+            panic!("the distinct boosted siblings must both survive");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_ne!(clauses[0].query, clauses[1].query);
+    }
+
+    #[test]
+    fn parser_syntax_rewrite_flattens_singletons_and_transfers_occurrence() {
+        assert!(matches!(parser().parse("+a").query, Query::Term { .. }));
+        assert!(matches!(parser().parse("(+a)").query, Query::Term { .. }));
+        let Query::Boolean { clauses, .. } = parser().parse("(+a) a").query else {
+            panic!("the rewritten duplicate keeps its root Boolean");
+        };
+        assert_eq!(clauses.len(), 1, "singleton unary Must is erased first");
+
+        let Query::Boolean { clauses, .. } = parser().parse("(+unknown:x^2) a").query else {
+            panic!("the optional boosted-empty branch and term remain Boolean");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(clauses.iter().all(|clause| clause.occur == Occur::Should));
+        assert!(matches!(clauses[0].query, Query::Boost { .. }));
+
+        let Query::Boolean { clauses, .. } = parser().parse("(-a) b").query else {
+            panic!("negative group plus optional term must remain Boolean");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].occur, Occur::MustNot);
+        assert_eq!(clauses[1].occur, Occur::Should);
+
+        let Query::Boolean { clauses, .. } = parser().parse("(a AND a) b").query else {
+            panic!("required group plus optional term must remain Boolean");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].occur, Occur::Must);
+        assert_eq!(clauses[1].occur, Occur::Should);
+
+        let Query::Boolean { clauses, .. } = parser().parse("((a AND a) b) (+a b)").query else {
+            panic!("the rewritten root must remain Boolean");
+        };
+        assert_eq!(clauses.len(), 1, "recursively equal groups deduplicate");
+        let Query::Boolean { clauses: inner, .. } = &clauses[0].query else {
+            panic!("the two-clause child must retain its grouping");
+        };
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner[0].occur, Occur::Must);
+        assert_eq!(inner[1].occur, Occur::Should);
+
+        let Query::Boolean { clauses, .. } = parser().parse("(a AND a) +a").query else {
+            panic!("dedup-before-flatten must leave the root Boolean");
+        };
+        assert_eq!(clauses.len(), 2, "the rewrite does not dedup a second time");
+        assert!(clauses.iter().all(|clause| clause.occur == Occur::Must));
+        assert_eq!(clauses[0].query, clauses[1].query);
+    }
+
+    #[test]
+    fn parser_syntax_rewrite_retains_lowered_away_raw_identity_until_trim() {
+        let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /y/)").query else {
+            panic!("raw-distinct groups must both survive");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(clauses.iter().all(|clause| {
+            matches!(&clause.query, Query::Boolean { clauses, .. } if clauses.len() == 1)
+        }));
+
+        let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /x/)").query else {
+            panic!("the rewritten duplicate keeps its root Boolean");
+        };
+        assert_eq!(clauses.len(), 1, "raw-identical groups deduplicate");
+
+        let Query::Boolean { clauses, .. } = parser().parse("(a unknown:x) (a unknown:y)").query
+        else {
+            panic!("distinct unknown-field syntax must prevent parent dedup");
+        };
+        assert_eq!(clauses.len(), 2);
+
+        let Query::Boost { query, .. } = parser().parse("(a AND unknown:x)^2").query else {
+            panic!("a valid boost remains a lowering boundary");
+        };
+        let Query::Boolean { clauses, .. } = *query else {
+            panic!("the boosted conjunction remains Boolean");
+        };
+        assert_eq!(clauses.len(), 1, "semantic drops trim inside Boost");
+        assert_eq!(clauses[0].occur, Occur::Must);
+
+        let Query::Boolean { clauses, .. } = parser().parse("a unknown:x^1.00000001").query else {
+            panic!("the valid sibling keeps the root Boolean");
+        };
+        assert_eq!(
+            clauses.len(),
+            1,
+            "an f64-only boost boundary erases after its f32 identity cast"
+        );
+    }
+
+    #[test]
+    fn overflowing_boost_recovers_without_nonfinite_score() {
+        for overflowing in [format!("4{}", "0".repeat(38)), "9".repeat(400)] {
+            let parsed = parser().parse(&format!("rust rust^{overflowing}"));
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| { diagnostic.kind == QueryDiagnosticKind::InvalidBoost })
+            );
+            let Query::Boolean { clauses, .. } = parsed.query else {
+                panic!("the recovered duplicate keeps the rewritten root clause");
+            };
+            assert_eq!(clauses.len(), 1, "the invalid boost is absent from its key");
+
+            let Query::Boolean { clauses, .. } =
+                parser().parse(&format!("(rust rust)^{overflowing}")).query
+            else {
+                panic!("the recovered group keeps its rewritten root Boolean");
+            };
+            assert_eq!(clauses.len(), 1, "invalid boost cannot block child rewrite");
+        }
+    }
+
+    #[test]
     fn typed_ranges_sets_comparisons_and_partial_recovery_are_pinned() {
         let typed_parser =
             DefaultQueryParser::new(TYPED_SCHEMA).expect("typed test schema is valid");
@@ -5307,6 +5638,22 @@ mod tests {
                 upper: Bound::Unbounded,
             }
         );
+
+        for raw in [
+            "signed:[* TO 5] signed:{* TO 5]",
+            "signed:[-5 TO *] signed:[-5 TO *}",
+            "signed:<5 signed:[* TO 5}",
+            "signed:>=5 signed:[5 TO *]",
+        ] {
+            let Query::Boolean { clauses, .. } = typed_parser.parse(raw).query else {
+                panic!("equivalent unbounded ranges must retain one root clause: {raw}");
+            };
+            assert_eq!(
+                clauses.len(),
+                1,
+                "unbounded delimiters normalize before parser dedup: {raw}"
+            );
+        }
 
         let partial = typed_parser.parse("unsigned:[bad TO 3]");
         assert_eq!(
@@ -5591,15 +5938,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_is_raw_and_does_not_merge_distinct_normalized_fragments() {
-        // Scoring duplicates are retained verbatim — the oracle's sum-union
-        // scores them twice (bd-quill-duel-ast-dedup-7hsu).
-        let Query::Boolean { clauses, .. } = parser().parse("rust rust").query else {
-            panic!("scoring duplicates must be retained");
-        };
-        assert_eq!(clauses.len(), 2);
-        assert_eq!(clauses[0].query, clauses[1].query);
-
+    fn parser_dedup_is_raw_and_preserves_distinct_normalized_fragments() {
         let distinct = parser().parse("Rust rust").query;
         assert!(matches!(&distinct, Query::Boolean { .. }));
         let Query::Boolean { clauses, .. } = distinct else {
@@ -5844,13 +6183,16 @@ mod tests {
             tokens,
             cursor: 0,
             diagnostics,
-            dropped_fragments: 0,
             lowered_atoms: Vec::new(),
             field_scopes: Vec::new(),
         };
         grammar.recover_leading_binary_operators();
         let mut parsed = grammar.parse_expression(0);
         grammar.recover_trailing_tokens();
+        if let Some(node) = parsed.as_mut() {
+            rewrite_parser_syntax(node);
+            trim_parser_dropped(&mut node.query, &node.dedup_key);
+        }
         repair_root_all_negative(&mut parsed, &mut grammar);
         ParsedQuery {
             query: parsed.map_or(Query::Empty, |node| node.query),
@@ -6066,7 +6408,7 @@ mod tests {
             ],
             operator: Some(BooleanOperator::And),
         };
-        canonicalize_query(&mut must_query);
+        let _ = canonicalize_query(&mut must_query);
         let Query::Boolean { clauses, .. } = &must_query else {
             panic!("stays Boolean")
         };
@@ -6074,61 +6416,143 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_dedups_match_only_must_filters() {
-        let mut query = Query::Boolean {
-            clauses: vec![
-                range_clause(Occur::Must, 7, 10, 99),
-                term_clause(Occur::Must, 1, "alpha"),
-                range_clause(Occur::Must, 7, 10, 99),
-                BooleanClause::new(Occur::Must, Query::All),
-                BooleanClause::new(Occur::Must, Query::All),
-            ],
-            operator: None,
+    fn canonicalize_retains_all_positive_scorers() {
+        let mut query = Query::Boost {
+            query: Box::new(Query::Boolean {
+                clauses: vec![
+                    range_clause(Occur::Must, 7, 10, 99),
+                    term_clause(Occur::Must, 1, "alpha"),
+                    range_clause(Occur::Must, 7, 10, 99),
+                    BooleanClause::new(Occur::Must, Query::All),
+                    BooleanClause::new(Occur::Must, Query::All),
+                ],
+                operator: None,
+            }),
+            factor: 2.0,
         };
         let report = canonicalize_query(&mut query);
-        assert_eq!(report.filter_duplicates_removed, 2);
-        let Query::Boolean { clauses, .. } = &query else {
-            panic!("stays Boolean")
+        assert_eq!(report.filter_duplicates_removed, 0);
+        let Query::Boost { query, factor } = &query else {
+            panic!("stays boosted")
         };
-        assert_eq!(clauses.len(), 3);
+        assert_eq!(factor.to_bits(), 2.0_f32.to_bits());
+        let Query::Boolean { clauses, .. } = query.as_ref() else {
+            panic!("boosted child stays Boolean")
+        };
+        assert_eq!(clauses.len(), 5);
+        assert_eq!(
+            clauses
+                .iter()
+                .filter(|clause| matches!(clause.query, Query::Range { .. }))
+                .count(),
+            2,
+            "duplicate constant scorers retain both score contributions",
+        );
         assert!(
             clauses
                 .iter()
                 .any(|clause| matches!(&clause.query, Query::Term { text, .. } if text == "alpha"))
         );
+        assert_eq!(
+            clauses
+                .iter()
+                .filter(|clause| matches!(clause.query, Query::All))
+                .count(),
+            2,
+            "ancestor boosts can make duplicate All children score independently",
+        );
     }
 
     #[test]
-    fn canonicalize_sorts_children_deterministically() {
-        let shuffled = Query::Boolean {
+    fn canonicalize_must_not_key_frames_distinct_string_bounds() {
+        let first = Query::Range {
+            field_id: 7,
+            lower: Bound::Included(QueryValue::Str("L".to_owned())),
+            upper: Bound::Included(QueryValue::Str("p\0\u{2}q".to_owned())),
+        };
+        let second = Query::Range {
+            field_id: 7,
+            lower: Bound::Included(QueryValue::Str("L\0\u{2}p".to_owned())),
+            upper: Bound::Included(QueryValue::Str("q".to_owned())),
+        };
+        assert_ne!(canonical_sort_key(&first), canonical_sort_key(&second));
+
+        let mut query = Query::Boolean {
             clauses: vec![
-                term_clause(Occur::MustNot, 1, "zzz"),
-                term_clause(Occur::Must, 9, "beta"),
-                term_clause(Occur::Should, 3, "alpha"),
-                term_clause(Occur::Must, 1, "alpha"),
+                BooleanClause::new(Occur::Must, Query::All),
+                BooleanClause::new(Occur::MustNot, first),
+                BooleanClause::new(Occur::MustNot, second),
             ],
             operator: None,
         };
-        let mut left = shuffled.clone();
-        let mut right = Query::Boolean {
+        let report = canonicalize_query(&mut query);
+        assert_eq!(report.must_not_duplicates_removed, 0);
+        let Query::Boolean { clauses, .. } = query else {
+            panic!("stays Boolean")
+        };
+        assert_eq!(clauses.len(), 3);
+    }
+
+    #[test]
+    fn canonicalize_groups_occurrences_without_reordering_scoring_clauses() {
+        let mut query = Query::Boolean {
             clauses: vec![
-                term_clause(Occur::Must, 1, "alpha"),
-                term_clause(Occur::Should, 3, "alpha"),
-                term_clause(Occur::Must, 9, "beta"),
                 term_clause(Occur::MustNot, 1, "zzz"),
+                term_clause(Occur::Must, 9, "beta"),
+                BooleanClause::new(
+                    Occur::Should,
+                    Query::Boost {
+                        query: Box::new(term_clause(Occur::Should, 3, "alpha").query),
+                        factor: 16_777_216.0,
+                    },
+                ),
+                term_clause(Occur::Must, 1, "alpha"),
+                BooleanClause::new(
+                    Occur::Should,
+                    Query::Boost {
+                        query: Box::new(term_clause(Occur::Should, 3, "gamma").query),
+                        factor: 1.0,
+                    },
+                ),
+                BooleanClause::new(
+                    Occur::Should,
+                    Query::Boost {
+                        query: Box::new(term_clause(Occur::Should, 3, "beta").query),
+                        factor: 0.5,
+                    },
+                ),
             ],
             operator: None,
         };
-        canonicalize_query(&mut left);
-        canonicalize_query(&mut right);
-        assert_eq!(left, right, "any input order yields one canonical plan");
-        let Query::Boolean { clauses, .. } = &left else {
+        let report = canonicalize_query(&mut query);
+        assert_eq!(report.boolean_levels_sorted, 1);
+        let Query::Boolean { clauses, .. } = &query else {
             panic!("stays Boolean")
         };
         let occurs: Vec<_> = clauses.iter().map(|clause| clause.occur).collect();
         assert_eq!(
             occurs,
-            [Occur::Must, Occur::Must, Occur::Should, Occur::MustNot]
+            [
+                Occur::Must,
+                Occur::Must,
+                Occur::Should,
+                Occur::Should,
+                Occur::Should,
+                Occur::MustNot,
+            ]
+        );
+        let should_factors = clauses
+            .iter()
+            .filter(|clause| clause.occur == Occur::Should)
+            .filter_map(|clause| match &clause.query {
+                Query::Boost { factor, .. } => Some(*factor),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            should_factors,
+            [16_777_216.0, 1.0, 0.5],
+            "score-bearing Should construction order is bit-observable",
         );
     }
 
@@ -6164,7 +6588,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_cleans_glob_fields_and_duplicate_field_expansions() {
+    fn canonicalize_sorts_glob_fields_and_preserves_scoring_expansions() {
         let mut glob = Query::Glob {
             field_ids: vec![3, 1, 3, 2, 1],
             pattern: "alp*".to_owned(),
@@ -6174,7 +6598,7 @@ mod tests {
         let Query::Glob { field_ids, .. } = &glob else {
             panic!("stays Glob")
         };
-        assert_eq!(field_ids, &[1, 2, 3]);
+        assert_eq!(field_ids, &[1, 1, 2, 3, 3]);
 
         let mut term = Query::Term {
             fields: vec![
@@ -6186,14 +6610,15 @@ mod tests {
             text: "alpha".to_owned(),
         };
         let report = canonicalize_query(&mut term);
-        assert_eq!(report.duplicate_fields_removed, 1);
+        assert_eq!(report.duplicate_fields_removed, 0);
         let Query::Term { fields, .. } = &term else {
             panic!("stays Term")
         };
-        assert_eq!(fields.len(), 3);
+        assert_eq!(fields.len(), 4);
         assert_eq!(fields[0], QueryField::new(1, 1.0));
         assert_eq!(fields[1], QueryField::new(2, 2.0));
-        assert_eq!(fields[2], QueryField::new(1, 2.0));
+        assert_eq!(fields[2], QueryField::new(1, 1.0));
+        assert_eq!(fields[3], QueryField::new(1, 2.0));
     }
 
     #[test]

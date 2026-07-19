@@ -4,44 +4,50 @@
   "fixtures": [
     {
       "id": "Q1-OB1",
-      "status": "stub",
-      "future_enforcement": "e3.2/e3.3 manifest validation, e3.5 merge assertions, and e3.9 crash matrix",
+      "status": "deferred",
+      "enforcement": "G1a runs the manifest-overlap sub-fixture; bound-consecutive merge enforcement and the crash matrix remain owned by e3.5 and e3.9",
       "assertion": "covering intervals do not overlap, merge inputs are bound-consecutive, and every seal stays within one lease"
     },
     {
       "id": "Q1-OB2a",
-      "status": "stub",
-      "future_enforcement": "e3.5 merge fixture with e5.4 seal determinism",
+      "status": "deferred",
+      "enforcement": "owned by e3.5 merge fixture with e5.4 seal determinism",
       "assertion": "decoded postings, aggregate statistics, and query results equal monolithic indexing, including df=100 plus df=300"
     },
     {
       "id": "Q1-OB2b",
-      "status": "stub",
-      "future_enforcement": "e3.5 raw-block witness and arbitrary merge-schedule property test",
+      "status": "deferred",
+      "enforcement": "owned by e3.5 raw-block witness and arbitrary merge-schedule property test",
       "assertion": "every input posting block remains byte-identical and source-ordered, with no new posting fragments"
     },
     {
+      "id": "Q1-OB2c",
+      "status": "deferred",
+      "enforcement": "owned by the e2.6 external-representative codec regression plus the e3.5 two-stage merge/reopen fixture",
+      "assertion": "merged IDMAP is gap-preserving positional concatenation and IDHASH selects exactly the unique live representative, or the lowest global docid when every duplicate row is dead, before sorting; stale high-seal-sequence containers cannot mask live rows"
+    },
+    {
       "id": "Q1-OB3",
-      "status": "stub",
-      "future_enforcement": "e3.5 random merge order and e6.3 metamorphic suite",
+      "status": "deferred",
+      "enforcement": "owned by e3.5 random merge order and e6.3 metamorphic suite",
       "assertion": "query results are invariant under every merge schedule"
     },
     {
       "id": "Q1-OB4",
-      "status": "stub",
-      "future_enforcement": "e3.6 compaction fixture",
+      "status": "deferred",
+      "enforcement": "owned by e3.6 compaction fixture",
       "assertion": "compaction preserves surviving document IDs and query behavior at 5, 20, and 50 percent tombstones"
     },
     {
       "id": "Q1-OB5",
-      "status": "stub",
-      "future_enforcement": "e1.6 lease properties and e5.4 delta-seal coverage",
+      "status": "deferred",
+      "enforcement": "G1a runs the allocator-boundary sub-fixture; real scalar-flush and delta-seal segment cuts remain owned by e5.4",
       "assertion": "concurrent leases remain disjoint, unused IDs burn on end, and lease exhaustion cuts a segment"
     },
     {
       "id": "Q1-OB6",
-      "status": "stub",
-      "future_enforcement": "e3.7 multi-shard property test",
+      "status": "deferred",
+      "enforcement": "owned by e3.7 multi-shard property test",
       "assertion": "interleaved multi-shard ingest and random policy merges preserve pairwise-disjoint intervals"
     }
   ],

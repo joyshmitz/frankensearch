@@ -761,6 +761,32 @@ impl TantivyIndex {
         Self::from_index(index, schema, fields, None, WRITER_HEAP_BYTES)
     }
 
+    /// Create an in-memory oracle with one deterministic indexing worker.
+    ///
+    /// This is reserved for differential campaigns that compare Tantivy's
+    /// native `DocAddress` tie order across repeated runs. Shipping callers
+    /// should use [`Self::in_memory`], which retains Tantivy's default writer
+    /// parallelism.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::SubsystemError` if the index writer cannot be
+    /// created.
+    #[cfg(feature = "tantivy-oracle")]
+    #[doc(hidden)]
+    pub fn in_memory_single_threaded_oracle() -> SearchResult<Self> {
+        let (schema, fields) = build_schema();
+        let index = Index::create_in_ram(schema.clone());
+        Self::from_index_with_writer_threads(
+            index,
+            schema,
+            fields,
+            None,
+            WRITER_HEAP_BYTES,
+            Some(1),
+        )
+    }
+
     /// Create an in-memory index with an explicit writer heap budget.
     ///
     /// This exists only for same-binary benchmark comparisons of Tantivy's
@@ -806,10 +832,21 @@ impl TantivyIndex {
     /// Internal constructor shared by `create`, `open`, and `in_memory`.
     fn from_index(
         index: Index,
+        schema: Schema,
+        fields: SchemaFields,
+        path: Option<PathBuf>,
+        writer_heap_bytes: usize,
+    ) -> SearchResult<Self> {
+        Self::from_index_with_writer_threads(index, schema, fields, path, writer_heap_bytes, None)
+    }
+
+    fn from_index_with_writer_threads(
+        index: Index,
         _schema: Schema,
         mut fields: SchemaFields,
         path: Option<PathBuf>,
         writer_heap_bytes: usize,
+        writer_threads: Option<usize>,
     ) -> SearchResult<Self> {
         // Resolve the `ord` fast field against the *actual* index schema so
         // indexes created before this field existed (no `ord`) cleanly fall back
@@ -829,8 +866,11 @@ impl TantivyIndex {
                 source: Box::new(e),
             })?;
 
-        let writer = index
-            .writer(writer_heap_bytes)
+        let writer = writer_threads
+            .map_or_else(
+                || index.writer(writer_heap_bytes),
+                |thread_count| index.writer_with_num_threads(thread_count, writer_heap_bytes),
+            )
             .map_err(|e| SearchError::SubsystemError {
                 subsystem: "tantivy",
                 source: Box::new(e),

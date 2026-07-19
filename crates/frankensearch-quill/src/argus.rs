@@ -24,6 +24,7 @@ use crate::quiver::{
 pub use crate::query::Occur;
 
 const UNION_HORIZON: usize = 4_096;
+const MAX_GLOBAL_DOCID_EXCLUSIVE: u64 = 1_u64 << 32;
 
 /// Owner-bound decoder for one cursor's compressed position runs.
 ///
@@ -220,6 +221,26 @@ pub enum ArgusError {
         value_count: usize,
         /// Physical at-seal documents supplied by the segment plan.
         segment_num_docs: u32,
+    },
+    /// A match-all leaf cannot describe the supplied global document domain.
+    #[error(
+        "invalid All scorer range [{docid_lo}, {docid_hi}) for {segment_num_docs} live documents: {reason}"
+    )]
+    InvalidAllRange {
+        /// Inclusive global document id lower bound.
+        docid_lo: u64,
+        /// Exclusive global document id upper bound.
+        docid_hi: u64,
+        /// Live documents reported by the segment.
+        segment_num_docs: u32,
+        /// Failed range invariant.
+        reason: &'static str,
+    },
+    /// A programmatic match-all query supplied a non-finite boost.
+    #[error("All scorer has invalid boost bits 0x{boost_bits:08x}")]
+    InvalidAllBoost {
+        /// Exact rejected f32 representation.
+        boost_bits: u32,
     },
 }
 
@@ -1368,6 +1389,7 @@ impl<'a> ScorerClause<'a> {
 
 enum ScorerNode<'a> {
     Empty,
+    All(AllScorer),
     Term(TermScorer<'a>),
     Phrase(PhraseScorer<'a>),
     NumericRange(NumericRangeScorer),
@@ -1416,6 +1438,52 @@ impl<'a> ReferenceScorer<'a> {
     pub const fn empty() -> Self {
         Self {
             node: ScorerNode::Empty,
+        }
+    }
+
+    /// Build a unit-score scorer over one half-open global document-id range.
+    ///
+    /// The range is the segment's physical document domain. It may include
+    /// holes or tombstoned rows; [`LiveDocs`] remains the single visibility
+    /// authority during collection. `segment_num_docs` is retained separately
+    /// for Tantivy-compatible composite estimates and therefore may be smaller
+    /// than the physical range span.
+    ///
+    /// The bounds use `u64` so `docid_hi == 2^32` can represent a final
+    /// searchable `u32::MAX` document. An empty range with zero live documents
+    /// lowers to [`Self::empty`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects reversed ranges, bounds outside the `u32` payload domain, and a
+    /// live count larger than the physical range span.
+    pub fn all(docid_lo: u64, docid_hi: u64, segment_num_docs: u32) -> Result<Self, ArgusError> {
+        Self::all_with_boost(docid_lo, docid_hi, segment_num_docs, 1.0)
+    }
+
+    /// Build a boosted match-all scorer over one half-open global document-id range.
+    ///
+    /// This is the exact scorer-level lowering for `Boost(All)`: every current
+    /// document receives `boost`, while movement and unscored collection never
+    /// evaluate it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same range failures as [`Self::all`] and rejects a non-finite
+    /// boost before exposing the scorer.
+    pub fn all_with_boost(
+        docid_lo: u64,
+        docid_hi: u64,
+        segment_num_docs: u32,
+        boost: f32,
+    ) -> Result<Self, ArgusError> {
+        let all = AllScorer::new(docid_lo, docid_hi, segment_num_docs, boost)?;
+        if all.doc().is_none() {
+            Ok(Self::empty())
+        } else {
+            Ok(Self {
+                node: ScorerNode::All(all),
+            })
         }
     }
 
@@ -1486,9 +1554,17 @@ impl<'a> ReferenceScorer<'a> {
         matches!(self.node, ScorerNode::Empty)
     }
 
+    fn is_raw_unit_all(&self) -> bool {
+        matches!(
+            &self.node,
+            ScorerNode::All(scorer) if scorer.is_raw_unit_score()
+        )
+    }
+
     fn is_unscored_safe(&self) -> bool {
         match &self.node {
             ScorerNode::Empty
+            | ScorerNode::All(_)
             | ScorerNode::Term(_)
             | ScorerNode::Phrase(_)
             | ScorerNode::NumericRange(_) => true,
@@ -1573,23 +1649,49 @@ impl<'a> ReferenceScorer<'a> {
             }
         }
 
-        let include = if must.is_empty() {
-            match mode {
-                BooleanMode::Scored => scorer_union(should)?,
-                BooleanMode::Unscored => scorer_union_unscored(should)?,
-            }
+        // Tantivy removes only direct, unboosted AllScorers before composing a
+        // complex Boolean tree. Keep one removed scorer per occurrence as the
+        // global-domain restoration token; duplicate unit contributions are
+        // deliberately collapsed, while boosted All scorers remain untouched.
+        let must_all = remove_raw_unit_all_scorers(&mut must);
+        let should_all = remove_raw_unit_all_scorers(&mut should);
+        if remove_raw_unit_all_scorers(&mut excluded).is_some() {
+            return Ok(Self::empty());
+        }
+
+        let required = if must.is_empty() {
+            must_all
         } else {
-            let required = scorer_intersection(must)?;
-            if should.is_empty() || mode == BooleanMode::Unscored {
-                required
-            } else {
-                let optional = scorer_union(should)?;
-                Self {
-                    node: ScorerNode::RequiredOptional(RequiredOptionalScorer::new(
-                        required, optional,
-                    )?),
+            Some(scorer_intersection(must)?)
+        };
+        let include = match required {
+            Some(required) => {
+                // A raw optional All is score-neutral in Tantivy once a MUST
+                // scorer determines matching. Non-All optional scorers retain
+                // their scored RequiredOptional shape.
+                if should.is_empty() || mode == BooleanMode::Unscored {
+                    required
+                } else {
+                    let optional = scorer_union(should)?;
+                    Self {
+                        node: ScorerNode::RequiredOptional(RequiredOptionalScorer::new(
+                            required, optional,
+                        )?),
+                    }
                 }
             }
+            None => match (should_all, mode) {
+                (Some(all), BooleanMode::Unscored) => all,
+                (Some(all), BooleanMode::Scored) if should.is_empty() => all,
+                (Some(all), BooleanMode::Scored) => {
+                    // Preserve Tantivy's nested score order: first aggregate
+                    // the ordinary SHOULD scorers, then union one AllScorer.
+                    let ordinary_should = scorer_union(should)?;
+                    scorer_union(vec![ordinary_should, all])?
+                }
+                (None, BooleanMode::Scored) => scorer_union(should)?,
+                (None, BooleanMode::Unscored) => scorer_union_unscored(should)?,
+            },
         };
         if excluded.is_empty() {
             return Ok(include);
@@ -1604,6 +1706,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn doc(&self) -> Option<u32> {
         match &self.node {
             ScorerNode::Empty => None,
+            ScorerNode::All(scorer) => scorer.doc(),
             ScorerNode::Term(scorer) => scorer.doc(),
             ScorerNode::Phrase(scorer) => scorer.doc(),
             ScorerNode::NumericRange(scorer) => scorer.doc(),
@@ -1620,6 +1723,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn cost(&self) -> u64 {
         match &self.node {
             ScorerNode::Empty => 0,
+            ScorerNode::All(scorer) => scorer.cost(),
             ScorerNode::Term(scorer) => scorer.cost,
             ScorerNode::Phrase(scorer) => scorer.cost,
             ScorerNode::NumericRange(scorer) => scorer.cost(),
@@ -1636,6 +1740,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn size_hint(&self) -> u32 {
         match &self.node {
             ScorerNode::Empty => 0,
+            ScorerNode::All(scorer) => scorer.size_hint(),
             ScorerNode::Term(scorer) => scorer.size_hint,
             ScorerNode::Phrase(scorer) => scorer.size_hint,
             ScorerNode::NumericRange(scorer) => scorer.size_hint(),
@@ -1652,6 +1757,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn segment_num_docs(&self) -> u32 {
         match &self.node {
             ScorerNode::Empty => 0,
+            ScorerNode::All(scorer) => scorer.segment_num_docs,
             ScorerNode::Term(scorer) => scorer.segment_num_docs,
             ScorerNode::Phrase(scorer) => scorer.segment_num_docs,
             ScorerNode::NumericRange(scorer) => scorer.segment_num_docs,
@@ -1675,6 +1781,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn next(&mut self) -> Result<Option<u32>, ArgusError> {
         match &mut self.node {
             ScorerNode::Empty => Ok(None),
+            ScorerNode::All(scorer) => Ok(scorer.next()),
             ScorerNode::Term(scorer) => scorer.next(),
             ScorerNode::Phrase(scorer) => scorer.next(),
             ScorerNode::NumericRange(scorer) => Ok(scorer.next()),
@@ -1694,6 +1801,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         match &mut self.node {
             ScorerNode::Empty => Ok(None),
+            ScorerNode::All(scorer) => Ok(scorer.seek(target)),
             ScorerNode::Term(scorer) => scorer.seek(target),
             ScorerNode::Phrase(scorer) => scorer.seek(target),
             ScorerNode::NumericRange(scorer) => Ok(scorer.seek(target)),
@@ -1708,6 +1816,7 @@ impl<'a> ReferenceScorer<'a> {
     fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
         match &mut self.node {
             ScorerNode::Empty => Ok(SeekDangerResult::SeekLowerBound(None)),
+            ScorerNode::All(scorer) => classify_seek_result(target, scorer.seek(target)),
             ScorerNode::Term(scorer) => {
                 let result = if scorer.doc().is_some_and(|doc| doc < target) {
                     scorer.seek(target)?
@@ -1749,6 +1858,7 @@ impl<'a> ReferenceScorer<'a> {
     pub fn score(&mut self) -> Result<f32, ArgusError> {
         match &mut self.node {
             ScorerNode::Empty => Err(ArgusError::CursorInvariant("cannot score an empty scorer")),
+            ScorerNode::All(scorer) => scorer.score(),
             ScorerNode::Term(scorer) => scorer.score(),
             ScorerNode::Phrase(scorer) => scorer.score(),
             ScorerNode::NumericRange(scorer) => scorer.score(),
@@ -1839,6 +1949,24 @@ fn reserve_scorers<'a>(
         .try_reserve_exact(count)
         .map_err(|_| ArgusError::Allocation { resource, count })?;
     Ok(scorers)
+}
+
+fn remove_raw_unit_all_scorers<'a>(
+    scorers: &mut Vec<ReferenceScorer<'a>>,
+) -> Option<ReferenceScorer<'a>> {
+    let mut retained_all = None;
+    let mut index = 0;
+    while index < scorers.len() {
+        if scorers[index].is_raw_unit_all() {
+            let all = scorers.remove(index);
+            if retained_all.is_none() {
+                retained_all = Some(all);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    retained_all
 }
 
 fn shared_segment_num_docs(scorers: &[ReferenceScorer<'_>]) -> Result<u32, ArgusError> {
@@ -1939,6 +2067,108 @@ fn scorer_union_unscored(
         _ => Ok(ReferenceScorer {
             node: ScorerNode::UnscoredUnion(UnscoredUnionScorer::new(scorers)?),
         }),
+    }
+}
+
+/// Allocation-free cursor over one physical segment document-id domain.
+///
+/// Unlike Tantivy's local-docid `AllScorer`, this cursor retains global bounds
+/// and an explicit exhausted state so `u32::MAX` remains a real match.
+struct AllScorer {
+    current: Option<u32>,
+    docid_hi: u64,
+    span: u64,
+    segment_num_docs: u32,
+    score: f32,
+}
+
+impl AllScorer {
+    fn new(
+        docid_lo: u64,
+        docid_hi: u64,
+        segment_num_docs: u32,
+        boost: f32,
+    ) -> Result<Self, ArgusError> {
+        if !boost.is_finite() {
+            return Err(ArgusError::InvalidAllBoost {
+                boost_bits: boost.to_bits(),
+            });
+        }
+        let invalid = |reason| ArgusError::InvalidAllRange {
+            docid_lo,
+            docid_hi,
+            segment_num_docs,
+            reason,
+        };
+        if docid_lo > docid_hi {
+            return Err(invalid("the lower bound exceeds the upper bound"));
+        }
+        if docid_hi > MAX_GLOBAL_DOCID_EXCLUSIVE {
+            return Err(invalid("the upper bound exceeds the u32 payload domain"));
+        }
+        let span = docid_hi - docid_lo;
+        if u64::from(segment_num_docs) > span {
+            return Err(invalid("the live document count exceeds the range span"));
+        }
+        let current =
+            if span == 0 {
+                None
+            } else {
+                Some(u32::try_from(docid_lo).map_err(|_| {
+                    invalid("the non-empty lower bound exceeds the u32 payload domain")
+                })?)
+            };
+        Ok(Self {
+            current,
+            docid_hi,
+            span,
+            segment_num_docs,
+            score: boost,
+        })
+    }
+
+    const fn doc(&self) -> Option<u32> {
+        self.current
+    }
+
+    const fn cost(&self) -> u64 {
+        self.span
+    }
+
+    fn size_hint(&self) -> u32 {
+        u32::try_from(self.span).unwrap_or(u32::MAX)
+    }
+
+    fn is_raw_unit_score(&self) -> bool {
+        self.score.to_bits() == 1.0_f32.to_bits()
+    }
+
+    fn next(&mut self) -> Option<u32> {
+        let current = self.current?;
+        let next = u64::from(current) + 1;
+        self.current = if next < self.docid_hi {
+            u32::try_from(next).ok()
+        } else {
+            None
+        };
+        self.current
+    }
+
+    fn seek(&mut self, target: u32) -> Option<u32> {
+        let current = self.current?;
+        if current >= target {
+            return Some(current);
+        }
+        self.current = (u64::from(target) < self.docid_hi).then_some(target);
+        self.current
+    }
+
+    fn score(&self) -> Result<f32, ArgusError> {
+        self.current
+            .ok_or(ArgusError::CursorInvariant(
+                "cannot score an exhausted All scorer",
+            ))
+            .map(|_| self.score)
     }
 }
 
@@ -3245,6 +3475,317 @@ mod tests {
 
     fn postings(docs: &[u32]) -> Vec<Posting> {
         docs.iter().map(|&doc| Posting::new(doc, 1)).collect()
+    }
+
+    #[test]
+    fn all_scorer_is_half_open_unit_scored_and_progresses_monotonically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut all = ReferenceScorer::all(7, 10, 2)?;
+        assert_eq!(all.doc(), Some(7));
+        assert_eq!(all.cost(), 3);
+        assert_eq!(all.size_hint(), 3);
+        assert_eq!(all.segment_num_docs(), 2);
+        assert_eq!(all.score()?.to_bits(), 1.0_f32.to_bits());
+
+        assert_eq!(all.advance(6)?, Some(7));
+        assert_eq!(all.advance(7)?, Some(7));
+        assert_eq!(all.advance(8)?, Some(8));
+        assert_eq!(all.next()?, Some(9));
+        assert_eq!(all.advance(9)?, Some(9));
+        assert_eq!(all.next()?, None);
+        assert_eq!(all.next()?, None, "exhaustion is fused");
+        assert_eq!(
+            all.advance(0)?,
+            None,
+            "an exhausted scorer cannot resurrect"
+        );
+        assert!(matches!(
+            all.score(),
+            Err(ArgusError::CursorInvariant(
+                "cannot score an exhausted All scorer"
+            ))
+        ));
+
+        let visible = |docid| docid != 8;
+        let mut top_docs = ReferenceScorer::all(7, 10, 2)?;
+        assert_eq!(
+            top_docs.top_k(3, &visible)?,
+            vec![
+                ScoredDoc {
+                    global_docid: 7,
+                    score: 1.0,
+                },
+                ScoredDoc {
+                    global_docid: 9,
+                    score: 1.0,
+                },
+            ]
+        );
+        let mut doc_set = ReferenceScorer::all(7, 10, 2)?;
+        assert_eq!(doc_set.collect_doc_set(&visible)?, vec![7, 9]);
+
+        let mut boosted = ReferenceScorer::all_with_boost(7, 10, 2, 2.5)?;
+        assert_eq!(boosted.score()?.to_bits(), 2.5_f32.to_bits());
+        assert!(matches!(
+            ReferenceScorer::all_with_boost(7, 10, 2, f32::NAN),
+            Err(ArgusError::InvalidAllBoost { boost_bits }) if boost_bits == f32::NAN.to_bits()
+        ));
+        assert!(matches!(
+            ReferenceScorer::all_with_boost(7, 10, 2, f32::INFINITY),
+            Err(ArgusError::InvalidAllBoost { boost_bits })
+                if boost_bits == f32::INFINITY.to_bits()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn all_scorer_validates_empty_and_u32_boundary_domains()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty = ReferenceScorer::all(17, 17, 0)?;
+        assert_eq!(empty.doc(), None);
+        assert_eq!(empty.cost(), 0);
+        assert_eq!(empty.size_hint(), 0);
+        assert_eq!(empty.segment_num_docs(), 0);
+
+        assert!(matches!(
+            ReferenceScorer::all(18, 17, 0),
+            Err(ArgusError::InvalidAllRange { .. })
+        ));
+        assert!(matches!(
+            ReferenceScorer::all(0, MAX_GLOBAL_DOCID_EXCLUSIVE + 1, 0),
+            Err(ArgusError::InvalidAllRange { .. })
+        ));
+        assert!(matches!(
+            ReferenceScorer::all(17, 18, 2),
+            Err(ArgusError::InvalidAllRange { .. })
+        ));
+
+        let mut final_doc =
+            ReferenceScorer::all(u64::from(u32::MAX), MAX_GLOBAL_DOCID_EXCLUSIVE, 1)?;
+        assert_eq!(final_doc.doc(), Some(u32::MAX));
+        assert_eq!(final_doc.score()?.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(final_doc.advance(u32::MAX)?, Some(u32::MAX));
+        assert_eq!(final_doc.next()?, None);
+
+        let mut full_domain = ReferenceScorer::all(0, MAX_GLOBAL_DOCID_EXCLUSIVE, u32::MAX)?;
+        assert_eq!(full_domain.cost(), MAX_GLOBAL_DOCID_EXCLUSIVE);
+        assert_eq!(full_domain.size_hint(), u32::MAX);
+        assert_eq!(full_domain.segment_num_docs(), u32::MAX);
+        assert_eq!(full_domain.advance(u32::MAX)?, Some(u32::MAX));
+        assert_eq!(full_domain.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn all_anchor_composes_with_exclusion_for_top_docs_and_doc_sets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(1); 4];
+        let encoded =
+            EncodedDocLenSection::encode(10, 14, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, 4, 4)?;
+
+        let mut scored = ReferenceScorer::boolean(vec![
+            ScorerClause::must(ReferenceScorer::all(10, 14, 4)?),
+            ScorerClause::must_not(term(postings(&[11, 13]), field, &snapshot, 2, 2, 1.0)?),
+        ])?;
+        assert_eq!(
+            scored.top_k(4, &AllLiveDocs)?,
+            vec![
+                ScoredDoc {
+                    global_docid: 10,
+                    score: 1.0,
+                },
+                ScoredDoc {
+                    global_docid: 12,
+                    score: 1.0,
+                },
+            ],
+            "the All anchor contributes Tantivy's unit score and MustNot only gates matches"
+        );
+
+        let mut unscored = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::must(ReferenceScorer::all_with_boost(10, 14, 4, 2.5)?),
+            ScorerClause::must_not(term(postings(&[11, 13]), field, &snapshot, 2, 2, 1.0)?),
+        ])?;
+        assert_eq!(unscored.collect_doc_set(&AllLiveDocs)?, vec![10, 12]);
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_raw_all_does_not_change_required_or_optional_term_score_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(1); 4];
+        let encoded =
+            EncodedDocLenSection::encode(0, 4, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, 4, 4)?;
+        let expected = expected_term_score(
+            &snapshot,
+            2,
+            field.fieldnorm_id(1).expect("fieldnorm exists"),
+            1,
+            1.0,
+        );
+
+        let mut all_and_term = ReferenceScorer::boolean(vec![
+            ScorerClause::must(ReferenceScorer::all(0, 4, 4)?),
+            ScorerClause::must(term(postings(&[1, 3]), field, &snapshot, 2, 2, 1.0)?),
+        ])?;
+        let hits = all_and_term.top_k(4, &AllLiveDocs)?;
+        assert_eq!(
+            hits.iter().map(|hit| hit.global_docid).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(
+            hits.iter()
+                .all(|hit| hit.score.to_bits() == expected.to_bits())
+        );
+
+        let mut optional_all = ReferenceScorer::boolean(vec![
+            ScorerClause::must(term(postings(&[1, 3]), field, &snapshot, 2, 2, 1.0)?),
+            ScorerClause::should(ReferenceScorer::all(0, 4, 4)?),
+        ])?;
+        let hits = optional_all.top_k(4, &AllLiveDocs)?;
+        assert_eq!(
+            hits.iter().map(|hit| hit.global_docid).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(
+            hits.iter()
+                .all(|hit| hit.score.to_bits() == expected.to_bits())
+        );
+
+        let mut unscored = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::must(ReferenceScorer::all(0, 4, 4)?),
+            ScorerClause::must(term(postings(&[1, 3]), field, &snapshot, 2, 2, 1.0)?),
+            ScorerClause::should(ReferenceScorer::all(0, 4, 4)?),
+        ])?;
+        assert_eq!(unscored.collect_doc_set(&AllLiveDocs)?, vec![1, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_raw_should_all_is_restored_once_when_it_supplies_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = [Some(1); 4];
+        let encoded =
+            EncodedDocLenSection::encode(0, 4, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, 4, 4)?;
+        let term_score = expected_term_score(
+            &snapshot,
+            1,
+            field.fieldnorm_id(1).expect("fieldnorm exists"),
+            1,
+            1.0,
+        );
+        let expected_overlap = term_score + 1.0;
+
+        let mut query = ReferenceScorer::boolean(vec![
+            ScorerClause::should(term(postings(&[1]), field, &snapshot, 1, 1, 1.0)?),
+            ScorerClause::should(ReferenceScorer::all(0, 4, 4)?),
+        ])?;
+        assert_eq!(query.doc(), Some(0));
+        assert_eq!(query.score()?.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(query.next()?, Some(1));
+        assert_eq!(query.score()?.to_bits(), expected_overlap.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_duplicate_raw_all_collapses_to_one_unit_score()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut required = ReferenceScorer::boolean(vec![
+            ScorerClause::must(ReferenceScorer::all(0, 4, 4)?),
+            ScorerClause::must(ReferenceScorer::all(0, 4, 4)?),
+        ])?;
+        assert_eq!(required.score()?.to_bits(), 1.0_f32.to_bits());
+
+        let mut optional = ReferenceScorer::boolean(vec![
+            ScorerClause::should(ReferenceScorer::all(0, 4, 4)?),
+            ScorerClause::should(ReferenceScorer::all(0, 4, 4)?),
+        ])?;
+        assert_eq!(optional.score()?.to_bits(), 1.0_f32.to_bits());
+
+        let mut unscored = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::should(ReferenceScorer::all(0, 4, 4)?),
+            ScorerClause::should(ReferenceScorer::all(0, 4, 4)?),
+        ])?;
+        assert_eq!(unscored.cost(), 4);
+        assert_eq!(unscored.collect_doc_set(&AllLiveDocs)?, vec![0, 1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_raw_all_exclusion_lowers_to_empty_in_both_modes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut scored = ReferenceScorer::boolean(vec![
+            ScorerClause::must(ReferenceScorer::all_with_boost(0, 4, 4, 2.5)?),
+            ScorerClause::must_not(ReferenceScorer::all(0, 4, 4)?),
+        ])?;
+        assert_eq!(scored.doc(), None);
+        assert_eq!(scored.cost(), 0);
+        assert_eq!(scored.size_hint(), 0);
+        assert_eq!(scored.segment_num_docs(), 0);
+        assert!(scored.top_k(4, &AllLiveDocs)?.is_empty());
+
+        let mut unscored = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::must(ReferenceScorer::all_with_boost(0, 4, 4, 2.5)?),
+            ScorerClause::must_not(ReferenceScorer::all(0, 4, 4)?),
+        ])?;
+        assert_eq!(unscored.doc(), None);
+        assert_eq!(unscored.cost(), 0);
+        assert_eq!(unscored.size_hint(), 0);
+        assert_eq!(unscored.segment_num_docs(), 0);
+        assert!(unscored.collect_doc_set(&AllLiveDocs)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_boosted_all_is_not_elided_from_score_bits() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let lengths = [Some(1); 4];
+        let encoded =
+            EncodedDocLenSection::encode(0, 4, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, 4, 4)?;
+        let term_score = expected_term_score(
+            &snapshot,
+            1,
+            field.fieldnorm_id(1).expect("fieldnorm exists"),
+            1,
+            1.0,
+        );
+
+        let mut required = ReferenceScorer::boolean(vec![
+            ScorerClause::must(ReferenceScorer::all_with_boost(0, 4, 4, 2.5)?),
+            ScorerClause::must(term(postings(&[1]), field, &snapshot, 1, 1, 1.0)?),
+        ])?;
+        let expected_required = term_score + 2.5;
+        assert_eq!(required.doc(), Some(1));
+        assert_eq!(required.score()?.to_bits(), expected_required.to_bits());
+
+        let mut optional = ReferenceScorer::boolean(vec![
+            ScorerClause::must(term(postings(&[1]), field, &snapshot, 1, 1, 1.0)?),
+            ScorerClause::should(ReferenceScorer::all_with_boost(0, 4, 4, 2.5)?),
+        ])?;
+        let mut expected_optional = 0.0_f32;
+        expected_optional += term_score;
+        expected_optional += 2.5;
+        assert_eq!(optional.doc(), Some(1));
+        assert_eq!(optional.score()?.to_bits(), expected_optional.to_bits());
+
+        let mut unscored = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::must(ReferenceScorer::all_with_boost(0, 4, 4, 2.5)?),
+            ScorerClause::must(term(postings(&[1]), field, &snapshot, 1, 1, 1.0)?),
+        ])?;
+        assert_eq!(unscored.collect_doc_set(&AllLiveDocs)?, vec![1]);
+        Ok(())
     }
 
     fn expected_term_score(

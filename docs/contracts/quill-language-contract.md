@@ -1,11 +1,13 @@
 # Quill Language and Scoring Contract
 
-**Contract version:** 1.0.0
+**Contract version:** 1.0.1
 
 **Owning bead:** `bd-quill-e0-contracts-j53p.1`
 
 **Oracle:** Tantivy 0.26.1, pinned by `Cargo.lock`
 **Contract fixture:** `tests/fixtures/quill_language_contract.json`
+
+**Amendment 1.0.1:** Corrects the default-parser duplicate fixture to match the pinned grammar's pre-analysis stable deduplication of exact raw siblings. Programmatically constructed scoring duplicates remain distinct in the post-parse canonicalizer.
 
 This document defines what “the same results as Tantivy” means for Quill. It is normative for the used lexical surface in `COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md` §3.1, §5, and §8. Quill code does not merge past gate G0 unless its scalar reference path satisfies this contract. The lexical-crate loader currently executes schema, analyzer, helper, and BM25 operation-order goldens and structurally validates the other records; the G1/G2 differential runner is responsible for executing canonical query trees, lifecycle rows, and cross-engine result comparisons.
 
@@ -128,7 +130,11 @@ fragment     := ['+' | '-' | 'NOT'] (literal | group | field_fragment) ['^' boos
 default join := OR; explicit AND has precedence over OR
 ```
 
-Every unfielded literal fragment is analyzed independently for each default field; a field-qualified literal is analyzed only for that field. Zero emitted tokens remove that field branch, one token makes a `Term`, and two or more tokens make a slop-zero `Phrase` even when the fragment was not quoted. Quoting therefore controls grammar grouping, not the token-count-to-query-node rule; a quoted one-token fragment is still a `Term`. Typed ranges, sets, and `All` bypass literal analysis and do not inherit the title literal boost. Clause merge at parse is restricted to idempotent occurrences — `MustNot` clauses and negation wrappers merge, because excluding the same documents once or twice is identical; scoring clauses are never merged at parse, because the oracle's BM25 sum-union scores a duplicated term twice (bd-quill-duel-ast-dedup-7hsu; score-neutral structural dedup of match-only filters and deterministic child ordering belong to the post-parse `canonicalize_query` pass, and probe-cheap cursor sharing for duplicate scoring clauses belongs to the planner).
+Every unfielded literal fragment is analyzed independently for each default field; a field-qualified literal is analyzed only for that field. Zero emitted tokens remove that field branch, one token makes a `Term`, and two or more tokens make a slop-zero `Phrase` even when the fragment was not quoted. Quoting therefore controls grammar grouping, not the token-count-to-query-node rule; a quoted one-token fragment is still a `Term`. Typed ranges, sets, and `All` bypass literal analysis and do not inherit the title literal boost.
+
+Before field analysis, the default parser mirrors the pinned grammar's raw-syntax rewrite: at every Boolean level it recursively rewrites clause children, stably retains the first exact `(optional occurrence, syntax child)` pair, and flattens an implicitly occurring singleton group while transferring any explicit inner occurrence. The rewrite deliberately does not enter a non-identity `Boost`, so `(rust rust)^2` retains both scorers while bare `rust rust` scores one. Syntax identity is pre-analysis identity: case and quote delimiter remain significant, while parentheses and identity boosts do not. This parser-only rule is separate from post-parse `canonicalize_query`; programmatically constructed positive/scoring duplicates remain distinct there because the oracle's BM25 sum-union scores each branch (bd-quill-duel-ast-dedup-7hsu). Exact `MustNot` canonicalization and stable `Must`/`Should`/`MustNot` grouping belong to that later pass, and probe-cheap cursor sharing belongs to the planner.
+
+Boosts have one finite-score safety exception to the pinned grammar (DIV-005): a syntactically valid boost that cannot be represented as a finite non-negative `f32` is diagnosed as `InvalidBoost` and recovered as the unboosted branch; its parser syntax key likewise treats the boost as absent. Individually finite nested boosts whose cumulative product becomes non-finite fail deterministically during lowering. Exact Tantivy score-bit parity excludes only this registered non-finite class.
 
 Lenient mode recovers as much input as possible. Semantic failures such as an unknown field are diagnosed and their invalid branch is dropped while valid siblings remain. Syntax recovery may retain a repaired branch—for example, an unterminated quote can still yield a term—with a diagnostic. An all-negative AST is diagnosed and receives an `All` clause so it has complement semantics. The current adapter records diagnostics through tracing. Empty or whitespace-only input returns no results.
 

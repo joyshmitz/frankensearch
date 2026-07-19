@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "1.0.0",
+  "contract_version": "1.0.1",
   "oracle": {
     "engine": "tantivy",
     "version": "0.26.1",
@@ -333,11 +333,10 @@
       "query_class": "short_keyword",
       "parser": "default_lenient",
       "input": "rust rust",
-      "rationale": "bd-quill-duel-ast-dedup-7hsu: scoring duplicates are retained (oracle sum-union scores a duplicated term twice); only idempotent MustNot/negation clauses merge",
+      "rationale": "The pinned default grammar stably deduplicates exact raw parser siblings before field analysis; generic post-parse canonicalization still retains programmatic scoring duplicates",
       "expected_ast": {
         "type": "Boolean",
         "children": [
-          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
           { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
         ]
       }

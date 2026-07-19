@@ -1,22 +1,21 @@
-#[cfg(any(feature = "tantivy-oracle", test))]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
 use asupersync::Cx;
-use frankensearch_quill::QuillConfig;
+use frankensearch_quill::{QuillConfig, QuillIndex};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::GauntletError;
-#[cfg(any(feature = "tantivy-oracle", test))]
-use crate::comparator::RankedHit;
 use crate::comparator::{
-    ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey,
+    ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey, RankedHit,
     compare_observations,
 };
 use crate::generator::MAX_DOCUMENT_ID_BYTES;
+#[cfg(feature = "tantivy-oracle")]
+use crate::runner::SemanticContract;
 use crate::version_contract::oracle_version_contract;
 
 const MAX_ORACLE_LIMIT: u64 = 100_000;
@@ -586,59 +585,303 @@ impl Default for DifferentialHarness {
     }
 }
 
-/// Quill-side placeholder until the first executable `QuillIndex` lands.
-#[derive(Debug, Clone)]
-pub struct QuillSubjectStub {
+/// Live scalar Quill subject used by the G1a campaign.
+pub struct QuillSubject {
     config: QuillConfig,
     descriptor: EngineDescriptor,
+    index: Option<QuillIndex>,
+    state: QuillCampaignState,
 }
 
-impl QuillSubjectStub {
-    #[must_use]
-    pub fn new(config: QuillConfig) -> Self {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuillCampaignState {
+    Fresh,
+    Ingesting,
+    Committed,
+    Aborted,
+}
+
+impl QuillSubject {
+    /// Construct a fresh owned-buffer scalar subject.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed Quill configuration/schema failure or invalid engine
+    /// descriptor input.
+    pub fn in_memory(
+        config: QuillConfig,
+        source_revision: impl Into<String>,
+        source_dirty: bool,
+    ) -> Result<Self, GauntletError> {
         let config_hash = quill_config_hash(&config);
-        Self {
+        let descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            source_revision: source_revision.into(),
+            source_dirty,
+            config_hash,
+        };
+        descriptor.validate()?;
+        Ok(Self {
+            index: Some(QuillIndex::in_memory(config.clone())?),
             config,
-            descriptor: EngineDescriptor {
-                family: EngineFamily::Quill,
-                implementation: "frankensearch-quill/subject-stub".to_owned(),
-                crate_version: env!("CARGO_PKG_VERSION").to_owned(),
-                source_revision: "unimplemented-subject-stub".to_owned(),
-                source_dirty: false,
-                config_hash,
-            },
-        }
+            descriptor,
+            state: QuillCampaignState::Fresh,
+        })
     }
 
     #[must_use]
     pub const fn config(&self) -> &QuillConfig {
         &self.config
     }
-}
 
-impl Default for QuillSubjectStub {
-    fn default() -> Self {
-        Self::new(QuillConfig::default())
+    pub(crate) fn index(&self) -> Result<&QuillIndex, GauntletError> {
+        self.index
+            .as_ref()
+            .ok_or_else(|| GauntletError::SubjectUnavailable {
+                reason: "Quill campaign subject was aborted".to_owned(),
+            })
+    }
+
+    pub(crate) fn index_mut(&mut self) -> Result<&mut QuillIndex, GauntletError> {
+        self.index
+            .as_mut()
+            .ok_or_else(|| GauntletError::SubjectUnavailable {
+                reason: "Quill campaign subject was aborted".to_owned(),
+            })
+    }
+
+    pub(crate) fn claim_fresh_campaign(&mut self) -> Result<(), GauntletError> {
+        if self.state != QuillCampaignState::Fresh {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Quill subject may execute only one campaign".to_owned(),
+            });
+        }
+        self.state = QuillCampaignState::Ingesting;
+        Ok(())
+    }
+
+    pub(crate) fn require_ingesting(&self) -> Result<(), GauntletError> {
+        if self.state != QuillCampaignState::Ingesting {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Quill indexing and commit require an active ingest session".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_committed(&mut self) -> Result<(), GauntletError> {
+        self.require_ingesting()?;
+        self.state = QuillCampaignState::Committed;
+        Ok(())
+    }
+
+    pub(crate) fn require_committed(&self) -> Result<(), GauntletError> {
+        if self.state != QuillCampaignState::Committed {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Quill observation requires a committed campaign snapshot".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.state = QuillCampaignState::Aborted;
+        self.index = None;
     }
 }
 
-impl GauntletEngine for QuillSubjectStub {
+impl GauntletEngine for QuillSubject {
     fn descriptor(&self) -> EngineDescriptor {
         self.descriptor.clone()
     }
 
-    fn observe<'a>(&'a self, _cx: &'a Cx, _case: &'a DifferentialCase) -> GauntletFuture<'a> {
-        Box::pin(async {
-            Err(GauntletError::SubjectUnavailable {
-                reason: "QuillIndex has not reached the executable G1 checkpoint".to_owned(),
-            })
+    fn observe<'a>(&'a self, cx: &'a Cx, case: &'a DifferentialCase) -> GauntletFuture<'a> {
+        Box::pin(async move {
+            self.require_committed()?;
+            quill_observe(self.index()?, cx, case)
         })
     }
 }
 
+fn quill_observe(
+    index: &QuillIndex,
+    cx: &Cx,
+    case: &DifferentialCase,
+) -> Result<EngineObservation, GauntletError> {
+    case.validate_shape()?;
+    if case.snippet_max_chars.is_some() {
+        return Err(GauntletError::InvalidCase {
+            reason: "the scalar G1a Quill adapter requires snippets to be disabled".to_owned(),
+        });
+    }
+    let limit = usize::try_from(case.limit).map_err(|_| GauntletError::InvalidCase {
+        reason: "limit does not fit usize".to_owned(),
+    })?;
+    let offset = usize::try_from(case.offset).map_err(|_| GauntletError::InvalidCase {
+        reason: "offset does not fit usize".to_owned(),
+    })?;
+    let tie_expansion =
+        usize::try_from(case.tie_expansion_limit).map_err(|_| GauntletError::InvalidCase {
+            reason: "tie expansion limit does not fit usize".to_owned(),
+        })?;
+    let page_end = offset
+        .checked_add(limit)
+        .ok_or_else(|| GauntletError::InvalidCase {
+            reason: "offset plus limit does not fit usize".to_owned(),
+        })?;
+    let fetch_limit =
+        page_end
+            .checked_add(tie_expansion)
+            .ok_or_else(|| GauntletError::InvalidCase {
+                reason: "expanded Quill observation window does not fit usize".to_owned(),
+            })?;
+    // The first call is the collector mode under test. Keep the expanded
+    // exact-count call separate: it exists only to furnish comparator tie
+    // evidence and must never stand in for pagination or count-free execution.
+    let observed = index.search_paginated(cx, &case.query, limit, offset, case.count_requested)?;
+    let evidence = index.search_paginated(cx, &case.query, fetch_limit, 0, true)?;
+    if observed.doc_count != evidence.doc_count {
+        return Err(GauntletError::InvalidObservation {
+            reason: "Quill collector modes disagreed on the committed document count".to_owned(),
+        });
+    }
+    let total_count = evidence
+        .total_count
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: "Quill tie-evidence observation omitted its exact count".to_owned(),
+        })?;
+    let match_count = match (case.count_requested, observed.total_count) {
+        (true, Some(observed_count)) if observed_count == total_count => {
+            CountState::Value(observed_count)
+        }
+        (true, Some(_)) => {
+            return Err(GauntletError::InvalidObservation {
+                reason: "Quill counted page disagreed with its expanded tie evidence".to_owned(),
+            });
+        }
+        (true, None) => {
+            return Err(GauntletError::InvalidObservation {
+                reason: "Quill counted page omitted its exact count".to_owned(),
+            });
+        }
+        (false, None) => CountState::NotRequested,
+        (false, Some(_)) => {
+            return Err(GauntletError::InvalidObservation {
+                reason: "Quill count-free page unexpectedly executed exact-count work".to_owned(),
+            });
+        }
+    };
+    let ranked = evidence
+        .hits
+        .iter()
+        .map(|hit| RankedHit {
+            doc_id: hit.document_id.clone(),
+            score_bits: hit.score.to_bits(),
+            native_tie_key: NativeTieKey::QuillDocId {
+                doc_id: hit.global_docid,
+            },
+        })
+        .collect::<Vec<_>>();
+    let top_len = page_end.min(ranked.len());
+    let page_window = &ranked[..top_len];
+    let (cutoff_tie_group, cutoff_tie_complete) =
+        cutoff_tie_group(&ranked, top_len, total_count, limit > 0 && top_len > offset);
+    let (offset_tie_group, offset_tie_complete) = if limit == 0 {
+        (Vec::new(), false)
+    } else {
+        offset_tie_group(
+            page_window,
+            offset,
+            total_count,
+            &cutoff_tie_group,
+            cutoff_tie_complete,
+        )
+    };
+    let hits = observed
+        .hits
+        .iter()
+        .map(|hit| RankedHit {
+            doc_id: hit.document_id.clone(),
+            score_bits: hit.score.to_bits(),
+            native_tie_key: NativeTieKey::QuillDocId {
+                doc_id: hit.global_docid,
+            },
+        })
+        .collect();
+    Ok(EngineObservation {
+        hits,
+        cutoff_tie_group,
+        cutoff_tie_complete,
+        offset_tie_group,
+        offset_tie_complete,
+        snippets: BTreeMap::new(),
+        match_count,
+        doc_count: observed.doc_count,
+        ast_differences: Vec::new(),
+    })
+}
+
+fn cutoff_tie_group(
+    hits: &[RankedHit],
+    boundary: usize,
+    total_count: u64,
+    relevant: bool,
+) -> (Vec<RankedHit>, bool) {
+    if !relevant || boundary == 0 || boundary > hits.len() {
+        return (Vec::new(), false);
+    }
+    let score_bits = hits[boundary - 1].score_bits;
+    let group = hits
+        .iter()
+        .filter(|hit| hit.score_bits == score_bits)
+        .cloned()
+        .collect::<Vec<_>>();
+    let complete = u64::try_from(hits.len()).is_ok_and(|fetched| fetched >= total_count)
+        || hits
+            .last()
+            .is_some_and(|last| last.score_bits != score_bits);
+    (group, complete)
+}
+
+fn offset_tie_group(
+    hits: &[RankedHit],
+    offset: usize,
+    total_count: u64,
+    cutoff_group: &[RankedHit],
+    cutoff_complete: bool,
+) -> (Vec<RankedHit>, bool) {
+    if offset == 0 || offset >= hits.len() {
+        return (Vec::new(), false);
+    }
+    let previous = &hits[offset - 1];
+    let leading = &hits[offset];
+    if previous.score_bits != leading.score_bits {
+        return (Vec::new(), false);
+    }
+    if cutoff_group
+        .first()
+        .is_some_and(|hit| hit.score_bits == leading.score_bits)
+    {
+        return (cutoff_group.to_vec(), cutoff_complete);
+    }
+    let group = hits
+        .iter()
+        .filter(|hit| hit.score_bits == leading.score_bits)
+        .cloned()
+        .collect::<Vec<_>>();
+    let complete = hits
+        .iter()
+        .skip(offset + 1)
+        .any(|hit| hit.score_bits != leading.score_bits)
+        || u64::try_from(hits.len()).is_ok_and(|fetched| fetched >= total_count);
+    (group, complete)
+}
+
 fn quill_config_hash(config: &QuillConfig) -> String {
     let canonical = format!(
-        "scribe={};delta={};fanout={};compact={:016x};holes={:016x};glob={};shards={};deterministic={}",
+        "scribe={};delta={};fanout={};compact={:016x};holes={:016x};glob={};shards={};deterministic={};visibility_ms={}",
         config.scribe_shard_budget_bytes,
         config.delta_budget_bytes,
         config.tier_fanout,
@@ -646,7 +889,8 @@ fn quill_config_hash(config: &QuillConfig) -> String {
         config.merge_max_hole_ratio.to_bits(),
         config.glob_expansion_limit,
         config.max_ingest_shards,
-        config.deterministic_ingest
+        config.deterministic_ingest,
+        config.max_visibility_lag_ms
     );
     format!("{:016x}", xxh3_64(canonical.as_bytes()))
 }
@@ -656,8 +900,18 @@ fn quill_config_hash(config: &QuillConfig) -> String {
 pub struct TantivyOracle {
     index: frankensearch_lexical::TantivyIndex,
     descriptor: EngineDescriptor,
+    semantic_contract: SemanticContract,
     campaign_freshness_verified: bool,
-    campaign_started: bool,
+    campaign_state: TantivyCampaignState,
+}
+
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TantivyCampaignState {
+    Fresh,
+    Ingesting,
+    Committed,
+    Aborted,
 }
 
 #[cfg(feature = "tantivy-oracle")]
@@ -677,6 +931,25 @@ impl TantivyOracle {
             observed_lexical_revision,
             source_dirty,
             true,
+            SemanticContract::shipping_default(),
+        )
+    }
+
+    /// Create a fresh in-memory oracle for the snippet-free scalar G1a profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same provenance or index-construction errors as [`Self::in_memory`].
+    pub fn in_memory_scalar_g1a(
+        observed_lexical_revision: &str,
+        source_dirty: bool,
+    ) -> Result<Self, GauntletError> {
+        Self::from_index_with_campaign_freshness(
+            frankensearch_lexical::TantivyIndex::in_memory_single_threaded_oracle()?,
+            observed_lexical_revision,
+            source_dirty,
+            true,
+            SemanticContract::scalar_g1a(),
         )
     }
 
@@ -695,6 +968,7 @@ impl TantivyOracle {
             observed_lexical_revision,
             source_dirty,
             false,
+            SemanticContract::shipping_default(),
         )
     }
 
@@ -703,6 +977,7 @@ impl TantivyOracle {
         observed_lexical_revision: &str,
         source_dirty: bool,
         campaign_freshness_verified: bool,
+        semantic_contract: SemanticContract,
     ) -> Result<Self, GauntletError> {
         let contract = oracle_version_contract()?;
         contract.validate_source_state(observed_lexical_revision, source_dirty)?;
@@ -716,19 +991,58 @@ impl TantivyOracle {
                 source_dirty,
                 config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
             },
+            semantic_contract,
             campaign_freshness_verified,
-            campaign_started: false,
+            campaign_state: TantivyCampaignState::Fresh,
         })
     }
 
+    pub(crate) const fn campaign_semantic_contract(&self) -> &SemanticContract {
+        &self.semantic_contract
+    }
+
     pub(crate) fn claim_fresh_campaign(&mut self) -> Result<(), GauntletError> {
-        if !self.campaign_freshness_verified || self.campaign_started {
+        if !self.campaign_freshness_verified {
             return Err(GauntletError::InvalidContract {
                 reason: "Tantivy campaigns require a newly constructed one-shot oracle".to_owned(),
             });
         }
-        self.campaign_started = true;
+        if self.campaign_state != TantivyCampaignState::Fresh {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Tantivy oracle may execute only one campaign".to_owned(),
+            });
+        }
+        self.campaign_state = TantivyCampaignState::Ingesting;
         Ok(())
+    }
+
+    pub(crate) fn require_ingesting(&self) -> Result<(), GauntletError> {
+        if self.campaign_state != TantivyCampaignState::Ingesting {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Tantivy indexing and commit require an active ingest session".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_committed(&mut self) -> Result<(), GauntletError> {
+        self.require_ingesting()?;
+        self.campaign_state = TantivyCampaignState::Committed;
+        Ok(())
+    }
+
+    pub(crate) fn require_committed(&self) -> Result<(), GauntletError> {
+        if self.campaign_state != TantivyCampaignState::Committed {
+            return Err(GauntletError::InvalidCampaign {
+                reason: "Tantivy observation requires a committed campaign snapshot".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort_campaign(&mut self) {
+        self.campaign_state = TantivyCampaignState::Aborted;
+        self.campaign_freshness_verified = false;
     }
 
     /// Index and commit a corpus through the shipping lexical trait.
@@ -846,7 +1160,9 @@ impl GauntletEngine for TantivyOracle {
                 .skip(offset)
                 .take(limit)
                 .map(|hit| {
-                    if let Some(snippet) = hit.snippet {
+                    if case.snippet_max_chars.is_some()
+                        && let Some(snippet) = hit.snippet
+                    {
                         snippets.insert(hit.doc_id.clone(), snippet);
                     }
                     RankedHit {
@@ -933,10 +1249,94 @@ mod tests {
     }
 
     #[test]
-    fn subject_stub_is_a_trait_object_with_quill_identity() {
-        let subject: Box<dyn GauntletEngine> = Box::new(QuillSubjectStub::default());
+    fn live_subject_is_a_trait_object_with_quill_identity() {
+        let subject: Box<dyn GauntletEngine> = Box::new(
+            QuillSubject::in_memory(QuillConfig::default(), "test-revision", false)
+                .expect("live Quill subject"),
+        );
         assert_eq!(subject.descriptor().family, EngineFamily::Quill);
         assert_eq!(subject.descriptor().config_hash.len(), 16);
+    }
+
+    #[test]
+    fn quill_config_hash_covers_every_public_knob() {
+        let baseline_config = QuillConfig::default();
+        let baseline_hash = quill_config_hash(&baseline_config);
+        let variants = [
+            (
+                "scribe_shard_budget_bytes",
+                QuillConfig {
+                    scribe_shard_budget_bytes: baseline_config.scribe_shard_budget_bytes + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "delta_budget_bytes",
+                QuillConfig {
+                    delta_budget_bytes: baseline_config.delta_budget_bytes + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "tier_fanout",
+                QuillConfig {
+                    tier_fanout: baseline_config.tier_fanout + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "compaction_tombstone_density",
+                QuillConfig {
+                    compaction_tombstone_density: 0.21,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "merge_max_hole_ratio",
+                QuillConfig {
+                    merge_max_hole_ratio: 0.51,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "glob_expansion_limit",
+                QuillConfig {
+                    glob_expansion_limit: baseline_config.glob_expansion_limit + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "max_ingest_shards",
+                QuillConfig {
+                    max_ingest_shards: baseline_config.max_ingest_shards + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "deterministic_ingest",
+                QuillConfig {
+                    deterministic_ingest: !baseline_config.deterministic_ingest,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "max_visibility_lag_ms",
+                QuillConfig {
+                    max_visibility_lag_ms: baseline_config.max_visibility_lag_ms + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+        ];
+
+        let mut observed_hashes = BTreeSet::from([baseline_hash.clone()]);
+        for (field, variant) in variants {
+            let variant_hash = quill_config_hash(&variant);
+            assert_ne!(variant_hash, baseline_hash, "hash omitted {field}");
+            assert!(
+                observed_hashes.insert(variant_hash),
+                "hash collision while mutating {field}"
+            );
+        }
     }
 
     #[test]

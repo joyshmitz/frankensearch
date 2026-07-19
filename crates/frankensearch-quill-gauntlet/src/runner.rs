@@ -278,6 +278,7 @@ impl CampaignSelection {
                                 | GeneratedQueryKind::Boolean
                                 | GeneratedQueryKind::Paginated
                                 | GeneratedQueryKind::Counted
+                                | GeneratedQueryKind::Harvested { .. }
                         )
                         && case.filters.created_from_ms.is_none()
                         && case.filters.created_to_ms.is_none()
@@ -3098,6 +3099,10 @@ pub fn persist_shrunk_reproduction(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "tantivy-oracle")]
+    use std::io::{self, Write};
+    #[cfg(feature = "tantivy-oracle")]
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3110,6 +3115,144 @@ mod tests {
     use crate::version_contract::oracle_version_contract;
 
     use super::*;
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Debug)]
+    struct TraceLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    impl Write for TraceLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("trace buffer lock is not poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn trace_field_u64(line: &str, field: &str) -> Option<u64> {
+        let prefix = format!("{field}=");
+        line.split_ascii_whitespace().find_map(|part| {
+            part.strip_prefix(&prefix).and_then(|value| {
+                value
+                    .trim_matches(|ch: char| !ch.is_ascii_digit())
+                    .parse()
+                    .ok()
+            })
+        })
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn is_stage_close(line: &str, stage: &str) -> bool {
+        if !line.contains(": close") {
+            return false;
+        }
+        let Some(stage_position) = line.rfind(stage) else {
+            return false;
+        };
+        frankensearch_quill::tracing_conventions::ALL_SPAN_NAMES
+            .iter()
+            .filter_map(|candidate| line.rfind(candidate))
+            .all(|candidate_position| candidate_position <= stage_position)
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn assert_scalar_g1a_trace_contract(logs: &str) {
+        use frankensearch_quill::tracing_conventions::{
+            ARGUS_COLLECT, ARGUS_PARSE, ARGUS_QUERY, ARGUS_SCORE, KEEPER_OPEN, KEEPER_SEAL,
+            SCRIBE_ACCUMULATE, SCRIBE_FLUSH, SCRIBE_TOKENIZE,
+        };
+
+        let required = [
+            SCRIBE_TOKENIZE,
+            SCRIBE_ACCUMULATE,
+            SCRIBE_FLUSH,
+            KEEPER_SEAL,
+            KEEPER_OPEN,
+            ARGUS_PARSE,
+            ARGUS_SCORE,
+            ARGUS_COLLECT,
+        ];
+        for stage in required {
+            let close = logs
+                .lines()
+                .find(|line| is_stage_close(line, stage))
+                .unwrap_or_else(|| panic!("missing close record for {stage}: {logs}"));
+            assert!(
+                close.contains("duration_us="),
+                "stage {stage} omitted explicit duration_us: {close}",
+            );
+            assert!(
+                close.contains("time.busy=") && close.contains("time.idle="),
+                "stage {stage} omitted subscriber timing: {close}",
+            );
+        }
+
+        let accumulate = logs
+            .lines()
+            .find(|line| is_stage_close(line, SCRIBE_ACCUMULATE))
+            .expect("accumulate close record");
+        let used = trace_field_u64(accumulate, "arena_bytes_used_high_water")
+            .expect("accumulate used high-water field");
+        let reserved = trace_field_u64(accumulate, "arena_bytes_reserved_high_water")
+            .expect("accumulate reserved high-water field");
+        assert!(
+            used > 0 && reserved >= used,
+            "invalid arena high-water evidence: {accumulate}"
+        );
+        assert!(
+            trace_field_u64(accumulate, "result_count").is_some_and(|count| count > 0),
+            "accumulate span lacks a non-vacuous result count: {accumulate}",
+        );
+
+        let seal = logs
+            .lines()
+            .find(|line| is_stage_close(line, KEEPER_SEAL))
+            .expect("seal close record");
+        assert!(
+            trace_field_u64(seal, "doc_count").is_some_and(|count| count > 0),
+            "seal span lacks a non-vacuous document count: {seal}",
+        );
+
+        let close_position = |stage: &str| {
+            logs.lines()
+                .position(|line| is_stage_close(line, stage))
+                .unwrap_or_else(|| panic!("missing close position for {stage}"))
+        };
+        assert!(close_position(SCRIBE_TOKENIZE) < close_position(SCRIBE_ACCUMULATE));
+        assert!(close_position(SCRIBE_FLUSH) < close_position(KEEPER_SEAL));
+        let committed_open = logs
+            .lines()
+            .position(|line| {
+                is_stage_close(line, KEEPER_OPEN) && line.contains("phase=\"open.committed\"")
+            })
+            .unwrap_or_else(|| panic!("missing post-seal committed-open close record: {logs}"));
+        assert!(close_position(KEEPER_SEAL) < committed_open);
+        assert!(close_position(ARGUS_PARSE) < close_position(ARGUS_SCORE));
+        assert!(close_position(ARGUS_SCORE) < close_position(ARGUS_COLLECT));
+        assert!(
+            logs.lines().any(|line| {
+                is_stage_close(line, ARGUS_QUERY)
+                    && line.contains("offset=17")
+                    && line.contains("exact_count=true")
+            }),
+            "live G1a trace did not execute Quill's paginated collector: {logs}",
+        );
+        assert!(
+            logs.lines().any(|line| {
+                is_stage_close(line, ARGUS_QUERY) && line.contains("exact_count=false")
+            }),
+            "live G1a trace did not execute Quill's count-free collector: {logs}",
+        );
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ScriptedBehavior {
@@ -3503,7 +3646,7 @@ mod tests {
             QueryGeneratorSpec {
                 seed: 0x6201,
                 default_limit: 20,
-                include_shared_relevance_queries: false,
+                include_shared_relevance_queries: true,
             },
             &corpus_hash,
             &shared,
@@ -4244,7 +4387,7 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
-    fn scalar_g1a_default_syntax_regression_is_exact_and_deterministic() {
+    fn scalar_g1a_harvested_default_syntax_is_exact_and_deterministic() {
         let fixture = make_scalar_g1a_regression_fixture();
         let first_root = tempfile::tempdir()
             .expect("first deterministic regression tempdir")
@@ -4252,33 +4395,52 @@ mod tests {
         let second_root = tempfile::tempdir()
             .expect("second deterministic regression tempdir")
             .keep();
+        let trace_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&trace_buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter("off,frankensearch.quill=info")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || TraceLogWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
 
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let first = run_scalar_g1a_deterministic_regression(&cx, &first_root, &fixture)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "corpus_hash={} run=first campaign_error={error}",
-                        fixture.corpus_hash
-                    )
-                });
-            let second = run_scalar_g1a_deterministic_regression(&cx, &second_root, &fixture)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "corpus_hash={} run=second campaign_error={error}",
-                        fixture.corpus_hash
-                    )
-                });
+        tracing::subscriber::with_default(subscriber, || {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let first = run_scalar_g1a_deterministic_regression(&cx, &first_root, &fixture)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "corpus_hash={} run=first campaign_error={error}",
+                            fixture.corpus_hash
+                        )
+                    });
+                let second = run_scalar_g1a_deterministic_regression(&cx, &second_root, &fixture)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "corpus_hash={} run=second campaign_error={error}",
+                            fixture.corpus_hash
+                        )
+                    });
 
-            let selected_ids = first
-                .cases
-                .iter()
-                .map(|case| case.case_id.as_str())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                selected_ids,
-                [
+                let selected_ids = first
+                    .cases
+                    .iter()
+                    .map(|case| case.case_id.as_str())
+                    .collect::<Vec<_>>();
+                let expected_ids = CampaignSelection::DefaultSyntax
+                    .select(&fixture.query_suite.cases)
+                    .expect("scalar G1a default-syntax selection")
+                    .into_iter()
+                    .map(|case| case.id.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    selected_ids, expected_ids,
+                    "the scalar G1a regression must execute the complete harvested default-parser corpus",
+                );
+                for required in [
                     "term",
                     "multi-term",
                     "phrase",
@@ -4287,67 +4449,254 @@ mod tests {
                     "paginated",
                     "uncounted",
                     "counted",
-                ],
-                "the scalar G1a regression must retain every owned default-parser class",
-            );
-            assert_eq!(first.selected_query_count, 8);
-            let mut observed_regression_hit = false;
-            for case in &first.cases {
+                ] {
+                    assert!(
+                        first.cases.iter().any(|case| case.case_id == required),
+                        "the scalar G1a regression dropped owned parser class {required}",
+                    );
+                }
                 assert_eq!(
-                    case.disposition,
-                    CampaignDisposition::Exact,
-                    "corpus_hash={} query_id={} first_divergence={:?} reason={:?}",
-                    first.corpus_manifest_hash,
-                    case.case_id,
-                    case.first_divergence,
-                    case.reason,
+                    first.selected_query_count,
+                    u64::try_from(expected_ids.len()).expect("default query count fits u64"),
                 );
                 assert_eq!(
-                    case.comparison_status,
-                    Some(ComparisonStatus::Exact),
-                    "corpus_hash={} query_id={} first_divergence={:?}",
-                    first.corpus_manifest_hash,
-                    case.case_id,
-                    case.first_divergence,
+                    fixture
+                        .query_suite
+                        .cases
+                        .iter()
+                        .filter(|case| {
+                            case.syntax == QuerySyntax::Default
+                                && case.source == "tests/fixtures/queries.json"
+                        })
+                        .count(),
+                    25,
+                    "all committed harvested relevance queries must enter the live campaign",
+                );
+                let mut observed_regression_hit = false;
+                for case in &first.cases {
+                    let object_hash = case
+                        .artifact_hash
+                        .as_deref()
+                        .expect("regression case artifact hash");
+                    let object_path = first_root
+                        .join("objects")
+                        .join(format!("{object_hash}.json"));
+                    let object: ArtifactObject = serde_json::from_slice(
+                        &std::fs::read(&object_path).expect("regression case artifact bytes"),
+                    )
+                    .expect("regression case artifact object");
+                    assert_eq!(
+                        case.disposition,
+                        CampaignDisposition::Exact,
+                        "corpus_hash={} query_id={} first_divergence={:?} reason={:?} divergences={:?} subject_hits={:?} oracle_hits={:?}",
+                        first.corpus_manifest_hash,
+                        case.case_id,
+                        case.first_divergence,
+                        case.reason,
+                        object.comparison.divergences,
+                        object.comparison.subject.hits,
+                        object.comparison.oracle.hits,
+                    );
+                    assert_eq!(
+                        case.comparison_status,
+                        Some(ComparisonStatus::Exact),
+                        "corpus_hash={} query_id={} first_divergence={:?}",
+                        first.corpus_manifest_hash,
+                        case.case_id,
+                        case.first_divergence,
+                    );
+                    assert_eq!(
+                        case.rank_class,
+                        Some(RankClass::RankExact),
+                        "corpus_hash={} query_id={} first_divergence={:?}",
+                        first.corpus_manifest_hash,
+                        case.case_id,
+                        case.first_divergence,
+                    );
+                    assert!(
+                        object.comparison.subject.snippets.is_empty()
+                            && object.comparison.oracle.snippets.is_empty(),
+                        "corpus_hash={} query_id={} unexpectedly emitted snippets",
+                        first.corpus_manifest_hash,
+                        case.case_id,
+                    );
+                    if fixture
+                        .query_suite
+                        .cases
+                        .iter()
+                        .find(|query| query.id == case.case_id)
+                        .is_some_and(|query| query.source == "tests/fixtures/queries.json")
+                        && case.case_id == "harvested-22"
+                    {
+                        assert!(
+                            !object.comparison.subject.hits.is_empty(),
+                            "corpus_hash={} duplicate-term regression query_id={} was vacuous",
+                            first.corpus_manifest_hash,
+                            case.case_id,
+                        );
+                    }
+                    observed_regression_hit |= !object.comparison.subject.hits.is_empty();
+                }
+                assert!(
+                    observed_regression_hit,
+                    "corpus_hash={} deterministic regression was vacuous",
+                    first.corpus_manifest_hash
                 );
                 assert_eq!(
-                    case.rank_class,
-                    Some(RankClass::RankExact),
-                    "corpus_hash={} query_id={} first_divergence={:?}",
-                    first.corpus_manifest_hash,
-                    case.case_id,
-                    case.first_divergence,
+                    first.report_hash().expect("first report hash"),
+                    second.report_hash().expect("second report hash")
                 );
+                assert_eq!(first, second, "repeated deterministic regression drifted");
+            });
+        });
+        let logs = String::from_utf8(
+            trace_buffer
+                .lock()
+                .expect("trace buffer lock is not poisoned")
+                .clone(),
+        )
+        .expect("captured Quill trace is UTF-8");
+        assert_scalar_g1a_trace_contract(&logs);
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn scalar_g1a_boosted_should_permutations_and_duplicate_all_match_tantivy_bits() {
+        let snapshot = RepositorySnapshot::from_entries(
+            "boosted-should-order-regression",
+            [
+                RepositoryEntry {
+                    relative_path: std::path::PathBuf::from("docs/01-short.txt"),
+                    bytes: b"alpha beta gamma".to_vec(),
+                },
+                RepositoryEntry {
+                    relative_path: std::path::PathBuf::from("docs/02-medium.txt"),
+                    bytes: b"alpha beta gamma filler filler filler".to_vec(),
+                },
+                RepositoryEntry {
+                    relative_path: std::path::PathBuf::from("docs/03-long.txt"),
+                    bytes: b"alpha beta gamma filler filler filler filler filler filler".to_vec(),
+                },
+            ],
+        )
+        .expect("boost-order corpus snapshot");
+        let corpus_hash = snapshot.manifest.manifest_hash().expect("corpus hash");
+        // Every term has equal df/tf, so scorer costs tie. These two source
+        // orders reach the parity-pinned union as `(alpha + gamma) + beta`
+        // versus `(alpha + beta) + gamma`; boosts 2/5/120 differ by one score
+        // bit on each of the three fieldnorm lanes above.
+        let query_suite = GeneratedQuerySuite::from_cases(
+            QueryGeneratorSpec {
+                seed: 0x6202,
+                default_limit: 10,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            [
+                (
+                    "boosted-should-beta-before-gamma",
+                    "alpha^2 beta^5 gamma^120",
+                ),
+                (
+                    "boosted-should-gamma-before-beta",
+                    "alpha^2 gamma^120 beta^5",
+                ),
+                ("outer-boosted-duplicate-all", "(* AND *)^2"),
+            ]
+            .into_iter()
+            .map(|(id, query)| GeneratedQueryCase {
+                id: id.to_owned(),
+                syntax: QuerySyntax::Default,
+                query_kind: GeneratedQueryKind::Boolean,
+                query: query.to_owned(),
+                limit: 10,
+                offset: 0,
+                count_requested: true,
+                filters: crate::generator::GeneratedQueryFilters::default(),
+                expected_divergence: None,
+                source: "runner.rs score-order and duplicate-All regression".to_owned(),
+            })
+            .collect(),
+        )
+        .expect("boost-order query suite");
+        let fixture = Fixture {
+            documents: snapshot.documents,
+            corpus_manifest: snapshot.manifest,
+            corpus_hash,
+            query_suite,
+        };
+        let root = tempfile::tempdir()
+            .expect("boost-order regression tempdir")
+            .keep();
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let report = run_scalar_g1a_deterministic_regression(&cx, &root, &fixture)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "corpus_hash={} boosted-Should campaign_error={error}",
+                        fixture.corpus_hash
+                    )
+                });
+            assert_eq!(report.cases.len(), 3);
+
+            let mut permutation_score_bits = Vec::new();
+            for case in &report.cases {
+                assert_eq!(case.disposition, CampaignDisposition::Exact, "{case:?}");
+                assert_eq!(case.comparison_status, Some(ComparisonStatus::Exact));
+                assert_eq!(case.rank_class, Some(RankClass::RankExact));
+
                 let object_hash = case
                     .artifact_hash
                     .as_deref()
-                    .expect("exact case artifact hash");
-                let object_path = first_root
-                    .join("objects")
-                    .join(format!("{object_hash}.json"));
+                    .expect("exact boosted-Should artifact hash");
+                let object_path = root.join("objects").join(format!("{object_hash}.json"));
                 let object: ArtifactObject = serde_json::from_slice(
-                    &std::fs::read(&object_path).expect("regression case artifact bytes"),
+                    &std::fs::read(&object_path).expect("boosted-Should artifact bytes"),
                 )
-                .expect("regression case artifact object");
-                assert!(
-                    object.comparison.subject.snippets.is_empty()
-                        && object.comparison.oracle.snippets.is_empty(),
-                    "corpus_hash={} query_id={} unexpectedly emitted snippets",
-                    first.corpus_manifest_hash,
-                    case.case_id,
+                .expect("boosted-Should artifact object");
+                let subject_hits = object
+                    .comparison
+                    .subject
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                    .collect::<Vec<_>>();
+                let oracle_hits = object
+                    .comparison
+                    .oracle
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                    .collect::<Vec<_>>();
+                assert!(!subject_hits.is_empty(), "{} was vacuous", case.case_id);
+                assert_eq!(
+                    subject_hits, oracle_hits,
+                    "{} must preserve Tantivy documents and exact f32 score bits",
+                    case.case_id
                 );
-                observed_regression_hit |= !object.comparison.subject.hits.is_empty();
+                if case.case_id.starts_with("boosted-should-") {
+                    permutation_score_bits.push(
+                        object
+                            .comparison
+                            .subject
+                            .hits
+                            .iter()
+                            .map(|hit| hit.score_bits)
+                            .collect::<Vec<_>>(),
+                    );
+                }
             }
+            assert_eq!(permutation_score_bits.len(), 2);
+            assert_eq!(permutation_score_bits[0].len(), 3);
+            assert_eq!(permutation_score_bits[1].len(), 3);
             assert!(
-                observed_regression_hit,
-                "corpus_hash={} deterministic regression was vacuous",
-                first.corpus_manifest_hash
+                permutation_score_bits[0]
+                    .iter()
+                    .zip(&permutation_score_bits[1])
+                    .all(|(left, right)| left != right),
+                "the clause permutations must change every order-sensitive f32 score",
             );
-            assert_eq!(
-                first.report_hash().expect("first report hash"),
-                second.report_hash().expect("second report hash")
-            );
-            assert_eq!(first, second, "repeated deterministic regression drifted");
         });
     }
 

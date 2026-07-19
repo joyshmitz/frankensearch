@@ -1670,6 +1670,22 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         numeric_values: &[IndexedNumericValue],
         stored_values: &[StoredFieldValue<'_>],
     ) -> Result<DocumentAccumulation, AccumulatorError> {
+        let accumulate_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::SCRIBE_ACCUMULATE,
+            phase = "accumulate",
+            doc_count = self.document_ords.len(),
+            doc_ord,
+            result_count = tracing::field::Empty,
+            admitted_tokens = tracing::field::Empty,
+            oversized_tokens = tracing::field::Empty,
+            token_count = tracing::field::Empty,
+            arena_bytes_used_high_water = tracing::field::Empty,
+            arena_bytes_reserved_high_water = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _accumulate_timer = crate::tracing_conventions::StageTimer::new(&accumulate_span);
+        let _accumulate_entered = accumulate_span.enter();
         if doc_ord >= DOC_ORDS_PER_LEASE {
             return Err(AccumulatorError::DocumentOutsideLease { doc_ord });
         }
@@ -1906,12 +1922,45 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                     debug_assert!(self.analyzer.supports(analyzer));
                     let terms = &mut self.terms;
                     let column = &mut self.fields[field_index];
-                    let report =
-                        analyze_admitted(&mut self.analyzer, analyzer, value.text, &mut |token| {
-                            let term_id = terms.intern(field_ord, token.text.as_bytes());
-                            column.append_token(term_id, doc_ord, token.position);
-                        })
+                    let report = {
+                        let tokenize_span = tracing::info_span!(
+                            target: crate::tracing_conventions::TARGET,
+                            crate::tracing_conventions::SCRIBE_TOKENIZE,
+                            phase = "tokenize",
+                            field_ord,
+                            source_bytes = value.text.len(),
+                            result_count = tracing::field::Empty,
+                            oversized_tokens = tracing::field::Empty,
+                            analyzer_bytes_reserved = tracing::field::Empty,
+                            duration_us = tracing::field::Empty,
+                        );
+                        let _tokenize_timer =
+                            crate::tracing_conventions::StageTimer::new(&tokenize_span);
+                        let _tokenize_entered = tokenize_span.enter();
+                        let report = analyze_admitted(
+                            &mut self.analyzer,
+                            analyzer,
+                            value.text,
+                            &mut |token| {
+                                let term_id = terms.intern(field_ord, token.text.as_bytes());
+                                column.append_token(term_id, doc_ord, token.position);
+                            },
+                        )
                         .expect("document validation checked analyzer-family support");
+                        tokenize_span.record(
+                            "result_count",
+                            u64::try_from(report.admitted_tokens).unwrap_or(u64::MAX),
+                        );
+                        tokenize_span.record(
+                            "oversized_tokens",
+                            u64::try_from(report.oversized_tokens).unwrap_or(u64::MAX),
+                        );
+                        tokenize_span.record(
+                            "analyzer_bytes_reserved",
+                            u64::try_from(self.analyzer.bytes_reserved()).unwrap_or(u64::MAX),
+                        );
+                        report
+                    };
                     (
                         u32::try_from(report.admitted_tokens)
                             .expect("validated source length bounds admitted token count to u32"),
@@ -1956,11 +2005,42 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
 
         self.document_ords.push(doc_ord);
         self.last_doc_ord = Some(doc_ord);
+        let arena_bytes_used = self.bytes_used();
+        let arena_bytes_reserved = self.bytes_reserved();
+        accumulate_span.record(
+            "doc_count",
+            u64::try_from(self.document_ords.len()).unwrap_or(u64::MAX),
+        );
+        accumulate_span.record("result_count", 1_u64);
+        accumulate_span.record("admitted_tokens", admitted_tokens);
+        accumulate_span.record("oversized_tokens", oversized_tokens);
+        accumulate_span.record(
+            "token_count",
+            u64::try_from(self.token_count()).unwrap_or(u64::MAX),
+        );
+        accumulate_span.record(
+            "arena_bytes_used_high_water",
+            u64::try_from(arena_bytes_used).unwrap_or(u64::MAX),
+        );
+        accumulate_span.record(
+            "arena_bytes_reserved_high_water",
+            u64::try_from(arena_bytes_reserved).unwrap_or(u64::MAX),
+        );
+        tracing::info!(
+            target: crate::tracing_conventions::TARGET,
+            phase = "accumulate.complete",
+            doc_count = self.document_ords.len(),
+            admitted_tokens,
+            oversized_tokens,
+            arena_bytes_used,
+            arena_bytes_reserved,
+            "scalar document accumulated"
+        );
         Ok(DocumentAccumulation {
             admitted_tokens,
             oversized_tokens,
-            bytes_reserved: self.bytes_reserved(),
-            bytes_used: self.bytes_used(),
+            bytes_reserved: arena_bytes_reserved,
+            bytes_used: arena_bytes_used,
         })
     }
 
@@ -2244,6 +2324,23 @@ pub struct FlushSegmentInput<'a> {
     pub documents: &'a [FlushDocumentInput<'a>],
 }
 
+/// Execution strategy for the stable radix partition used during a Scribe flush.
+///
+/// [`FlushMode::Automatic`] preserves the shipping behavior and may use Rayon
+/// once the token-row count crosses the parallel chunk boundary.
+/// [`FlushMode::Scalar`] enters the serial radix implementation directly: it
+/// does not query Rayon or construct a parallel iterator. The explicit scalar
+/// mode is the deterministic G1a reference path; later optimized strategies can
+/// be added here without changing the accumulator or segment APIs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FlushMode {
+    /// Select the existing row-count- and worker-aware implementation.
+    #[default]
+    Automatic,
+    /// Force the stable single-threaded radix implementation.
+    Scalar,
+}
+
 /// Typed failures from [`flush_accumulator`].
 #[derive(Debug, Error)]
 pub enum FlushError {
@@ -2427,6 +2524,42 @@ pub fn flush_accumulator<A: TokenAnalyzer>(
     accumulator: &ColumnarAccumulator<A>,
     input: FlushSegmentInput<'_>,
 ) -> Result<EncodedSegment, FlushError> {
+    flush_accumulator_with_mode(accumulator, input, FlushMode::Automatic)
+}
+
+/// Seal one shard accumulator using an explicit radix execution strategy.
+///
+/// This is the strategy-stable entry point for callers that require the scalar
+/// reference implementation. [`FlushMode::Scalar`] bypasses every Rayon-aware
+/// helper and enters the serial stable radix partition directly. All modes
+/// produce the same canonical FSLX bytes for the same accumulator and metadata.
+///
+/// # Errors
+///
+/// Returns [`FlushError`] under the same conditions as [`flush_accumulator`].
+pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
+    accumulator: &ColumnarAccumulator<A>,
+    input: FlushSegmentInput<'_>,
+    mode: FlushMode,
+) -> Result<EncodedSegment, FlushError> {
+    let flush_span = tracing::info_span!(
+        target: crate::tracing_conventions::TARGET,
+        crate::tracing_conventions::SCRIBE_FLUSH,
+        phase = "flush",
+        doc_count = accumulator.document_count(),
+        token_count = accumulator.token_count(),
+        arena_bytes_used = accumulator.bytes_used(),
+        arena_bytes_reserved = accumulator.bytes_reserved(),
+        arena_bytes_used_high_water = accumulator.bytes_used(),
+        arena_bytes_reserved_high_water = accumulator.bytes_reserved(),
+        term_count = accumulator.terms().len(),
+        result_count = tracing::field::Empty,
+        output_bytes = tracing::field::Empty,
+        duration_us = tracing::field::Empty,
+        mode = ?mode,
+    );
+    let _flush_timer = crate::tracing_conventions::StageTimer::new(&flush_span);
+    let _flush_entered = flush_span.enter();
     let first_doc_ord = accumulator
         .first_doc_ord()
         .ok_or(FlushError::EmptyAccumulator)?;
@@ -2464,7 +2597,7 @@ pub fn flush_accumulator<A: TokenAnalyzer>(
     let (expected_field_ords, doclen_columns) =
         build_doclen_columns(accumulator, first_doc_ord, span)?;
     let rows = collect_flush_rows(accumulator)?;
-    let partition = stable_radix_partition(rows, accumulator.terms().len())?;
+    let partition = stable_radix_partition_for_mode(rows, accumulator.terms().len(), mode)?;
     let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) =
         encode_ordered_term_streams(
             accumulator,
@@ -2559,7 +2692,7 @@ pub fn flush_accumulator<A: TokenAnalyzer>(
     }
     sections.push(SectionInput::new(SectionKind::STATS, stats.as_bytes()));
 
-    EncodedSegment::encode(
+    let encoded = EncodedSegment::encode(
         SegmentHeaderInput {
             segment_id: input.segment_id,
             schema,
@@ -2571,7 +2704,10 @@ pub fn flush_accumulator<A: TokenAnalyzer>(
         },
         &sections,
     )
-    .map_err(FlushError::from)
+    .map_err(FlushError::from)?;
+    flush_span.record("result_count", u64::from(doc_count));
+    flush_span.record("output_bytes", encoded.file_len());
+    Ok(encoded)
 }
 
 fn schema_has_positions(schema: SchemaDescriptor) -> bool {
@@ -2800,6 +2936,17 @@ fn stable_radix_partition(
         .min(rows.len().div_ceil(PARALLEL_RADIX_ROWS_PER_CHUNK))
         .max(1);
     stable_radix_partition_with_chunks(rows, term_count, chunk_count)
+}
+
+fn stable_radix_partition_for_mode(
+    rows: Vec<FlushTokenRow>,
+    term_count: usize,
+    mode: FlushMode,
+) -> Result<RadixPartition, FlushError> {
+    match mode {
+        FlushMode::Automatic => stable_radix_partition(rows, term_count),
+        FlushMode::Scalar => stable_radix_partition_serial(rows, term_count),
+    }
 }
 
 fn stable_radix_partition_with_chunks(
@@ -6063,6 +6210,53 @@ mod tests {
         assert_eq!(stored_field.get(65_538), Some(b"stored-a".as_slice()));
         assert_eq!(stored_field.get(65_539), None);
         assert_eq!(stored_field.get(65_541), Some(b"stored-b".as_slice()));
+    }
+
+    #[test]
+    fn scalar_and_automatic_flush_are_byte_identical_at_parallel_row_boundary() {
+        assert_eq!(FlushMode::default(), FlushMode::Automatic);
+        let automatic_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread automatic flush pool");
+
+        for row_count in [
+            PARALLEL_RADIX_ROWS_PER_CHUNK - 1,
+            PARALLEL_RADIX_ROWS_PER_CHUNK,
+            PARALLEL_RADIX_ROWS_PER_CHUNK + 1,
+        ] {
+            let text = "boundary ".repeat(row_count);
+            let mut accumulator =
+                ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid schema");
+            accumulator
+                .add_document(0, &[IndexedFieldValue::new(1, &text)])
+                .expect("boundary document accumulates");
+            assert_eq!(accumulator.token_count(), row_count);
+
+            let identities = [FlushDocumentInput::from_canonical_content(
+                0,
+                "boundary-doc",
+                text.as_bytes(),
+            )];
+            let input = FlushSegmentInput {
+                segment_id: u64::try_from(row_count).expect("row count fits u64"),
+                lease_docid_base: 0,
+                created_unix_s: 0,
+                engine_version: 0,
+                documents: &identities,
+            };
+            let automatic = automatic_pool
+                .install(|| flush_accumulator(&accumulator, input))
+                .expect("automatic flush");
+            let scalar = flush_accumulator_with_mode(&accumulator, input, FlushMode::Scalar)
+                .expect("scalar flush");
+
+            assert_eq!(
+                scalar.as_bytes(),
+                automatic.as_bytes(),
+                "canonical bytes drift at {row_count} token rows"
+            );
+        }
     }
 
     #[test]
