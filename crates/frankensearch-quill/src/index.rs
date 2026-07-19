@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
+use asupersync::runtime::spawn_blocking;
 use frankensearch_core::IndexableDocument;
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
@@ -600,6 +601,65 @@ impl QuillIndex {
         self.pending_field_stats.clear();
         self.pending_manifest = None;
         self.uncommitted_ids.clear();
+        Ok(self.backend.snapshot())
+    }
+
+    /// Replace one exact committed manifest run with a Q1 concat merge.
+    ///
+    /// The caller supplies source ids in current manifest order plus a
+    /// collision-free output identity. Policy-driven candidate selection and
+    /// identity generation remain Keeper E3.7 concerns; this method enforces
+    /// that no accumulator or staged publication can race the structural
+    /// replacement.
+    ///
+    /// # Errors
+    ///
+    /// Rejects uncommitted state, cancellation, a nonconsecutive source run,
+    /// codec/invariant failures, or durable publication failure.
+    pub async fn concat_merge(
+        &mut self,
+        cx: &Cx,
+        source_segment_ids: &[u64],
+        output_segment_id: u64,
+        created_unix_s: i64,
+    ) -> Result<&KeeperSnapshot, QuillIndexError> {
+        check_cancel(cx, "concat merge")?;
+        if self.has_uncommitted_changes() {
+            return Err(invalid_state(
+                "concat merge requires a fully committed scalar index",
+            ));
+        }
+        let next_seal_seq = self
+            .next_seal_seq
+            .checked_add(1)
+            .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+        match &mut self.backend {
+            IndexBackend::Durable(writer) => {
+                writer
+                    .concat_merge(cx, source_segment_ids, output_segment_id, created_unix_s)
+                    .await?;
+            }
+            IndexBackend::Memory(snapshot) => {
+                check_cancel(cx, "concat merge")?;
+                let source_snapshot = snapshot.clone();
+                let mut source_ids = Vec::new();
+                source_ids
+                    .try_reserve_exact(source_segment_ids.len())
+                    .map_err(|_| invalid_state("could not allocate concat-merge source ids"))?;
+                source_ids.extend_from_slice(source_segment_ids);
+                let successor = spawn_blocking(move || {
+                    source_snapshot.concat_merge_owned(
+                        &source_ids,
+                        output_segment_id,
+                        created_unix_s,
+                    )
+                })
+                .await?;
+                check_cancel(cx, "concat merge")?;
+                *snapshot = successor;
+            }
+        }
+        self.next_seal_seq = next_seal_seq;
         Ok(self.backend.snapshot())
     }
 
@@ -1659,6 +1719,7 @@ fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::future::Future;
     #[cfg(feature = "durability")]
     use std::sync::Arc;
@@ -1667,6 +1728,30 @@ mod tests {
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig};
 
     use super::*;
+    use crate::keeper::ConcatMergeError;
+    use crate::quiver::{StatsSection, aggregate_field_stats};
+
+    const CONCAT_MERGE_QUERIES: [&str; 4] =
+        ["rust", "python", "rust OR python", "\"rust ownership\""];
+    const Q1_OB2A_QUERIES: [&str; 5] = [
+        "shared",
+        "left",
+        "right",
+        "left OR right",
+        "\"shared left\"",
+    ];
+    const KNOWN_SECTION_KINDS: [SectionKind; 10] = [
+        SectionKind::TERMDICT,
+        SectionKind::POSTINGS,
+        SectionKind::POSITIONS,
+        SectionKind::BLOCKMAX,
+        SectionKind::DOCLEN,
+        SectionKind::IDMAP,
+        SectionKind::IDHASH,
+        SectionKind::NUMERIC,
+        SectionKind::STOREDMETA,
+        SectionKind::STATS,
+    ];
 
     fn run_with_cx<F, Fut>(test: F)
     where
@@ -1695,6 +1780,255 @@ mod tests {
                 .with_title("Python guide")
                 .with_metadata("cluster", "data"),
         ]
+    }
+
+    async fn concat_merge_fixture_index(cx: &Cx) -> QuillIndex {
+        let documents = fixture_documents();
+        let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+        for (batch_index, document) in documents.iter().enumerate() {
+            index
+                .index_documents(cx, std::slice::from_ref(document))
+                .await
+                .expect("accumulate concat-merge leaf");
+            index.commit(cx).await.expect("commit concat-merge leaf");
+            assert_eq!(
+                index.snapshot().segments().len(),
+                batch_index + 1,
+                "each committed fixture batch must seal one leaf segment",
+            );
+        }
+        index
+    }
+
+    struct Q1Ob2aSeal {
+        encoded: EncodedSegment,
+        field_stats: BTreeMap<u16, (u64, u32)>,
+    }
+
+    fn q1_ob2a_documents() -> Vec<IndexableDocument> {
+        (0_u32..400)
+            .map(|ordinal| {
+                let cohort = if ordinal < 100 { "left" } else { "right" };
+                IndexableDocument::new(
+                    format!("q1-ob2a-{ordinal:03}"),
+                    format!("shared {cohort} concat parity"),
+                )
+                .with_title(format!("{cohort} cohort"))
+                .with_metadata("cohort", cohort)
+            })
+            .collect()
+    }
+
+    fn q1_ob2a_doc_ord(first_doc_ord: u32, offset: usize) -> u32 {
+        first_doc_ord
+            .checked_add(u32::try_from(offset).expect("Q1-OB2a offset fits u32"))
+            .expect("Q1-OB2a document ordinal stays in one lease")
+    }
+
+    fn seal_q1_ob2a_documents(
+        documents: &[IndexableDocument],
+        first_doc_ord: u32,
+        segment_id: u64,
+    ) -> Q1Ob2aSeal {
+        let mut accumulator =
+            ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("Q1-OB2a accumulator");
+        let mut canonical_contents = Vec::with_capacity(documents.len());
+        for (offset, document) in documents.iter().enumerate() {
+            let doc_ord = q1_ob2a_doc_ord(first_doc_ord, offset);
+            let metadata = canonical_metadata(&document.metadata).expect("canonical metadata");
+            let ordinal = u64::from(doc_ord).to_le_bytes();
+            let title = document.title.as_deref().unwrap_or("");
+            let indexed = [
+                IndexedFieldValue::new(ID_FIELD, &document.id),
+                IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+                IndexedFieldValue::new(TITLE_FIELD, title),
+            ];
+            let stored = [
+                StoredFieldValue::new(METADATA_FIELD, &metadata),
+                StoredFieldValue::new(ORD_FIELD, &ordinal),
+            ];
+            accumulator
+                .add_document_with_values(doc_ord, &indexed, &[], &stored)
+                .expect("accumulate Q1-OB2a document");
+            canonical_contents.push(
+                canonical_document_preimage(document, &metadata)
+                    .expect("canonical Q1-OB2a content"),
+            );
+        }
+
+        let doc_count = u32::try_from(documents.len()).expect("Q1-OB2a document count fits u32");
+        let field_stats = accumulator
+            .fields()
+            .iter()
+            .map(|field| (field.field_ord(), (field.total_tokens(), doc_count)))
+            .collect::<BTreeMap<_, _>>();
+        let identities = documents
+            .iter()
+            .zip(&canonical_contents)
+            .enumerate()
+            .map(|(offset, (document, canonical_content))| {
+                FlushDocumentInput::from_canonical_content(
+                    q1_ob2a_doc_ord(first_doc_ord, offset),
+                    &document.id,
+                    canonical_content,
+                )
+            })
+            .collect::<Vec<_>>();
+        let encoded = flush_accumulator_with_mode(
+            &accumulator,
+            FlushSegmentInput {
+                segment_id,
+                lease_docid_base: 0,
+                created_unix_s: 0,
+                engine_version: CURRENT_ENGINE_VERSION,
+                documents: &identities,
+            },
+            FlushMode::Scalar,
+        )
+        .expect("seal Q1-OB2a segment");
+        Q1Ob2aSeal {
+            encoded,
+            field_stats,
+        }
+    }
+
+    fn q1_ob2a_owned_index(
+        encoded_segments: Vec<EncodedSegment>,
+        field_stats: Vec<ManifestFieldStats>,
+    ) -> QuillIndex {
+        let genesis = KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("Q1-OB2a genesis");
+        let mut manifest = genesis.next_manifest().expect("Q1-OB2a manifest");
+        manifest.docid_high_watermark = u64::from(DOC_ORDS_PER_LEASE);
+        manifest.segments = encoded_segments
+            .iter()
+            .enumerate()
+            .map(|(index, encoded)| {
+                manifest_segment(
+                    encoded,
+                    u64::try_from(index + 1).expect("Q1-OB2a seal sequence fits u64"),
+                )
+            })
+            .collect();
+        manifest.field_stats = field_stats;
+        let snapshot = genesis
+            .publish_owned_segments(&manifest, encoded_segments)
+            .expect("publish Q1-OB2a fixture");
+        QuillIndex::from_backend(
+            IndexBackend::Memory(snapshot),
+            DEFAULT_SCHEMA,
+            deterministic_config(),
+        )
+        .expect("bind Q1-OB2a fixture index")
+    }
+
+    fn q1_ob2a_fixture_indexes() -> (QuillIndex, QuillIndex) {
+        let documents = q1_ob2a_documents();
+        let left = seal_q1_ob2a_documents(&documents[..100], 0, 0x0b2a_0001);
+        let right = seal_q1_ob2a_documents(&documents[100..], 100, 0x0b2a_0002);
+        let monolithic = seal_q1_ob2a_documents(&documents, 0, 0x0b2a_0003);
+
+        let first_segment_stats =
+            merge_field_stats(&[], &left.field_stats).expect("left Q1-OB2a stats");
+        let combined_segment_stats = merge_field_stats(&first_segment_stats, &right.field_stats)
+            .expect("aggregate leaf stats");
+        let monolithic_stats =
+            merge_field_stats(&[], &monolithic.field_stats).expect("monolithic Q1-OB2a stats");
+        assert_eq!(combined_segment_stats, monolithic_stats);
+
+        let leaves = q1_ob2a_owned_index(vec![left.encoded, right.encoded], combined_segment_stats);
+        let monolithic = q1_ob2a_owned_index(vec![monolithic.encoded], monolithic_stats);
+        (leaves, monolithic)
+    }
+
+    fn q1_ob2a_decoded_terms(index: &QuillIndex) -> Vec<(u16, Vec<u8>, u32, Vec<Posting>)> {
+        let mut decoded = BTreeMap::<(u16, Vec<u8>), (u32, Vec<Posting>)>::new();
+        for segment in index.snapshot().segments() {
+            let dictionary = open_dictionary(segment, DEFAULT_SCHEMA).expect("Q1-OB2a TERMDICT");
+            let limit = usize::try_from(dictionary.term_count()).expect("term count fits usize");
+            let terms = dictionary
+                .cursor()
+                .expect("Q1-OB2a term cursor")
+                .collect_bounded(limit)
+                .expect("materialize Q1-OB2a terms");
+            for term in terms {
+                let postings =
+                    open_owned_cursor(segment, DEFAULT_SCHEMA, term.field_ord, &term.term, false)
+                        .expect("decode Q1-OB2a postings")
+                        .postings;
+                let entry = decoded.entry((term.field_ord, term.term)).or_default();
+                entry.0 = entry
+                    .0
+                    .checked_add(term.metadata.doc_freq)
+                    .expect("Q1-OB2a aggregate df fits u32");
+                entry.1.extend(postings);
+            }
+        }
+        decoded
+            .into_iter()
+            .map(|((field_ord, term), (doc_freq, postings))| (field_ord, term, doc_freq, postings))
+            .collect()
+    }
+
+    fn q1_ob2a_decoded_stats(segment: &RecoveredSegment) -> StatsSection {
+        let expected_fields = term_field_ords(DEFAULT_SCHEMA);
+        StatsSection::parse(
+            required_section(segment, SectionKind::STATS).expect("Q1-OB2a STATS bytes"),
+            &expected_fields,
+            segment.manifest().doc_count,
+        )
+        .expect("decode Q1-OB2a STATS")
+    }
+
+    fn q1_ob2a_query_evidence(index: &QuillIndex, cx: &Cx) -> Vec<(QuillSearchResult, Vec<u32>)> {
+        Q1_OB2A_QUERIES
+            .iter()
+            .map(|query| {
+                let ranked = index
+                    .search_paginated(cx, query, 500, 0, true)
+                    .expect("Q1-OB2a ranked query");
+                let docids = index
+                    .collect_docids(cx, query)
+                    .expect("Q1-OB2a scoreless query");
+                (ranked, docids)
+            })
+            .collect()
+    }
+
+    fn committed_segment_ids(index: &QuillIndex) -> Vec<u64> {
+        index
+            .snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().segment_id)
+            .collect()
+    }
+
+    fn fresh_merge_segment_id(index: &QuillIndex, seed: u64) -> u64 {
+        let mut candidate = seed;
+        loop {
+            if index
+                .snapshot()
+                .segments()
+                .iter()
+                .all(|segment| segment.manifest().segment_id != candidate)
+            {
+                return candidate;
+            }
+            candidate = candidate
+                .checked_add(1)
+                .expect("concat-merge test segment-id space exhausted");
+        }
+    }
+
+    fn concat_merge_query_results(index: &QuillIndex, cx: &Cx) -> Vec<QuillSearchResult> {
+        CONCAT_MERGE_QUERIES
+            .iter()
+            .map(|query| {
+                index
+                    .search_paginated(cx, query, 10, 0, true)
+                    .expect("concat-merge fixture query")
+            })
+            .collect()
     }
 
     #[cfg(feature = "durability")]
@@ -1799,6 +2133,353 @@ mod tests {
             assert_eq!(docids, ranked_docids);
             assert_eq!(docids.len(), 3);
             assert_eq!(ranked.total_count, Some(3));
+        });
+    }
+
+    #[test]
+    fn in_memory_concat_merge_preserves_query_results_scores_and_docids() {
+        run_with_cx(|cx| async move {
+            let mut index = concat_merge_fixture_index(&cx).await;
+            let source_ids = committed_segment_ids(&index);
+            assert_eq!(source_ids.len(), 3);
+
+            let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            let results_before = concat_merge_query_results(&index, &cx);
+            let docids_before = index
+                .collect_docids(&cx, "rust OR python")
+                .expect("collect pre-merge docids");
+            let output_segment_id = fresh_merge_segment_id(&index, 0xc011_ca7e_0000_0001);
+
+            index
+                .concat_merge(&cx, &source_ids, output_segment_id, 17)
+                .await
+                .expect("merge the complete in-memory leaf run");
+
+            assert_eq!(index.snapshot().segments().len(), 1);
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation_before + 1,
+            );
+            assert_eq!(
+                concat_merge_query_results(&index, &cx),
+                results_before,
+                "ranked hits, exact scores, global docids, and counts must survive merge",
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "rust OR python")
+                    .expect("collect post-merge docids"),
+                docids_before,
+            );
+            let merge_seal_seq = index.snapshot().segments()[0].manifest().seal_seq;
+
+            index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new(
+                        "after-merge",
+                        "ordinary sealing remains available after concat merge",
+                    )],
+                )
+                .await
+                .expect("accumulate after concat merge");
+            index
+                .commit(&cx)
+                .await
+                .expect("ordinary commit after concat merge");
+            assert_eq!(
+                index
+                    .snapshot()
+                    .segments()
+                    .iter()
+                    .map(|segment| segment.manifest().seal_seq)
+                    .collect::<Vec<_>>(),
+                [merge_seal_seq, merge_seal_seq + 1],
+                "concat output and the next ordinary seal need distinct monotone sequences",
+            );
+        });
+    }
+
+    #[test]
+    fn concat_merge_matches_fresh_monolithic_df_100_plus_300_with_same_docids() {
+        run_with_cx(|cx| async move {
+            let (mut leaves, monolithic) = q1_ob2a_fixture_indexes();
+            assert_eq!(
+                leaves
+                    .snapshot()
+                    .segments()
+                    .iter()
+                    .map(|segment| (segment.manifest().docid_lo, segment.manifest().docid_hi))
+                    .collect::<Vec<_>>(),
+                [(0, 100), (100, 400)],
+                "Q1-OB2a leaves must be adjacent inside one lease",
+            );
+            assert_eq!(monolithic.snapshot().segments()[0].manifest().docid_lo, 0);
+            assert_eq!(monolithic.snapshot().segments()[0].manifest().docid_hi, 400);
+
+            let source_shared_dfs = leaves
+                .snapshot()
+                .segments()
+                .iter()
+                .map(|segment| {
+                    open_dictionary(segment, DEFAULT_SCHEMA)
+                        .expect("source Q1-OB2a TERMDICT")
+                        .lookup(CONTENT_FIELD, b"shared")
+                        .expect("source shared lookup")
+                        .expect("source shared term")
+                        .metadata
+                        .doc_freq
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(source_shared_dfs, [100, 300]);
+            assert_eq!(
+                snapshot_doc_freq(
+                    monolithic.snapshot(),
+                    DEFAULT_SCHEMA,
+                    CONTENT_FIELD,
+                    b"shared",
+                )
+                .expect("monolithic shared df"),
+                400,
+            );
+
+            let source_stats = leaves
+                .snapshot()
+                .segments()
+                .iter()
+                .map(q1_ob2a_decoded_stats)
+                .collect::<Vec<_>>();
+            let source_aggregate =
+                aggregate_field_stats(source_stats.iter()).expect("aggregate source STATS");
+            let monolithic_stats = q1_ob2a_decoded_stats(&monolithic.snapshot().segments()[0]);
+            let monolithic_aggregate = monolithic_stats
+                .rows()
+                .iter()
+                .map(|row| SnapshotFieldStats {
+                    field_ord: row.field_ord,
+                    total_tokens: row.total_tokens,
+                    doc_count: u64::from(row.doc_count),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(source_aggregate, monolithic_aggregate);
+            assert_eq!(
+                leaves.snapshot().loaded_manifest().manifest.field_stats,
+                monolithic.snapshot().loaded_manifest().manifest.field_stats,
+            );
+
+            let monolithic_terms = q1_ob2a_decoded_terms(&monolithic);
+            assert_eq!(
+                q1_ob2a_decoded_terms(&leaves),
+                monolithic_terms,
+                "source terms and decoded postings must match fresh monolithic indexing",
+            );
+            let monolithic_evidence = q1_ob2a_query_evidence(&monolithic, &cx);
+            assert_eq!(
+                q1_ob2a_query_evidence(&leaves, &cx),
+                monolithic_evidence,
+                "source leaves and fresh monolithic seal must have exact scores, ids, docids, and counts",
+            );
+            assert_eq!(
+                leaves
+                    .collect_docids(&cx, "shared")
+                    .expect("source shared docids"),
+                (0_u32..400).collect::<Vec<_>>(),
+            );
+
+            let source_ids = committed_segment_ids(&leaves);
+            leaves
+                .concat_merge(&cx, &source_ids, 0x0b2a_0004, 0)
+                .await
+                .expect("Q1-OB2a concat merge");
+            assert_eq!(leaves.snapshot().segments().len(), 1);
+            assert_eq!(
+                snapshot_doc_freq(leaves.snapshot(), DEFAULT_SCHEMA, CONTENT_FIELD, b"shared")
+                    .expect("merged shared df"),
+                400,
+            );
+            assert_eq!(
+                q1_ob2a_decoded_terms(&leaves),
+                monolithic_terms,
+                "every merged term and decoded posting must match fresh monolithic indexing",
+            );
+            assert_eq!(
+                q1_ob2a_decoded_stats(&leaves.snapshot().segments()[0]),
+                monolithic_stats,
+                "merged decoded STATS must match fresh monolithic indexing",
+            );
+            assert_eq!(
+                leaves.snapshot().loaded_manifest().manifest.field_stats,
+                monolithic.snapshot().loaded_manifest().manifest.field_stats,
+            );
+            assert_eq!(
+                q1_ob2a_query_evidence(&leaves, &cx),
+                monolithic_evidence,
+                "merged and monolithic query scores, ids, docids, counts, and docsets must match",
+            );
+        });
+    }
+
+    #[test]
+    fn concat_merge_rejects_reversed_and_skipped_runs_without_publication() {
+        run_with_cx(|cx| async move {
+            let mut index = concat_merge_fixture_index(&cx).await;
+            let source_ids = committed_segment_ids(&index);
+            assert_eq!(source_ids.len(), 3);
+            let manifest_before = index.snapshot().loaded_manifest().manifest.clone();
+            let output_segment_id = fresh_merge_segment_id(&index, 0xc011_ca7e_0000_0010);
+
+            let reversed = [source_ids[1], source_ids[0]];
+            let Err(error) = index
+                .concat_merge(&cx, &reversed, output_segment_id, 19)
+                .await
+            else {
+                panic!("reversed concat-merge run unexpectedly published");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                    source: ConcatMergeError::NonConsecutiveSources { .. }
+                })
+            ));
+            assert_eq!(
+                &index.snapshot().loaded_manifest().manifest,
+                &manifest_before,
+                "reversed rejection must not advance the snapshot generation",
+            );
+
+            let skipped = [source_ids[0], source_ids[2]];
+            let Err(error) = index
+                .concat_merge(&cx, &skipped, output_segment_id, 23)
+                .await
+            else {
+                panic!("skipped concat-merge run unexpectedly published");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                    source: ConcatMergeError::NonConsecutiveSources { .. }
+                })
+            ));
+            assert_eq!(
+                &index.snapshot().loaded_manifest().manifest,
+                &manifest_before,
+                "skipped-run rejection must leave the exact snapshot unchanged",
+            );
+
+            let wrapped = [source_ids[1], source_ids[2], source_ids[0]];
+            let Err(error) = index
+                .concat_merge(&cx, &wrapped, output_segment_id, 29)
+                .await
+            else {
+                panic!("manifest-wrapping concat-merge run unexpectedly published");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                    source: ConcatMergeError::SourceRunPastManifest {
+                        position: 2,
+                        actual,
+                    }
+                }) if actual == source_ids[0]
+            ));
+            assert_eq!(
+                &index.snapshot().loaded_manifest().manifest,
+                &manifest_before,
+                "wrapped-run rejection must leave the exact snapshot unchanged",
+            );
+        });
+    }
+
+    #[test]
+    fn concat_merge_direct_and_associated_schedules_match() {
+        run_with_cx(|cx| async move {
+            let mut direct = concat_merge_fixture_index(&cx).await;
+            let mut left_associated = concat_merge_fixture_index(&cx).await;
+            let mut right_associated = concat_merge_fixture_index(&cx).await;
+            let leaf_ids = committed_segment_ids(&direct);
+            assert_eq!(leaf_ids, committed_segment_ids(&left_associated));
+            assert_eq!(leaf_ids, committed_segment_ids(&right_associated));
+            assert_eq!(leaf_ids.len(), 3);
+
+            let results_before = concat_merge_query_results(&direct, &cx);
+            assert_eq!(
+                concat_merge_query_results(&left_associated, &cx),
+                results_before,
+            );
+            assert_eq!(
+                concat_merge_query_results(&right_associated, &cx),
+                results_before,
+            );
+            let final_segment_id = fresh_merge_segment_id(&direct, 0xc011_ca7e_0000_0020);
+            let intermediate_segment_id =
+                fresh_merge_segment_id(&left_associated, 0xc011_ca7e_0000_0030);
+            let right_intermediate_segment_id =
+                fresh_merge_segment_id(&right_associated, 0xc011_ca7e_0000_0040);
+
+            direct
+                .concat_merge(&cx, &leaf_ids, final_segment_id, 31)
+                .await
+                .expect("direct three-leaf concat merge");
+            left_associated
+                .concat_merge(&cx, &leaf_ids[..2], intermediate_segment_id, 29)
+                .await
+                .expect("left-associated first concat merge");
+            let left_final_sources = [intermediate_segment_id, leaf_ids[2]];
+            left_associated
+                .concat_merge(&cx, &left_final_sources, final_segment_id, 31)
+                .await
+                .expect("left-associated final concat merge");
+            right_associated
+                .concat_merge(&cx, &leaf_ids[1..], right_intermediate_segment_id, 29)
+                .await
+                .expect("right-associated first concat merge");
+            let right_final_sources = [leaf_ids[0], right_intermediate_segment_id];
+            right_associated
+                .concat_merge(&cx, &right_final_sources, final_segment_id, 31)
+                .await
+                .expect("right-associated final concat merge");
+
+            assert_eq!(direct.snapshot().segments().len(), 1);
+            assert_eq!(left_associated.snapshot().segments().len(), 1);
+            assert_eq!(right_associated.snapshot().segments().len(), 1);
+            let direct_segment = &direct.snapshot().segments()[0];
+            let left_segment = &left_associated.snapshot().segments()[0];
+            let right_segment = &right_associated.snapshot().segments()[0];
+            assert_eq!(
+                direct_segment.source_bytes(),
+                left_segment.source_bytes(),
+                "the complete merged FSLX image must be schedule-independent",
+            );
+            assert_eq!(
+                direct_segment.source_bytes(),
+                right_segment.source_bytes(),
+                "right-associated merge must emit the same complete FSLX image",
+            );
+            for kind in KNOWN_SECTION_KINDS {
+                assert_eq!(
+                    direct_segment.section(kind).expect("direct merged section"),
+                    left_segment
+                        .section(kind)
+                        .expect("left-associated merged section"),
+                    "section {} differs by merge schedule",
+                    kind.raw(),
+                );
+                assert_eq!(
+                    direct_segment.section(kind).expect("direct merged section"),
+                    right_segment
+                        .section(kind)
+                        .expect("right-associated merged section"),
+                    "section {} differs under right association",
+                    kind.raw(),
+                );
+            }
+
+            let direct_results = concat_merge_query_results(&direct, &cx);
+            let left_results = concat_merge_query_results(&left_associated, &cx);
+            let right_results = concat_merge_query_results(&right_associated, &cx);
+            assert_eq!(direct_results, results_before);
+            assert_eq!(left_results, results_before);
+            assert_eq!(right_results, results_before);
         });
     }
 

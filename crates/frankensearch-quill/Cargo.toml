@@ -60,5 +60,9 @@ name = "id_map_materialize_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "concat_merge_ab"
+harness = false
+
 [lints]
 workspace = true

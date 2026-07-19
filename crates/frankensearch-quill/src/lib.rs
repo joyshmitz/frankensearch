@@ -40,7 +40,7 @@ pub use grimoire::{
 pub use index::{QuillHit, QuillIndex, QuillIndexError, QuillSearchResult};
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
-    CurrentPointer, CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES,
+    ConcatMergeError, CurrentPointer, CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES,
     GarbageCollectionOptions, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
     LoadedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC, Manifest,
     ManifestCodecError, ManifestFieldStats, ManifestSegment, ManifestSource, RecoveredSegment,

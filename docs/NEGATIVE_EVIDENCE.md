@@ -15463,3 +15463,41 @@ calibration done; index quantize = cod-active; durability = #2 landed + #3 below
 worthwhile, un-swarmed perf lever this pass.** Next: the fsvi #3 stays a deprioritized lead (do it only if the
 verify() split is wanted for its own sake); otherwise wait for quill code or a fresh win to spawn a new twin.
 No code changed.
+
+### 2026-07-19 — SapphireHill — HOLD: Quill concat merge remains above the 2/4/8/16-source CPU/physical-I/O-byte spread gate (`bd-quill-e3-keeper-ndtk.5`)
+
+The predeclared gate in `concat_merge_ab` is
+`max(median ns / exact physical I/O byte) / min(...) <= 1.35x`, where the exact
+physical byte count is source FSLX bytes plus merged-output FSLX bytes. All
+measurements used strict remote execution on the same `ovh-a` worker:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+The fixture held logical work fixed at 1,024 documents (1,008 live, 16
+tombstones) and reported exact physical byte counts of 2,745,208 / 7,277,512 /
+16,354,280 / 34,543,016 for 2 / 4 / 8 / 16 source segments.
+
+| Variant | 2-source median (ns/B) | 4-source median (ns/B) | 8-source median (ns/B) | 16-source median (ns/B) | max/min spread |
+|---|---:|---:|---:|---:|---:|
+| Restored control (`quiver.rs` SHA-256 `7216c6dbd2d5aa36dda5529f708cba834d8e2ef756747c9074fbaf9bef0404ac`) | 3.4676 ms (1.263147) | 8.1796 ms (1.123956) | 18.485 ms (1.130285) | 69.385 ms (2.008655) | **1.787130x — FAIL** |
+| Direct STOREDMETA assembly (eliminate span-sized value materialization and copy each source field blob once) | 2.3012 ms (0.838261) | 4.7021 ms (0.646114) | 10.403 ms (0.636103) | 52.949 ms (1.532842) | **2.409741x — FAIL** |
+| Direct IDMAP final-buffer emission (eliminate temporary `Vec<u32>` offsets and `Vec<u64>` hashes) | 2.9945 ms (1.090810) | 6.8508 ms (0.941366) | 15.150 ms (0.926363) | 46.527 ms (1.346929) | **1.453997x — FAIL** |
+
+The IDMAP candidate passed the exact monolithic-byte oracle remotely before its
+timed run. It improved the absolute 16-source median by about 32.9% versus the
+fresh control, but improved the smaller fan-ins enough that normalized spread
+still missed the contract by 7.7%. The STOREDMETA candidate widened spread even
+further. Both speculative source cuts were reverted; the IDMAP revert was
+verified byte-for-byte by the restored control hash above and `rustfmt --check`.
+
+The remote benchmark commands exited 0 and emitted all measurements. Local
+Criterion artifact retrieval subsequently warned `No space left on device`; that
+post-measurement rsync failure does not invalidate the complete remote stdout.
+
+**Decision: HOLD.** Keep `bd-quill-e3-keeper-ndtk.5` `in_progress`; do not claim
+flat CPU/byte or close the Bead. The correctness checkpoint may land separately,
+but no measured perf candidate from this dig is retained.
