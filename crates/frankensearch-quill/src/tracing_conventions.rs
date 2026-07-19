@@ -4,8 +4,10 @@
 //! `frankensearch::quill::<subsystem>::<phase>` name. Later implementations
 //! attach only applicable fields from this common vocabulary: `phase`,
 //! `schema_id`, `generation`, `segment_id`, `shard_id`, `doc_count`,
-//! `query_len`, `result_count`, and `duration_us`. High-cardinality document
-//! IDs, terms, query text, and source content are never span fields.
+//! `query_len`, `result_count`, `duration_us`, privacy-safe query-shape counts
+//! and topology hash, `plan`, `segments_touched`, `pruning_windows`,
+//! `blocks_skipped`, and `candidate_docs`. High-cardinality document IDs,
+//! terms, query text, source content, and score cutoffs are never span fields.
 
 use std::time::Instant;
 
@@ -51,7 +53,7 @@ pub const QUIVER_DECODE: &str = "frankensearch::quill::quiver::decode";
 pub const ARGUS_QUERY: &str = "frankensearch::quill::argus::query";
 /// Default-query parse and lenient diagnostics.
 pub const ARGUS_PARSE: &str = "frankensearch::quill::argus::parse";
-/// Exhaustive BM25 scorer construction and traversal.
+/// BM25 scorer construction and exhaustive or rank-safe pruned traversal.
 pub const ARGUS_SCORE: &str = "frankensearch::quill::argus::score";
 /// Global top-doc/count collection and materialization.
 pub const ARGUS_COLLECT: &str = "frankensearch::quill::argus::collect";

@@ -24,8 +24,8 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 use crate::argus::{
     ArgusError, BMW_MIN_CLAUSES, Bm25FieldSnapshot, DeltaFieldNorms, DeltaPostingCursor,
     DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer, PhraseTerm,
-    PositionsHandle, PositionsReader, PostingCursor, ReferenceScorer, ScorerClause,
-    SealedPostingCursor, TermScorer, TopDocsCollector,
+    PositionsHandle, PositionsReader, PostingCursor, PruningTelemetry, ReferenceScorer,
+    ScorerClause, SealedPostingCursor, TermScorer, TopDocsCollector,
 };
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
@@ -40,8 +40,8 @@ use crate::keeper::{
     validate_manifest_successor,
 };
 use crate::query::{
-    DefaultQueryParser, Query, QueryDiagnostic, QueryParserConfigError, QueryValue,
-    canonicalize_query,
+    BooleanOperator, DefaultQueryParser, Occur, Query, QueryDiagnostic, QueryParserConfigError,
+    QueryValue, canonicalize_query,
 };
 use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenField, DocLenSection, EncodedNumericSection,
@@ -2071,6 +2071,15 @@ impl QuillIndex {
                 query_len = query.len(),
                 diagnostic_count = tracing::field::Empty,
                 result_count = tracing::field::Empty,
+                query_root = tracing::field::Empty,
+                query_shape_hash = tracing::field::Empty,
+                query_nodes = tracing::field::Empty,
+                query_depth = tracing::field::Empty,
+                term_nodes = tracing::field::Empty,
+                phrase_nodes = tracing::field::Empty,
+                boolean_nodes = tracing::field::Empty,
+                predicate_nodes = tracing::field::Empty,
+                boost_nodes = tracing::field::Empty,
                 duration_us = tracing::field::Empty,
             );
             let _parse_timer = crate::tracing_conventions::StageTimer::new(&parse_span);
@@ -2082,6 +2091,7 @@ impl QuillIndex {
                 u64::try_from(parsed.diagnostics.len()).unwrap_or(u64::MAX),
             );
             parse_span.record("result_count", 1_u64);
+            record_query_trace_shape(&parse_span, &parsed.query);
             tracing::debug!(
                 target: crate::tracing_conventions::TARGET,
                 must_not_duplicates_removed = report.must_not_duplicates_removed,
@@ -2152,6 +2162,15 @@ impl QuillIndex {
                 query_len = query.len(),
                 diagnostic_count = tracing::field::Empty,
                 result_count = tracing::field::Empty,
+                query_root = tracing::field::Empty,
+                query_shape_hash = tracing::field::Empty,
+                query_nodes = tracing::field::Empty,
+                query_depth = tracing::field::Empty,
+                term_nodes = tracing::field::Empty,
+                phrase_nodes = tracing::field::Empty,
+                boolean_nodes = tracing::field::Empty,
+                predicate_nodes = tracing::field::Empty,
+                boost_nodes = tracing::field::Empty,
                 duration_us = tracing::field::Empty,
             );
             let _parse_timer = crate::tracing_conventions::StageTimer::new(&parse_span);
@@ -2163,6 +2182,7 @@ impl QuillIndex {
                 u64::try_from(parsed.diagnostics.len()).unwrap_or(u64::MAX),
             );
             parse_span.record("result_count", 1_u64);
+            record_query_trace_shape(&parse_span, &parsed.query);
             parsed
         };
         let docids = self.execute_docid_query(cx, &parsed.query, snapshot)?;
@@ -2255,6 +2275,11 @@ impl QuillIndex {
                 phase = "score",
                 segment_id = segment.manifest().segment_id,
                 doc_count = segment.doc_count(),
+                plan = tracing::field::Empty,
+                segments_touched = 1_u64,
+                pruning_windows = tracing::field::Empty,
+                blocks_skipped = tracing::field::Empty,
+                candidate_docs = tracing::field::Empty,
                 duration_us = tracing::field::Empty,
             );
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
@@ -2269,6 +2294,7 @@ impl QuillIndex {
                 rank_pruning,
             )?;
             collector.collect(&mut scorer, segment)?;
+            record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
         }
         for delta in snapshot.delta_snapshots() {
             check_cancel(cx, "search")?;
@@ -2279,6 +2305,11 @@ impl QuillIndex {
                 residency = "delta",
                 lease_base = delta.lease_base(),
                 doc_count = delta.live_document_count(),
+                plan = tracing::field::Empty,
+                segments_touched = 1_u64,
+                pruning_windows = tracing::field::Empty,
+                blocks_skipped = tracing::field::Empty,
+                candidate_docs = tracing::field::Empty,
                 duration_us = tracing::field::Empty,
             );
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
@@ -2293,12 +2324,14 @@ impl QuillIndex {
                 rank_pruning,
             )?;
             collector.collect(&mut scorer, delta.as_ref())?;
+            record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
         }
         let collect_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_COLLECT,
             phase = "collect",
             segment_count,
+            segments_touched = segment_count,
             doc_count = snapshot.live_doc_count(),
             result_count = tracing::field::Empty,
             total_count = tracing::field::Empty,
@@ -2358,6 +2391,11 @@ impl QuillIndex {
                 collector = "docset",
                 segment_id = segment.manifest().segment_id,
                 doc_count = segment.doc_count(),
+                plan = "unscored",
+                segments_touched = 1_u64,
+                pruning_windows = 0_u64,
+                blocks_skipped = 0_u64,
+                candidate_docs = 0_u64,
                 duration_us = tracing::field::Empty,
             );
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
@@ -2382,6 +2420,11 @@ impl QuillIndex {
                 residency = "delta",
                 lease_base = delta.lease_base(),
                 doc_count = delta.live_document_count(),
+                plan = "unscored",
+                segments_touched = 1_u64,
+                pruning_windows = 0_u64,
+                blocks_skipped = 0_u64,
+                candidate_docs = 0_u64,
                 duration_us = tracing::field::Empty,
             );
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
@@ -2402,6 +2445,7 @@ impl QuillIndex {
             phase = "collect",
             collector = "docset",
             segment_count,
+            segments_touched = segment_count,
             doc_count = snapshot.live_doc_count(),
             result_count = tracing::field::Empty,
             duration_us = tracing::field::Empty,
@@ -2415,6 +2459,13 @@ impl QuillIndex {
         );
         Ok(docids)
     }
+}
+
+fn record_pruning_telemetry(span: &tracing::Span, telemetry: PruningTelemetry) {
+    span.record("plan", telemetry.plan());
+    span.record("pruning_windows", telemetry.pruning_windows());
+    span.record("blocks_skipped", telemetry.blocks_skipped());
+    span.record("candidate_docs", telemetry.candidate_docs());
 }
 
 fn record_snapshot_fields(span: &tracing::Span, snapshot: &KeeperSnapshot) {
@@ -2891,6 +2942,154 @@ fn lower_query_unscored<'a>(
         QueryLoweringMode::Unscored,
         false,
     )
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct QueryTraceShape {
+    root_kind: &'static str,
+    topology_hash: u64,
+    nodes: u64,
+    depth: u64,
+    terms: u64,
+    phrases: u64,
+    booleans: u64,
+    predicates: u64,
+    boosts: u64,
+}
+
+impl QueryTraceShape {
+    fn from_query(query: &Query) -> Self {
+        let mut shape = Self {
+            root_kind: query_trace_kind(query),
+            topology_hash: query_topology_hash(query),
+            ..Self::default()
+        };
+        shape.visit(query, 1);
+        shape
+    }
+
+    fn visit(&mut self, query: &Query, depth: u64) {
+        self.nodes = self.nodes.saturating_add(1);
+        self.depth = self.depth.max(depth);
+        match query {
+            Query::Empty | Query::All => {}
+            Query::Term { .. } => self.terms = self.terms.saturating_add(1),
+            Query::Phrase { .. } => self.phrases = self.phrases.saturating_add(1),
+            Query::Boolean { clauses, .. } => {
+                self.booleans = self.booleans.saturating_add(1);
+                for clause in clauses {
+                    self.visit(&clause.query, depth.saturating_add(1));
+                }
+            }
+            Query::Range { .. } | Query::Set { .. } | Query::Glob { .. } => {
+                self.predicates = self.predicates.saturating_add(1);
+            }
+            Query::Boost { query, .. } => {
+                self.boosts = self.boosts.saturating_add(1);
+                self.visit(query, depth.saturating_add(1));
+            }
+        }
+    }
+}
+
+const fn query_trace_kind(query: &Query) -> &'static str {
+    match query {
+        Query::Empty => "empty",
+        Query::All => "all",
+        Query::Term { .. } => "term",
+        Query::Phrase { .. } => "phrase",
+        Query::Boolean { .. } => "boolean",
+        Query::Range { .. } => "range",
+        Query::Set { .. } => "set",
+        Query::Glob { .. } => "glob",
+        Query::Boost { .. } => "boost",
+    }
+}
+
+fn record_query_trace_shape(span: &tracing::Span, query: &Query) {
+    let shape = QueryTraceShape::from_query(query);
+    span.record("query_root", shape.root_kind);
+    span.record("query_shape_hash", shape.topology_hash);
+    span.record("query_nodes", shape.nodes);
+    span.record("query_depth", shape.depth);
+    span.record("term_nodes", shape.terms);
+    span.record("phrase_nodes", shape.phrases);
+    span.record("boolean_nodes", shape.booleans);
+    span.record("predicate_nodes", shape.predicates);
+    span.record("boost_nodes", shape.boosts);
+}
+
+fn query_topology_hash(query: &Query) -> u64 {
+    let mut hasher = Xxh3::new();
+    hash_query_topology(&mut hasher, query);
+    hasher.digest()
+}
+
+fn hash_query_topology(hasher: &mut Xxh3, query: &Query) {
+    match query {
+        Query::Empty => hasher.update(&[0]),
+        Query::All => hasher.update(&[1]),
+        Query::Term { fields, .. } => {
+            hasher.update(&[2]);
+            hash_topology_len(hasher, fields.len());
+        }
+        Query::Phrase {
+            fields,
+            terms,
+            slop,
+            prefix,
+        } => {
+            hasher.update(&[3]);
+            hash_topology_len(hasher, fields.len());
+            hash_topology_len(hasher, terms.len());
+            hasher.update(&slop.to_le_bytes());
+            hasher.update(&[u8::from(*prefix)]);
+        }
+        Query::Boolean { clauses, operator } => {
+            hasher.update(&[4]);
+            hash_topology_len(hasher, clauses.len());
+            hasher.update(&[match operator {
+                None => 0,
+                Some(BooleanOperator::And) => 1,
+                Some(BooleanOperator::Or) => 2,
+            }]);
+            for clause in clauses {
+                hasher.update(&[match clause.occur {
+                    Occur::Must => 0,
+                    Occur::Should => 1,
+                    Occur::MustNot => 2,
+                }]);
+                hash_query_topology(hasher, &clause.query);
+            }
+        }
+        Query::Range { lower, upper, .. } => {
+            hasher.update(&[5, bound_topology_kind(lower), bound_topology_kind(upper)]);
+        }
+        Query::Set { values, .. } => {
+            hasher.update(&[6]);
+            hash_topology_len(hasher, values.len());
+        }
+        Query::Glob { field_ids, .. } => {
+            hasher.update(&[7]);
+            hash_topology_len(hasher, field_ids.len());
+        }
+        Query::Boost { query, .. } => {
+            hasher.update(&[8]);
+            hash_query_topology(hasher, query);
+        }
+    }
+}
+
+fn hash_topology_len(hasher: &mut Xxh3, len: usize) {
+    hasher.update(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+}
+
+const fn bound_topology_kind(bound: &Bound<QueryValue>) -> u8 {
+    match bound {
+        Bound::Unbounded => 0,
+        Bound::Included(_) => 1,
+        Bound::Excluded(_) => 2,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

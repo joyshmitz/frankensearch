@@ -2223,12 +2223,19 @@ impl<'a> ReferenceScorer<'a> {
         }
     }
 
-    #[cfg(test)]
     fn union_pruning_stats(&self) -> Option<UnionPruningStats> {
         let ScorerNode::Union(union) = &self.node else {
             return None;
         };
         Some(union.pruning_stats)
+    }
+
+    /// Return privacy-safe aggregate evidence for the pruning path that
+    /// actually executed while this scorer was collected.
+    #[must_use]
+    pub(crate) fn pruning_telemetry(&self) -> PruningTelemetry {
+        self.union_pruning_stats()
+            .map_or_else(PruningTelemetry::default, PruningTelemetry::from)
     }
 
     #[cfg(test)]
@@ -3292,6 +3299,60 @@ struct UnionPruningStats {
     block_max_wand_windows: u64,
     blocks_skipped: u64,
     candidate_docs: u64,
+}
+
+/// Aggregate scorer evidence suitable for stable tracing fields.
+///
+/// This deliberately excludes terms, document identifiers, and cutoff scores.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PruningTelemetry {
+    max_score_windows: u64,
+    block_max_wand_windows: u64,
+    blocks_skipped: u64,
+    candidate_docs: u64,
+}
+
+impl From<UnionPruningStats> for PruningTelemetry {
+    fn from(stats: UnionPruningStats) -> Self {
+        Self {
+            max_score_windows: stats.max_score_windows,
+            block_max_wand_windows: stats.block_max_wand_windows,
+            blocks_skipped: stats.blocks_skipped,
+            candidate_docs: stats.candidate_docs,
+        }
+    }
+}
+
+impl PruningTelemetry {
+    /// Stable name for the pruning path observed during collection.
+    #[must_use]
+    pub(crate) const fn plan(self) -> &'static str {
+        match (
+            self.max_score_windows != 0,
+            self.block_max_wand_windows != 0,
+        ) {
+            (false, false) => "exhaustive",
+            (true, false) => "max_score",
+            (false, true) => "block_max_wand",
+            (true, true) => "mixed_pruning",
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn pruning_windows(self) -> u64 {
+        self.max_score_windows
+            .saturating_add(self.block_max_wand_windows)
+    }
+
+    #[must_use]
+    pub(crate) const fn blocks_skipped(self) -> u64 {
+        self.blocks_skipped
+    }
+
+    #[must_use]
+    pub(crate) const fn candidate_docs(self) -> u64 {
+        self.candidate_docs
+    }
 }
 
 struct CompetitiveCandidates {
@@ -6714,6 +6775,139 @@ mod tests {
     }
 
     #[test]
+    fn e410_seeded_query_algebra_and_pagination_metamorphics_hold()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DOCS: usize = 48;
+        const PAGE: usize = 7;
+        let lengths = [Some(1); DOCS];
+        let encoded = EncodedDocLenSection::encode(
+            0,
+            DOCS as u64,
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, DOCS as u64, DOCS as u64)?;
+
+        for seed in 1_u64..=32 {
+            let mut state = seed;
+            let mut membership = [[false; DOCS]; 3];
+            for doc in 0..DOCS {
+                for term_membership in &mut membership {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    term_membership[doc] = state >> 63 != 0;
+                }
+            }
+            let docs_by_term = std::array::from_fn::<_, 3, _>(|term_index| {
+                membership[term_index]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(doc, present)| {
+                        present.then_some(u32::try_from(doc).expect("DOCS fits u32"))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let leaf = |term_index: usize| {
+                term(
+                    postings(&docs_by_term[term_index]),
+                    field,
+                    &snapshot,
+                    docs_by_term[term_index].len() as u64,
+                    docs_by_term[term_index].len() as u64,
+                    1.0,
+                )
+            };
+            let should_set = |order: [usize; 3]| {
+                let mut scorer = ReferenceScorer::boolean_unscored(
+                    order
+                        .into_iter()
+                        .map(|index| leaf(index).map(ScorerClause::should))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )?;
+                scorer.collect_doc_set(&AllLiveDocs)
+            };
+            let expected_union = (0..DOCS)
+                .filter(|&doc| membership.iter().any(|term| term[doc]))
+                .map(|doc| u32::try_from(doc).expect("DOCS fits u32"))
+                .collect::<Vec<_>>();
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                assert_eq!(
+                    should_set(order)?,
+                    expected_union,
+                    "Should result-set commutativity failed for seed {seed} order={order:?}",
+                );
+            }
+
+            let mut left_associated = ReferenceScorer::boolean_unscored(vec![
+                ScorerClause::must(ReferenceScorer::boolean_unscored(vec![
+                    ScorerClause::must(leaf(0)?),
+                    ScorerClause::must(leaf(1)?),
+                ])?),
+                ScorerClause::must(leaf(2)?),
+            ])?;
+            let mut right_associated = ReferenceScorer::boolean_unscored(vec![
+                ScorerClause::must(leaf(0)?),
+                ScorerClause::must(ReferenceScorer::boolean_unscored(vec![
+                    ScorerClause::must(leaf(1)?),
+                    ScorerClause::must(leaf(2)?),
+                ])?),
+            ])?;
+            let expected_intersection = (0..DOCS)
+                .filter(|&doc| membership.iter().all(|term| term[doc]))
+                .map(|doc| u32::try_from(doc).expect("DOCS fits u32"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                left_associated.collect_doc_set(&AllLiveDocs)?,
+                expected_intersection,
+                "left-associated Must drifted from the set oracle for seed {seed}",
+            );
+            assert_eq!(
+                right_associated.collect_doc_set(&AllLiveDocs)?,
+                expected_intersection,
+                "right-associated Must drifted from the set oracle for seed {seed}",
+            );
+
+            let ranked_should = || {
+                ReferenceScorer::boolean(vec![
+                    ScorerClause::should(leaf(0)?),
+                    ScorerClause::should(leaf(1)?),
+                    ScorerClause::should(leaf(2)?),
+                ])
+            };
+            let mut full_scorer = ranked_should()?;
+            let full = full_scorer.top_k(DOCS, &AllLiveDocs)?;
+            let mut scored_docids = full.iter().map(|hit| hit.global_docid).collect::<Vec<_>>();
+            scored_docids.sort_unstable();
+            assert_eq!(
+                scored_docids, expected_union,
+                "scored Should lowering drifted from the set oracle for seed {seed}",
+            );
+            let mut concatenated = Vec::new();
+            for offset in (0..DOCS).step_by(PAGE) {
+                let mut page_scorer = ranked_should()?;
+                let mut collector = TopDocsCollector::new(PAGE, offset)?;
+                collector.collect(&mut page_scorer, &AllLiveDocs)?;
+                concatenated.extend(collector.finish()?.hits);
+            }
+            assert_eq!(
+                concatenated, full,
+                "page concatenation drifted from the full ranking for seed {seed}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn global_collectors_page_count_and_materialize_only_winners()
     -> Result<(), Box<dyn std::error::Error>> {
         let lengths = vec![Some(1); 10];
@@ -7320,6 +7514,23 @@ mod tests {
                 f32::NAN
             ),
             Err(ArgusError::InvalidBoost { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn e410_zero_document_snapshot_has_no_average_or_tf_division() -> Result<(), ArgusError> {
+        let empty = snapshot(1, 0, 0)?;
+        assert_eq!(empty.doc_count(), 0);
+        assert_eq!(empty.total_tokens(), 0);
+        assert_eq!(empty.average_field_length(), None);
+        assert!(empty.tf_cache.iter().all(|value| value.to_bits() == 0));
+        assert!(matches!(
+            snapshot(1, 1, 0),
+            Err(ArgusError::InvalidSnapshot {
+                field_ord: 1,
+                reason: "an empty snapshot cannot contain field tokens",
+            })
         ));
         Ok(())
     }

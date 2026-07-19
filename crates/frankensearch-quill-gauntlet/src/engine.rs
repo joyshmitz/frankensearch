@@ -1667,6 +1667,10 @@ mod tests {
     fn e55_query_cases() -> Vec<E55QueryCase> {
         vec![
             E55QueryCase {
+                id: "empty",
+                input: E55QueryInput::Source(""),
+            },
+            E55QueryCase {
                 id: "all",
                 input: E55QueryInput::Source("*"),
             },
@@ -1781,7 +1785,19 @@ mod tests {
         live_leaf_ranges: Vec<(u64, u64)>,
     }
 
-    #[derive(Clone, Debug, Serialize)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct E410EdgeStateShape {
+        keeper_segments: usize,
+        keeper_at_seal_documents: u64,
+        keeper_tombstones: u64,
+        delta_leaves: usize,
+        delta_physical_documents: usize,
+        delta_live_documents: usize,
+        live_documents: u64,
+        tombstoned_docid: Option<u32>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
     struct E55CaseEvidence {
         diagnostics: Vec<String>,
         observation: EngineObservation,
@@ -2528,6 +2544,185 @@ mod tests {
         }
     }
 
+    fn e410_capture_edge_state(
+        index: &QuillIndex,
+        cx: &Cx,
+        state: &'static str,
+        expected: E410EdgeStateShape,
+    ) -> BTreeMap<String, E55CaseEvidence> {
+        let snapshot = index.search_snapshot();
+        let keeper = snapshot.keeper_snapshot();
+        assert_eq!(
+            keeper.segments().len(),
+            expected.keeper_segments,
+            "E4.10 {state} Keeper segment count",
+        );
+        assert_eq!(
+            keeper.at_seal_doc_count(),
+            expected.keeper_at_seal_documents,
+            "E4.10 {state} Keeper physical row count",
+        );
+        assert_eq!(
+            keeper.tombstone_count(),
+            expected.keeper_tombstones,
+            "E4.10 {state} Keeper tombstone count",
+        );
+        assert_eq!(
+            snapshot.delta_count(),
+            expected.delta_leaves,
+            "E4.10 {state} Delta leaf count",
+        );
+        assert_eq!(
+            snapshot
+                .delta_snapshots()
+                .iter()
+                .map(|delta| delta.segment().physical_document_count())
+                .sum::<usize>(),
+            expected.delta_physical_documents,
+            "E4.10 {state} Delta physical row count",
+        );
+        assert_eq!(
+            snapshot
+                .delta_snapshots()
+                .iter()
+                .map(|delta| delta.live_document_count())
+                .sum::<usize>(),
+            expected.delta_live_documents,
+            "E4.10 {state} Delta live row count",
+        );
+        assert_eq!(
+            snapshot.bm25_doc_count(),
+            expected.keeper_at_seal_documents.saturating_add(
+                u64::try_from(expected.delta_live_documents)
+                    .expect("E4.10 Delta live row count fits u64"),
+            ),
+            "E4.10 {state} BM25 lifecycle population",
+        );
+        assert_eq!(
+            snapshot.live_doc_count(),
+            expected.live_documents,
+            "E4.10 {state} live document count",
+        );
+        if let Some(global_docid) = expected.tombstoned_docid {
+            assert!(
+                keeper
+                    .segments()
+                    .iter()
+                    .any(|segment| segment.is_tombstoned(global_docid)),
+                "E4.10 {state} must physically retain tombstoned docid {global_docid}",
+            );
+        }
+        let mut cases = BTreeMap::new();
+        for query in e55_query_cases() {
+            for mode in E55CollectorMode::ALL {
+                let evidence = match mode {
+                    E55CollectorMode::DocSet => e55_docset_evidence(index, cx, &query),
+                    E55CollectorMode::Full
+                    | E55CollectorMode::Paginated
+                    | E55CollectorMode::ExactCount
+                    | E55CollectorMode::ZeroLimit
+                    | E55CollectorMode::BeyondTotal => e55_ranked_evidence(
+                        index,
+                        cx,
+                        &query,
+                        mode,
+                        0xe410,
+                        xxh3_64(state.as_bytes()),
+                    ),
+                };
+                let result_count = evidence.observation.hits.len();
+                tracing::info!(
+                    target: "frankensearch.quill.gauntlet.e410",
+                    state,
+                    query_id = query.id,
+                    collector = mode.id(),
+                    expected_doc_count = expected.live_documents,
+                    result_count,
+                    "completed E4.10 edge-state query case",
+                );
+                assert_eq!(
+                    evidence.observation.doc_count,
+                    expected.live_documents,
+                    "E4.10 {state} query={} collector={} doc_count",
+                    query.id,
+                    mode.id(),
+                );
+                let expected_matches =
+                    u64::from(expected.live_documents == 1 && query.id != "empty");
+                let expected_matching_hits =
+                    usize::try_from(expected_matches).expect("E4.10 match count fits usize");
+                let expected_hits = match mode {
+                    E55CollectorMode::Full
+                    | E55CollectorMode::ExactCount
+                    | E55CollectorMode::DocSet => expected_matching_hits,
+                    E55CollectorMode::Paginated
+                    | E55CollectorMode::ZeroLimit
+                    | E55CollectorMode::BeyondTotal => 0,
+                };
+                assert_eq!(
+                    evidence.observation.hits.len(),
+                    expected_hits,
+                    "E4.10 {state} query={} collector={} result cardinality",
+                    query.id,
+                    mode.id(),
+                );
+                if expected_hits == 1 {
+                    assert_eq!(
+                        evidence.observation.hits[0].doc_id,
+                        E55_HISTORICAL_ID,
+                        "E4.10 {state} query={} collector={} returned the wrong row",
+                        query.id,
+                        mode.id(),
+                    );
+                }
+                let expected_count = if matches!(
+                    mode,
+                    E55CollectorMode::ExactCount
+                        | E55CollectorMode::ZeroLimit
+                        | E55CollectorMode::DocSet
+                ) {
+                    CountState::Value(expected_matches)
+                } else {
+                    CountState::NotRequested
+                };
+                assert_eq!(
+                    evidence.observation.match_count,
+                    expected_count,
+                    "E4.10 {state} query={} collector={} count evidence",
+                    query.id,
+                    mode.id(),
+                );
+                let case_id = format!("{}::{}", query.id, mode.id());
+                assert!(
+                    cases.insert(case_id.clone(), evidence).is_none(),
+                    "duplicate E4.10 edge-state case {case_id}",
+                );
+            }
+        }
+        cases
+    }
+
+    fn e410_delta_only_index() -> QuillIndex {
+        let index = QuillIndex::in_memory_with_schema(E55_SCHEMA, e55_config())
+            .expect("construct strict E4.10 Delta-only index");
+        let generation = index.search_snapshot().keeper_generation();
+        let mut delta = E55DeltaBuilder::new(0);
+        let (_, replaced) = delta.add(E55Document::new(
+            E55_HISTORICAL_ID,
+            "historicalonly alpha beta",
+            "historicalonly title",
+            "blue",
+            -7,
+            2,
+        ));
+        assert!(replaced.is_none());
+        let delta = delta.freeze(generation);
+        index
+            .publish_delta_table(vec![delta.snapshot])
+            .expect("publish strict E4.10 Delta-only snapshot");
+        index
+    }
+
     fn e55_first_native_key_divergence(
         subject: &EngineObservation,
         oracle: &EngineObservation,
@@ -2741,6 +2936,91 @@ mod tests {
             case_count = all_delta.cases.len(),
             "completed exact E5.5 all-Delta to mixed to all-sealed campaign"
         );
+    }
+
+    #[test]
+    fn e410_edge_state_query_matrix_is_total_and_residency_exact() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let empty = QuillIndex::in_memory_with_schema(E55_SCHEMA, e55_config())
+                .expect("construct E4.10 empty index");
+            let empty_cases = e410_capture_edge_state(
+                &empty,
+                &cx,
+                "empty",
+                E410EdgeStateShape {
+                    keeper_segments: 0,
+                    keeper_at_seal_documents: 0,
+                    keeper_tombstones: 0,
+                    delta_leaves: 0,
+                    delta_physical_documents: 0,
+                    delta_live_documents: 0,
+                    live_documents: 0,
+                    tombstoned_docid: None,
+                },
+            );
+
+            let delta_only = e410_delta_only_index();
+            let delta_cases = e410_capture_edge_state(
+                &delta_only,
+                &cx,
+                "delta_only",
+                E410EdgeStateShape {
+                    keeper_segments: 0,
+                    keeper_at_seal_documents: 0,
+                    keeper_tombstones: 0,
+                    delta_leaves: 1,
+                    delta_physical_documents: 1,
+                    delta_live_documents: 1,
+                    live_documents: 1,
+                    tombstoned_docid: None,
+                },
+            );
+
+            let (single, _, _) = e55_index_with_live_history(&cx).await;
+            let single_cases = e410_capture_edge_state(
+                &single,
+                &cx,
+                "single_sealed",
+                E410EdgeStateShape {
+                    keeper_segments: 1,
+                    keeper_at_seal_documents: 1,
+                    keeper_tombstones: 0,
+                    delta_leaves: 0,
+                    delta_physical_documents: 0,
+                    delta_live_documents: 0,
+                    live_documents: 1,
+                    tombstoned_docid: None,
+                },
+            );
+
+            let (all_tombstoned_source, _, retired_docid) = e55_index_with_live_history(&cx).await;
+            let all_tombstoned =
+                e55_tombstone_sealed_upsert_source(&all_tombstoned_source, retired_docid);
+            let tombstoned_cases = e410_capture_edge_state(
+                &all_tombstoned,
+                &cx,
+                "all_tombstoned",
+                E410EdgeStateShape {
+                    keeper_segments: 1,
+                    keeper_at_seal_documents: 1,
+                    keeper_tombstones: 1,
+                    delta_leaves: 0,
+                    delta_physical_documents: 0,
+                    delta_live_documents: 0,
+                    live_documents: 0,
+                    tombstoned_docid: Some(retired_docid),
+                },
+            );
+
+            assert_eq!(
+                delta_cases, single_cases,
+                "strict Delta-only and single-sealed states must be bit-exact",
+            );
+            assert_eq!(
+                empty_cases, tombstoned_cases,
+                "empty and all-tombstoned states must expose the same public results",
+            );
+        });
     }
 
     #[test]
@@ -3225,6 +3505,136 @@ mod tests {
                 "encode length={length}"
             );
         }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn e410_controlled_public_search_semantics_match_oracle() {
+        let revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let mut subject = QuillSubject::in_memory(e55_config(), "e410-subject", false)
+            .expect("E4.10 Quill subject");
+        let mut oracle =
+            TantivyOracle::in_memory_scalar_g1a(&revision, false).expect("E4.10 Tantivy oracle");
+        let documents = vec![
+            frankensearch_core::IndexableDocument::new("title-hit", "quiet filler")
+                .with_title("Needle"),
+            frankensearch_core::IndexableDocument::new(
+                "content-hit",
+                "needle filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler",
+            )
+            .with_title("quiet"),
+            frankensearch_core::IndexableDocument::new(
+                "hyphen-hit",
+                "ERR-404 troubleshooting guide",
+            ),
+            frankensearch_core::IndexableDocument::new("case-hit", "MiXeDcAsE identifier"),
+            frankensearch_core::IndexableDocument::new("special-hit", "C++ interop"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            subject
+                .claim_fresh_campaign()
+                .expect("claim E4.10 subject campaign");
+            subject
+                .index_mut()
+                .expect("E4.10 subject index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index E4.10 subject corpus");
+            subject
+                .index_mut()
+                .expect("E4.10 subject index")
+                .commit(&cx)
+                .await
+                .expect("commit E4.10 subject corpus");
+            subject
+                .mark_committed()
+                .expect("publish E4.10 subject campaign");
+
+            oracle
+                .claim_fresh_campaign()
+                .expect("claim E4.10 oracle campaign");
+            oracle
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index E4.10 oracle corpus");
+            oracle
+                .mark_committed()
+                .expect("publish E4.10 oracle campaign");
+
+            let harness = DifferentialHarness::default();
+            let mut casefold_hits = None;
+            for (id, query) in [
+                ("title-boost", "needle"),
+                ("casefold-lower", "mixedcase"),
+                ("casefold-mixed", "MiXeDcAsE"),
+                ("hyphen", "ERR-404"),
+                ("special-chars", "C++"),
+                ("empty-query", ""),
+            ] {
+                let mut case = DifferentialCase::new(format!("e410-{id}"), query, 10);
+                case.snippet_max_chars = None;
+                let run = harness
+                    .run(&cx, &subject, &oracle, &case)
+                    .await
+                    .unwrap_or_else(|error| panic!("E4.10 case {id} failed: {error}"));
+                assert_eq!(
+                    run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "E4.10 case {id}: {:?}",
+                    run.comparison.divergences,
+                );
+                assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+                if id == "title-boost" {
+                    assert_eq!(
+                        run.comparison
+                            .subject
+                            .hits
+                            .first()
+                            .map(|hit| hit.doc_id.as_str()),
+                        Some("title-hit"),
+                        "title-field boost must outrank a content-only hit",
+                    );
+                }
+                let ids = run
+                    .comparison
+                    .subject
+                    .hits
+                    .iter()
+                    .map(|hit| hit.doc_id.clone())
+                    .collect::<Vec<_>>();
+                if id.starts_with("casefold-") {
+                    assert_eq!(
+                        ids,
+                        vec!["case-hit".to_owned()],
+                        "case-folded query must retrieve the intended mixed-case document",
+                    );
+                    if let Some(expected) = &casefold_hits {
+                        assert_eq!(&ids, expected, "case-folded queries changed the hit set");
+                    } else {
+                        casefold_hits = Some(ids.clone());
+                    }
+                }
+                if id == "hyphen" {
+                    assert!(
+                        ids.iter().any(|doc_id| doc_id == "hyphen-hit"),
+                        "hyphenated query must retrieve the intended document: {ids:?}",
+                    );
+                }
+                if id == "special-chars" {
+                    assert_eq!(
+                        ids,
+                        vec!["special-hit".to_owned()],
+                        "special-character query must retrieve the intended document",
+                    );
+                }
+                if id == "empty-query" {
+                    assert!(ids.is_empty(), "empty query must return no hits");
+                }
+            }
+        });
     }
 
     #[cfg(feature = "tantivy-oracle")]
