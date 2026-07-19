@@ -5790,6 +5790,13 @@ mod tests {
                 upper: Bound::Included(QueryValue::U64(1)),
             }
         );
+        assert_eq!(
+            parser().parse("ord: IN [0 1]").query,
+            Query::Set {
+                field_id: 4,
+                values: vec![QueryValue::U64(0), QueryValue::U64(1)],
+            }
+        );
     }
 
     #[test]

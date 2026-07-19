@@ -205,8 +205,8 @@ pub enum ArgusError {
     /// An exact match count exceeded the durable collection domain.
     #[error("exact match count overflowed u64")]
     MatchCountOverflow,
-    /// A scoreless collector received a scorer that scores while advancing.
-    #[error("doc-set collection requires a recursively unscored Boolean scorer")]
+    /// A movement-only operation received a tree that scores while advancing.
+    #[error("movement-only scoring requires a recursively unscored scorer tree")]
     ScoredTreeForUnscoredCollector,
     /// A caller attempted to score a deliberately unscored query tree.
     #[error("an unscored Boolean query has no BM25 score")]
@@ -222,6 +222,12 @@ pub enum ArgusError {
         value_count: usize,
         /// Physical at-seal documents supplied by the segment plan.
         segment_num_docs: u32,
+    },
+    /// A programmatic constant-score predicate supplied a non-finite boost.
+    #[error("constant-score predicate has invalid boost bits 0x{boost_bits:08x}")]
+    InvalidConstantBoost {
+        /// Exact rejected f32 representation.
+        boost_bits: u32,
     },
     /// A match-all leaf cannot describe the supplied global document domain.
     #[error(
@@ -1616,6 +1622,7 @@ enum ScorerNode<'a> {
     Term(TermScorer<'a>),
     Phrase(PhraseScorer<'a>),
     NumericRange(NumericRangeScorer),
+    ConstantScore(ConstantScoreScorer),
     Intersection(IntersectionScorer<'a>),
     Union(BufferedUnionScorer<'a>),
     UnscoredUnion(UnscoredUnionScorer<'a>),
@@ -1752,6 +1759,31 @@ impl<'a> ReferenceScorer<'a> {
         upper: Bound<NumericValue>,
         segment_num_docs: u32,
     ) -> Result<Self, ArgusError> {
+        Self::numeric_range_with_boost(field, lower, upper, segment_num_docs, 1.0)
+    }
+
+    /// Compile one boosted NUMERIC field range into an owned constant-score doc set.
+    ///
+    /// Movement, cost, and size estimates are identical to [`Self::numeric_range`].
+    /// Each current match scores exactly `boost`, preserving `Boost(Range)` without
+    /// introducing a synthetic Boolean child or changing score accumulation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::numeric_range`] and rejects a
+    /// non-finite boost before exposing the scorer.
+    pub fn numeric_range_with_boost(
+        field: NumericField<'_>,
+        lower: Bound<NumericValue>,
+        upper: Bound<NumericValue>,
+        segment_num_docs: u32,
+        boost: f32,
+    ) -> Result<Self, ArgusError> {
+        if !boost.is_finite() {
+            return Err(ArgusError::InvalidConstantBoost {
+                boost_bits: boost.to_bits(),
+            });
+        }
         let value_count = field.len();
         if value_count > usize::try_from(segment_num_docs).unwrap_or(usize::MAX) {
             return Err(ArgusError::InvalidNumericCardinality {
@@ -1769,7 +1801,103 @@ impl<'a> ReferenceScorer<'a> {
                 docids,
                 value_count,
                 segment_num_docs,
+                boost,
             )),
+        })
+    }
+
+    /// Build one numeric-range scorer from an already materialized sorted doc set.
+    ///
+    /// Fast-only numeric columns are retained outside NUMERIC, so the index layer
+    /// scans their leaf-local column and supplies the exact matches here. Planning
+    /// metadata and constant-score behavior remain identical to NUMERIC-backed
+    /// ranges.
+    pub(crate) fn materialized_numeric_range(
+        field_ord: u16,
+        docids: Vec<u32>,
+        value_count: usize,
+        segment_num_docs: u32,
+        boost: f32,
+    ) -> Result<Self, ArgusError> {
+        if !boost.is_finite() {
+            return Err(ArgusError::InvalidConstantBoost {
+                boost_bits: boost.to_bits(),
+            });
+        }
+        if value_count > usize::try_from(segment_num_docs).unwrap_or(usize::MAX) {
+            return Err(ArgusError::InvalidNumericCardinality {
+                field_ord,
+                value_count,
+                segment_num_docs,
+            });
+        }
+        if docids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ArgusError::CursorInvariant(
+                "materialized numeric range docids are not strictly ascending",
+            ));
+        }
+        if docids.is_empty() {
+            return Ok(Self::empty());
+        }
+        Ok(Self {
+            node: ScorerNode::NumericRange(NumericRangeScorer::new_materialized(
+                docids,
+                value_count,
+                segment_num_docs,
+                boost,
+            )),
+        })
+    }
+
+    /// Replace one movement-only scorer tree's score with a finite constant.
+    ///
+    /// This is the canonical lowering for predicates such as a bounded glob:
+    /// the child is materialized into its exact unique document set, so each
+    /// document contributes the constant exactly once and the resulting cost
+    /// is the true unique-match cardinality. The child must be safe for
+    /// scoreless movement so no discarded BM25 arithmetic can affect traversal
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-finite score or a child tree that requires scoring while
+    /// advancing.
+    pub fn constant_score(mut inner: Self, score: f32) -> Result<Self, ArgusError> {
+        if !score.is_finite() {
+            return Err(ArgusError::InvalidConstantBoost {
+                boost_bits: score.to_bits(),
+            });
+        }
+        if inner.is_explicit_empty() {
+            return Ok(Self::empty());
+        }
+        if !inner.is_unscored_safe() {
+            return Err(ArgusError::ScoredTreeForUnscoredCollector);
+        }
+        let segment_num_docs = inner.segment_num_docs();
+        let mut docids = Vec::new();
+        while let Some(doc) = inner.doc() {
+            if docids.last().is_some_and(|previous| *previous >= doc) {
+                return Err(ArgusError::CursorInvariant(
+                    "constant-score child did not advance monotonically",
+                ));
+            }
+            if docids.len() == docids.capacity() {
+                docids.try_reserve(1).map_err(|_| ArgusError::Allocation {
+                    resource: "constant-score docids",
+                    count: docids.len().saturating_add(1),
+                })?;
+            }
+            docids.push(doc);
+            inner.next()?;
+        }
+        Ok(Self {
+            node: ScorerNode::ConstantScore(ConstantScoreScorer {
+                docids,
+                index: 0,
+                segment_num_docs,
+                score,
+            }),
         })
     }
 
@@ -1791,6 +1919,7 @@ impl<'a> ReferenceScorer<'a> {
             | ScorerNode::Term(_)
             | ScorerNode::Phrase(_)
             | ScorerNode::NumericRange(_) => true,
+            ScorerNode::ConstantScore(_) => true,
             ScorerNode::Intersection(scorer) => scorer.scorers.iter().all(Self::is_unscored_safe),
             ScorerNode::Union(_) => false,
             ScorerNode::UnscoredUnion(scorer) => scorer.active.iter().all(Self::is_unscored_safe),
@@ -1933,6 +2062,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.doc(),
             ScorerNode::Phrase(scorer) => scorer.doc(),
             ScorerNode::NumericRange(scorer) => scorer.doc(),
+            ScorerNode::ConstantScore(scorer) => scorer.doc(),
             ScorerNode::Intersection(scorer) => scorer.doc(),
             ScorerNode::Union(scorer) => scorer.doc(),
             ScorerNode::UnscoredUnion(scorer) => scorer.doc(),
@@ -1950,6 +2080,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.cost,
             ScorerNode::Phrase(scorer) => scorer.cost,
             ScorerNode::NumericRange(scorer) => scorer.cost(),
+            ScorerNode::ConstantScore(scorer) => scorer.cost(),
             ScorerNode::Intersection(scorer) => scorer.cost(),
             ScorerNode::Union(scorer) => scorer.cost(),
             ScorerNode::UnscoredUnion(scorer) => scorer.cost(),
@@ -1967,6 +2098,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.size_hint,
             ScorerNode::Phrase(scorer) => scorer.size_hint,
             ScorerNode::NumericRange(scorer) => scorer.size_hint(),
+            ScorerNode::ConstantScore(scorer) => scorer.size_hint(),
             ScorerNode::Intersection(scorer) => scorer.size_hint(),
             ScorerNode::Union(scorer) => scorer.size_hint(),
             ScorerNode::UnscoredUnion(scorer) => scorer.size_hint(),
@@ -1984,6 +2116,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.segment_num_docs,
             ScorerNode::Phrase(scorer) => scorer.segment_num_docs,
             ScorerNode::NumericRange(scorer) => scorer.segment_num_docs,
+            ScorerNode::ConstantScore(scorer) => scorer.segment_num_docs(),
             ScorerNode::Intersection(scorer) => scorer.segment_num_docs,
             ScorerNode::Union(scorer) => scorer.segment_num_docs,
             ScorerNode::UnscoredUnion(scorer) => scorer.segment_num_docs,
@@ -2008,6 +2141,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.next(),
             ScorerNode::Phrase(scorer) => scorer.next(),
             ScorerNode::NumericRange(scorer) => Ok(scorer.next()),
+            ScorerNode::ConstantScore(scorer) => Ok(scorer.next()),
             ScorerNode::Intersection(scorer) => scorer.next(),
             ScorerNode::Union(scorer) => scorer.next(),
             ScorerNode::UnscoredUnion(scorer) => scorer.next(),
@@ -2028,6 +2162,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.seek(target),
             ScorerNode::Phrase(scorer) => scorer.seek(target),
             ScorerNode::NumericRange(scorer) => Ok(scorer.seek(target)),
+            ScorerNode::ConstantScore(scorer) => Ok(scorer.seek(target)),
             ScorerNode::Intersection(scorer) => scorer.seek(target),
             ScorerNode::Union(scorer) => scorer.seek(target),
             ScorerNode::UnscoredUnion(scorer) => scorer.seek(target),
@@ -2057,6 +2192,7 @@ impl<'a> ReferenceScorer<'a> {
                 classify_seek_result(target, result)
             }
             ScorerNode::NumericRange(scorer) => classify_seek_result(target, scorer.seek(target)),
+            ScorerNode::ConstantScore(scorer) => scorer.seek_danger(target),
             ScorerNode::Intersection(scorer) => scorer.seek_danger(target),
             ScorerNode::Union(scorer) => scorer.seek_danger(target),
             ScorerNode::UnscoredUnion(scorer) => scorer.seek_danger(target),
@@ -2085,6 +2221,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.score(),
             ScorerNode::Phrase(scorer) => scorer.score(),
             ScorerNode::NumericRange(scorer) => scorer.score(),
+            ScorerNode::ConstantScore(scorer) => scorer.score(),
             ScorerNode::Intersection(scorer) => scorer.score(),
             ScorerNode::Union(scorer) => scorer.score(),
             ScorerNode::UnscoredUnion(_) => Err(ArgusError::ScoreUnavailable),
@@ -2401,15 +2538,44 @@ impl AllScorer {
 /// Tantivy's runtime fast-field range scorer. Keeping those concerns separate
 /// preserves both filter-first seeking and the oracle's stable f32 score order.
 struct NumericRangeScorer {
-    docids: NumericDocIdSet,
+    docids: NumericRangeDocIds,
     index: usize,
     cost: u64,
     size_hint: u32,
     segment_num_docs: u32,
+    score: f32,
 }
 
 impl NumericRangeScorer {
-    fn new(docids: NumericDocIdSet, value_count: usize, segment_num_docs: u32) -> Self {
+    fn new(docids: NumericDocIdSet, value_count: usize, segment_num_docs: u32, score: f32) -> Self {
+        Self::from_docids(
+            NumericRangeDocIds::Encoded(docids),
+            value_count,
+            segment_num_docs,
+            score,
+        )
+    }
+
+    fn new_materialized(
+        docids: Vec<u32>,
+        value_count: usize,
+        segment_num_docs: u32,
+        score: f32,
+    ) -> Self {
+        Self::from_docids(
+            NumericRangeDocIds::Materialized(docids),
+            value_count,
+            segment_num_docs,
+            score,
+        )
+    }
+
+    fn from_docids(
+        docids: NumericRangeDocIds,
+        value_count: usize,
+        segment_num_docs: u32,
+        score: f32,
+    ) -> Self {
         let match_count = u32::try_from(docids.len()).unwrap_or(u32::MAX);
         let full_cardinality =
             value_count == usize::try_from(segment_num_docs).unwrap_or(usize::MAX);
@@ -2425,6 +2591,7 @@ impl NumericRangeScorer {
             cost,
             size_hint,
             segment_num_docs,
+            score,
         }
     }
 
@@ -2457,7 +2624,25 @@ impl NumericRangeScorer {
         let doc = self.doc().ok_or(ArgusError::CursorInvariant(
             "cannot score an exhausted numeric range",
         ))?;
-        finite_score(1.0, doc)
+        finite_score(self.score, doc)
+    }
+}
+
+enum NumericRangeDocIds {
+    Encoded(NumericDocIdSet),
+    Materialized(Vec<u32>),
+}
+
+impl NumericRangeDocIds {
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Encoded(docids) => docids.as_slice(),
+            Self::Materialized(docids) => docids,
+        }
     }
 }
 
@@ -2468,6 +2653,57 @@ impl NumericRangeScorer {
 )]
 fn tantivy_range_cost(segment_num_docs: u32) -> u64 {
     (f64::from(segment_num_docs) * 0.8) as u64
+}
+
+/// Materialized constant-score cursor over one exact unique document set.
+struct ConstantScoreScorer {
+    docids: Vec<u32>,
+    index: usize,
+    segment_num_docs: u32,
+    score: f32,
+}
+
+impl ConstantScoreScorer {
+    fn doc(&self) -> Option<u32> {
+        self.docids.get(self.index).copied()
+    }
+
+    fn cost(&self) -> u64 {
+        u64::try_from(self.docids.len()).unwrap_or(u64::MAX)
+    }
+
+    fn size_hint(&self) -> u32 {
+        u32::try_from(self.docids.len()).unwrap_or(u32::MAX)
+    }
+
+    const fn segment_num_docs(&self) -> u32 {
+        self.segment_num_docs
+    }
+
+    fn next(&mut self) -> Option<u32> {
+        if self.index < self.docids.len() {
+            self.index += 1;
+        }
+        self.doc()
+    }
+
+    fn seek(&mut self, target: u32) -> Option<u32> {
+        let tail = self.docids.get(self.index..).unwrap_or_default();
+        self.index += tail.partition_point(|&docid| docid < target);
+        self.doc()
+    }
+
+    fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
+        let result = self.seek(target);
+        classify_seek_result(target, result)
+    }
+
+    fn score(&self) -> Result<f32, ArgusError> {
+        let doc = self.doc().ok_or(ArgusError::CursorInvariant(
+            "cannot score an exhausted constant-score predicate",
+        ))?;
+        finite_score(self.score, doc)
+    }
 }
 
 /// Lazy scoreless disjunction used only by doc-set collection.
@@ -5585,6 +5821,91 @@ mod tests {
                 "cannot score an exhausted numeric range"
             ))
         ));
+
+        let mut boosted = ReferenceScorer::numeric_range_with_boost(
+            field,
+            Bound::Included(NumericValue::I64(5)),
+            Bound::Excluded(NumericValue::I64(10)),
+            8,
+            2.5,
+        )?;
+        assert_eq!(boosted.score()?.to_bits(), 2.5_f32.to_bits());
+
+        let inner = ReferenceScorer::numeric_range(
+            field,
+            Bound::Included(NumericValue::I64(5)),
+            Bound::Excluded(NumericValue::I64(10)),
+            8,
+        )?;
+        let mut replaced = ReferenceScorer::constant_score(inner, 3.25)?;
+        assert_eq!(replaced.score()?.to_bits(), 3.25_f32.to_bits());
+        assert!(matches!(
+            ReferenceScorer::constant_score(replaced, f32::NAN),
+            Err(ArgusError::InvalidConstantBoost { boost_bits })
+                if boost_bits == f32::NAN.to_bits()
+        ));
+
+        let overlap = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::should(ReferenceScorer::numeric_range(
+                field,
+                Bound::Unbounded,
+                Bound::Included(NumericValue::I64(5)),
+                8,
+            )?),
+            ScorerClause::should(ReferenceScorer::numeric_range(
+                field,
+                Bound::Included(NumericValue::I64(5)),
+                Bound::Included(NumericValue::I64(10)),
+                8,
+            )?),
+        ])?;
+        let mut deduplicated = ReferenceScorer::constant_score(overlap, 4.0)?;
+        assert_eq!(deduplicated.cost(), 5, "overlapping matches count once");
+        assert_eq!(deduplicated.size_hint(), 5);
+        assert_eq!(deduplicated.score()?.to_bits(), 4.0_f32.to_bits());
+        assert_eq!(
+            deduplicated.collect_doc_set(&AllLiveDocs)?,
+            vec![100, 101, 102, 103, 104]
+        );
+
+        let high = ReferenceScorer::constant_score(
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Included(NumericValue::I64(0)),
+                Bound::Included(NumericValue::I64(0)),
+                8,
+            )?,
+            1.0e8,
+        )?;
+        let low = ReferenceScorer::constant_score(
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Unbounded,
+                Bound::Included(NumericValue::I64(5)),
+                8,
+            )?,
+            -1.0e8,
+        )?;
+        let unit = ReferenceScorer::constant_score(
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Unbounded,
+                Bound::Included(NumericValue::I64(10)),
+                8,
+            )?,
+            1.0,
+        )?;
+        let mut cancellation = ReferenceScorer::boolean(vec![
+            ScorerClause::must(unit),
+            ScorerClause::must(low),
+            ScorerClause::must(high),
+        ])?;
+        assert_eq!(cancellation.doc(), Some(101));
+        assert_eq!(
+            cancellation.score()?.to_bits(),
+            1.0_f32.to_bits(),
+            "unique-cardinality costs pin Tantivy's stable Must score order"
+        );
 
         let mut unscored = ReferenceScorer::numeric_range(
             field,

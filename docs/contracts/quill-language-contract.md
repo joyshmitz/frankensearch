@@ -1,6 +1,6 @@
 # Quill Language and Scoring Contract
 
-**Contract version:** 1.0.1
+**Contract version:** 1.0.2
 
 **Owning bead:** `bd-quill-e0-contracts-j53p.1`
 
@@ -8,6 +8,8 @@
 **Contract fixture:** `tests/fixtures/quill_language_contract.json`
 
 **Amendment 1.0.1:** Corrects the default-parser duplicate fixture to match the pinned grammar's pre-analysis stable deduplication of exact raw siblings. Programmatically constructed scoring duplicates remain distinct in the post-parse canonicalizer.
+
+**Amendment 1.0.2:** Pins the E5 mixed-residency execution surface: string and numeric ranges and sets, bounded globs, exact-count pagination, and scoreless global-id collection now execute identically across Delta, sealed, and mixed snapshots with invariant physical scoring history.
 
 This document defines what “the same results as Tantivy” means for Quill. It is normative for the used lexical surface in `COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md` §3.1, §5, and §8. Quill code does not merge past gate G0 unless its scalar reference path satisfies this contract. The lexical-crate loader currently executes schema, analyzer, helper, and BM25 operation-order goldens and structurally validates the other records; the G1/G2 differential runner is responsible for executing canonical query trees, lifecycle rows, and cross-engine result comparisons.
 
@@ -40,7 +42,7 @@ Every §3.1 row has at least one fixture ID in the executable `surface_coverage`
 |---|---|
 | Schema | `id`: stored exact text (`Basic` postings); `content` and `title`: stored text using `frankensearch_default` with frequencies, positions, and fieldnorms; `metadata_json`: stored-only text; `ord`: stored fast `u64`. |
 | Analyzers | `frankensearch_default`, `hyphen_normalize`, `prefix_normalize`, edge-prefix generation, and preview generation. |
-| Queries | Term, Boolean, phrase, inclusive i64 range, glob-derived term matching, all-docs, and the default lenient parser. |
+| Queries | Term, Boolean, phrase, typed string/`i64`/`u64` range, typed string/`i64`/`u64` set, bounded glob-derived term matching, all-docs, boost, and the default lenient parser. |
 | Collectors | Top-k plus offset, exact count, id-set collection, and count-free top-k where applicable. |
 | Scoring | BM25 constants/formula, fieldnorm quantization, title boost, fixed f32 accumulation, and deterministic tie order. |
 | Writer | Add, batch add, upsert, delete, clear, commit/seal, and cancellation taxonomy. |
@@ -268,10 +270,11 @@ Every comparison is classified as exactly one of `RankExact`, `ScoreEpsilon`, or
 `tests/fixtures/quill_language_contract.json` contains:
 
 - exact analyzer token streams and helper outputs;
-- canonical parse trees for identifier, short-keyword, natural-language, phrase, Boolean, glob, and range classes;
+- canonical parse trees for identifier, short-keyword, natural-language, phrase, Boolean, glob, typed range, and typed set classes;
 - scoring/statistics cases;
 - behavioral cases for every §3.1 row;
-- a query-class corpus that labels genuinely harvested rows separately from constructed Boolean, glob, range, and boundary probes.
+- a query-class corpus that labels genuinely harvested rows separately from constructed Boolean, glob, range, set, and boundary probes;
+- `engine::tests::e55_mixed_residency_conformance_is_exact` plus its ignored seeded sibling, which execute the complete E5 mixed-residency query/collector matrix and mutation witnesses.
 
 Fixture IDs are stable and additive. Editing expected behavior requires a contract-version bump and a rationale. The lexical crate test loads the JSON, rejects duplicate or dangling IDs, verifies required query/analyzer classes, introspects the shipping schema, executes analyzer/helper/BM25-order goldens, and proves every §3.1 surface row has coverage. Canonical parse trees, lifecycle rows, deleted-stat transitions, and end-to-end ranking cases remain inputs to the downstream Quill differential runner rather than claims of execution by this loader.
 
@@ -315,11 +318,28 @@ old Delta; later readers see the sealed Keeper. Thus seal publication has no
 visibility gap even though visibility and durability remain distinct states.
 
 The public scorer and collectors execute the currently supported query tree
-(`All`, term, exact phrase, Boolean, and boost) over Keeper leaves and every
-frozen Delta leaf through one composite BM25 statistics snapshot. Winners are
-globally merged and external IDs are materialized from either residency. The
-seal guarantee therefore means continuous query findability, ranking, counts,
-pagination, and doc-set membership, not merely continuous internal residency.
+(`All`, term, exact phrase, Boolean, boost, string and numeric range, string and
+numeric set, and bounded glob) over Keeper leaves and every frozen Delta leaf
+through one composite BM25 statistics snapshot. Range, set, and each matching
+glob field contribute their finite inherited boost exactly once per matching
+document. Set values and expanded terms are deduplicated before scoring. Glob
+expansion is planned snapshot-globally per field in byte-lexicographic order;
+the configured expansion limit applies once to that unique field-term set, not
+once per residency leaf. Winners are globally merged and external IDs are
+materialized from either residency. The seal guarantee therefore means
+continuous query findability, ranking, counts, pagination, and doc-set
+membership, not merely continuous internal residency.
+
+The E5 mixed-state conformance corpus holds logical rows, Q1 leaf boundaries,
+sealed tombstone history, composite BM25 `N`, field token totals, and term
+document frequencies fixed while transitioning from all live rows in Delta,
+through one sealed plus one Delta leaf, to all sealed leaves. Every supported
+query class runs through full ranking, pagination, exact counting, and
+scoreless global-id collection. Rank, score bits, external IDs, native global
+IDs, diagnostics, counts, and statistics must be identical in all three
+states. Delta upsert, sealed-row replacement, and delete-then-readd histories
+are mandatory fixture mutations. A larger deterministic corpus repeats the
+same matrix as a seeded, seed-logged nightly test.
 
 Once FSLX construction has produced a complete proposal, the writer retains
 the canonical bytes, a zero-timestamp successor MANIFEST, the complete

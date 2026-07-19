@@ -110,6 +110,11 @@ jobs:
         timeout-minutes: 30
         run: cargo test --profile release -p frankensearch-quill-gauntlet generator::tests::nightly_xlarge_stream_hash_integrity -- --ignored --exact --nocapture
 
+      - name: Nightly Quill E5.5 seeded mixed-state conformance
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 30
+        run: cargo test --profile release -p frankensearch-quill-gauntlet engine::tests::e55_seeded_mixed_residency_conformance_is_exact -- --ignored --exact
+
       - name: Nightly full validation (all features)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
         run: cargo test --workspace --all-features -- --nocapture

@@ -6,6 +6,7 @@
 //! assembled here; later mixed-state beads wire them into the public writer loop.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,18 +29,23 @@ use crate::argus::{
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
-use crate::grimoire::{ByteSpan, TermDictionary, TermDictionaryError, TermSectionLengths};
+use crate::grimoire::{
+    ByteSpan, TermDictionary, TermDictionaryError, TermSectionLengths, star_glob_matches,
+    validate_bound_term, validate_query_term,
+};
 use crate::keeper::{
     CURRENT_ENGINE_VERSION, KeeperError, KeeperSnapshot, KeeperWriter, Manifest,
     ManifestFieldStats, ManifestSegment, RecoveredSegment, TombstoneSet,
     validate_manifest_successor,
 };
 use crate::query::{
-    DefaultQueryParser, Query, QueryDiagnostic, QueryParserConfigError, canonicalize_query,
+    DefaultQueryParser, Query, QueryDiagnostic, QueryParserConfigError, QueryValue,
+    canonicalize_query,
 };
 use crate::quiver::{
-    DocLenCodecError, DocLenSection, PositionCodecError, PositionList, Posting, PostingCodecError,
-    PostingList, SnapshotFieldStats,
+    DocLenCodecError, DocLenSection, EncodedNumericSection, NumericEntry, NumericField,
+    NumericFieldInput, NumericSection, NumericValue, PositionCodecError, PositionList, Posting,
+    PostingCodecError, PostingList, SnapshotFieldStats, StoredMetaCodecError, StoredMetaSection,
 };
 use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
@@ -89,6 +95,9 @@ pub enum QuillIndexError {
     /// A field-length section was malformed.
     #[error(transparent)]
     DocLen(#[from] DocLenCodecError),
+    /// A stored metadata column was malformed.
+    #[error(transparent)]
+    StoredMeta(#[from] StoredMetaCodecError),
     /// Exhaustive scorer construction or collection failed.
     #[error(transparent)]
     Argus(#[from] ArgusError),
@@ -1137,6 +1146,43 @@ impl QuillIndex {
         Ok(index)
     }
 
+    /// Build an owned-buffer index for one explicit compile-time schema.
+    ///
+    /// This constructor is intentionally limited to conformance and benchmark
+    /// builds. It lets the mixed-residency gauntlet exercise the same private
+    /// schema binding used by durable opens without expanding the shipping API.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, schema, or genesis-snapshot failures.
+    #[cfg(feature = "bench-internals")]
+    pub fn in_memory_with_schema(
+        schema: SchemaDescriptor,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        validate_config(&config)?;
+        let snapshot = KeeperSnapshot::in_memory(schema)?;
+        Self::from_backend(IndexBackend::Memory(snapshot), schema, config)
+    }
+
+    /// Bind an existing owned Keeper snapshot to the private writer facade.
+    ///
+    /// The conformance gauntlet uses this to replay identical tombstone and
+    /// field-stat history before varying only current document residency.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, parser/schema, or snapshot failures.
+    #[cfg(feature = "bench-internals")]
+    pub fn from_in_memory_snapshot(
+        snapshot: KeeperSnapshot,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        validate_config(&config)?;
+        let schema = snapshot.schema();
+        Self::from_backend(IndexBackend::Memory(snapshot), schema, config)
+    }
+
     fn from_backend(
         backend: IndexBackend,
         schema: SchemaDescriptor,
@@ -1432,10 +1478,10 @@ impl QuillIndex {
         self.backend.snapshot().directory()
     }
 
-    /// Number of committed live documents.
+    /// Number of live documents in the published Keeper-plus-Delta view.
     #[must_use]
-    pub const fn doc_count(&self) -> u64 {
-        self.backend.snapshot().doc_count()
+    pub fn doc_count(&self) -> u64 {
+        self.published_snapshot.load().live_doc_count()
     }
 
     /// Whether the writer holds documents or installed segments not yet visible.
@@ -2042,96 +2088,21 @@ impl QuillIndex {
             );
             parsed
         };
-        let mut collector = if exact_count {
-            TopDocsCollector::with_exact_count(limit, offset)?
-        } else {
-            TopDocsCollector::new(limit, offset)?
-        };
-        for segment in keeper.segments() {
-            check_cancel(cx, "search")?;
-            let score_span = tracing::info_span!(
-                target: crate::tracing_conventions::TARGET,
-                crate::tracing_conventions::ARGUS_SCORE,
-                phase = "score",
-                segment_id = segment.manifest().segment_id,
-                doc_count = segment.doc_count(),
-                duration_us = tracing::field::Empty,
-            );
-            let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
-            let _score_entered = score_span.enter();
-            let mut scorer = lower_query(
-                &parsed.query,
-                1.0,
-                QueryLeaf::Sealed(segment),
-                snapshot,
-                self.schema,
-            )?;
-            collector.collect(&mut scorer, segment)?;
-        }
-        for delta in snapshot.delta_snapshots() {
-            check_cancel(cx, "search")?;
-            let score_span = tracing::info_span!(
-                target: crate::tracing_conventions::TARGET,
-                crate::tracing_conventions::ARGUS_SCORE,
-                phase = "score",
-                residency = "delta",
-                lease_base = delta.lease_base(),
-                doc_count = delta.live_document_count(),
-                duration_us = tracing::field::Empty,
-            );
-            let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
-            let _score_entered = score_span.enter();
-            let mut scorer = lower_query(
-                &parsed.query,
-                1.0,
-                QueryLeaf::Delta(delta),
-                snapshot,
-                self.schema,
-            )?;
-            collector.collect(&mut scorer, delta.as_ref())?;
-        }
-        let collect_span = tracing::info_span!(
-            target: crate::tracing_conventions::TARGET,
-            crate::tracing_conventions::ARGUS_COLLECT,
-            phase = "collect",
-            segment_count,
-            doc_count = snapshot.live_doc_count(),
-            result_count = tracing::field::Empty,
-            total_count = tracing::field::Empty,
-            duration_us = tracing::field::Empty,
-        );
-        let _collect_timer = crate::tracing_conventions::StageTimer::new(&collect_span);
-        let _collect_entered = collect_span.enter();
-        let collected = collector.finish()?;
-        let total_count = collected.total_count;
-        let mut hits = Vec::new();
-        hits.try_reserve_exact(collected.hits.len())
-            .map_err(|_| invalid_state("could not allocate final hit page"))?;
-        for hit in collected.hits {
-            let document_id = snapshot.materialize_document_id(hit.global_docid).ok_or(
-                ArgusError::MissingExternalDocId {
-                    global_docid: hit.global_docid,
-                },
-            )?;
-            hits.push(QuillHit {
-                document_id: document_id.to_string(),
-                global_docid: hit.global_docid,
-                score: hit.score,
-            });
-        }
-        let result_count = u64::try_from(hits.len()).unwrap_or(u64::MAX);
-        collect_span.record("result_count", result_count);
+        let result = self.execute_ranked_query(
+            cx,
+            &parsed.query,
+            snapshot,
+            limit,
+            offset,
+            exact_count,
+            parsed.diagnostics,
+        )?;
+        let result_count = u64::try_from(result.hits.len()).unwrap_or(u64::MAX);
         query_span.record("result_count", result_count);
-        if let Some(total_count) = total_count {
-            collect_span.record("total_count", total_count);
+        if let Some(total_count) = result.total_count {
             query_span.record("total_count", total_count);
         }
-        Ok(QuillSearchResult {
-            hits,
-            total_count,
-            doc_count: snapshot.live_doc_count(),
-            diagnostics: parsed.diagnostics,
-        })
+        Ok(result)
     }
 
     /// Collect the complete deterministic set of matching global document IDs.
@@ -2189,6 +2160,186 @@ impl QuillIndex {
             parse_span.record("result_count", 1_u64);
             parsed
         };
+        let docids = self.execute_docid_query(cx, &parsed.query, snapshot)?;
+        let result_count = u64::try_from(docids.len()).unwrap_or(u64::MAX);
+        query_span.record("result_count", result_count);
+        Ok(docids)
+    }
+
+    /// Execute one already-built query tree through the ranked mixed-state path.
+    ///
+    /// This remains feature-gated because the shipping surface accepts the
+    /// language string and owns parser diagnostics. The conformance gauntlet
+    /// needs the lower AST boundary to cover query classes that the default
+    /// shipping parser cannot construct for every compiled schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed lowering, collection, and cancellation failures
+    /// as [`Self::search_paginated`].
+    #[cfg(feature = "bench-internals")]
+    pub fn search_preparsed_paginated(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        check_cancel(cx, "search_preparsed")?;
+        let mut canonical = query.clone();
+        let _canonicalization = canonicalize_query(&mut canonical);
+        let published = self.published_snapshot.load();
+        self.execute_ranked_query(
+            cx,
+            &canonical,
+            published.as_ref(),
+            limit,
+            offset,
+            exact_count,
+            Vec::new(),
+        )
+    }
+
+    /// Execute one already-built query tree through the scoreless id-set path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed lowering, collection, and cancellation failures
+    /// as [`Self::collect_docids`].
+    #[cfg(feature = "bench-internals")]
+    pub fn collect_preparsed_docids(
+        &self,
+        cx: &Cx,
+        query: &Query,
+    ) -> Result<Vec<u32>, QuillIndexError> {
+        check_cancel(cx, "collect_preparsed_docids")?;
+        let mut canonical = query.clone();
+        let _canonicalization = canonicalize_query(&mut canonical);
+        let published = self.published_snapshot.load();
+        self.execute_docid_query(cx, &canonical, published.as_ref())
+    }
+
+    fn execute_ranked_query(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        snapshot: &QuillSearchSnapshot,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        diagnostics: Vec<QueryDiagnostic>,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        validate_query_lowering(query, 1.0, self.schema)?;
+        let keeper = snapshot.keeper_snapshot();
+        let segment_count = keeper
+            .segments()
+            .len()
+            .saturating_add(snapshot.delta_count());
+        let mut collector = if exact_count {
+            TopDocsCollector::with_exact_count(limit, offset)?
+        } else {
+            TopDocsCollector::new(limit, offset)?
+        };
+        for segment in keeper.segments() {
+            check_cancel(cx, "search")?;
+            let score_span = tracing::info_span!(
+                target: crate::tracing_conventions::TARGET,
+                crate::tracing_conventions::ARGUS_SCORE,
+                phase = "score",
+                segment_id = segment.manifest().segment_id,
+                doc_count = segment.doc_count(),
+                duration_us = tracing::field::Empty,
+            );
+            let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
+            let _score_entered = score_span.enter();
+            let mut scorer = lower_query(
+                query,
+                1.0,
+                QueryLeaf::Sealed(segment),
+                snapshot,
+                self.schema,
+                self.config.glob_expansion_limit,
+            )?;
+            collector.collect(&mut scorer, segment)?;
+        }
+        for delta in snapshot.delta_snapshots() {
+            check_cancel(cx, "search")?;
+            let score_span = tracing::info_span!(
+                target: crate::tracing_conventions::TARGET,
+                crate::tracing_conventions::ARGUS_SCORE,
+                phase = "score",
+                residency = "delta",
+                lease_base = delta.lease_base(),
+                doc_count = delta.live_document_count(),
+                duration_us = tracing::field::Empty,
+            );
+            let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
+            let _score_entered = score_span.enter();
+            let mut scorer = lower_query(
+                query,
+                1.0,
+                QueryLeaf::Delta(delta),
+                snapshot,
+                self.schema,
+                self.config.glob_expansion_limit,
+            )?;
+            collector.collect(&mut scorer, delta.as_ref())?;
+        }
+        let collect_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::ARGUS_COLLECT,
+            phase = "collect",
+            segment_count,
+            doc_count = snapshot.live_doc_count(),
+            result_count = tracing::field::Empty,
+            total_count = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _collect_timer = crate::tracing_conventions::StageTimer::new(&collect_span);
+        let _collect_entered = collect_span.enter();
+        let collected = collector.finish()?;
+        let total_count = collected.total_count;
+        let mut hits = Vec::new();
+        hits.try_reserve_exact(collected.hits.len())
+            .map_err(|_| invalid_state("could not allocate final hit page"))?;
+        for hit in collected.hits {
+            let document_id = snapshot.materialize_document_id(hit.global_docid).ok_or(
+                ArgusError::MissingExternalDocId {
+                    global_docid: hit.global_docid,
+                },
+            )?;
+            hits.push(QuillHit {
+                document_id: document_id.to_string(),
+                global_docid: hit.global_docid,
+                score: hit.score,
+            });
+        }
+        let result_count = u64::try_from(hits.len()).unwrap_or(u64::MAX);
+        collect_span.record("result_count", result_count);
+        if let Some(total_count) = total_count {
+            collect_span.record("total_count", total_count);
+        }
+        Ok(QuillSearchResult {
+            hits,
+            total_count,
+            doc_count: snapshot.live_doc_count(),
+            diagnostics,
+        })
+    }
+
+    fn execute_docid_query(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<Vec<u32>, QuillIndexError> {
+        validate_query_lowering(query, 1.0, self.schema)?;
+        let keeper = snapshot.keeper_snapshot();
+        let segment_count = keeper
+            .segments()
+            .len()
+            .saturating_add(snapshot.delta_count());
         let mut collector = DocSetCollector::new();
         for segment in keeper.segments() {
             check_cancel(cx, "collect_docids")?;
@@ -2204,11 +2355,12 @@ impl QuillIndex {
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
             let _score_entered = score_span.enter();
             let mut scorer = lower_query_unscored(
-                &parsed.query,
+                query,
                 1.0,
                 QueryLeaf::Sealed(segment),
                 snapshot,
                 self.schema,
+                self.config.glob_expansion_limit,
             )?;
             collector.collect(&mut scorer, segment)?;
         }
@@ -2227,11 +2379,12 @@ impl QuillIndex {
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
             let _score_entered = score_span.enter();
             let mut scorer = lower_query_unscored(
-                &parsed.query,
+                query,
                 1.0,
                 QueryLeaf::Delta(delta),
                 snapshot,
                 self.schema,
+                self.config.glob_expansion_limit,
             )?;
             collector.collect(&mut scorer, delta.as_ref())?;
         }
@@ -2248,9 +2401,10 @@ impl QuillIndex {
         let _collect_timer = crate::tracing_conventions::StageTimer::new(&collect_span);
         let _collect_entered = collect_span.enter();
         let docids = collector.finish();
-        let result_count = u64::try_from(docids.len()).unwrap_or(u64::MAX);
-        collect_span.record("result_count", result_count);
-        query_span.record("result_count", result_count);
+        collect_span.record(
+            "result_count",
+            u64::try_from(docids.len()).unwrap_or(u64::MAX),
+        );
         Ok(docids)
     }
 }
@@ -2516,12 +2670,187 @@ impl QueryLeaf<'_> {
     }
 }
 
+fn validate_query_lowering(
+    query: &Query,
+    inherited_boost: f32,
+    schema: SchemaDescriptor,
+) -> Result<(), QuillIndexError> {
+    match query {
+        Query::Empty | Query::All => Ok(()),
+        Query::Term { fields, text } => {
+            for field in fields {
+                validate_query_term(schema, field.field_id, text.as_bytes())?;
+                validate_cumulative_boost(inherited_boost, field.boost)?;
+            }
+            Ok(())
+        }
+        Query::Phrase {
+            fields,
+            terms,
+            slop,
+            prefix,
+        } => {
+            if *slop != 0 || *prefix {
+                return Err(QuillIndexError::UnsupportedQuery {
+                    detail: format!("phrase slop={slop} prefix={prefix}"),
+                });
+            }
+            if terms.is_empty() {
+                return Err(ArgusError::InvalidPhrase {
+                    reason: "an exact phrase requires positioned terms",
+                }
+                .into());
+            }
+            if terms.len() > 1 {
+                if terms
+                    .windows(2)
+                    .any(|pair| pair[0].position > pair[1].position)
+                {
+                    return Err(ArgusError::InvalidPhrase {
+                        reason: "phrase positions must be non-decreasing",
+                    }
+                    .into());
+                }
+                if terms.first().map(|term| term.position) == terms.last().map(|term| term.position)
+                {
+                    return Err(ArgusError::InvalidPhrase {
+                        reason: "an exact phrase must span at least two positions",
+                    }
+                    .into());
+                }
+                for field in fields {
+                    if !matches!(
+                        query_field_kind(schema, field.field_id)?,
+                        FieldKind::Text {
+                            positions: true,
+                            ..
+                        }
+                    ) {
+                        return Err(QuillIndexError::UnsupportedQuery {
+                            detail: format!("phrase names non-positioned field {}", field.field_id),
+                        });
+                    }
+                }
+            }
+            for term in terms {
+                for field in fields {
+                    validate_query_term(schema, field.field_id, term.text.as_bytes())?;
+                }
+            }
+            for field in fields {
+                validate_cumulative_boost(inherited_boost, field.boost)?;
+            }
+            Ok(())
+        }
+        Query::Boolean { clauses, .. } => {
+            for clause in clauses {
+                validate_query_lowering(&clause.query, inherited_boost, schema)?;
+            }
+            Ok(())
+        }
+        Query::Range {
+            field_id,
+            lower,
+            upper,
+        } => match query_field_kind(schema, *field_id)? {
+            FieldKind::Keyword | FieldKind::Text { .. } => {
+                validate_string_query_field(schema, *field_id, "range")?;
+                let (lower, upper) = string_query_bounds(*field_id, lower, upper)?;
+                validate_bound_term(schema, *field_id, &lower)?;
+                validate_bound_term(schema, *field_id, &upper).map_err(QuillIndexError::from)
+            }
+            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
+                numeric_query_bounds(schema, *field_id, lower, upper).map(|_| ())
+            }
+            FieldKind::I64 {
+                indexed: false,
+                fast: true,
+            }
+            | FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            } => {
+                let descriptor = query_field_descriptor(schema, *field_id)?;
+                if !descriptor.stored {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!(
+                            "fast-only numeric range field {field_id} has no persisted stored column"
+                        ),
+                    });
+                }
+                numeric_query_bounds(schema, *field_id, lower, upper).map(|_| ())
+            }
+            FieldKind::I64 {
+                indexed: false,
+                fast: false,
+            }
+            | FieldKind::U64 {
+                indexed: false,
+                fast: false,
+            } => Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("range names non-indexed numeric field {field_id}"),
+            }),
+            FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("range names stored-only field {field_id}"),
+            }),
+        },
+        Query::Set { field_id, values } => match query_field_kind(schema, *field_id)? {
+            FieldKind::Keyword | FieldKind::Text { .. } => {
+                for value in values {
+                    let QueryValue::Str(value) = value else {
+                        return Err(QuillIndexError::UnsupportedQuery {
+                            detail: format!(
+                                "set value type does not match string field {field_id}"
+                            ),
+                        });
+                    };
+                    validate_query_term(schema, *field_id, value.as_bytes())?;
+                }
+                Ok(())
+            }
+            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
+                numeric_query_values(schema, *field_id, values).map(|_| ())
+            }
+            FieldKind::I64 { indexed: false, .. } | FieldKind::U64 { indexed: false, .. } => {
+                Err(QuillIndexError::UnsupportedQuery {
+                    detail: format!("set names non-indexed numeric field {field_id}"),
+                })
+            }
+            FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("set names stored-only field {field_id}"),
+            }),
+        },
+        Query::Glob { field_ids, .. } => {
+            for &field_id in field_ids {
+                validate_string_query_field(schema, field_id, "glob")?;
+            }
+            Ok(())
+        }
+        Query::Boost { query, factor } => {
+            let boost = validate_cumulative_boost(inherited_boost, *factor)?;
+            validate_query_lowering(query, boost, schema)
+        }
+    }
+}
+
+fn validate_cumulative_boost(inherited: f32, factor: f32) -> Result<f32, QuillIndexError> {
+    let boost = inherited * factor;
+    if boost.is_finite() {
+        Ok(boost)
+    } else {
+        Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("non-finite cumulative boost bits 0x{:08x}", boost.to_bits()),
+        })
+    }
+}
+
 fn lower_query<'a>(
     query: &Query,
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
+    glob_expansion_limit: usize,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         query,
@@ -2529,6 +2858,7 @@ fn lower_query<'a>(
         leaf,
         snapshot,
         schema,
+        glob_expansion_limit,
         QueryLoweringMode::Scored,
     )
 }
@@ -2539,6 +2869,7 @@ fn lower_query_unscored<'a>(
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
+    glob_expansion_limit: usize,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         query,
@@ -2546,6 +2877,7 @@ fn lower_query_unscored<'a>(
         leaf,
         snapshot,
         schema,
+        glob_expansion_limit,
         QueryLoweringMode::Unscored,
     )
 }
@@ -2573,6 +2905,7 @@ fn lower_query_with_mode<'a>(
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
+    glob_expansion_limit: usize,
     mode: QueryLoweringMode,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     match query {
@@ -2694,6 +3027,7 @@ fn lower_query_with_mode<'a>(
                         leaf,
                         snapshot,
                         schema,
+                        glob_expansion_limit,
                         mode,
                     )?,
                 ));
@@ -2707,14 +3041,778 @@ fn lower_query_with_mode<'a>(
                     detail: format!("non-finite cumulative boost bits 0x{:08x}", boost.to_bits()),
                 });
             }
-            lower_query_with_mode(query, boost, leaf, snapshot, schema, mode)
+            lower_query_with_mode(
+                query,
+                boost,
+                leaf,
+                snapshot,
+                schema,
+                glob_expansion_limit,
+                mode,
+            )
         }
-        Query::Range { .. } | Query::Set { .. } | Query::Glob { .. } => {
+        Query::Range {
+            field_id,
+            lower,
+            upper,
+        } => lower_leaf_range(
+            leaf,
+            snapshot,
+            schema,
+            *field_id,
+            lower,
+            upper,
+            inherited_boost,
+            mode,
+        ),
+        Query::Glob { field_ids, pattern } => lower_leaf_glob(
+            leaf,
+            snapshot,
+            schema,
+            field_ids,
+            pattern.as_bytes(),
+            inherited_boost,
+            glob_expansion_limit,
+            mode,
+        ),
+        Query::Set { field_id, values } => lower_leaf_set(
+            leaf,
+            snapshot,
+            schema,
+            *field_id,
+            values,
+            inherited_boost,
+            mode,
+        ),
+    }
+}
+
+fn lower_leaf_range<'a>(
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    lower: &Bound<QueryValue>,
+    upper: &Bound<QueryValue>,
+    boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    match query_field_kind(schema, field_ord)? {
+        FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
+            lower_leaf_numeric_range(leaf, schema, field_ord, lower, upper, boost, mode)
+        }
+        FieldKind::I64 {
+            indexed: false,
+            fast: true,
+        }
+        | FieldKind::U64 {
+            indexed: false,
+            fast: true,
+        } => lower_leaf_fast_numeric_range(leaf, schema, field_ord, lower, upper, boost, mode),
+        FieldKind::Keyword | FieldKind::Text { .. } => {
+            let (lower, upper) = string_query_bounds(field_ord, lower, upper)?;
+            let terms = snapshot_string_range_terms(snapshot, schema, field_ord, lower, upper)?;
+            lower_leaf_string_predicate(leaf, snapshot, schema, field_ord, terms, boost, mode)
+        }
+        FieldKind::I64 {
+            indexed: false,
+            fast: false,
+        }
+        | FieldKind::U64 {
+            indexed: false,
+            fast: false,
+        } => Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("range names non-indexed numeric field {field_ord}"),
+        }),
+        FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("range names stored-only field {field_ord}"),
+        }),
+    }
+}
+
+fn lower_leaf_numeric_range<'a>(
+    leaf: QueryLeaf<'a>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    lower: &Bound<QueryValue>,
+    upper: &Bound<QueryValue>,
+    boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    let (lower, upper) = numeric_query_bounds(schema, field_ord, lower, upper)?;
+    match leaf {
+        QueryLeaf::Sealed(segment) => {
+            let manifest = segment.manifest();
+            let section = NumericSection::parse(
+                required_section(segment, SectionKind::NUMERIC)?,
+                schema,
+                manifest.docid_lo,
+                manifest.docid_hi,
+            )
+            .map_err(ArgusError::from)?;
+            let field = section.field(field_ord).ok_or_else(|| {
+                invalid_state(format!("NUMERIC has no indexed field {field_ord}"))
+            })?;
+            match mode {
+                QueryLoweringMode::Scored => ReferenceScorer::numeric_range_with_boost(
+                    field,
+                    lower,
+                    upper,
+                    segment.at_seal_doc_count(),
+                    boost,
+                ),
+                QueryLoweringMode::Unscored => {
+                    ReferenceScorer::numeric_range(field, lower, upper, segment.at_seal_doc_count())
+                }
+            }
+            .map_err(QuillIndexError::from)
+        }
+        QueryLeaf::Delta(delta) => {
+            let encoded = encode_live_delta_numeric(delta, schema)?;
+            let (docid_lo, docid_hi) = leaf.docid_range();
+            let section = NumericSection::parse(encoded.as_bytes(), schema, docid_lo, docid_hi)
+                .map_err(ArgusError::from)?;
+            let field = section.field(field_ord).ok_or_else(|| {
+                invalid_state(format!("Delta NUMERIC has no indexed field {field_ord}"))
+            })?;
+            let document_count = leaf.live_document_count()?;
+            match mode {
+                QueryLoweringMode::Scored => ReferenceScorer::numeric_range_with_boost(
+                    field,
+                    lower,
+                    upper,
+                    document_count,
+                    boost,
+                ),
+                QueryLoweringMode::Unscored => {
+                    ReferenceScorer::numeric_range(field, lower, upper, document_count)
+                }
+            }
+            .map_err(QuillIndexError::from)
+        }
+    }
+}
+
+fn lower_leaf_fast_numeric_range<'a>(
+    leaf: QueryLeaf<'a>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    lower: &Bound<QueryValue>,
+    upper: &Bound<QueryValue>,
+    boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    let descriptor = query_field_descriptor(schema, field_ord)?;
+    if !descriptor.stored {
+        return Err(QuillIndexError::UnsupportedQuery {
+            detail: format!(
+                "fast-only numeric range field {field_ord} has no persisted stored column"
+            ),
+        });
+    }
+    let (lower, upper) = numeric_query_bounds(schema, field_ord, lower, upper)?;
+    let score = match mode {
+        QueryLoweringMode::Scored => boost,
+        QueryLoweringMode::Unscored => 1.0,
+    };
+    let (docids, value_count, segment_num_docs) = match leaf {
+        QueryLeaf::Sealed(segment) => {
+            let manifest = segment.manifest();
+            let stored_fields = schema
+                .fields
+                .iter()
+                .filter(|field| field.stored)
+                .map(|field| field.id)
+                .collect::<Vec<_>>();
+            let stored = StoredMetaSection::parse(
+                required_section(segment, SectionKind::STOREDMETA)?,
+                manifest.docid_lo,
+                manifest.docid_hi,
+                &stored_fields,
+            )?;
+            let field = stored.field(field_ord).ok_or_else(|| {
+                invalid_state(format!(
+                    "STOREDMETA has no fast-only numeric field {field_ord}"
+                ))
+            })?;
+            let segment_num_docs = segment.at_seal_doc_count();
+            let mut docids = Vec::new();
+            docids
+                .try_reserve_exact(usize::try_from(segment_num_docs).unwrap_or(usize::MAX))
+                .map_err(|_| invalid_state("could not allocate fast numeric range docids"))?;
+            let mut value_count = 0_usize;
+            for global_docid in manifest.docid_lo..manifest.docid_hi {
+                let Some(bytes) = field.get(global_docid) else {
+                    continue;
+                };
+                value_count = value_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_state("fast numeric value count overflow"))?;
+                let value = decode_stored_numeric_value(descriptor.kind, field_ord, bytes)?;
+                if numeric_value_in_bounds(value, &lower, &upper) {
+                    docids.push(
+                        u32::try_from(global_docid).map_err(|_| {
+                            invalid_state("fast numeric range docid does not fit u32")
+                        })?,
+                    );
+                }
+            }
+            (docids, value_count, segment_num_docs)
+        }
+        QueryLeaf::Delta(delta) => {
+            let segment_num_docs = leaf.live_document_count()?;
+            let mut docids = Vec::new();
+            docids
+                .try_reserve_exact(usize::try_from(segment_num_docs).unwrap_or(usize::MAX))
+                .map_err(|_| invalid_state("could not allocate Delta fast numeric range docids"))?;
+            let mut value_count = 0_usize;
+            for (global_docid, _) in delta.live_documents() {
+                let Some(bytes) = delta.stored_value(field_ord, global_docid) else {
+                    continue;
+                };
+                value_count = value_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_state("Delta fast numeric value count overflow"))?;
+                let value = decode_stored_numeric_value(descriptor.kind, field_ord, bytes)?;
+                if numeric_value_in_bounds(value, &lower, &upper) {
+                    docids.push(global_docid);
+                }
+            }
+            (docids, value_count, segment_num_docs)
+        }
+    };
+    ReferenceScorer::materialized_numeric_range(
+        field_ord,
+        docids,
+        value_count,
+        segment_num_docs,
+        score,
+    )
+    .map_err(QuillIndexError::from)
+}
+
+fn decode_stored_numeric_value(
+    kind: FieldKind,
+    field_ord: u16,
+    bytes: &[u8],
+) -> Result<NumericValue, QuillIndexError> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+        invalid_state(format!(
+            "fast-only numeric field {field_ord} has a non-eight-byte stored value"
+        ))
+    })?;
+    match kind {
+        FieldKind::I64 { .. } => Ok(NumericValue::I64(i64::from_le_bytes(bytes))),
+        FieldKind::U64 { .. } => Ok(NumericValue::U64(u64::from_le_bytes(bytes))),
+        FieldKind::Keyword | FieldKind::Text { .. } | FieldKind::StoredOnly => Err(invalid_state(
+            format!("fast numeric decoder received non-numeric field {field_ord}"),
+        )),
+    }
+}
+
+fn numeric_value_in_bounds(
+    value: NumericValue,
+    lower: &Bound<NumericValue>,
+    upper: &Bound<NumericValue>,
+) -> bool {
+    let above_lower = match lower {
+        Bound::Included(bound) => {
+            numeric_value_cmp(value, *bound).is_some_and(|order| !order.is_lt())
+        }
+        Bound::Excluded(bound) => {
+            numeric_value_cmp(value, *bound).is_some_and(|order| order.is_gt())
+        }
+        Bound::Unbounded => true,
+    };
+    let below_upper = match upper {
+        Bound::Included(bound) => {
+            numeric_value_cmp(value, *bound).is_some_and(|order| !order.is_gt())
+        }
+        Bound::Excluded(bound) => {
+            numeric_value_cmp(value, *bound).is_some_and(|order| order.is_lt())
+        }
+        Bound::Unbounded => true,
+    };
+    above_lower && below_upper
+}
+
+fn numeric_value_cmp(left: NumericValue, right: NumericValue) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (NumericValue::I64(left), NumericValue::I64(right)) => Some(left.cmp(&right)),
+        (NumericValue::U64(left), NumericValue::U64(right)) => Some(left.cmp(&right)),
+        (NumericValue::I64(_), NumericValue::U64(_))
+        | (NumericValue::U64(_), NumericValue::I64(_)) => None,
+    }
+}
+
+fn numeric_query_bounds(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    lower: &Bound<QueryValue>,
+    upper: &Bound<QueryValue>,
+) -> Result<(Bound<NumericValue>, Bound<NumericValue>), QuillIndexError> {
+    let kind = query_field_kind(schema, field_ord)?;
+    let expected = match kind {
+        FieldKind::I64 { indexed: true, .. }
+        | FieldKind::I64 {
+            indexed: false,
+            fast: true,
+        } => NumericValueKind::I64,
+        FieldKind::U64 { indexed: true, .. }
+        | FieldKind::U64 {
+            indexed: false,
+            fast: true,
+        } => NumericValueKind::U64,
+        FieldKind::I64 {
+            indexed: false,
+            fast: false,
+        }
+        | FieldKind::U64 {
+            indexed: false,
+            fast: false,
+        } => {
+            return Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("numeric range names non-indexed field {field_ord}"),
+            });
+        }
+        FieldKind::Keyword | FieldKind::Text { .. } | FieldKind::StoredOnly => {
+            return Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("numeric range names non-numeric field {field_ord}"),
+            });
+        }
+    };
+    Ok((
+        numeric_query_bound(field_ord, expected, lower)?,
+        numeric_query_bound(field_ord, expected, upper)?,
+    ))
+}
+
+fn query_field_kind(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+) -> Result<FieldKind, QuillIndexError> {
+    query_field_descriptor(schema, field_ord).map(|field| field.kind)
+}
+
+fn query_field_descriptor(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+) -> Result<crate::schema::FieldDescriptor, QuillIndexError> {
+    schema
+        .fields
+        .get(usize::from(field_ord))
+        .filter(|field| field.id == field_ord)
+        .copied()
+        .ok_or_else(|| QuillIndexError::UnsupportedQuery {
+            detail: format!("query names unknown field {field_ord}"),
+        })
+}
+
+#[derive(Clone, Copy)]
+enum NumericValueKind {
+    I64,
+    U64,
+}
+
+fn numeric_query_bound(
+    field_ord: u16,
+    expected: NumericValueKind,
+    bound: &Bound<QueryValue>,
+) -> Result<Bound<NumericValue>, QuillIndexError> {
+    let convert = |value: &QueryValue| match (expected, value) {
+        (NumericValueKind::I64, QueryValue::I64(value)) => Ok(NumericValue::I64(*value)),
+        (NumericValueKind::U64, QueryValue::U64(value)) => Ok(NumericValue::U64(*value)),
+        _ => Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("numeric range bound type does not match field {field_ord}"),
+        }),
+    };
+    match bound {
+        Bound::Included(value) => convert(value).map(Bound::Included),
+        Bound::Excluded(value) => convert(value).map(Bound::Excluded),
+        Bound::Unbounded => Ok(Bound::Unbounded),
+    }
+}
+
+type StringQueryBounds<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
+
+fn string_query_bounds<'a>(
+    field_ord: u16,
+    lower: &'a Bound<QueryValue>,
+    upper: &'a Bound<QueryValue>,
+) -> Result<StringQueryBounds<'a>, QuillIndexError> {
+    Ok((
+        string_query_bound(field_ord, lower)?,
+        string_query_bound(field_ord, upper)?,
+    ))
+}
+
+fn string_query_bound(
+    field_ord: u16,
+    bound: &Bound<QueryValue>,
+) -> Result<Bound<&[u8]>, QuillIndexError> {
+    match bound {
+        Bound::Included(QueryValue::Str(value)) => Ok(Bound::Included(value.as_bytes())),
+        Bound::Excluded(QueryValue::Str(value)) => Ok(Bound::Excluded(value.as_bytes())),
+        Bound::Unbounded => Ok(Bound::Unbounded),
+        Bound::Included(QueryValue::I64(_) | QueryValue::U64(_))
+        | Bound::Excluded(QueryValue::I64(_) | QueryValue::U64(_)) => {
             Err(QuillIndexError::UnsupportedQuery {
-                detail: "range, set, and glob lowering belongs to a later checkpoint".to_owned(),
+                detail: format!("string range bound type does not match field {field_ord}"),
             })
         }
     }
+}
+
+fn snapshot_string_range_terms(
+    snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+) -> Result<Vec<Vec<u8>>, QuillIndexError> {
+    validate_string_query_field(schema, field_ord, "range")?;
+    if string_range_is_reversed(&lower, &upper) {
+        return Ok(Vec::new());
+    }
+    let mut terms = BTreeSet::<Vec<u8>>::new();
+    for segment in snapshot.keeper_snapshot().segments() {
+        let dictionary = open_dictionary(segment, schema)?;
+        let limit = usize::try_from(dictionary.term_count())
+            .map_err(|_| invalid_state("dictionary term count does not fit usize"))?;
+        for term in dictionary
+            .range_cursor(field_ord, lower, upper)?
+            .collect_bounded(limit)?
+        {
+            terms.insert(term.term);
+        }
+    }
+    for delta in snapshot.delta_snapshots() {
+        for term in delta.segment().sorted_terms() {
+            if term.field_ord() == field_ord
+                && term.live_doc_freq() != 0
+                && term_in_string_range(term.term(), &lower, &upper)
+            {
+                terms.insert(term.term().to_vec());
+            }
+        }
+    }
+    Ok(terms.into_iter().collect())
+}
+
+fn string_range_is_reversed(lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
+    match (lower, upper) {
+        (
+            Bound::Included(lower) | Bound::Excluded(lower),
+            Bound::Included(upper) | Bound::Excluded(upper),
+        ) => lower > upper,
+        _ => false,
+    }
+}
+
+fn term_in_string_range(term: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
+    let above_lower = match lower {
+        Bound::Included(bound) => term >= *bound,
+        Bound::Excluded(bound) => term > *bound,
+        Bound::Unbounded => true,
+    };
+    let below_upper = match upper {
+        Bound::Included(bound) => term <= *bound,
+        Bound::Excluded(bound) => term < *bound,
+        Bound::Unbounded => true,
+    };
+    above_lower && below_upper
+}
+
+fn validate_string_query_field(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    predicate: &'static str,
+) -> Result<(), QuillIndexError> {
+    match query_field_kind(schema, field_ord)? {
+        FieldKind::Keyword | FieldKind::Text { .. } => Ok(()),
+        FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => {
+            Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("{predicate} names non-string field {field_ord}"),
+            })
+        }
+    }
+}
+
+fn encode_live_delta_numeric(
+    delta: &DeltaSnapshot,
+    schema: SchemaDescriptor,
+) -> Result<EncodedNumericSection, QuillIndexError> {
+    let mut owned_fields = Vec::<(u16, Vec<NumericEntry>)>::new();
+    for field in schema.fields.iter().filter(|field| {
+        matches!(
+            field.kind,
+            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
+        )
+    }) {
+        let mut entries = Vec::new();
+        for (global_docid, _) in delta.live_documents() {
+            let Some(value) = delta.numeric_value(field.id, global_docid) else {
+                continue;
+            };
+            entries.push(match value {
+                NumericValue::I64(value) => NumericEntry::i64(value, global_docid),
+                NumericValue::U64(value) => NumericEntry::u64(value, global_docid),
+            });
+        }
+        owned_fields.push((field.id, entries));
+    }
+    let inputs = owned_fields
+        .iter()
+        .map(|(field_ord, entries)| NumericFieldInput::new(*field_ord, entries))
+        .collect::<Vec<_>>();
+    let (docid_lo, docid_hi) = QueryLeaf::Delta(delta).docid_range();
+    EncodedNumericSection::encode(schema, docid_lo, docid_hi, &inputs)
+        .map_err(ArgusError::from)
+        .map_err(QuillIndexError::from)
+}
+
+fn lower_leaf_set<'a>(
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    values: &[QueryValue],
+    boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    match query_field_kind(schema, field_ord)? {
+        FieldKind::Keyword | FieldKind::Text { .. } => {
+            let mut terms = BTreeSet::<Vec<u8>>::new();
+            for value in values {
+                let QueryValue::Str(value) = value else {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!("set value type does not match string field {field_ord}"),
+                    });
+                };
+                terms.insert(value.as_bytes().to_vec());
+            }
+            lower_leaf_string_predicate(
+                leaf,
+                snapshot,
+                schema,
+                field_ord,
+                terms.into_iter().collect(),
+                boost,
+                mode,
+            )
+        }
+        FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
+            let values = numeric_query_values(schema, field_ord, values)?;
+            lower_leaf_numeric_set(leaf, schema, field_ord, &values, boost, mode)
+        }
+        FieldKind::I64 { indexed: false, .. } | FieldKind::U64 { indexed: false, .. } => {
+            Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("set names non-indexed numeric field {field_ord}"),
+            })
+        }
+        FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("set names stored-only field {field_ord}"),
+        }),
+    }
+}
+
+fn numeric_query_values(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    values: &[QueryValue],
+) -> Result<Vec<NumericValue>, QuillIndexError> {
+    match query_field_kind(schema, field_ord)? {
+        FieldKind::I64 { indexed: true, .. } => {
+            let mut unique = BTreeSet::new();
+            for value in values {
+                let QueryValue::I64(value) = value else {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!("set value type does not match i64 field {field_ord}"),
+                    });
+                };
+                unique.insert(*value);
+            }
+            Ok(unique.into_iter().map(NumericValue::I64).collect())
+        }
+        FieldKind::U64 { indexed: true, .. } => {
+            let mut unique = BTreeSet::new();
+            for value in values {
+                let QueryValue::U64(value) = value else {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!("set value type does not match u64 field {field_ord}"),
+                    });
+                };
+                unique.insert(*value);
+            }
+            Ok(unique.into_iter().map(NumericValue::U64).collect())
+        }
+        FieldKind::I64 { indexed: false, .. }
+        | FieldKind::U64 { indexed: false, .. }
+        | FieldKind::Keyword
+        | FieldKind::Text { .. }
+        | FieldKind::StoredOnly => Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("numeric set names incompatible field {field_ord}"),
+        }),
+    }
+}
+
+fn lower_leaf_numeric_set<'a>(
+    leaf: QueryLeaf<'a>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    values: &[NumericValue],
+    boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    match leaf {
+        QueryLeaf::Sealed(segment) => {
+            let manifest = segment.manifest();
+            let section = NumericSection::parse(
+                required_section(segment, SectionKind::NUMERIC)?,
+                schema,
+                manifest.docid_lo,
+                manifest.docid_hi,
+            )
+            .map_err(ArgusError::from)?;
+            let field = section.field(field_ord).ok_or_else(|| {
+                invalid_state(format!("NUMERIC has no indexed field {field_ord}"))
+            })?;
+            lower_numeric_field_set(field, values, segment.at_seal_doc_count(), boost, mode)
+        }
+        QueryLeaf::Delta(delta) => {
+            let encoded = encode_live_delta_numeric(delta, schema)?;
+            let (docid_lo, docid_hi) = leaf.docid_range();
+            let section = NumericSection::parse(encoded.as_bytes(), schema, docid_lo, docid_hi)
+                .map_err(ArgusError::from)?;
+            let field = section.field(field_ord).ok_or_else(|| {
+                invalid_state(format!("Delta NUMERIC has no indexed field {field_ord}"))
+            })?;
+            lower_numeric_field_set(field, values, leaf.live_document_count()?, boost, mode)
+        }
+    }
+}
+
+fn lower_numeric_field_set<'a>(
+    field: NumericField<'_>,
+    values: &[NumericValue],
+    document_count: u32,
+    boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    let mut clauses = Vec::new();
+    clauses
+        .try_reserve_exact(values.len())
+        .map_err(|_| invalid_state("could not allocate numeric set clauses"))?;
+    for &value in values {
+        clauses.push(ScorerClause::should(ReferenceScorer::numeric_range(
+            field,
+            Bound::Included(value),
+            Bound::Included(value),
+            document_count,
+        )?));
+    }
+    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored)?;
+    match mode {
+        QueryLoweringMode::Scored => {
+            ReferenceScorer::constant_score(matching, boost).map_err(QuillIndexError::from)
+        }
+        QueryLoweringMode::Unscored => Ok(matching),
+    }
+}
+
+fn lower_leaf_string_predicate<'a>(
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    terms: Vec<Vec<u8>>,
+    boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    let mut clauses = Vec::new();
+    clauses
+        .try_reserve_exact(terms.len())
+        .map_err(|_| invalid_state("could not allocate string predicate clauses"))?;
+    for term in terms {
+        clauses.push(ScorerClause::should(lower_leaf_term(
+            leaf, snapshot, schema, field_ord, &term, 1.0,
+        )?));
+    }
+    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored)?;
+    match mode {
+        QueryLoweringMode::Scored => {
+            ReferenceScorer::constant_score(matching, boost).map_err(QuillIndexError::from)
+        }
+        QueryLoweringMode::Unscored => Ok(matching),
+    }
+}
+
+fn lower_leaf_glob<'a>(
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
+    field_ids: &[u16],
+    pattern: &[u8],
+    boost: f32,
+    expansion_limit: usize,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    let mut fields = Vec::new();
+    fields
+        .try_reserve_exact(field_ids.len())
+        .map_err(|_| invalid_state("could not allocate glob field clauses"))?;
+    for &field_ord in field_ids {
+        let terms = snapshot_glob_terms(snapshot, schema, field_ord, pattern, expansion_limit)?;
+        let field_scorer =
+            lower_leaf_string_predicate(leaf, snapshot, schema, field_ord, terms, boost, mode)?;
+        fields.push(ScorerClause::should(field_scorer));
+    }
+    lower_boolean(fields, mode)
+}
+
+fn snapshot_glob_terms(
+    snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    pattern: &[u8],
+    expansion_limit: usize,
+) -> Result<Vec<Vec<u8>>, QuillIndexError> {
+    validate_string_query_field(schema, field_ord, "glob")?;
+    let mut terms = BTreeSet::<Vec<u8>>::new();
+    for segment in snapshot.keeper_snapshot().segments() {
+        let dictionary = open_dictionary(segment, schema)?;
+        for term in dictionary.expand_glob(field_ord, pattern, expansion_limit)? {
+            insert_glob_term(&mut terms, field_ord, term.term, expansion_limit)?;
+        }
+    }
+    for delta in snapshot.delta_snapshots() {
+        for term in delta.segment().sorted_terms() {
+            if term.field_ord() == field_ord
+                && term.live_doc_freq() != 0
+                && star_glob_matches(pattern, term.term())
+            {
+                insert_glob_term(&mut terms, field_ord, term.term().to_vec(), expansion_limit)?;
+            }
+        }
+    }
+    Ok(terms.into_iter().collect())
+}
+
+fn insert_glob_term(
+    terms: &mut BTreeSet<Vec<u8>>,
+    field_ord: u16,
+    term: Vec<u8>,
+    expansion_limit: usize,
+) -> Result<(), QuillIndexError> {
+    if terms.insert(term) && terms.len() > expansion_limit {
+        return Err(TermDictionaryError::GlobExpansionLimitExceeded {
+            field_ord,
+            limit: expansion_limit,
+            actual: terms.len(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn lower_leaf_term<'a>(
@@ -3049,7 +4147,7 @@ mod tests {
         SectionKind::STOREDMETA,
         SectionKind::STATS,
     ];
-    const DELTA_PARITY_FIELDS: [FieldDescriptor; 4] = [
+    const DELTA_PARITY_FIELDS: [FieldDescriptor; 6] = [
         FieldDescriptor {
             id: 0,
             name: "id",
@@ -3078,6 +4176,24 @@ mod tests {
             id: 3,
             name: "opaque",
             kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 5,
+            name: "fast_rank",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
             stored: true,
         },
     ];
@@ -3284,6 +4400,177 @@ mod tests {
                 &stored,
             )
             .expect("apply tokenized Delta fixture document");
+    }
+
+    fn apply_typed_delta_document(
+        delta: &mut DeltaSegment,
+        global_docid: u32,
+        document_id: &str,
+        content: &str,
+        rank: u64,
+    ) {
+        let mut term_positions = BTreeMap::<&str, Vec<u32>>::new();
+        for (position, term) in content.split_ascii_whitespace().enumerate() {
+            term_positions.entry(term).or_default().push(
+                u32::try_from(position).expect("typed fixture position fits the Delta wire type"),
+            );
+        }
+        let token_count = u32::try_from(term_positions.values().map(Vec::len).sum::<usize>())
+            .expect("typed fixture token count fits u32");
+        let fieldnorms = [
+            DeltaFieldNorm {
+                field_ord: 0,
+                raw_length: 1,
+                fieldnorm_id: fieldnorm_to_id(1),
+            },
+            DeltaFieldNorm {
+                field_ord: 1,
+                raw_length: token_count,
+                fieldnorm_id: fieldnorm_to_id(token_count),
+            },
+            DeltaFieldNorm {
+                field_ord: 4,
+                raw_length: 0,
+                fieldnorm_id: fieldnorm_to_id(0),
+            },
+        ];
+        let mut postings = Vec::with_capacity(term_positions.len() + 1);
+        postings.push(DeltaTermPosting {
+            field_ord: 0,
+            term: document_id.as_bytes(),
+            frequency: 1,
+            positions: None,
+        });
+        for (term, positions) in &term_positions {
+            postings.push(DeltaTermPosting {
+                field_ord: 1,
+                term: term.as_bytes(),
+                frequency: u32::try_from(positions.len())
+                    .expect("typed fixture frequency fits u32"),
+                positions: Some(positions),
+            });
+        }
+        let rank_bytes = rank.to_le_bytes();
+        let stored = [
+            DeltaStoredValue::new(0, document_id.as_bytes()),
+            DeltaStoredValue::new(1, content.as_bytes()),
+            DeltaStoredValue::new(3, b""),
+            DeltaStoredValue::new(5, &rank_bytes),
+        ];
+        delta
+            .apply_document_with_values(
+                global_docid,
+                DocId::from(document_id),
+                shipping_content_hash(document_id, content),
+                &fieldnorms,
+                &postings,
+                &[DeltaNumericValue::u64(2, rank)],
+                &stored,
+            )
+            .expect("apply typed lowering fixture document");
+    }
+
+    fn typed_delta_snapshot(
+        lease_base: u64,
+        global_docid: u32,
+        document_id: &str,
+        content: &str,
+        rank: u64,
+    ) -> Arc<DeltaSnapshot> {
+        let mut delta = DeltaSegment::new(DELTA_PARITY_SCHEMA, lease_base, usize::MAX)
+            .expect("typed lowering Delta lease");
+        apply_typed_delta_document(&mut delta, global_docid, document_id, content, rank);
+        Arc::new(delta.freeze(0))
+    }
+
+    fn typed_residency_index(
+        sealed: &[Arc<DeltaSnapshot>],
+        deltas: &[Arc<DeltaSnapshot>],
+        config: QuillConfig,
+    ) -> QuillIndex {
+        let genesis =
+            KeeperSnapshot::in_memory(DELTA_PARITY_SCHEMA).expect("typed lowering genesis Keeper");
+        let keeper = if sealed.is_empty() {
+            genesis
+        } else {
+            let mut manifest = genesis
+                .next_manifest()
+                .expect("typed lowering successor MANIFEST");
+            let mut encoded = Vec::new();
+            for (index, delta) in sealed.iter().enumerate() {
+                let segment = flush_delta_snapshot(
+                    delta,
+                    DeltaFlushInput {
+                        segment_id: 0xe5_5000
+                            + u64::try_from(index).expect("typed segment index fits u64"),
+                        created_unix_s: 0,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .expect("flush typed lowering Delta")
+                .expect("typed lowering Delta is non-empty");
+                manifest.segments.push(manifest_segment(
+                    &segment,
+                    u64::try_from(index + 1).expect("typed seal sequence fits u64"),
+                ));
+                manifest.docid_high_watermark =
+                    manifest.docid_high_watermark.max(delta.lease_end());
+                encoded.push(segment);
+            }
+            manifest.field_stats = DELTA_PARITY_SCHEMA
+                .fields
+                .iter()
+                .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+                .map(|field| ManifestFieldStats {
+                    field_ord: field.id,
+                    total_tokens: sealed
+                        .iter()
+                        .map(|delta| {
+                            delta
+                                .live_total_tokens(field.id)
+                                .expect("typed Delta field statistics")
+                        })
+                        .sum(),
+                    doc_count: sealed
+                        .iter()
+                        .map(|delta| {
+                            u32::try_from(delta.live_document_count())
+                                .expect("typed Delta count fits u32")
+                        })
+                        .sum(),
+                })
+                .collect();
+            genesis
+                .publish_owned_segments(&manifest, encoded)
+                .expect("publish typed lowering Keeper")
+        };
+        let generation = keeper.loaded_manifest().manifest.generation;
+        let rebound = deltas
+            .iter()
+            .map(|delta| Arc::new(delta.rebind_keeper_generation(generation)))
+            .collect::<Vec<_>>();
+        let index =
+            QuillIndex::from_backend(IndexBackend::Memory(keeper), DELTA_PARITY_SCHEMA, config)
+                .expect("bind typed lowering index");
+        index
+            .publish_delta_table(rebound)
+            .expect("publish typed lowering Delta table");
+        index
+    }
+
+    fn execute_typed_query(
+        index: &QuillIndex,
+        cx: &Cx,
+        query: &Query,
+    ) -> (QuillSearchResult, Vec<u32>) {
+        let snapshot = index.search_snapshot();
+        let ranked = index
+            .execute_ranked_query(cx, query, &snapshot, 10, 0, true, Vec::new())
+            .expect("execute typed ranked query");
+        let docids = index
+            .execute_docid_query(cx, query, &snapshot)
+            .expect("execute typed doc-set query");
+        (ranked, docids)
     }
 
     fn alpha_snapshot_tuple(snapshot: &QuillSearchSnapshot) -> (u64, u64, u64, u64, u64) {
@@ -4440,6 +5727,11 @@ mod tests {
                             field_ord: 1,
                             raw_length: frequency,
                             fieldnorm_id: fieldnorm_to_id(frequency),
+                        },
+                        DeltaFieldNorm {
+                            field_ord: 4,
+                            raw_length: 0,
+                            fieldnorm_id: fieldnorm_to_id(0),
                         },
                     ];
                     let postings = [
@@ -5663,6 +6955,279 @@ mod tests {
                 mixed.collect_docids(&cx, "alpha").expect("mixed docset"),
                 vec![0, delta_docid]
             );
+        });
+    }
+
+    #[test]
+    fn range_set_and_glob_lowering_is_identical_across_residency() {
+        run_with_cx(|cx| async move {
+            let second_base = u64::from(DOC_ORDS_PER_LEASE);
+            let second_docid = u32::try_from(second_base).expect("second fixture lease fits u32");
+            let first = typed_delta_snapshot(0, 0, "first", "alpha alpine", 11);
+            let second =
+                typed_delta_snapshot(second_base, second_docid, "second", "alpine beta", 17);
+            let empty = typed_residency_index(&[], &[], deterministic_config());
+            let all_delta = typed_residency_index(
+                &[],
+                &[Arc::clone(&first), Arc::clone(&second)],
+                deterministic_config(),
+            );
+            let mixed = typed_residency_index(
+                &[Arc::clone(&first)],
+                &[Arc::clone(&second)],
+                deterministic_config(),
+            );
+            let all_sealed = typed_residency_index(
+                &[Arc::clone(&first), Arc::clone(&second)],
+                &[],
+                deterministic_config(),
+            );
+            assert_eq!(all_delta.doc_count(), 2);
+            assert_eq!(empty.doc_count(), 0);
+            assert_eq!(mixed.doc_count(), 2, "public count includes the Delta leaf");
+            assert_eq!(all_sealed.doc_count(), 2);
+
+            let queries = [
+                (
+                    Query::Boost {
+                        query: Box::new(Query::Range {
+                            field_id: 2,
+                            lower: Bound::Included(QueryValue::U64(11)),
+                            upper: Bound::Included(QueryValue::U64(17)),
+                        }),
+                        factor: 2.5,
+                    },
+                    2.5_f32,
+                ),
+                (
+                    Query::Range {
+                        field_id: 1,
+                        lower: Bound::Included(QueryValue::Str("alpha".to_owned())),
+                        upper: Bound::Included(QueryValue::Str("alpine".to_owned())),
+                    },
+                    1.0,
+                ),
+                (
+                    Query::Range {
+                        field_id: 5,
+                        lower: Bound::Included(QueryValue::U64(11)),
+                        upper: Bound::Included(QueryValue::U64(17)),
+                    },
+                    1.0,
+                ),
+                (
+                    Query::Set {
+                        field_id: 1,
+                        values: vec![
+                            QueryValue::Str("alpha".to_owned()),
+                            QueryValue::Str("alpine".to_owned()),
+                            QueryValue::Str("alpha".to_owned()),
+                        ],
+                    },
+                    1.0,
+                ),
+                (
+                    Query::Set {
+                        field_id: 2,
+                        values: vec![
+                            QueryValue::U64(11),
+                            QueryValue::U64(17),
+                            QueryValue::U64(11),
+                        ],
+                    },
+                    1.0,
+                ),
+                (
+                    Query::Glob {
+                        field_ids: vec![1],
+                        pattern: "alp*".to_owned(),
+                    },
+                    1.0,
+                ),
+                (
+                    Query::Glob {
+                        field_ids: vec![1, 1],
+                        pattern: "alp*".to_owned(),
+                    },
+                    2.0,
+                ),
+            ];
+            for (query, expected_score) in &queries {
+                let delta_evidence = execute_typed_query(&all_delta, &cx, query);
+                let mixed_evidence = execute_typed_query(&mixed, &cx, query);
+                let sealed_evidence = execute_typed_query(&all_sealed, &cx, query);
+                assert_eq!(mixed_evidence, delta_evidence, "mixed query {query:?}");
+                assert_eq!(sealed_evidence, delta_evidence, "sealed query {query:?}");
+                assert_eq!(delta_evidence.1, vec![0, second_docid]);
+                assert_eq!(delta_evidence.0.total_count, Some(2));
+                assert!(
+                    delta_evidence
+                        .0
+                        .hits
+                        .iter()
+                        .all(|hit| { hit.score.to_bits() == expected_score.to_bits() })
+                );
+            }
+
+            for empty_range in [
+                Query::Range {
+                    field_id: 1,
+                    lower: Bound::Included(QueryValue::Str("zeta".to_owned())),
+                    upper: Bound::Included(QueryValue::Str("alpha".to_owned())),
+                },
+                Query::Range {
+                    field_id: 1,
+                    lower: Bound::Excluded(QueryValue::Str("alpha".to_owned())),
+                    upper: Bound::Included(QueryValue::Str("alpha".to_owned())),
+                },
+            ] {
+                let (ranked, docids) = execute_typed_query(&mixed, &cx, &empty_range);
+                assert!(ranked.hits.is_empty());
+                assert_eq!(ranked.total_count, Some(0));
+                assert!(docids.is_empty());
+            }
+
+            let invalid_queries = [
+                Query::Range {
+                    field_id: 99,
+                    lower: Bound::Included(QueryValue::U64(0)),
+                    upper: Bound::Included(QueryValue::U64(1)),
+                },
+                Query::Range {
+                    field_id: 2,
+                    lower: Bound::Included(QueryValue::Str("wrong".to_owned())),
+                    upper: Bound::Unbounded,
+                },
+                Query::Set {
+                    field_id: 5,
+                    values: vec![QueryValue::U64(11)],
+                },
+                Query::Boost {
+                    query: Box::new(Query::All),
+                    factor: f32::INFINITY,
+                },
+                Query::Phrase {
+                    fields: vec![crate::query::QueryField::new(1, 1.0)],
+                    terms: vec![
+                        crate::query::PositionedTerm::new(0, "alpha"),
+                        crate::query::PositionedTerm::new(1, "beta"),
+                    ],
+                    slop: 1,
+                    prefix: false,
+                },
+                Query::Range {
+                    field_id: 1,
+                    lower: Bound::Included(QueryValue::Str(
+                        "x".repeat(crate::grimoire::MAX_TERM_BYTES + 1),
+                    )),
+                    upper: Bound::Unbounded,
+                },
+            ];
+            for query in &invalid_queries {
+                let errors = [&empty, &all_delta, &mixed, &all_sealed].map(|index| {
+                    let snapshot = index.search_snapshot();
+                    let ranked = index
+                        .execute_ranked_query(&cx, query, &snapshot, 10, 0, true, Vec::new())
+                        .expect_err("invalid ranked query must fail before leaf iteration")
+                        .to_string();
+                    let docset = index
+                        .execute_docid_query(&cx, query, &snapshot)
+                        .expect_err("invalid docset query must fail before leaf iteration")
+                        .to_string();
+                    assert_eq!(ranked, docset, "collector validation parity for {query:?}");
+                    ranked
+                });
+                assert!(
+                    errors.windows(2).all(|pair| pair[0] == pair[1]),
+                    "residency-independent validation for {query:?}: {errors:?}"
+                );
+            }
+
+            let mut bounded = deterministic_config();
+            bounded.glob_expansion_limit = 1;
+            let bounded = typed_residency_index(&[], &[first, second], bounded);
+            let snapshot = bounded.search_snapshot();
+            let glob = Query::Glob {
+                field_ids: vec![1],
+                pattern: "alp*".to_owned(),
+            };
+            assert!(matches!(
+                bounded.execute_ranked_query(&cx, &glob, &snapshot, 10, 0, true, Vec::new()),
+                Err(QuillIndexError::Dictionary(
+                    TermDictionaryError::GlobExpansionLimitExceeded {
+                        field_ord: 1,
+                        limit: 1,
+                        actual: 2,
+                    }
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn default_fast_only_ord_range_executes_and_validates_before_leaf_iteration() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let empty_set_error = index
+                .search_paginated(&cx, "ord: IN [0 1]", 10, 0, true)
+                .expect_err("fast-only set is unsupported before any leaf exists");
+            assert!(matches!(
+                &empty_set_error,
+                QuillIndexError::UnsupportedQuery { detail }
+                    if detail == "set names non-indexed numeric field 4"
+            ));
+            let empty_range = index
+                .search_paginated(&cx, "ord:[0 TO 1]", 10, 0, true)
+                .expect("fast-only range is valid against an empty snapshot");
+            assert!(empty_range.hits.is_empty());
+            assert_eq!(empty_range.total_count, Some(0));
+
+            index
+                .index_documents(&cx, &fixture_documents())
+                .await
+                .expect("accumulate fixture");
+            index.commit(&cx).await.expect("publish fixture");
+
+            let ranked = index
+                .search_paginated(&cx, "ord:[0 TO 1]", 10, 0, true)
+                .expect("execute default fast-only range");
+            assert_eq!(ranked.total_count, Some(2));
+            assert_eq!(
+                ranked
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.document_id.as_str(), hit.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                vec![("rust-1", 1.0_f32.to_bits()), ("rust-2", 1.0_f32.to_bits())]
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "ord:[0 TO 1]")
+                    .expect("collect fast-only range docids"),
+                vec![0, 1]
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "ord:{0 TO 2}", 10, 0, true)
+                    .expect("execute exclusive fast-only range")
+                    .hits
+                    .iter()
+                    .map(|hit| hit.document_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["rust-2"]
+            );
+            assert!(
+                index
+                    .search_paginated(&cx, "ord:[0 TO 1]^2.5", 10, 0, true)
+                    .expect("execute boosted fast-only range")
+                    .hits
+                    .iter()
+                    .all(|hit| hit.score.to_bits() == 2.5_f32.to_bits())
+            );
+            let populated_set_error = index
+                .search_paginated(&cx, "ord: IN [0 1]", 10, 0, true)
+                .expect_err("fast-only set remains unsupported with sealed leaves");
+            assert_eq!(populated_set_error.to_string(), empty_set_error.to_string());
         });
     }
 

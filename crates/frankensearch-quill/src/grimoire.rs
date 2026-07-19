@@ -1502,7 +1502,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     })
 }
 
-fn star_glob_matches(pattern: &[u8], term: &[u8]) -> bool {
+pub(crate) fn star_glob_matches(pattern: &[u8], term: &[u8]) -> bool {
     let mut pattern_pos = 0;
     let mut term_pos = 0;
     let mut resume_after_star = None;
@@ -2294,7 +2294,7 @@ fn validate_composite_key(
     field_has_positions(schema, u16::from_be_bytes([key[0], key[1]]))
 }
 
-fn validate_query_term(
+pub(crate) fn validate_query_term(
     schema: SchemaDescriptor,
     field_ord: u16,
     term: &[u8],
@@ -2309,7 +2309,7 @@ fn validate_query_term(
     Ok(())
 }
 
-fn validate_bound_term(
+pub(crate) fn validate_bound_term(
     schema: SchemaDescriptor,
     field_ord: u16,
     bound: &Bound<&[u8]>,
