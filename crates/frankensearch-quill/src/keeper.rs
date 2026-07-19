@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use arc_swap::ArcSwap;
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
@@ -36,7 +37,7 @@ use crate::quiver::{
     EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
     EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdHashLookupPlan,
     IdHashSection, IdMapCodecError, IdMapSection, NumericSection, PositionList, PostingList,
-    StatsSection, StoredMetaSection, aggregate_field_stats,
+    StatsSection, StoredMetaSection, ValidatedTermPruningMetadata, aggregate_field_stats,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{
@@ -1634,6 +1635,104 @@ pub struct ResolvedDocumentId {
     pub global_docid: u32,
 }
 
+#[derive(Clone)]
+struct CachedRankPruningTerm {
+    term_ord: u32,
+    term_metadata: TermMetadata,
+    pruning: Arc<ValidatedTermPruningMetadata>,
+}
+
+const MAX_RANK_PRUNING_CACHE_TERMS: usize = 128;
+const MAX_RANK_PRUNING_CACHE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Sparse lock-free cache for immutable per-term rank-pruning metadata.
+///
+/// Searches overwhelmingly revisit a small vocabulary relative to the full
+/// dictionary, so a copy-on-write sorted sidecar avoids allocating one cache
+/// cell per durable term. Concurrent first touches may duplicate validation,
+/// but compare-and-swap publishes exactly one paired result and readers never
+/// block one another.
+struct RankPruningCache {
+    terms: ArcSwap<Vec<CachedRankPruningTerm>>,
+}
+
+impl RankPruningCache {
+    fn new() -> Self {
+        Self {
+            terms: ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+
+    fn get(
+        &self,
+        term_ord: u32,
+        term_metadata: TermMetadata,
+    ) -> Result<Option<Arc<ValidatedTermPruningMetadata>>, &'static str> {
+        let terms = self.terms.load();
+        let Ok(index) = terms.binary_search_by_key(&term_ord, |term| term.term_ord) else {
+            return Ok(None);
+        };
+        let cached = &terms[index];
+        if cached.term_metadata != term_metadata {
+            return Err("cached rank-pruning term metadata disagrees with TERMDICT");
+        }
+        Ok(Some(Arc::clone(&cached.pruning)))
+    }
+
+    fn insert(
+        &self,
+        term_ord: u32,
+        term_metadata: TermMetadata,
+        pruning: Arc<ValidatedTermPruningMetadata>,
+    ) -> Result<Arc<ValidatedTermPruningMetadata>, &'static str> {
+        loop {
+            let current = self.terms.load_full();
+            match current.binary_search_by_key(&term_ord, |term| term.term_ord) {
+                Ok(index) => {
+                    let cached = &current[index];
+                    if cached.term_metadata != term_metadata {
+                        return Err("concurrent rank-pruning cache entry disagrees with TERMDICT");
+                    }
+                    return Ok(Arc::clone(&cached.pruning));
+                }
+                Err(insertion) => {
+                    let retained_bytes = current.iter().fold(0_usize, |bytes, term| {
+                        bytes.saturating_add(term.pruning.heap_bytes())
+                    });
+                    if current.len() >= MAX_RANK_PRUNING_CACHE_TERMS
+                        || pruning.heap_bytes()
+                            > MAX_RANK_PRUNING_CACHE_PAYLOAD_BYTES.saturating_sub(retained_bytes)
+                    {
+                        return Ok(pruning);
+                    }
+                    let mut next = Vec::new();
+                    next.try_reserve_exact(current.len().saturating_add(1))
+                        .map_err(|_| "could not allocate rank-pruning cache sidecar")?;
+                    next.extend(current.iter().cloned());
+                    next.insert(
+                        insertion,
+                        CachedRankPruningTerm {
+                            term_ord,
+                            term_metadata,
+                            pruning: Arc::clone(&pruning),
+                        },
+                    );
+                    let next = Arc::new(next);
+                    let previous = self.terms.compare_and_swap(&current, next);
+                    if Arc::ptr_eq(&current, &previous) {
+                        return Ok(pruning);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.terms.load().len()
+    }
+}
+
 /// One immutable mapped or owned segment admitted by a recovered snapshot.
 ///
 /// Structural framing, MANIFEST witnesses, and the IDMAP-bound IDHASH identity
@@ -1647,6 +1746,7 @@ pub struct RecoveredSegment {
     tombstone_index: TombstoneIndex,
     id_lookup: IdHashLookupPlan,
     live_doc_count: u32,
+    rank_pruning_cache: Arc<RankPruningCache>,
 }
 
 impl RecoveredSegment {
@@ -1679,13 +1779,19 @@ impl RecoveredSegment {
         manifest: ManifestSegment,
         reader: RecoveredSegmentBacking,
     ) -> Result<Self, KeeperError> {
-        Self::bind_shared(path, manifest, Arc::new(reader))
+        Self::bind_shared(
+            path,
+            manifest,
+            Arc::new(reader),
+            Arc::new(RankPruningCache::new()),
+        )
     }
 
     fn bind_shared(
         path: PathBuf,
         manifest: ManifestSegment,
         reader: Arc<RecoveredSegmentBacking>,
+        rank_pruning_cache: Arc<RankPruningCache>,
     ) -> Result<Self, KeeperError> {
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
         let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
@@ -1738,12 +1844,41 @@ impl RecoveredSegment {
             tombstone_index,
             id_lookup,
             live_doc_count,
+            rank_pruning_cache,
         })
     }
 
     fn rebind(&self, manifest: ManifestSegment) -> Result<Self, KeeperError> {
         self.reader.validate_witnesses(&self.path, &manifest)?;
-        Self::bind_shared(self.path.clone(), manifest, Arc::clone(&self.reader))
+        Self::bind_shared(
+            self.path.clone(),
+            manifest,
+            Arc::clone(&self.reader),
+            Arc::clone(&self.rank_pruning_cache),
+        )
+    }
+
+    pub(crate) fn cached_rank_pruning_metadata(
+        &self,
+        term_ord: u32,
+        term_metadata: TermMetadata,
+    ) -> Result<Option<Arc<ValidatedTermPruningMetadata>>, &'static str> {
+        self.rank_pruning_cache.get(term_ord, term_metadata)
+    }
+
+    pub(crate) fn cache_rank_pruning_metadata(
+        &self,
+        term_ord: u32,
+        term_metadata: TermMetadata,
+        pruning: Arc<ValidatedTermPruningMetadata>,
+    ) -> Result<Arc<ValidatedTermPruningMetadata>, &'static str> {
+        self.rank_pruning_cache
+            .insert(term_ord, term_metadata, pruning)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_rank_pruning_term_count(&self) -> usize {
+        self.rank_pruning_cache.len()
     }
 
     /// Canonical published path, or a stable synthetic label for owned bytes.
@@ -10343,6 +10478,38 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn rank_pruning_cache_caps_unique_terms_and_rejects_dictionary_drift() {
+        let cache = RankPruningCache::new();
+        let term_metadata =
+            TermMetadata::without_positions(1, ByteSpan::new(0, 1), ByteSpan::new(0, 1));
+        for term_ord in
+            0..u32::try_from(MAX_RANK_PRUNING_CACHE_TERMS + 16).expect("cache test count fits u32")
+        {
+            cache
+                .insert(
+                    term_ord,
+                    term_metadata,
+                    Arc::new(ValidatedTermPruningMetadata::empty_for_cache_test()),
+                )
+                .expect("bounded cache admission");
+        }
+        assert_eq!(cache.len(), MAX_RANK_PRUNING_CACHE_TERMS);
+        assert!(
+            cache
+                .get(
+                    u32::try_from(MAX_RANK_PRUNING_CACHE_TERMS).expect("cache limit fits u32"),
+                    term_metadata,
+                )
+                .expect("bounded cache lookup")
+                .is_none(),
+            "terms beyond the cap must remain query-local"
+        );
+
+        let drifted = TermMetadata::without_positions(1, ByteSpan::new(1, 1), ByteSpan::new(0, 1));
+        assert!(cache.get(0, drifted).is_err());
+    }
 
     fn array_tombstone_bytes(chunk_id: u16, lows: &[u16]) -> Vec<u8> {
         let mut bytes = Vec::new();

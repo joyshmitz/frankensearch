@@ -670,6 +670,7 @@ impl<T: Copy + Default> TypedChainArena<T> {
     }
 }
 
+#[derive(Clone)]
 struct ChainIter<'a, T: Copy + Default> {
     arena: &'a TypedChainArena<T>,
     block: Option<usize>,
@@ -2307,6 +2308,21 @@ impl<'a> DeltaTerm<'a> {
             .count()
     }
 
+    /// Compute the live cardinality and whole-term pruning envelope in one
+    /// physical-chain pass.
+    #[must_use]
+    pub(crate) fn live_doc_freq_and_block_max(self) -> (usize, Option<DeltaBlockMax>) {
+        let live_doc_freq = self.live_doc_freq();
+        let block_max = (live_doc_freq != 0).then(|| {
+            let chain = &self.delta.chains[self.term_index as usize];
+            DeltaBlockMax {
+                max_frequency_code: chain.max_frequency_code,
+                min_fieldnorm_id: chain.min_fieldnorm_id,
+            }
+        });
+        (live_doc_freq, block_max)
+    }
+
     /// Conservative whole-term impact envelope for future pruning paths.
     ///
     /// Returns `None` when every physical posting has been superseded or
@@ -2314,14 +2330,7 @@ impl<'a> DeltaTerm<'a> {
     /// which only makes it more conservative.
     #[must_use]
     pub fn block_max(self) -> Option<DeltaBlockMax> {
-        if self.live_doc_freq() == 0 {
-            return None;
-        }
-        let chain = &self.delta.chains[self.term_index as usize];
-        Some(DeltaBlockMax {
-            max_frequency_code: chain.max_frequency_code,
-            min_fieldnorm_id: chain.min_fieldnorm_id,
-        })
+        self.live_doc_freq_and_block_max().1
     }
 
     /// Whether an owner-bound posting remains visible in this generation.
@@ -2366,6 +2375,7 @@ impl<'a> DeltaTerm<'a> {
 }
 
 /// Physical posting iterator for one owner-bound term.
+#[derive(Clone)]
 pub struct DeltaPostings<'a> {
     inner: ChainIter<'a, PostingRecord>,
     term_index: u32,

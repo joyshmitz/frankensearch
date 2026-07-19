@@ -6090,3 +6090,63 @@ rrf_config tier_weighted/hash_tiebreak realistic. Two regressions are newly deci
 normalize_signal's single-pass rewrite is ~14% SLOWER at n192/n1536, and neighbor_smooth_recip's
 v2 mutual is ~1.2× slower — both warrant follow-up before any KEEP claim. Any future KEEP/REJECT
 row for these benches must quote the lever median AND its null p5/p95 from the same run.
+
+## 2026-07-19 — Direct-term MaxScore + Block-Max WAND rank-safe pruning (`bd-quill-e4-argus-3ycz.4`, SapphireHill)
+
+The retained E4.4 path adds exact two-pass MaxScore for root unions with 2–8
+direct term children and Block-Max WAND for direct 9+-term unions above the
+physical-list cost threshold. Every skip ceiling is reconstructed at query time
+from validated `(max_frequency, min_fieldnorm)` metadata plus the live
+snapshot's idf/avgdl; no stored impact scalar participates. Sealed terms use
+paired POSTINGS/BLOCKMAX metadata, while Delta supplies conservative whole-term
+bounds for MaxScore and deliberately opts out of BMW because it has no physical
+skip blocks. Exact-count, zero-limit, unsupported, and nested scorer shapes stay
+on the compressed POSTINGS-only exhaustive path.
+
+Repeated validation is amortized by a lock-free-read, bounded-admission cache
+owned by each immutable recovered segment (maximum 128 terms and 16 MiB of
+validated payload). Cache identity includes the complete term dictionary
+metadata, and construction privately pairs each BLOCKMAX row with the exact
+POSTINGS block table it validated. Exact-count queries never initiate cache
+population. The cache payload numbers below exclude the small cache-row and
+`Arc` bookkeeping overhead.
+
+Authoritative profile: strict remote execution on RCH worker `hz1`, release
+profile with LTO, one final binary, 21 alternating paired rounds plus seven
+alternating-order latency trials. The timer starts before DOCLEN/POSTINGS cursor
+opening and includes scorer construction, collection, and finish. Warm arms
+reuse the segment-equivalent validated metadata cache; a separate single cold
+observation includes POSTINGS parse and full BLOCKMAX validation. Ratios are
+pruned/exhaustive, so `< 1` is faster:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=hz1 \
+  rch exec -- cargo test --profile release -p frankensearch-quill \
+  argus::tests::e44_disjunction_profile_100k_and_1m -- \
+  --ignored --exact --nocapture
+```
+
+| strategy | docs | warm exhaustive median | warm pruned median | lever median [p5, p95] | A/A null [p5, p95] | speedup | cached payload |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| MaxScore, 8 direct terms | 100k | 7,674 us | 535 us | **0.069302 [0.063037, 0.072217]** | 0.997529 [0.818903, 1.016239] | **14.43×** | 64,656 B |
+| BMW, 9 direct terms | 100k | 7,800 us | 1,603 us | **0.198811 [0.193835, 0.205571]** | 0.999935 [0.983390, 1.012372] | **5.03×** | 68,832 B |
+| MaxScore, 8 direct terms | 1M | 83,417 us | 2,624 us | **0.032588 [0.031035, 0.044329]** | 0.996991 [0.870855, 1.060778] | **30.69×** | 644,544 B |
+| BMW, 9 direct terms | 1M | 79,093 us | 19,846 us | **0.176633 [0.155324, 0.256451]** | 1.007424 [0.945164, 1.112317] | **5.66×** | 686,256 B |
+
+Every lever median is below its same-binary null p5. The single cold observations
+also favored pruning: 10,035→2,821 us and 8,390→3,398 us at 100k; 103,635→19,448
+us and 102,474→34,928 us at 1M for MaxScore and BMW respectively. These cold
+numbers are setup-inclusive routing evidence, not substituted for the paired
+warm claim.
+
+Rank safety is separately pinned by exact global-docid and `f32::to_bits()`
+comparison against exhaustive collection at k={1,10,100,1000}, randomized
+corpora, tombstones/offsets, and mixed sealed+Delta snapshots whose live avgdl
+differs from seal-time avgdl. The final strict-remote Quill suite passed 431
+tests (0 failed, 2 ignored, one known flaky symlink case explicitly filtered).
+The rejected nested-union attempt and its 19–26% regression are retained in
+`docs/NEGATIVE_EVIDENCE.md`.
+
+**Decision: KEEP.** Ship direct-term MaxScore, direct high-clause BMW, the
+bounded validated-metadata cache, exact-count bypass, structural/runtime
+fail-closed gates, and the retained ignored profile.

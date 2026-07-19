@@ -22,9 +22,10 @@ use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::argus::{
-    ArgusError, Bm25FieldSnapshot, DeltaFieldNorms, DeltaPostingCursor, DocSetCollector,
-    FieldNormReader, PhraseScorer, PhraseTerm, PositionsHandle, PositionsReader, PostingCursor,
-    ReferenceScorer, ScorerClause, TermScorer, TopDocsCollector,
+    ArgusError, BMW_MIN_CLAUSES, Bm25FieldSnapshot, DeltaFieldNorms, DeltaPostingCursor,
+    DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer, PhraseTerm,
+    PositionsHandle, PositionsReader, PostingCursor, ReferenceScorer, ScorerClause,
+    SealedPostingCursor, TermScorer, TopDocsCollector,
 };
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
@@ -43,9 +44,10 @@ use crate::query::{
     canonicalize_query,
 };
 use crate::quiver::{
-    DocLenCodecError, DocLenSection, EncodedNumericSection, NumericEntry, NumericField,
-    NumericFieldInput, NumericSection, NumericValue, PositionCodecError, PositionList, Posting,
-    PostingCodecError, PostingList, SnapshotFieldStats, StoredMetaCodecError, StoredMetaSection,
+    BlockMaxError, DocLenCodecError, DocLenField, DocLenSection, EncodedNumericSection,
+    NumericEntry, NumericField, NumericFieldInput, NumericSection, NumericValue,
+    PositionCodecError, PositionList, Posting, PostingCodecError, PostingList, SnapshotFieldStats,
+    StoredMetaCodecError, StoredMetaSection,
 };
 use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
@@ -89,6 +91,9 @@ pub enum QuillIndexError {
     /// A posting list was malformed.
     #[error(transparent)]
     Postings(#[from] PostingCodecError),
+    /// A block-max list was malformed or inconsistent with POSTINGS/DOCLEN.
+    #[error(transparent)]
+    BlockMax(#[from] BlockMaxError),
     /// A positions list was malformed.
     #[error(transparent)]
     Positions(#[from] PositionCodecError),
@@ -2241,6 +2246,7 @@ impl QuillIndex {
         } else {
             TopDocsCollector::new(limit, offset)?
         };
+        let rank_pruning = !exact_count && limit != 0 && query_has_prunable_root_union(query, 1.0);
         for segment in keeper.segments() {
             check_cancel(cx, "search")?;
             let score_span = tracing::info_span!(
@@ -2260,6 +2266,7 @@ impl QuillIndex {
                 snapshot,
                 self.schema,
                 self.config.glob_expansion_limit,
+                rank_pruning,
             )?;
             collector.collect(&mut scorer, segment)?;
         }
@@ -2283,6 +2290,7 @@ impl QuillIndex {
                 snapshot,
                 self.schema,
                 self.config.glob_expansion_limit,
+                rank_pruning,
             )?;
             collector.collect(&mut scorer, delta.as_ref())?;
         }
@@ -2851,6 +2859,7 @@ fn lower_query<'a>(
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
+    rank_pruning: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         query,
@@ -2860,6 +2869,7 @@ fn lower_query<'a>(
         schema,
         glob_expansion_limit,
         QueryLoweringMode::Scored,
+        rank_pruning,
     )
 }
 
@@ -2879,6 +2889,86 @@ fn lower_query_unscored<'a>(
         schema,
         glob_expansion_limit,
         QueryLoweringMode::Unscored,
+        false,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrunableScorerShape {
+    Empty,
+    Term,
+    Union { children: usize, direct_terms: bool },
+}
+
+/// Mirror the score-tree topology that lowering will build without opening any
+/// segment sections. Only pure non-negative term unions can consume `MaxScore`
+/// or BMW metadata; every other shape keeps the pre-E4.4 POSTINGS-only path.
+fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<PrunableScorerShape> {
+    match query {
+        Query::Empty => Some(PrunableScorerShape::Empty),
+        Query::Term { fields, .. } => {
+            if fields.iter().any(|field| {
+                let boost = inherited_boost * field.boost;
+                !boost.is_finite() || boost.is_sign_negative()
+            }) {
+                return None;
+            }
+            Some(match fields.len() {
+                0 => PrunableScorerShape::Empty,
+                1 => PrunableScorerShape::Term,
+                children => PrunableScorerShape::Union {
+                    children,
+                    direct_terms: true,
+                },
+            })
+        }
+        Query::Boolean { clauses, .. }
+            if clauses
+                .iter()
+                .all(|clause| clause.occur == crate::query::Occur::Should) =>
+        {
+            let mut children = 0_usize;
+            let mut singleton = PrunableScorerShape::Empty;
+            let mut direct_terms = true;
+            for clause in clauses {
+                let shape = prunable_scorer_shape(&clause.query, inherited_boost)?;
+                if shape == PrunableScorerShape::Empty {
+                    continue;
+                }
+                children = children.checked_add(1)?;
+                direct_terms &= shape == PrunableScorerShape::Term;
+                singleton = shape;
+            }
+            Some(match children {
+                0 => PrunableScorerShape::Empty,
+                1 => singleton,
+                _ => PrunableScorerShape::Union {
+                    children,
+                    direct_terms,
+                },
+            })
+        }
+        Query::Boost { query, factor } => {
+            let boost = inherited_boost * *factor;
+            (boost.is_finite() && !boost.is_sign_negative())
+                .then(|| prunable_scorer_shape(query, boost))?
+        }
+        Query::All
+        | Query::Phrase { .. }
+        | Query::Range { .. }
+        | Query::Set { .. }
+        | Query::Glob { .. }
+        | Query::Boolean { .. } => None,
+    }
+}
+
+fn query_has_prunable_root_union(query: &Query, inherited_boost: f32) -> bool {
+    matches!(
+        prunable_scorer_shape(query, inherited_boost),
+        Some(PrunableScorerShape::Union {
+            children: 2..=MAX_SCORE_MAX_CLAUSES | BMW_MIN_CLAUSES..,
+            direct_terms: true,
+        })
     )
 }
 
@@ -2907,6 +2997,7 @@ fn lower_query_with_mode<'a>(
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
     mode: QueryLoweringMode,
+    rank_pruning: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     match query {
         Query::Empty => Ok(ReferenceScorer::empty()),
@@ -2932,6 +3023,7 @@ fn lower_query_with_mode<'a>(
                     field.field_id,
                     text.as_bytes(),
                     inherited_boost * field.boost,
+                    rank_pruning,
                 )?));
             }
             lower_boolean(clauses, mode)
@@ -2958,6 +3050,7 @@ fn lower_query_with_mode<'a>(
                         field.field_id,
                         term.text.as_bytes(),
                         inherited_boost * field.boost,
+                        false,
                     )?));
                 }
                 return lower_boolean(clauses, mode);
@@ -3029,6 +3122,7 @@ fn lower_query_with_mode<'a>(
                         schema,
                         glob_expansion_limit,
                         mode,
+                        rank_pruning,
                     )?,
                 ));
             }
@@ -3049,6 +3143,7 @@ fn lower_query_with_mode<'a>(
                 schema,
                 glob_expansion_limit,
                 mode,
+                rank_pruning,
             )
         }
         Query::Range {
@@ -3735,7 +3830,7 @@ fn lower_leaf_string_predicate<'a>(
         .map_err(|_| invalid_state("could not allocate string predicate clauses"))?;
     for term in terms {
         clauses.push(ScorerClause::should(lower_leaf_term(
-            leaf, snapshot, schema, field_ord, &term, 1.0,
+            leaf, snapshot, schema, field_ord, &term, 1.0, false,
         )?));
     }
     let matching = lower_boolean(clauses, QueryLoweringMode::Unscored)?;
@@ -3822,17 +3917,16 @@ fn lower_leaf_term<'a>(
     field_ord: u16,
     term: &[u8],
     boost: f32,
+    rank_pruning: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let stats = composite_snapshot_field(snapshot, field_ord)?;
     let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
     match leaf {
-        QueryLeaf::Sealed(segment) => build_term_scorer(
-            open_owned_cursor(segment, schema, field_ord, term, false)?,
-            owned_fieldnorms(segment, schema, field_ord)?,
-            stats,
-            doc_freq,
-            boost,
-        ),
+        QueryLeaf::Sealed(segment) => {
+            let (cursor, fieldnorms) =
+                open_sealed_term_cursor(segment, schema, field_ord, term, rank_pruning)?;
+            build_term_scorer(cursor, fieldnorms, stats, doc_freq, boost)
+        }
         QueryLeaf::Delta(delta) => build_term_scorer(
             DeltaPostingCursor::new(delta, field_ord, term)?,
             DeltaFieldNorms::new(delta, field_ord),
@@ -3841,6 +3935,74 @@ fn lower_leaf_term<'a>(
             boost,
         ),
     }
+}
+
+fn open_sealed_term_cursor<'a>(
+    segment: &'a RecoveredSegment,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    term: &[u8],
+    rank_pruning: bool,
+) -> Result<(SealedPostingCursor<'a>, DocLenField<'a>), QuillIndexError> {
+    let manifest = segment.manifest();
+    let expected = term_field_ords(schema);
+    let doclen = DocLenSection::parse(
+        required_section(segment, SectionKind::DOCLEN)?,
+        manifest.docid_lo,
+        manifest.docid_hi,
+        &expected,
+    )?;
+    let fieldnorms = doclen
+        .field(field_ord)
+        .ok_or_else(|| invalid_state(format!("DOCLEN has no field {field_ord}")))?;
+    let dictionary = open_dictionary(segment, schema)?;
+    let Some(found) = dictionary.lookup(field_ord, term)? else {
+        let postings = PostingList::parse(&[], 0)?.into_cursor()?;
+        let cursor = SealedPostingCursor::from_owned(postings, 0, segment.doc_count());
+        return Ok((cursor, fieldnorms));
+    };
+
+    let postings_section = required_section(segment, SectionKind::POSTINGS)?;
+    let postings_bytes = span(postings_section, found.metadata.postings, "POSTINGS")?;
+    if let Some(cached) = segment
+        .cached_rank_pruning_metadata(found.term_ord, found.metadata)
+        .map_err(invalid_state)?
+    {
+        let cursor = if rank_pruning {
+            SealedPostingCursor::from_validated_pruning(
+                postings_bytes,
+                cached,
+                segment.doc_count(),
+            )?
+        } else {
+            let size_hint = cached.doc_freq();
+            SealedPostingCursor::from_owned(
+                cached.cursor(postings_bytes)?,
+                size_hint,
+                segment.doc_count(),
+            )
+        };
+        return Ok((cursor, fieldnorms));
+    }
+    let postings = PostingList::parse(postings_bytes, found.metadata.doc_freq)?;
+    if !rank_pruning {
+        let size_hint = postings.doc_freq();
+        let cursor = postings.into_cursor()?;
+        return Ok((
+            SealedPostingCursor::from_owned(cursor, size_hint, segment.doc_count()),
+            fieldnorms,
+        ));
+    }
+    let blockmax_section = required_section(segment, SectionKind::BLOCKMAX)?;
+    let blockmax_bytes = span(blockmax_section, found.metadata.blockmax, "BLOCKMAX")?;
+    let pruning = Arc::new(postings.into_pruning_metadata(blockmax_bytes, fieldnorms)?);
+    let pruning = segment
+        .cache_rank_pruning_metadata(found.term_ord, found.metadata, pruning)
+        .map_err(invalid_state)?;
+    Ok((
+        SealedPostingCursor::from_validated_pruning(postings_bytes, pruning, segment.doc_count())?,
+        fieldnorms,
+    ))
 }
 
 fn composite_snapshot_field(
@@ -6954,6 +7116,206 @@ mod tests {
             assert_eq!(
                 mixed.collect_docids(&cx, "alpha").expect("mixed docset"),
                 vec![0, delta_docid]
+            );
+        });
+    }
+
+    #[test]
+    fn rank_pruning_gate_matches_runtime_union_capabilities() {
+        let parser = DefaultQueryParser::new(DEFAULT_SCHEMA).expect("bind shipping parser");
+        let nested_two = parser.parse("alpha OR beta");
+        assert!(
+            !query_has_prunable_root_union(&nested_two.query, 1.0),
+            "nested field unions eagerly score their own windows and must stay exhaustive"
+        );
+
+        let direct_two = parser.parse("content:alpha OR content:beta");
+        assert!(
+            query_has_prunable_root_union(&direct_two.query, 1.0),
+            "two direct term children are MaxScore-capable"
+        );
+
+        let nested_nine = parser
+            .parse("alpha OR beta OR gamma OR delta OR epsilon OR zeta OR eta OR theta OR iota");
+        assert!(
+            !query_has_prunable_root_union(&nested_nine.query, 1.0),
+            "nine default multi-field children cannot supply physical BMW blocks"
+        );
+
+        let direct_nine = parser.parse(
+            "content:alpha OR content:beta OR content:gamma OR content:delta OR \
+             content:epsilon OR content:zeta OR content:eta OR content:theta OR content:iota",
+        );
+        assert!(
+            query_has_prunable_root_union(&direct_nine.query, 1.0),
+            "nine direct sealed term children are BMW-capable"
+        );
+    }
+
+    #[test]
+    fn mixed_snapshot_disjunction_count_free_matches_exhaustive_at_pinned_k() {
+        const DOCS_PER_RESIDENCY: u32 = 5_000;
+        run_with_cx(|cx| async move {
+            let mut mixed = QuillIndex::in_memory(deterministic_config()).expect("mixed index");
+            let mut sealed_documents = Vec::with_capacity(
+                usize::try_from(DOCS_PER_RESIDENCY).expect("fixture count fits usize"),
+            );
+            for ordinal in 0..DOCS_PER_RESIDENCY {
+                let content = if ordinal == 4_352 {
+                    std::iter::repeat_n("alpha", 64)
+                        .chain(std::iter::once("beta"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    "alpha beta".to_owned()
+                };
+                let title = if ordinal.is_multiple_of(2) {
+                    "alpha"
+                } else {
+                    "unrelated"
+                };
+                sealed_documents.push(
+                    IndexableDocument::new(format!("sealed-{ordinal:05}"), content)
+                        .with_title(title),
+                );
+            }
+            mixed
+                .index_documents(&cx, &sealed_documents)
+                .await
+                .expect("accumulate large sealed fixture");
+            mixed.commit(&cx).await.expect("seal large fixture");
+            let keeper = Arc::new(mixed.snapshot().clone());
+            let sealed_snapshot = QuillSearchSnapshot::compose(0, Arc::clone(&keeper), Vec::new())
+                .expect("sealed-only statistics snapshot");
+            let sealed_stats = sealed_snapshot
+                .bm25_field_stats(CONTENT_FIELD)
+                .expect("sealed content statistics");
+
+            let generation = keeper.loaded_manifest().manifest.generation;
+            let delta_base = u64::from(DOC_ORDS_PER_LEASE);
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, delta_base, usize::MAX)
+                .expect("large Delta shard");
+            for ordinal in 0..DOCS_PER_RESIDENCY {
+                let global_docid = u32::try_from(delta_base + u64::from(ordinal))
+                    .expect("Delta fixture docid fits u32");
+                let content = if ordinal == 4_352 {
+                    "alpha beta beta beta beta beta beta beta beta beta"
+                } else {
+                    "alpha beta gamma delta epsilon zeta eta theta"
+                };
+                apply_tokenized_delta_document(
+                    &mut delta,
+                    global_docid,
+                    &format!("delta-{ordinal:05}"),
+                    content,
+                );
+            }
+            let delta = Arc::new(delta.freeze(generation));
+            mixed
+                .publish_delta_table(vec![delta])
+                .expect("publish large mixed snapshot");
+            let live_snapshot = mixed.search_snapshot();
+            let live_stats = live_snapshot
+                .bm25_field_stats(CONTENT_FIELD)
+                .expect("mixed content statistics");
+            assert_ne!(
+                sealed_stats
+                    .average_field_length()
+                    .expect("sealed avgdl")
+                    .to_bits(),
+                live_stats
+                    .average_field_length()
+                    .expect("mixed avgdl")
+                    .to_bits(),
+                "query-time avgdl must differ from the value at block seal time"
+            );
+
+            let direct_query = "content:alpha OR content:beta";
+            let parsed = DefaultQueryParser::new(DEFAULT_SCHEMA)
+                .expect("bind shipping parser")
+                .parse(direct_query);
+            let segment = live_snapshot
+                .keeper_snapshot()
+                .segments()
+                .first()
+                .expect("mixed fixture has one sealed segment");
+            assert_eq!(segment.cached_rank_pruning_term_count(), 0);
+            let exact_probe = mixed
+                .search_paginated(&cx, direct_query, 1, 0, true)
+                .expect("execute exact-count cache probe");
+            assert_eq!(exact_probe.total_count, Some(10_000));
+            assert_eq!(
+                segment.cached_rank_pruning_term_count(),
+                0,
+                "exact counting must not trigger BLOCKMAX validation"
+            );
+            let mut direct = lower_query(
+                &parsed.query,
+                1.0,
+                QueryLeaf::Sealed(segment),
+                &live_snapshot,
+                DEFAULT_SCHEMA,
+                1_024,
+                true,
+            )
+            .expect("lower direct disjunction with pruning metadata");
+            let mut direct_collector = TopDocsCollector::new(1, 0).expect("top-one collector");
+            direct_collector
+                .collect(&mut direct, segment)
+                .expect("collect direct disjunction");
+            let (maxscore_windows, bmw_windows) = direct
+                .pruning_window_counts()
+                .expect("direct disjunction remains a top-level union");
+            assert!(
+                maxscore_windows > 0,
+                "direct disjunction silently fell back"
+            );
+            assert_eq!(bmw_windows, 0);
+            assert_eq!(
+                segment.cached_rank_pruning_term_count(),
+                2,
+                "only content alpha/beta should be cached"
+            );
+
+            for limit in [1, 10, 100, 1_000] {
+                let count_free = mixed
+                    .search_paginated(&cx, direct_query, limit, 0, false)
+                    .expect("execute count-free disjunction");
+                let exhaustive = mixed
+                    .search_paginated(&cx, direct_query, limit, 0, true)
+                    .expect("execute exhaustive counted disjunction");
+                assert_eq!(count_free.total_count, None);
+                assert_eq!(
+                    exhaustive.total_count,
+                    Some(u64::from(DOCS_PER_RESIDENCY) * 2)
+                );
+                assert_eq!(count_free.hits.len(), exhaustive.hits.len());
+                for (candidate, oracle) in count_free.hits.iter().zip(&exhaustive.hits) {
+                    assert_eq!(candidate.document_id, oracle.document_id);
+                    assert_eq!(candidate.global_docid, oracle.global_docid);
+                    assert_eq!(candidate.score.to_bits(), oracle.score.to_bits());
+                }
+                assert_eq!(segment.cached_rank_pruning_term_count(), 2);
+            }
+
+            let nested_count_free = mixed
+                .search_paginated(&cx, "alpha OR beta", 10, 0, false)
+                .expect("execute nested count-free fallback");
+            let nested_exhaustive = mixed
+                .search_paginated(&cx, "alpha OR beta", 10, 0, true)
+                .expect("execute nested exhaustive oracle");
+            assert_eq!(nested_count_free.total_count, None);
+            assert_eq!(nested_exhaustive.total_count, Some(10_000));
+            assert_eq!(nested_count_free.hits.len(), nested_exhaustive.hits.len());
+            for (candidate, oracle) in nested_count_free.hits.iter().zip(&nested_exhaustive.hits) {
+                assert_eq!(candidate.document_id, oracle.document_id);
+                assert_eq!(candidate.global_docid, oracle.global_docid);
+                assert_eq!(candidate.score.to_bits(), oracle.score.to_bits());
+            }
+            assert_eq!(
+                segment.cached_rank_pruning_term_count(),
+                2,
+                "nested fallback must not validate title BLOCKMAX metadata"
             );
         });
     }

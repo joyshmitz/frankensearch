@@ -767,6 +767,24 @@ fn quill_observation_from_results(
             reason: "Quill collector modes disagreed on parser diagnostics".to_owned(),
         });
     }
+    let expected_start = offset.min(evidence.hits.len());
+    let expected_end = page_end.min(evidence.hits.len());
+    let expected_page = &evidence.hits[expected_start..expected_end];
+    let rank_safe = observed.hits.len() == expected_page.len()
+        && observed
+            .hits
+            .iter()
+            .zip(expected_page)
+            .all(|(actual, expected)| {
+                actual.global_docid == expected.global_docid
+                    && actual.document_id == expected.document_id
+                    && actual.score.to_bits() == expected.score.to_bits()
+            });
+    if !rank_safe {
+        return Err(GauntletError::InvalidObservation {
+            reason: "Quill observed and exhaustive collector pages differ".to_owned(),
+        });
+    }
     let total_count = evidence
         .total_count
         .ok_or_else(|| GauntletError::InvalidObservation {
@@ -2914,6 +2932,39 @@ mod tests {
             ));
         });
         assert_eq!(observe_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn quill_observation_rejects_any_count_free_rank_drift() {
+        let evidence = QuillSearchResult {
+            hits: vec![frankensearch_quill::QuillHit {
+                document_id: "winner".to_owned(),
+                global_docid: 7,
+                score: 3.5,
+            }],
+            total_count: Some(1),
+            doc_count: 1,
+            diagnostics: Vec::new(),
+        };
+        let observed = QuillSearchResult {
+            total_count: None,
+            ..evidence.clone()
+        };
+        let expected_reason = "Quill observed and exhaustive collector pages differ";
+
+        let mut wrong_external_id = observed.clone();
+        wrong_external_id.hits[0].document_id = "other".to_owned();
+        let mut wrong_native_tie_key = observed.clone();
+        wrong_native_tie_key.hits[0].global_docid = 8;
+        let mut wrong_score_bits = observed;
+        wrong_score_bits.hits[0].score = f32::from_bits(3.5_f32.to_bits() + 1);
+
+        for mismatch in [wrong_external_id, wrong_native_tie_key, wrong_score_bits] {
+            assert!(matches!(
+                quill_observation_from_results(&mismatch, &evidence, 1, 0, false),
+                Err(GauntletError::InvalidObservation { reason }) if reason == expected_reason
+            ));
+        }
     }
 
     #[test]

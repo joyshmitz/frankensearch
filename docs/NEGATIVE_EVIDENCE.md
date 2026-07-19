@@ -15651,3 +15651,35 @@ local Cargo fallback was used.
 retain only this evidence. Leave `bd-quill-e3-keeper-ndtk.5` `in_progress`, add
 no PERF_LEDGER win, and do not claim the flat CPU/physical-byte acceptance
 criterion.
+
+### 2026-07-19 — SapphireHill — REJECTED topology: nested field-union MaxScore adds 19–26% after caching (`bd-quill-e4-argus-3ycz.4`)
+
+The first E4.4 MaxScore cut accepted a root union whose logical children were
+themselves buffered field unions, matching the default parser shape for
+`alpha OR beta`. Candidate discovery used independent movement-only shadows so
+the second pass retained exact scorer-vector addition order and score bits.
+That was rank-safe, but it could not save the dominant work: every inner
+`BufferedUnionScorer` had already scored its complete 4,096-doc window before
+root MaxScore saw the running top-k cutoff. The shadow traversal and candidate
+merge therefore became pure overhead.
+
+One strict-remote release-LTO run on RCH worker `hz1` used 21 paired rounds for
+the same-binary A/A floor and seven alternating-order medians. Ratios are
+pruned/exhaustive, so values above 1 are slower:
+
+| nested union-of-unions | cold exhaustive | cold pruned | warm exhaustive median | warm pruned median | lever median | null p5–p95 | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 100k docs | 10,613 us | 13,908 us | 9,913 us | 12,237 us | **1.255722** | 0.986475–1.011886 | **DECIDABLE REGRESSION** |
+| 1M docs | 104,140 us | 138,636 us | 97,576 us | 117,715 us | **1.194165** | 0.836461–1.043851 | **DECIDABLE REGRESSION** |
+
+An earlier setup-inclusive 100k probe had independently measured 11,101 us
+exhaustive versus 14,095 us pruned (`1.273357`, null p95 `1.005864`), so the
+result is not a cache-placement artifact. The validated per-term metadata cache
+removes repeated BLOCKMAX parsing, but cannot make eager nested scoring lazy.
+
+**Decision: REJECT this topology.** The movement-only nested shadow was removed.
+Both the query-shape gate and the Argus runtime now fail closed to exhaustive
+collection unless a 2–8-clause MaxScore root has direct term children. Direct
+term MaxScore and direct 9+-term BMW are measured separately in
+`docs/PERF_LEDGER.md`; a future nested attempt must first introduce deferred
+group scoring and beat this same setup-inclusive null-controlled comparator.
