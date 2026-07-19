@@ -2,7 +2,7 @@
 //!
 //! This module owns mutable storage invariants and the immutable freeze
 //! boundary. Composite publication lives in `index`, allocation-free cursor
-//! adapters live in `argus`, and FSLX sealing remains a separate E5 milestone.
+//! adapters live in `argus`, and canonical FSLX sealing lives in `scribe`.
 
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::config::DEFAULT_DELTA_BUDGET_BYTES;
 use crate::contract::fieldnorm_to_id;
 use crate::grimoire::MAX_TERM_BYTES;
-use crate::quiver::POSTINGS_PER_BLOCK;
+use crate::quiver::{NumericValue, POSTINGS_PER_BLOCK};
 use crate::schema::{FieldKind, SchemaDescriptor};
 #[cfg(test)]
 use crate::scribe::{ArenaSpan, FIELD_PREFIX_BYTES, TERM_BUCKET_BYTES_ESTIMATE};
@@ -124,6 +124,60 @@ pub enum DeltaError {
         previous: u32,
         current: u32,
     },
+    /// A value named no field in the validated dense descriptor.
+    #[error("delta value names unknown schema field {field_ord}")]
+    UnknownValueField { field_ord: u16 },
+    /// A document may supply a field through only one value input.
+    #[error("delta document {global_docid} supplies field {field_ord} more than once")]
+    DuplicateValueField { global_docid: u32, field_ord: u16 },
+    /// A typed numeric value named a string or stored-only field.
+    #[error("delta field {field_ord} ({field_name}) is not numeric")]
+    NonNumericField {
+        field_ord: u16,
+        field_name: &'static str,
+    },
+    /// A typed numeric value named a non-indexed numeric field.
+    #[error("delta numeric field {field_ord} ({field_name}) is not indexed")]
+    NonIndexedNumericField {
+        field_ord: u16,
+        field_name: &'static str,
+    },
+    /// An in-memory numeric tag disagreed with the schema descriptor.
+    #[error("delta numeric field {field_ord} ({field_name}) expects {expected}, got {actual}")]
+    NumericTypeMismatch {
+        field_ord: u16,
+        field_name: &'static str,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    /// A value named a field whose descriptor does not store original bytes.
+    #[error("delta field {field_ord} ({field_name}) is not stored")]
+    NonStoredField {
+        field_ord: u16,
+        field_name: &'static str,
+    },
+    /// Opaque bytes used as a numeric value must be exactly one scalar wide.
+    #[error(
+        "delta numeric field {field_ord} ({field_name}) has {actual} stored bytes, expected {expected}"
+    )]
+    InvalidNumericBytes {
+        field_ord: u16,
+        field_name: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    /// One stored value cannot be represented by the durable u32 offsets.
+    #[error("delta stored field {field_ord} value is {bytes} bytes and exceeds the u32 domain")]
+    StoredValueTooLarge { field_ord: u16, bytes: usize },
+    /// Appending a value would make one field blob exceed the durable u32 domain.
+    #[error(
+        "delta stored field {field_ord} blob cannot append {appended} bytes to its current {current} bytes"
+    )]
+    StoredBlobTooLarge {
+        field_ord: u16,
+        current: usize,
+        appended: usize,
+    },
     /// Per-term postings must remain strictly ascending.
     #[error(
         "delta field {field_ord} term {term:?} docid {global_docid} does not follow {previous}"
@@ -160,6 +214,55 @@ pub struct DeltaFieldNorm {
     pub raw_length: u32,
     /// Tantivy-compatible quantized fieldnorm byte.
     pub fieldnorm_id: u8,
+}
+
+/// One schema-typed indexed numeric value retained for sealing.
+///
+/// When the descriptor also sets `stored=true`, the delta derives the exact
+/// canonical eight little-endian stored bytes automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaNumericValue {
+    /// Stable schema field ordinal.
+    pub field_ord: u16,
+    /// Signed or unsigned value matching the field descriptor.
+    pub value: NumericValue,
+}
+
+impl DeltaNumericValue {
+    /// Construct one signed indexed value.
+    #[must_use]
+    pub const fn i64(field_ord: u16, value: i64) -> Self {
+        Self {
+            field_ord,
+            value: NumericValue::I64(value),
+        }
+    }
+
+    /// Construct one unsigned indexed value.
+    #[must_use]
+    pub const fn u64(field_ord: u16, value: u64) -> Self {
+        Self {
+            field_ord,
+            value: NumericValue::U64(value),
+        }
+    }
+}
+
+/// One opaque schema-stored value retained for sealing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaStoredValue<'a> {
+    /// Stable schema field ordinal.
+    pub field_ord: u16,
+    /// Borrowed opaque bytes copied into the delta on apply.
+    pub bytes: &'a [u8],
+}
+
+impl<'a> DeltaStoredValue<'a> {
+    /// Construct one borrowed stored value.
+    #[must_use]
+    pub const fn new(field_ord: u16, bytes: &'a [u8]) -> Self {
+        Self { field_ord, bytes }
+    }
 }
 
 /// One grouped term posting for a completed document.
@@ -632,6 +735,21 @@ struct FieldNormColumn {
     fieldnorm_ids: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct NumericColumn {
+    field_ord: u16,
+    values: Vec<Option<NumericValue>>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredColumn {
+    field_ord: u16,
+    values: Vec<Option<Vec<u8>>>,
+    payload_bytes: usize,
+}
+
+type ResolvedDocumentValues = (Vec<Option<NumericValue>>, Vec<Option<Vec<u8>>>);
+
 #[derive(Debug, Clone, Copy)]
 struct TermChain {
     postings: ChainState,
@@ -670,9 +788,12 @@ pub struct DeltaSegment {
     position_arena: TypedChainArena<u32>,
     document_docids: Vec<u32>,
     document_ids: Vec<DocId>,
+    document_content_hashes: Vec<Option<u64>>,
     document_term_offsets: Vec<u32>,
     document_term_ids: Vec<u32>,
     fieldnorms: Vec<FieldNormColumn>,
+    numeric_fields: Vec<NumericColumn>,
+    stored_fields: Vec<StoredColumn>,
     live_ids: AHashMap<DocId, u32>,
     tombstone_words: Vec<u64>,
     tombstone_count: usize,
@@ -690,6 +811,7 @@ pub struct DeltaSegment {
 pub struct DeltaSnapshot {
     segment: DeltaSegment,
     keeper_generation: u64,
+    lineage_id: u64,
 }
 
 impl DeltaSnapshot {
@@ -703,6 +825,29 @@ impl DeltaSnapshot {
     #[must_use]
     pub const fn keeper_generation(&self) -> u64 {
         self.keeper_generation
+    }
+
+    /// Clone this exact frozen epoch against a successor Keeper generation.
+    ///
+    /// Sealing one shard advances the MANIFEST generation for every shard.
+    /// Surviving immutable epochs use this operation to retain their private
+    /// lineage witness while receiving owner-isolated arena storage for the
+    /// successor composite publication.
+    #[must_use]
+    pub fn rebind_keeper_generation(&self, keeper_generation: u64) -> Self {
+        let mut rebound = self.segment.freeze(keeper_generation);
+        rebound.lineage_id = self.lineage_id;
+        rebound
+    }
+
+    /// Private shard/epoch/lease identity retained across Keeper rebinding.
+    pub(crate) const fn publication_lineage(&self) -> (u64, u64, u64, u64) {
+        (
+            self.lineage_id,
+            self.segment.generation,
+            self.segment.lease_base,
+            self.segment.lease_end,
+        )
     }
 
     /// Compile-time schema carried by this generation.
@@ -729,6 +874,30 @@ impl DeltaSnapshot {
         self.segment.live_document_count()
     }
 
+    /// Whether one global document id names a visible row in this generation.
+    #[must_use]
+    pub fn is_live_document(&self, global_docid: u32) -> bool {
+        self.segment
+            .document_docids
+            .binary_search(&global_docid)
+            .is_ok()
+            && !self.segment.is_tombstoned(global_docid)
+    }
+
+    /// Materialize one visible row's stable external identifier.
+    #[must_use]
+    pub fn materialize_document_id(&self, global_docid: u32) -> Option<DocId> {
+        let row = self
+            .segment
+            .document_docids
+            .binary_search(&global_docid)
+            .ok()?;
+        if self.segment.is_tombstoned(global_docid) {
+            return None;
+        }
+        self.segment.document_ids.get(row).cloned()
+    }
+
     /// Exact live token numerator for one indexed string field.
     #[must_use]
     pub fn live_total_tokens(&self, field_ord: u16) -> Option<u64> {
@@ -739,6 +908,24 @@ impl DeltaSnapshot {
     #[must_use]
     pub fn fieldnorm_id(&self, field_ord: u16, global_docid: u32) -> Option<u8> {
         self.segment.fieldnorm_id(field_ord, global_docid)
+    }
+
+    /// Physical content hash, including a tombstoned row.
+    #[must_use]
+    pub fn content_hash(&self, global_docid: u32) -> Option<u64> {
+        self.segment.content_hash(global_docid)
+    }
+
+    /// Physical indexed numeric value, including a tombstoned row.
+    #[must_use]
+    pub fn numeric_value(&self, field_ord: u16, global_docid: u32) -> Option<NumericValue> {
+        self.segment.numeric_value(field_ord, global_docid)
+    }
+
+    /// Physical stored bytes, including a tombstoned row.
+    #[must_use]
+    pub fn stored_value(&self, field_ord: u16, global_docid: u32) -> Option<&[u8]> {
+        self.segment.stored_value(field_ord, global_docid)
     }
 
     /// Live-only fieldnorm byte for one visible row in this generation.
@@ -770,6 +957,12 @@ impl DeltaSnapshot {
         let first = u64::from(*self.segment.document_docids.first()?);
         let last = u64::from(*self.segment.document_docids.last()?);
         Some((first, last + 1))
+    }
+}
+
+impl crate::argus::LiveDocs for DeltaSnapshot {
+    fn is_live(&self, global_docid: u32) -> bool {
+        self.is_live_document(global_docid)
     }
 }
 
@@ -828,6 +1021,29 @@ impl DeltaSegment {
                 fieldnorm_ids: Vec::new(),
             })
             .collect();
+        let numeric_fields = schema
+            .fields
+            .iter()
+            .filter_map(|field| match field.kind {
+                FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
+                    Some(NumericColumn {
+                        field_ord: field.id,
+                        values: Vec::new(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let stored_fields = schema
+            .fields
+            .iter()
+            .filter(|field| field.stored)
+            .map(|field| StoredColumn {
+                field_ord: field.id,
+                values: Vec::new(),
+                payload_bytes: 0,
+            })
+            .collect();
         let mut tombstone_words = Vec::new();
         tombstone_words
             .try_reserve_exact(TOMBSTONE_WORDS_PER_LEASE)
@@ -850,9 +1066,12 @@ impl DeltaSegment {
             position_arena: TypedChainArena::new("delta position arena"),
             document_docids: Vec::new(),
             document_ids: Vec::new(),
+            document_content_hashes: Vec::new(),
             document_term_offsets: vec![0],
             document_term_ids: Vec::new(),
             fieldnorms,
+            numeric_fields,
+            stored_fields,
             live_ids: AHashMap::new(),
             tombstone_words,
             tombstone_count: 0,
@@ -899,6 +1118,7 @@ impl DeltaSegment {
     /// batch boundary; composite publication rejects a stale witness.
     #[must_use]
     pub fn freeze(&self, keeper_generation: u64) -> DeltaSnapshot {
+        let snapshot_owner_id = NEXT_DELTA_OWNER_ID.fetch_add(1, Ordering::Relaxed);
         DeltaSnapshot {
             segment: Self {
                 schema: self.schema,
@@ -906,7 +1126,7 @@ impl DeltaSegment {
                 lease_end: self.lease_end,
                 next_docid_floor: self.next_docid_floor,
                 budget_bytes: self.budget_bytes,
-                owner_id: NEXT_DELTA_OWNER_ID.fetch_add(1, Ordering::Relaxed),
+                owner_id: snapshot_owner_id,
                 generation: self.generation,
                 fields: self.fields.clone(),
                 terms: self.terms.clone(),
@@ -915,25 +1135,37 @@ impl DeltaSegment {
                 position_arena: self.position_arena.snapshot_copy(),
                 document_docids: self.document_docids.clone(),
                 document_ids: self.document_ids.clone(),
+                document_content_hashes: self.document_content_hashes.clone(),
                 document_term_offsets: self.document_term_offsets.clone(),
                 document_term_ids: self.document_term_ids.clone(),
                 fieldnorms: self.fieldnorms.clone(),
+                numeric_fields: self.numeric_fields.clone(),
+                stored_fields: self.stored_fields.clone(),
                 live_ids: self.live_ids.clone(),
                 tombstone_words: self.tombstone_words.clone(),
                 tombstone_count: self.tombstone_count,
                 logical_bytes_used: self.logical_bytes_used,
             },
             keeper_generation,
+            // Each frozen epoch is a distinct publication candidate, even
+            // when two freezes observe the same mutable Delta generation.
+            // Rebinding deliberately preserves this witness; a later freeze
+            // must never be replaceable by an earlier, shorter snapshot.
+            lineage_id: snapshot_owner_id,
         }
     }
 
-    /// Apply one complete document. A budget crossing accepts the entire row
-    /// and reports `seal_required`; a document is never split.
+    /// Apply one complete document without seal sidecar values.
+    ///
+    /// The physical row records an absent content hash and absent
+    /// numeric/stored values. It remains process-locally searchable, but a
+    /// later FSLX seal rejects it rather than fabricating an identity witness.
+    /// Use [`Self::apply_document_with_values`] for sealable rows.
     ///
     /// # Errors
     ///
-    /// Semantic validation and all fallible capacity planning complete before
-    /// logical state changes.
+    /// Delegates all validation and allocation failures to
+    /// [`Self::apply_document_with_values`].
     pub fn apply_document(
         &mut self,
         global_docid: u32,
@@ -941,7 +1173,71 @@ impl DeltaSegment {
         fieldnorms: &[DeltaFieldNorm],
         postings: &[DeltaTermPosting<'_>],
     ) -> Result<DeltaApply, DeltaError> {
-        self.validate_document(global_docid, &document_id, fieldnorms, postings)?;
+        self.apply_document_inner(
+            global_docid,
+            document_id,
+            None,
+            fieldnorms,
+            postings,
+            &[],
+            &[],
+        )
+    }
+
+    /// Apply one complete document with every sidecar required for sealing.
+    ///
+    /// Numeric and stored values may be in any order, but a field may appear in
+    /// only one input slice. A stored indexed numeric supplied through
+    /// `numeric_values` receives canonical little-endian stored bytes. Supplying
+    /// its exact eight stored bytes instead also populates the numeric column.
+    /// A budget crossing accepts the entire row and reports `seal_required`; a
+    /// document is never split.
+    ///
+    /// # Errors
+    ///
+    /// Semantic validation and all fallible capacity planning complete before
+    /// logical state changes.
+    pub fn apply_document_with_values(
+        &mut self,
+        global_docid: u32,
+        document_id: DocId,
+        content_hash: u64,
+        fieldnorms: &[DeltaFieldNorm],
+        postings: &[DeltaTermPosting<'_>],
+        numeric_values: &[DeltaNumericValue],
+        stored_values: &[DeltaStoredValue<'_>],
+    ) -> Result<DeltaApply, DeltaError> {
+        self.apply_document_inner(
+            global_docid,
+            document_id,
+            Some(content_hash),
+            fieldnorms,
+            postings,
+            numeric_values,
+            stored_values,
+        )
+    }
+
+    fn apply_document_inner(
+        &mut self,
+        global_docid: u32,
+        document_id: DocId,
+        content_hash: Option<u64>,
+        fieldnorms: &[DeltaFieldNorm],
+        postings: &[DeltaTermPosting<'_>],
+        numeric_values: &[DeltaNumericValue],
+        stored_values: &[DeltaStoredValue<'_>],
+    ) -> Result<DeltaApply, DeltaError> {
+        self.validate_document(
+            global_docid,
+            &document_id,
+            fieldnorms,
+            postings,
+            numeric_values,
+            stored_values,
+        )?;
+        let (resolved_numeric_values, resolved_stored_values) =
+            self.resolve_document_values(numeric_values, stored_values)?;
         let mut document_terms = Vec::new();
         reserve_vec(
             &mut document_terms,
@@ -1032,6 +1328,11 @@ impl DeltaSegment {
         let document_id_len = document_id.len();
         let overlay_id = document_id.clone();
         let identity_was_live = self.live_ids.contains_key(&overlay_id);
+        let stored_value_bytes = resolved_stored_values
+            .iter()
+            .flatten()
+            .map(Vec::len)
+            .sum::<usize>();
 
         let mut added_bytes = 0_usize;
         for (posting, planned_term) in postings.iter().zip(&mut document_terms) {
@@ -1086,6 +1387,7 @@ impl DeltaSegment {
 
         self.document_docids.push(global_docid);
         self.document_ids.push(document_id);
+        self.document_content_hashes.push(content_hash);
         self.document_term_ids.extend_from_slice(&document_terms);
         let offset = u32::try_from(self.document_term_ids.len())
             .expect("preflighted document-term offset fits u32");
@@ -1094,16 +1396,38 @@ impl DeltaSegment {
             column.raw_lengths.push(input.raw_length);
             column.fieldnorm_ids.push(input.fieldnorm_id);
         }
+        for (column, value) in self.numeric_fields.iter_mut().zip(resolved_numeric_values) {
+            column.values.push(value);
+        }
+        for (column, value) in self.stored_fields.iter_mut().zip(resolved_stored_values) {
+            column.payload_bytes = column
+                .payload_bytes
+                .checked_add(value.as_ref().map_or(0, Vec::len))
+                .expect("validated stored payload length fits usize");
+            column.values.push(value);
+        }
         added_bytes = added_bytes
             .saturating_add(size_of::<u32>())
             .saturating_add(size_of::<DocId>() + document_id_len)
+            .saturating_add(size_of::<Option<u64>>())
             .saturating_add(size_of::<u32>())
             .saturating_add(postings.len().saturating_mul(size_of::<u32>()))
             .saturating_add(
                 self.fieldnorms
                     .len()
                     .saturating_mul(size_of::<u32>() + size_of::<u8>()),
-            );
+            )
+            .saturating_add(
+                self.numeric_fields
+                    .len()
+                    .saturating_mul(size_of::<Option<NumericValue>>()),
+            )
+            .saturating_add(
+                self.stored_fields
+                    .len()
+                    .saturating_mul(size_of::<Option<Vec<u8>>>()),
+            )
+            .saturating_add(stored_value_bytes);
         let replaced_delta_docid = self.live_ids.insert(overlay_id, global_docid);
         if !identity_was_live {
             added_bytes = added_bytes.saturating_add(
@@ -1128,6 +1452,8 @@ impl DeltaSegment {
         document_id: &str,
         fieldnorms: &[DeltaFieldNorm],
         postings: &[DeltaTermPosting<'_>],
+        numeric_values: &[DeltaNumericValue],
+        stored_values: &[DeltaStoredValue<'_>],
     ) -> Result<(), DeltaError> {
         if self.lease_ordinal(global_docid).is_none() {
             return Err(DeltaError::DocumentOutsideLease {
@@ -1248,12 +1574,215 @@ impl DeltaSegment {
                 (false, None) => {}
             }
         }
+        self.validate_document_values(global_docid, numeric_values, stored_values)
+    }
+
+    fn validate_document_values(
+        &self,
+        global_docid: u32,
+        numeric_values: &[DeltaNumericValue],
+        stored_values: &[DeltaStoredValue<'_>],
+    ) -> Result<(), DeltaError> {
+        let mut seen_fields = Vec::new();
+        reserve_vec(
+            &mut seen_fields,
+            self.schema.fields.len(),
+            "delta document value validation",
+        )?;
+        seen_fields.resize(self.schema.fields.len(), false);
+
+        for value in numeric_values {
+            let field_index = usize::from(value.field_ord);
+            let Some(field) = self.schema.fields.get(field_index) else {
+                return Err(DeltaError::UnknownValueField {
+                    field_ord: value.field_ord,
+                });
+            };
+            if field.id != value.field_ord {
+                return Err(DeltaError::UnknownValueField {
+                    field_ord: value.field_ord,
+                });
+            }
+            if std::mem::replace(&mut seen_fields[field_index], true) {
+                return Err(DeltaError::DuplicateValueField {
+                    global_docid,
+                    field_ord: value.field_ord,
+                });
+            }
+            match (field.kind, value.value) {
+                (FieldKind::I64 { indexed: true, .. }, NumericValue::I64(_))
+                | (FieldKind::U64 { indexed: true, .. }, NumericValue::U64(_)) => {}
+                (
+                    FieldKind::I64 { indexed: false, .. } | FieldKind::U64 { indexed: false, .. },
+                    _,
+                ) => {
+                    return Err(DeltaError::NonIndexedNumericField {
+                        field_ord: field.id,
+                        field_name: field.name,
+                    });
+                }
+                (FieldKind::I64 { .. }, actual) => {
+                    return Err(DeltaError::NumericTypeMismatch {
+                        field_ord: field.id,
+                        field_name: field.name,
+                        expected: "i64",
+                        actual: numeric_value_type_name(actual),
+                    });
+                }
+                (FieldKind::U64 { .. }, actual) => {
+                    return Err(DeltaError::NumericTypeMismatch {
+                        field_ord: field.id,
+                        field_name: field.name,
+                        expected: "u64",
+                        actual: numeric_value_type_name(actual),
+                    });
+                }
+                _ => {
+                    return Err(DeltaError::NonNumericField {
+                        field_ord: field.id,
+                        field_name: field.name,
+                    });
+                }
+            }
+        }
+
+        for value in stored_values {
+            let field_index = usize::from(value.field_ord);
+            let Some(field) = self.schema.fields.get(field_index) else {
+                return Err(DeltaError::UnknownValueField {
+                    field_ord: value.field_ord,
+                });
+            };
+            if field.id != value.field_ord {
+                return Err(DeltaError::UnknownValueField {
+                    field_ord: value.field_ord,
+                });
+            }
+            if std::mem::replace(&mut seen_fields[field_index], true) {
+                return Err(DeltaError::DuplicateValueField {
+                    global_docid,
+                    field_ord: value.field_ord,
+                });
+            }
+            if !field.stored {
+                return Err(DeltaError::NonStoredField {
+                    field_ord: field.id,
+                    field_name: field.name,
+                });
+            }
+            if matches!(field.kind, FieldKind::I64 { .. } | FieldKind::U64 { .. })
+                && value.bytes.len() != size_of::<u64>()
+            {
+                return Err(DeltaError::InvalidNumericBytes {
+                    field_ord: field.id,
+                    field_name: field.name,
+                    expected: size_of::<u64>(),
+                    actual: value.bytes.len(),
+                });
+            }
+            if u32::try_from(value.bytes.len()).is_err() {
+                return Err(DeltaError::StoredValueTooLarge {
+                    field_ord: field.id,
+                    bytes: value.bytes.len(),
+                });
+            }
+        }
+        for field in &self.stored_fields {
+            let appended = numeric_values
+                .iter()
+                .find(|value| value.field_ord == field.field_ord)
+                .map_or_else(
+                    || {
+                        stored_values
+                            .iter()
+                            .find(|value| value.field_ord == field.field_ord)
+                            .map_or(0, |value| value.bytes.len())
+                    },
+                    |_| size_of::<u64>(),
+                );
+            let final_bytes = field.payload_bytes.checked_add(appended);
+            if final_bytes.is_none_or(|bytes| u32::try_from(bytes).is_err()) {
+                return Err(DeltaError::StoredBlobTooLarge {
+                    field_ord: field.field_ord,
+                    current: field.payload_bytes,
+                    appended,
+                });
+            }
+        }
         Ok(())
+    }
+
+    fn resolve_document_values(
+        &self,
+        numeric_values: &[DeltaNumericValue],
+        stored_values: &[DeltaStoredValue<'_>],
+    ) -> Result<ResolvedDocumentValues, DeltaError> {
+        let mut resolved_numeric_values = Vec::new();
+        reserve_vec(
+            &mut resolved_numeric_values,
+            self.numeric_fields.len(),
+            "delta numeric value scratch",
+        )?;
+        for field in &self.numeric_fields {
+            let value = numeric_values
+                .iter()
+                .find(|value| value.field_ord == field.field_ord)
+                .map(|value| value.value)
+                .or_else(|| {
+                    stored_values
+                        .iter()
+                        .find(|value| value.field_ord == field.field_ord)
+                        .and_then(|value| {
+                            numeric_value_from_le_bytes(
+                                self.schema.fields[usize::from(field.field_ord)].kind,
+                                value.bytes,
+                            )
+                        })
+                });
+            resolved_numeric_values.push(value);
+        }
+
+        let mut resolved_stored_values = Vec::new();
+        reserve_vec(
+            &mut resolved_stored_values,
+            self.stored_fields.len(),
+            "delta stored value scratch",
+        )?;
+        for field in &self.stored_fields {
+            let numeric_bytes = numeric_values
+                .iter()
+                .find(|value| value.field_ord == field.field_ord)
+                .map(|value| value.value.to_le_bytes());
+            let bytes = numeric_bytes
+                .as_ref()
+                .map(|bytes| bytes.as_slice())
+                .or_else(|| {
+                    stored_values
+                        .iter()
+                        .find(|value| value.field_ord == field.field_ord)
+                        .map(|value| value.bytes)
+                });
+            let value = if let Some(bytes) = bytes {
+                let mut owned = Vec::new();
+                reserve_vec(&mut owned, bytes.len(), "delta stored value bytes")?;
+                owned.extend_from_slice(bytes);
+                Some(owned)
+            } else {
+                None
+            };
+            resolved_stored_values.push(value);
+        }
+        Ok((resolved_numeric_values, resolved_stored_values))
     }
 
     fn reserve_document(&mut self, term_count: usize) -> Result<(), DeltaError> {
         reserve_vec(&mut self.document_docids, 1, "delta document docids")?;
         reserve_vec(&mut self.document_ids, 1, "delta document ids")?;
+        reserve_vec(
+            &mut self.document_content_hashes,
+            1,
+            "delta document content hashes",
+        )?;
         reserve_vec(
             &mut self.document_term_offsets,
             1,
@@ -1274,6 +1803,12 @@ impl DeltaSegment {
         for column in &mut self.fieldnorms {
             reserve_vec(&mut column.raw_lengths, 1, "delta raw field lengths")?;
             reserve_vec(&mut column.fieldnorm_ids, 1, "delta fieldnorm bytes")?;
+        }
+        for column in &mut self.numeric_fields {
+            reserve_vec(&mut column.values, 1, "delta numeric values")?;
+        }
+        for column in &mut self.stored_fields {
+            reserve_vec(&mut column.values, 1, "delta stored values")?;
         }
         Ok(())
     }
@@ -1326,6 +1861,36 @@ impl DeltaSegment {
         let row = self.document_docids.binary_search(&global_docid).ok()?;
         let field = self.field_index(field_ord)?;
         self.fieldnorms[field].fieldnorm_ids.get(row).copied()
+    }
+
+    /// Physical content hash, including a tombstoned row.
+    #[must_use]
+    pub fn content_hash(&self, global_docid: u32) -> Option<u64> {
+        let row = self.document_docids.binary_search(&global_docid).ok()?;
+        self.document_content_hashes.get(row).copied().flatten()
+    }
+
+    /// Physical indexed numeric value, including a tombstoned row.
+    #[must_use]
+    pub fn numeric_value(&self, field_ord: u16, global_docid: u32) -> Option<NumericValue> {
+        let row = self.document_docids.binary_search(&global_docid).ok()?;
+        let field = self.numeric_field_index(field_ord)?;
+        self.numeric_fields[field]
+            .values
+            .get(row)
+            .copied()
+            .flatten()
+    }
+
+    /// Physical stored bytes, including a tombstoned row.
+    #[must_use]
+    pub fn stored_value(&self, field_ord: u16, global_docid: u32) -> Option<&[u8]> {
+        let row = self.document_docids.binary_search(&global_docid).ok()?;
+        let field = self.stored_field_index(field_ord)?;
+        self.stored_fields[field]
+            .values
+            .get(row)
+            .and_then(Option::as_deref)
     }
 
     /// Exact raw length for snapshot-level BM25 aggregation.
@@ -1416,6 +1981,27 @@ impl DeltaSegment {
                     .saturating_add(column.fieldnorm_ids.len())
             })
             .sum::<usize>();
+        let numeric_value_bytes = self
+            .numeric_fields
+            .iter()
+            .map(|column| {
+                column
+                    .values
+                    .len()
+                    .saturating_mul(size_of::<Option<NumericValue>>())
+            })
+            .sum::<usize>();
+        let stored_value_bytes = self
+            .stored_fields
+            .iter()
+            .map(|column| {
+                column
+                    .values
+                    .len()
+                    .saturating_mul(size_of::<Option<Vec<u8>>>())
+                    .saturating_add(column.values.iter().flatten().map(Vec::len).sum::<usize>())
+            })
+            .sum::<usize>();
         self.terms
             .bytes_used()
             .saturating_add(self.chains.len().saturating_mul(size_of::<TermChain>()))
@@ -1423,6 +2009,11 @@ impl DeltaSegment {
             .saturating_add(self.position_arena.bytes_used())
             .saturating_add(self.document_docids.len().saturating_mul(size_of::<u32>()))
             .saturating_add(document_id_bytes)
+            .saturating_add(
+                self.document_content_hashes
+                    .len()
+                    .saturating_mul(size_of::<Option<u64>>()),
+            )
             .saturating_add(
                 self.document_term_offsets
                     .len()
@@ -1435,6 +2026,8 @@ impl DeltaSegment {
                     .saturating_mul(size_of::<u32>()),
             )
             .saturating_add(fieldnorm_bytes)
+            .saturating_add(numeric_value_bytes)
+            .saturating_add(stored_value_bytes)
             .saturating_add(identity_bytes)
             .saturating_add(self.tombstone_words.len().saturating_mul(size_of::<u64>()))
     }
@@ -1473,6 +2066,44 @@ impl DeltaSegment {
                     .saturating_add(column.fieldnorm_ids.capacity())
             })
             .sum::<usize>();
+        let numeric_value_bytes = self
+            .numeric_fields
+            .capacity()
+            .saturating_mul(size_of::<NumericColumn>())
+            .saturating_add(
+                self.numeric_fields
+                    .iter()
+                    .map(|column| {
+                        column
+                            .values
+                            .capacity()
+                            .saturating_mul(size_of::<Option<NumericValue>>())
+                    })
+                    .sum::<usize>(),
+            );
+        let stored_value_bytes = self
+            .stored_fields
+            .capacity()
+            .saturating_mul(size_of::<StoredColumn>())
+            .saturating_add(
+                self.stored_fields
+                    .iter()
+                    .map(|column| {
+                        column
+                            .values
+                            .capacity()
+                            .saturating_mul(size_of::<Option<Vec<u8>>>())
+                            .saturating_add(
+                                column
+                                    .values
+                                    .iter()
+                                    .flatten()
+                                    .map(Vec::capacity)
+                                    .sum::<usize>(),
+                            )
+                    })
+                    .sum::<usize>(),
+            );
         self.fields
             .capacity()
             .saturating_mul(size_of::<FieldLayout>())
@@ -1491,6 +2122,11 @@ impl DeltaSegment {
             )
             .saturating_add(document_id_bytes)
             .saturating_add(
+                self.document_content_hashes
+                    .capacity()
+                    .saturating_mul(size_of::<Option<u64>>()),
+            )
+            .saturating_add(
                 self.document_term_offsets
                     .capacity()
                     .saturating_mul(size_of::<u32>()),
@@ -1506,6 +2142,8 @@ impl DeltaSegment {
                     .saturating_mul(size_of::<FieldNormColumn>()),
             )
             .saturating_add(fieldnorm_bytes)
+            .saturating_add(numeric_value_bytes)
+            .saturating_add(stored_value_bytes)
             .saturating_add(identity_bytes)
             .saturating_add(
                 self.tombstone_words
@@ -1566,12 +2204,20 @@ impl DeltaSegment {
         self.position_arena.reset();
         self.document_docids.clear();
         self.document_ids.clear();
+        self.document_content_hashes.clear();
         self.document_term_offsets.clear();
         self.document_term_offsets.push(0);
         self.document_term_ids.clear();
         for column in &mut self.fieldnorms {
             column.raw_lengths.clear();
             column.fieldnorm_ids.clear();
+        }
+        for column in &mut self.numeric_fields {
+            column.values.clear();
+        }
+        for column in &mut self.stored_fields {
+            column.values.clear();
+            column.payload_bytes = 0;
         }
         self.live_ids.clear();
         self.tombstone_words.fill(0);
@@ -1583,6 +2229,18 @@ impl DeltaSegment {
 
     fn field_index(&self, field_ord: u16) -> Option<usize> {
         self.fields
+            .binary_search_by_key(&field_ord, |field| field.field_ord)
+            .ok()
+    }
+
+    fn numeric_field_index(&self, field_ord: u16) -> Option<usize> {
+        self.numeric_fields
+            .binary_search_by_key(&field_ord, |field| field.field_ord)
+            .ok()
+    }
+
+    fn stored_field_index(&self, field_ord: u16) -> Option<usize> {
+        self.stored_fields
             .binary_search_by_key(&field_ord, |field| field.field_ord)
             .ok()
     }
@@ -1768,6 +2426,22 @@ impl<'a> Iterator for DeltaLiveDocuments<'a> {
     }
 }
 
+fn numeric_value_type_name(value: NumericValue) -> &'static str {
+    match value {
+        NumericValue::I64(_) => "i64",
+        NumericValue::U64(_) => "u64",
+    }
+}
+
+fn numeric_value_from_le_bytes(kind: FieldKind, bytes: &[u8]) -> Option<NumericValue> {
+    let bytes: [u8; 8] = bytes.try_into().ok()?;
+    match kind {
+        FieldKind::I64 { .. } => Some(NumericValue::I64(i64::from_le_bytes(bytes))),
+        FieldKind::U64 { .. } => Some(NumericValue::U64(u64::from_le_bytes(bytes))),
+        FieldKind::Keyword | FieldKind::Text { .. } | FieldKind::StoredOnly => None,
+    }
+}
+
 fn validate_lease_base(lease_base: u64) -> Result<u64, DeltaError> {
     if !lease_base.is_multiple_of(u64::from(DOC_ORDS_PER_LEASE)) {
         return Err(DeltaError::MisalignedLeaseBase { lease_base });
@@ -1838,6 +2512,52 @@ mod tests {
         fields: &TEST_FIELDS,
     };
 
+    const VALUE_FIELDS: [FieldDescriptor; 5] = [
+        FieldDescriptor {
+            id: 0,
+            name: "keyword",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "signed",
+            kind: FieldKind::I64 {
+                indexed: true,
+                fast: false,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "unsigned",
+            kind: FieldKind::U64 {
+                indexed: true,
+                fast: true,
+            },
+            stored: false,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "fast_only",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "opaque",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+    ];
+    const VALUE_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "delta-value-tests",
+        fields: &VALUE_FIELDS,
+    };
+
     fn norms(keyword: u32, positioned: u32, plain: u32) -> [DeltaFieldNorm; 3] {
         [
             DeltaFieldNorm {
@@ -1856,6 +2576,14 @@ mod tests {
                 fieldnorm_id: fieldnorm_to_id(plain),
             },
         ]
+    }
+
+    fn value_norms(keyword: u32) -> [DeltaFieldNorm; 1] {
+        [DeltaFieldNorm {
+            field_ord: 0,
+            raw_length: keyword,
+            fieldnorm_id: fieldnorm_to_id(keyword),
+        }]
     }
 
     fn apply_positioned(
@@ -1890,6 +2618,7 @@ mod tests {
         let identity_bytes =
             size_of::<DocId>() + size_of::<u32>() + HASH_SLOT_ESTIMATE + document_id.len();
         let fieldnorm_bytes = 3 * (size_of::<u32>() + size_of::<u8>());
+        let seal_sidecar_bytes = size_of::<Option<u64>>() + size_of::<Option<Vec<u8>>>();
         term_table_bytes
             + size_of::<TermChain>()
             + posting_bytes
@@ -1899,7 +2628,217 @@ mod tests {
             + size_of::<u32>()
             + size_of::<u32>()
             + fieldnorm_bytes
+            + seal_sidecar_bytes
             + identity_bytes
+    }
+
+    #[test]
+    fn seal_sidecars_survive_tombstones_freeze_and_writer_reset() -> Result<(), DeltaError> {
+        let mut delta = DeltaSegment::new(VALUE_SCHEMA, 0, usize::MAX)?;
+        let fast_only = 31_u64.to_le_bytes();
+        delta.apply_document_with_values(
+            0,
+            DocId::from("same-id"),
+            0x1122_3344_5566_7788,
+            &value_norms(1),
+            &[],
+            &[DeltaNumericValue::i64(1, -7), DeltaNumericValue::u64(2, 9)],
+            &[
+                DeltaStoredValue::new(0, b"first-keyword"),
+                DeltaStoredValue::new(3, &fast_only),
+                DeltaStoredValue::new(4, b"first-opaque"),
+            ],
+        )?;
+
+        assert_eq!(delta.content_hash(0), Some(0x1122_3344_5566_7788));
+        assert_eq!(delta.numeric_value(1, 0), Some(NumericValue::I64(-7)));
+        assert_eq!(delta.numeric_value(2, 0), Some(NumericValue::U64(9)));
+        assert_eq!(delta.numeric_value(3, 0), None);
+        assert_eq!(delta.stored_value(0, 0), Some(b"first-keyword".as_slice()));
+        assert_eq!(
+            delta.stored_value(1, 0),
+            Some((-7_i64).to_le_bytes().as_slice())
+        );
+        assert_eq!(delta.stored_value(2, 0), None);
+        assert_eq!(delta.stored_value(3, 0), Some(fast_only.as_slice()));
+        assert_eq!(delta.stored_value(4, 0), Some(b"first-opaque".as_slice()));
+        assert_eq!(delta.bytes_used(), delta.recompute_bytes_used());
+
+        let signed_from_stored = 42_i64.to_le_bytes();
+        let next_fast_only = 63_u64.to_le_bytes();
+        let replacement = delta.apply_document_with_values(
+            1,
+            DocId::from("same-id"),
+            0x8877_6655_4433_2211,
+            &value_norms(0),
+            &[],
+            &[DeltaNumericValue::u64(2, 17)],
+            &[
+                DeltaStoredValue::new(1, &signed_from_stored),
+                DeltaStoredValue::new(3, &next_fast_only),
+                DeltaStoredValue::new(4, b"second-opaque"),
+            ],
+        )?;
+        assert_eq!(replacement.replaced_delta_docid, Some(0));
+        assert!(delta.is_tombstoned(0));
+        assert_eq!(delta.content_hash(0), Some(0x1122_3344_5566_7788));
+        assert_eq!(delta.stored_value(4, 0), Some(b"first-opaque".as_slice()));
+        assert_eq!(delta.numeric_value(1, 1), Some(NumericValue::I64(42)));
+        assert_eq!(
+            delta.stored_value(1, 1),
+            Some(signed_from_stored.as_slice())
+        );
+        assert_eq!(delta.bytes_used(), delta.recompute_bytes_used());
+
+        let frozen = delta.freeze(19);
+        assert!(frozen.segment().is_tombstoned(0));
+        assert_eq!(frozen.content_hash(0), Some(0x1122_3344_5566_7788));
+        assert_eq!(frozen.numeric_value(1, 1), Some(NumericValue::I64(42)));
+        assert_eq!(frozen.stored_value(4, 1), Some(b"second-opaque".as_slice()));
+
+        delta.reset_after_seal(0)?;
+        assert_eq!(delta.content_hash(0), None);
+        assert_eq!(delta.numeric_value(1, 1), None);
+        assert_eq!(delta.stored_value(4, 1), None);
+        assert_eq!(delta.bytes_used(), 0);
+
+        delta.apply_document(2, DocId::from("convenience"), &value_norms(0), &[])?;
+        assert_eq!(delta.content_hash(2), None);
+        assert_eq!(delta.numeric_value(1, 2), None);
+        assert_eq!(delta.stored_value(4, 2), None);
+        assert_eq!(delta.bytes_used(), delta.recompute_bytes_used());
+        assert_eq!(frozen.content_hash(1), Some(0x8877_6655_4433_2211));
+        Ok(())
+    }
+
+    #[test]
+    fn seal_sidecar_validation_is_typed_and_atomic() -> Result<(), DeltaError> {
+        let mut delta = DeltaSegment::new(VALUE_SCHEMA, 0, usize::MAX)?;
+        let initial = delta.memory_stats();
+
+        assert!(matches!(
+            delta.apply_document_with_values(
+                0,
+                DocId::from("unknown"),
+                1,
+                &value_norms(0),
+                &[],
+                &[DeltaNumericValue::u64(5, 1)],
+                &[],
+            ),
+            Err(DeltaError::UnknownValueField { field_ord: 5 })
+        ));
+        assert_eq!(delta.memory_stats(), initial);
+
+        assert!(matches!(
+            delta.apply_document_with_values(
+                0,
+                DocId::from("duplicate"),
+                1,
+                &value_norms(0),
+                &[],
+                &[DeltaNumericValue::i64(1, 1), DeltaNumericValue::i64(1, 2)],
+                &[],
+            ),
+            Err(DeltaError::DuplicateValueField { field_ord: 1, .. })
+        ));
+        assert_eq!(delta.memory_stats(), initial);
+
+        assert!(matches!(
+            delta.apply_document_with_values(
+                0,
+                DocId::from("non-numeric"),
+                1,
+                &value_norms(0),
+                &[],
+                &[DeltaNumericValue::u64(0, 1)],
+                &[],
+            ),
+            Err(DeltaError::NonNumericField { field_ord: 0, .. })
+        ));
+        assert_eq!(delta.memory_stats(), initial);
+
+        assert!(matches!(
+            delta.apply_document_with_values(
+                0,
+                DocId::from("not-indexed"),
+                1,
+                &value_norms(0),
+                &[],
+                &[DeltaNumericValue::u64(3, 1)],
+                &[],
+            ),
+            Err(DeltaError::NonIndexedNumericField { field_ord: 3, .. })
+        ));
+        assert_eq!(delta.memory_stats(), initial);
+
+        assert!(matches!(
+            delta.apply_document_with_values(
+                0,
+                DocId::from("wrong-type"),
+                1,
+                &value_norms(0),
+                &[],
+                &[DeltaNumericValue::u64(1, 1)],
+                &[],
+            ),
+            Err(DeltaError::NumericTypeMismatch {
+                field_ord: 1,
+                expected: "i64",
+                actual: "u64",
+                ..
+            })
+        ));
+        assert_eq!(delta.memory_stats(), initial);
+
+        assert!(matches!(
+            delta.apply_document_with_values(
+                0,
+                DocId::from("not-stored"),
+                1,
+                &value_norms(0),
+                &[],
+                &[],
+                &[DeltaStoredValue::new(2, &1_u64.to_le_bytes())],
+            ),
+            Err(DeltaError::NonStoredField { field_ord: 2, .. })
+        ));
+        assert_eq!(delta.memory_stats(), initial);
+
+        assert!(matches!(
+            delta.apply_document_with_values(
+                0,
+                DocId::from("bad-width"),
+                1,
+                &value_norms(0),
+                &[],
+                &[],
+                &[DeltaStoredValue::new(3, b"short")],
+            ),
+            Err(DeltaError::InvalidNumericBytes {
+                field_ord: 3,
+                expected: 8,
+                actual: 5,
+                ..
+            })
+        ));
+        assert_eq!(delta.memory_stats(), initial);
+
+        let signed = 1_i64.to_le_bytes();
+        assert!(matches!(
+            delta.apply_document_with_values(
+                0,
+                DocId::from("cross-slice-duplicate"),
+                1,
+                &value_norms(0),
+                &[],
+                &[DeltaNumericValue::i64(1, 1)],
+                &[DeltaStoredValue::new(1, &signed)],
+            ),
+            Err(DeltaError::DuplicateValueField { field_ord: 1, .. })
+        ));
+        assert_eq!(delta.memory_stats(), initial);
+        Ok(())
     }
 
     #[test]
@@ -2265,6 +3204,8 @@ mod tests {
             + size_of::<u32>()
             + size_of::<u32>()
             + 3 * (size_of::<u32>() + size_of::<u8>())
+            + size_of::<Option<u64>>()
+            + size_of::<Option<Vec<u8>>>()
             + size_of::<u64>();
         assert_eq!(delta.bytes_used(), expected + second_row_bytes);
         Ok(())

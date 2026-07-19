@@ -2,8 +2,8 @@
 //!
 //! This module deliberately joins the already-final Scribe, FSLX, Keeper,
 //! parser, cursor, scorer, and collector boundaries. Immutable Delta epochs,
-//! their composite statistics, and their scorer adapters are assembled here;
-//! the later seal and mixed-state beads wire them into the public writer loop.
+//! their composite statistics, scorer adapters, and seal transaction are
+//! assembled here; later mixed-state beads wire them into the public writer loop.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
-use frankensearch_core::IndexableDocument;
+use frankensearch_core::{DocId, IndexableDocument};
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
 use thiserror::Error;
@@ -21,12 +21,10 @@ use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::argus::{
-    ArgusError, Bm25FieldSnapshot, DocSetCollector, FieldNormReader, PhraseScorer, PhraseTerm,
-    PositionsHandle, PositionsReader, PostingCursor, ReferenceScorer, ScorerClause, TermScorer,
-    TopDocsCollector,
+    ArgusError, Bm25FieldSnapshot, DeltaFieldNorms, DeltaPostingCursor, DocSetCollector,
+    FieldNormReader, PhraseScorer, PhraseTerm, PositionsHandle, PositionsReader, PostingCursor,
+    ReferenceScorer, ScorerClause, TermScorer, TopDocsCollector,
 };
-#[cfg(test)]
-use crate::argus::{DeltaFieldNorms, DeltaPostingCursor};
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
@@ -45,8 +43,9 @@ use crate::quiver::{
 };
 use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
-    AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, FlushDocumentInput, FlushError,
-    FlushMode, FlushSegmentInput, IndexedFieldValue, StoredFieldValue, flush_accumulator_with_mode,
+    AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, DeltaFlushInput, FlushDocumentInput,
+    FlushError, FlushMode, FlushSegmentInput, IndexedFieldValue, StoredFieldValue,
+    flush_accumulator_with_mode, flush_delta_snapshot,
 };
 use crate::segment::{EncodedSegment, SectionKind};
 
@@ -185,6 +184,14 @@ pub enum SnapshotError {
         /// Second exclusive lease end.
         second_end: u64,
     },
+    /// A seal replacement table omitted one independently published shard.
+    #[error("delta seal replacement table omitted the epoch in lease [{lease_base}, {lease_end})")]
+    MissingDeltaRebind {
+        /// Inclusive lease base of the disappearing process-local epoch.
+        lease_base: u64,
+        /// Exclusive lease end of the disappearing process-local epoch.
+        lease_end: u64,
+    },
     /// A complete publication attempted to replace a newer Keeper generation.
     #[error("Keeper generation regressed from current {current} to proposed {proposed}")]
     KeeperGenerationRegression {
@@ -268,62 +275,9 @@ impl QuillSearchSnapshot {
     ) -> Result<Self, SnapshotError> {
         let schema = keeper.schema();
         let manifest = &keeper.loaded_manifest().manifest;
-        let keeper_generation = manifest.generation;
-        for delta in &deltas {
-            if delta.schema() != schema {
-                return Err(SnapshotError::SchemaMismatch {
-                    expected: schema.name,
-                    actual: delta.schema().name,
-                });
-            }
-            if delta.keeper_generation() != keeper_generation {
-                return Err(SnapshotError::KeeperGenerationMismatch {
-                    expected: keeper_generation,
-                    actual: delta.keeper_generation(),
-                    lease_base: delta.lease_base(),
-                });
-            }
-            if let Some((delta_lo, delta_hi)) = delta.occupied_docid_range() {
-                for segment in &manifest.segments {
-                    if delta_lo < segment.docid_hi && segment.docid_lo < delta_hi {
-                        return Err(SnapshotError::KeeperDeltaDocidOverlap {
-                            delta_lo,
-                            delta_hi,
-                            segment_id: segment.segment_id,
-                            keeper_lo: segment.docid_lo,
-                            keeper_hi: segment.docid_hi,
-                        });
-                    }
-                }
-            }
-        }
-        for (index, first) in deltas.iter().enumerate() {
-            for second in &deltas[index + 1..] {
-                if first.lease_base() < second.lease_end()
-                    && second.lease_base() < first.lease_end()
-                {
-                    return Err(SnapshotError::OverlappingDeltaLeases {
-                        first_base: first.lease_base(),
-                        first_end: first.lease_end(),
-                        second_base: second.lease_base(),
-                        second_end: second.lease_end(),
-                    });
-                }
-            }
-        }
+        validate_delta_table(schema, manifest, &deltas)?;
 
-        let delta_live_doc_count = deltas.iter().try_fold(0_u64, |total, delta| {
-            let count = u64::try_from(delta.live_document_count()).map_err(|_| {
-                SnapshotError::CounterOverflow {
-                    counter: "live Delta document count",
-                }
-            })?;
-            total
-                .checked_add(count)
-                .ok_or(SnapshotError::CounterOverflow {
-                    counter: "live Delta document count",
-                })
-        })?;
+        let delta_live_doc_count = delta_live_document_count(&deltas)?;
         let bm25_doc_count = keeper
             .at_seal_doc_count()
             .checked_add(delta_live_doc_count)
@@ -434,6 +388,106 @@ impl QuillSearchSnapshot {
         }
         Ok(total)
     }
+
+    /// Materialize one live winner from either immutable residency.
+    #[must_use]
+    pub fn materialize_document_id(&self, global_docid: u32) -> Option<DocId> {
+        self.keeper
+            .materialize_document_id(global_docid)
+            .or_else(|| {
+                self.deltas
+                    .iter()
+                    .find_map(|delta| delta.materialize_document_id(global_docid))
+            })
+    }
+}
+
+fn validate_delta_table(
+    schema: SchemaDescriptor,
+    manifest: &Manifest,
+    deltas: &[Arc<DeltaSnapshot>],
+) -> Result<(), SnapshotError> {
+    let keeper_generation = manifest.generation;
+    for delta in deltas {
+        if delta.schema() != schema {
+            return Err(SnapshotError::SchemaMismatch {
+                expected: schema.name,
+                actual: delta.schema().name,
+            });
+        }
+        if delta.keeper_generation() != keeper_generation {
+            return Err(SnapshotError::KeeperGenerationMismatch {
+                expected: keeper_generation,
+                actual: delta.keeper_generation(),
+                lease_base: delta.lease_base(),
+            });
+        }
+        if let Some((delta_lo, delta_hi)) = delta.occupied_docid_range() {
+            for segment in &manifest.segments {
+                if delta_lo < segment.docid_hi && segment.docid_lo < delta_hi {
+                    return Err(SnapshotError::KeeperDeltaDocidOverlap {
+                        delta_lo,
+                        delta_hi,
+                        segment_id: segment.segment_id,
+                        keeper_lo: segment.docid_lo,
+                        keeper_hi: segment.docid_hi,
+                    });
+                }
+            }
+        }
+    }
+    for (index, first) in deltas.iter().enumerate() {
+        for second in &deltas[index + 1..] {
+            if first.lease_base() < second.lease_end() && second.lease_base() < first.lease_end() {
+                return Err(SnapshotError::OverlappingDeltaLeases {
+                    first_base: first.lease_base(),
+                    first_end: first.lease_end(),
+                    second_base: second.lease_base(),
+                    second_end: second.lease_end(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_delta_seal_replacements(
+    current: &QuillSearchSnapshot,
+    sealed: &Arc<DeltaSnapshot>,
+    replacements: &[Arc<DeltaSnapshot>],
+) -> Result<(), SnapshotError> {
+    for survivor in current
+        .delta_snapshots()
+        .iter()
+        .filter(|delta| !Arc::ptr_eq(delta, sealed))
+    {
+        let lineage = survivor.publication_lineage();
+        if !replacements
+            .iter()
+            .any(|replacement| replacement.publication_lineage() == lineage)
+        {
+            return Err(SnapshotError::MissingDeltaRebind {
+                lease_base: survivor.lease_base(),
+                lease_end: survivor.lease_end(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn delta_live_document_count(deltas: &[Arc<DeltaSnapshot>]) -> Result<u64, SnapshotError> {
+    deltas.iter().try_fold(0_u64, |total, delta| {
+        let count = u64::try_from(delta.live_document_count()).map_err(|_| {
+            SnapshotError::CounterOverflow {
+                counter: "live Delta document count",
+            }
+        })?;
+        total
+            .checked_add(count)
+            .ok_or(SnapshotError::CounterOverflow {
+                counter: "live Delta document count",
+            })
+    })
 }
 
 fn composite_field_stats(
@@ -546,6 +600,8 @@ struct PreparedSealedPublication {
     field_stats: Box<[SnapshotFieldStats]>,
     bm25_doc_count: u64,
     live_doc_count: u64,
+    delta_live_doc_count: u64,
+    deltas: Box<[Arc<DeltaSnapshot>]>,
 }
 
 /// Lock-free publisher for one authoritative Keeper plus all-Delta view.
@@ -586,18 +642,39 @@ impl SnapshotPublisher {
         schema: SchemaDescriptor,
         proposed: &Manifest,
     ) -> Result<PreparedSealedPublication, SnapshotError> {
+        self.prepare_sealed_manifest_with_deltas(schema, proposed, Vec::new())
+    }
+
+    fn prepare_sealed_manifest_with_deltas(
+        &self,
+        schema: SchemaDescriptor,
+        proposed: &Manifest,
+        deltas: Vec<Arc<DeltaSnapshot>>,
+    ) -> Result<PreparedSealedPublication, SnapshotError> {
         let current = self.current.load_full();
         validate_complete_keeper_transition(&current.keeper.loaded_manifest().manifest, proposed)?;
+        validate_delta_table(schema, proposed, &deltas)?;
         let snapshot_epoch = current
             .snapshot_epoch()
             .checked_add(1)
             .ok_or(SnapshotError::EpochExhausted)?;
-        let (bm25_doc_count, live_doc_count) = manifest_document_counts(proposed)?;
+        let (sealed_doc_count, sealed_live_doc_count) = manifest_document_counts(proposed)?;
+        let delta_live_doc_count = delta_live_document_count(&deltas)?;
+        let bm25_doc_count = sealed_doc_count.checked_add(delta_live_doc_count).ok_or(
+            SnapshotError::CounterOverflow {
+                counter: "BM25 document count",
+            },
+        )?;
+        let live_doc_count = sealed_live_doc_count
+            .checked_add(delta_live_doc_count)
+            .ok_or(SnapshotError::CounterOverflow {
+                counter: "live document count",
+            })?;
         let field_stats = composite_field_stats(
             schema,
             proposed,
             proposed.segments.is_empty(),
-            &[],
+            &deltas,
             bm25_doc_count,
         )?;
         Ok(PreparedSealedPublication {
@@ -609,6 +686,8 @@ impl SnapshotPublisher {
             field_stats,
             bm25_doc_count,
             live_doc_count,
+            delta_live_doc_count,
+            deltas: deltas.into_boxed_slice(),
         })
     }
 
@@ -650,6 +729,8 @@ impl SnapshotPublisher {
             field_stats: field_stats.into_boxed_slice(),
             bm25_doc_count: current.bm25_doc_count,
             live_doc_count: current.live_doc_count,
+            delta_live_doc_count: 0,
+            deltas: Box::default(),
         })
     }
 
@@ -676,33 +757,55 @@ impl SnapshotPublisher {
             "Keeper installed a schema descriptor that differs from the prepared publication"
         );
         assert_eq!(
-            keeper.at_seal_doc_count(),
-            prepared.bm25_doc_count,
-            "Keeper at-seal count differs from the prepared publication"
+            keeper
+                .at_seal_doc_count()
+                .checked_add(prepared.delta_live_doc_count),
+            Some(prepared.bm25_doc_count),
+            "Keeper plus Delta BM25 count differs from the prepared publication"
         );
         assert_eq!(
-            keeper.doc_count(),
-            prepared.live_doc_count,
-            "Keeper live count differs from the prepared publication"
+            keeper
+                .doc_count()
+                .checked_add(prepared.delta_live_doc_count),
+            Some(prepared.live_doc_count),
+            "Keeper plus Delta live count differs from the prepared publication"
         );
         for expected in &prepared.field_stats {
-            let actual_total_tokens = manifest
+            let keeper_stats = manifest
                 .field_stats
                 .iter()
-                .find(|row| row.field_ord == expected.field_ord)
+                .find(|row| row.field_ord == expected.field_ord);
+            let keeper_total_tokens = keeper_stats
                 .map(|row| row.total_tokens)
                 .or_else(|| manifest.segments.is_empty().then_some(0));
+            let keeper_doc_count = keeper_stats
+                .map(|row| u64::from(row.doc_count))
+                .or_else(|| manifest.segments.is_empty().then_some(0));
+            let delta_total_tokens = prepared.deltas.iter().fold(0_u64, |total, delta| {
+                total
+                    .checked_add(
+                        delta
+                            .live_total_tokens(expected.field_ord)
+                            .expect("prepared Delta field statistics must remain complete"),
+                    )
+                    .expect("prepared composite field statistics must remain in range")
+            });
             assert_eq!(
-                actual_total_tokens,
+                keeper_total_tokens.and_then(|total| total.checked_add(delta_total_tokens)),
                 Some(expected.total_tokens),
-                "Keeper field statistics differ from the prepared publication"
+                "Keeper plus Delta token statistics differ from the prepared publication"
+            );
+            assert_eq!(
+                keeper_doc_count.and_then(|count| count.checked_add(prepared.delta_live_doc_count)),
+                Some(expected.doc_count),
+                "Keeper plus Delta field document count differs from the prepared publication"
             );
         }
 
         let next = Arc::new(QuillSearchSnapshot {
             snapshot_epoch: prepared.snapshot_epoch,
             keeper,
-            deltas: Box::default(),
+            deltas: prepared.deltas,
             field_stats: prepared.field_stats,
             bm25_doc_count: prepared.bm25_doc_count,
             live_doc_count: prepared.live_doc_count,
@@ -815,6 +918,15 @@ struct StagedFlush {
     next_seal_seq: u64,
 }
 
+struct PendingDeltaSeal {
+    encoded: Option<Arc<EncodedSegment>>,
+    segment_installed: bool,
+    manifest: Manifest,
+    prepared: PreparedSealedPublication,
+    next_seal_seq: u64,
+    successor_watermark: u64,
+}
+
 /// Scalar Quill writer plus committed and process-local reader views.
 pub struct QuillIndex {
     config: QuillConfig,
@@ -833,6 +945,7 @@ pub struct QuillIndex {
     pending_owned_segments: Vec<EncodedSegment>,
     pending_field_stats: BTreeMap<u16, (u64, u32)>,
     pending_manifest: Option<Manifest>,
+    pending_delta_seal: Option<PendingDeltaSeal>,
 }
 
 enum IndexBackend {
@@ -1060,6 +1173,7 @@ impl QuillIndex {
             pending_owned_segments: Vec::new(),
             pending_field_stats: BTreeMap::new(),
             pending_manifest: None,
+            pending_delta_seal: None,
         })
     }
 
@@ -1072,11 +1186,244 @@ impl QuillIndex {
     /// Current process-local Keeper plus Delta snapshot.
     ///
     /// Readers should pin this `Arc` once and retain it for the complete query.
-    /// The scalar search implementation consumes only its Keeper component
-    /// until E5.3 supplies Delta cursor adapters.
+    /// Public queries consume both immutable residencies through one composite
+    /// statistics and collection path.
     #[must_use]
     pub fn search_snapshot(&self) -> Arc<QuillSearchSnapshot> {
         self.published_snapshot.load()
+    }
+
+    /// Atomically publish the complete process-local Delta table for the
+    /// current durable Keeper generation.
+    ///
+    /// Batch writers call this after freezing every shard at one quiescent
+    /// boundary. A same-generation publication changes only process-local
+    /// visibility; cross-process readers continue to observe the MANIFEST.
+    ///
+    /// # Errors
+    ///
+    /// Rejects schema/generation drift, overlapping leases, Keeper-range
+    /// overlap, allocation failure, and process-local epoch exhaustion.
+    pub fn publish_delta_table(
+        &self,
+        deltas: Vec<Arc<DeltaSnapshot>>,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        if self.pending_delta_seal.is_some() {
+            return Err(invalid_state(
+                "resume the retained Delta seal before publishing another Delta table",
+            ));
+        }
+        if self.has_uncommitted_changes() {
+            return Err(invalid_state(
+                "Delta publication requires the scalar writer to be fully committed",
+            ));
+        }
+        Ok(self
+            .published_snapshot
+            .publish_complete(Arc::new(self.backend.snapshot().clone()), deltas)?)
+    }
+
+    /// Seal one already-published Delta epoch into Keeper and atomically
+    /// replace the complete process-local Delta table.
+    ///
+    /// The frozen source remains retained through FSLX construction, segment
+    /// fsync/install, and MANIFEST publication. The final `ArcSwap` installs the
+    /// new Keeper plus all replacement Delta epochs in one non-cancellable
+    /// step; only then may this method release its source Arc. Consequently a
+    /// reader can observe the document in the old Delta or the new Keeper, but
+    /// never a visibility gap between them.
+    ///
+    /// `replacement_deltas` must already be frozen against the successor
+    /// MANIFEST generation. Multi-shard callers must rebind every surviving
+    /// shard epoch through [`DeltaSnapshot::rebind_keeper_generation`], not
+    /// only the shard being sealed; omission is rejected before FSLX work.
+    ///
+    /// # Errors
+    ///
+    /// Rejects scalar pending state, an unpublished source epoch, invalid
+    /// replacement epochs, cancellation before durable authority changes, or
+    /// any FSLX/Keeper publication failure. An installed-but-unreferenced
+    /// segment remains invisible and is safe for exact retry.
+    pub async fn seal_delta_snapshot(
+        &mut self,
+        cx: &Cx,
+        sealed: Arc<DeltaSnapshot>,
+        replacement_deltas: Vec<Arc<DeltaSnapshot>>,
+        input: DeltaFlushInput,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        check_cancel(cx, "Delta seal")?;
+        if self.pending_delta_seal.is_some() {
+            return Err(invalid_state(
+                "a prior Delta seal requires resume_pending_delta_seal before new mutation",
+            ));
+        }
+        if self.has_uncommitted_changes() {
+            return Err(invalid_state(
+                "Delta seal requires the scalar writer to be fully committed",
+            ));
+        }
+        let current = self.published_snapshot.load();
+        if !current
+            .delta_snapshots()
+            .iter()
+            .any(|delta| Arc::ptr_eq(delta, &sealed))
+        {
+            return Err(invalid_state(
+                "Delta seal source is not present in the published process-local epoch",
+            ));
+        }
+        if sealed.keeper_generation() != current.keeper_generation() {
+            return Err(invalid_state(
+                "Delta seal source is stale relative to the published Keeper",
+            ));
+        }
+        validate_delta_seal_replacements(&current, &sealed, &replacement_deltas)?;
+
+        let build_source = Arc::clone(&sealed);
+        let encoded = spawn_blocking(move || flush_delta_snapshot(&build_source, input))
+            .await?
+            .map(Arc::new);
+        check_cancel(cx, "Delta segment install")?;
+
+        let mut manifest = self.backend.snapshot().next_manifest()?;
+        // Keeper owns the one authoritative publish timestamp. Retaining a
+        // zero here also lets an ambiguous retry compare the exact logical
+        // proposal after Keeper normalizes its installed timestamp.
+        manifest.last_publish_unix_s = 0;
+        let mut next_seal_seq = self.next_seal_seq;
+        if let Some(encoded) = &encoded {
+            manifest
+                .segments
+                .push(manifest_segment(encoded, next_seal_seq));
+            manifest
+                .segments
+                .sort_unstable_by_key(|segment| segment.docid_lo);
+            next_seal_seq = next_seal_seq
+                .checked_add(1)
+                .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+        }
+        let successor_watermark = replacement_deltas.iter().fold(
+            manifest.docid_high_watermark.max(sealed.lease_end()),
+            |watermark, delta| watermark.max(delta.lease_end()),
+        );
+        manifest.docid_high_watermark = successor_watermark;
+        let live_document_count = u32::try_from(sealed.live_document_count())
+            .map_err(|_| invalid_state("Delta live document count does not fit u32"))?;
+        let mut pending_field_stats = BTreeMap::new();
+        if live_document_count != 0 {
+            for field in
+                self.schema.fields.iter().filter(|field| {
+                    matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. })
+                })
+            {
+                let total_tokens = sealed.live_total_tokens(field.id).ok_or_else(|| {
+                    invalid_state(format!(
+                        "Delta seal omitted indexed field {} statistics",
+                        field.id
+                    ))
+                })?;
+                pending_field_stats.insert(field.id, (total_tokens, live_document_count));
+            }
+        }
+        manifest.field_stats = merge_field_stats(&manifest.field_stats, &pending_field_stats)?;
+        let prepared = self
+            .published_snapshot
+            .prepare_sealed_manifest_with_deltas(self.schema, &manifest, replacement_deltas)?;
+        self.pending_delta_seal = Some(PendingDeltaSeal {
+            encoded,
+            segment_installed: false,
+            manifest,
+            prepared,
+            next_seal_seq,
+            successor_watermark,
+        });
+        drop(sealed);
+        self.finish_pending_delta_seal(cx).await
+    }
+
+    /// Resume an exact Delta seal proposal retained across cancellation or a
+    /// dropped future.
+    ///
+    /// Until this succeeds, the old process-local Delta epoch remains visible
+    /// and every writer mutation is rejected. The retained zero-timestamp
+    /// MANIFEST proposal and canonical FSLX bytes make reconciliation exact
+    /// even if the prior durable publication won ambiguously.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when no seal awaits reconciliation or when segment
+    /// installation, MANIFEST publication, or Keeper reopening fails again.
+    pub async fn resume_pending_delta_seal(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        if self.pending_delta_seal.is_none() {
+            return Err(invalid_state("no Delta seal awaits reconciliation"));
+        }
+        self.finish_pending_delta_seal(cx).await
+    }
+
+    async fn finish_pending_delta_seal(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Arc<QuillSearchSnapshot>, QuillIndexError> {
+        let (encoded, segment_installed, manifest, memory_owned) = {
+            let pending = self
+                .pending_delta_seal
+                .as_ref()
+                .expect("Delta seal completion requires retained state");
+            let encoded = pending.encoded.clone();
+            let memory_owned = if matches!(&self.backend, IndexBackend::Memory(_)) {
+                pending
+                    .encoded
+                    .iter()
+                    .map(|encoded| encoded.as_ref().clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (
+                encoded,
+                pending.segment_installed,
+                pending.manifest.clone(),
+                memory_owned,
+            )
+        };
+
+        if let (Some(encoded), IndexBackend::Durable(writer)) = (encoded, &mut self.backend)
+            && !segment_installed
+        {
+            writer
+                .publish_encoded_segment_retryable(cx, encoded)
+                .await?;
+            self.pending_delta_seal
+                .as_mut()
+                .expect("installed Delta segment retains transaction state")
+                .segment_installed = true;
+        }
+        check_cancel(cx, "Delta MANIFEST publish")?;
+        match &mut self.backend {
+            IndexBackend::Durable(writer) => {
+                writer.publish(cx, &manifest).await?;
+            }
+            IndexBackend::Memory(snapshot) => {
+                *snapshot = snapshot.publish_owned_segments(&manifest, memory_owned)?;
+            }
+        }
+
+        // No await or cancellation checkpoint is permitted after MANIFEST
+        // authority changes. Taking the retained state and swapping the local
+        // epoch therefore complete in the same poll that observes publication.
+        let pending = self
+            .pending_delta_seal
+            .take()
+            .expect("published Delta seal retains its prepared local swap");
+        let installed = self
+            .published_snapshot
+            .install_prepared_sealed(Arc::new(self.backend.snapshot().clone()), pending.prepared);
+        self.next_seal_seq = pending.next_seal_seq;
+        self.next_lease_base = self.next_lease_base.max(pending.successor_watermark);
+        Ok(installed)
     }
 
     /// Durable index directory, or `None` for an owned-buffer index.
@@ -1098,6 +1445,11 @@ impl QuillIndex {
             || self.staged_flush.is_some()
             || !self.pending_segments.is_empty()
             || self.pending_manifest.is_some()
+            || self.pending_delta_seal.is_some()
+    }
+
+    fn has_active_deltas(&self) -> bool {
+        !self.published_snapshot.load().delta_snapshots().is_empty()
     }
 
     /// Accumulate one bounded batch into the single scalar shard.
@@ -1130,6 +1482,16 @@ impl QuillIndex {
         let instrumented = ingest_span.clone();
         async move {
             check_cancel(cx, "index")?;
+            if self.pending_delta_seal.is_some() {
+                return Err(invalid_state(
+                    "resume the retained Delta seal before scalar indexing",
+                ));
+            }
+            if self.has_active_deltas() {
+                return Err(invalid_state(
+                    "scalar indexing cannot run while process-local Delta epochs are active",
+                ));
+            }
             if self.staged_flush.is_some()
                 || !self.pending_segments.is_empty()
                 || self.pending_manifest.is_some()
@@ -1227,6 +1589,16 @@ impl QuillIndex {
     /// invisible and are retained for a publication retry.
     pub async fn commit(&mut self, cx: &Cx) -> Result<&KeeperSnapshot, QuillIndexError> {
         check_cancel(cx, "commit")?;
+        if self.pending_delta_seal.is_some() {
+            return Err(invalid_state(
+                "resume the retained Delta seal before scalar commit",
+            ));
+        }
+        if self.has_active_deltas() {
+            return Err(invalid_state(
+                "scalar commit cannot run while process-local Delta epochs are active",
+            ));
+        }
         self.flush_current(cx).await?;
         check_cancel(cx, "commit publish")?;
         if self.pending_segments.is_empty() {
@@ -1599,13 +1971,15 @@ impl QuillIndex {
         wall_clock_unix_s()
     }
 
-    /// Parse and exhaustively execute one query over the committed snapshot.
+    /// Parse and exhaustively execute one query over the published composite
+    /// Keeper-plus-Delta snapshot.
     ///
     /// # Errors
     ///
     /// Returns typed cancellation, section validation, unsupported-query, or
-    /// scorer/collector failures. Uncommitted accumulator and installed bytes
-    /// are intentionally absent from the searched snapshot.
+    /// scorer/collector failures. Scalar accumulator state and installed but
+    /// MANIFEST-unreferenced bytes are intentionally absent; frozen Delta
+    /// epochs published in the process-local view are included.
     pub fn search_paginated(
         &self,
         cx: &Cx,
@@ -1615,14 +1989,19 @@ impl QuillIndex {
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         let published = self.published_snapshot.load();
-        let snapshot = published.keeper_snapshot();
+        let snapshot = published.as_ref();
+        let keeper = snapshot.keeper_snapshot();
+        let segment_count = keeper
+            .segments()
+            .len()
+            .saturating_add(snapshot.delta_count());
         let query_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_QUERY,
             phase = "query",
             query_len = query.len(),
-            segment_count = snapshot.segments().len(),
-            doc_count = snapshot.doc_count(),
+            segment_count,
+            doc_count = snapshot.live_doc_count(),
             limit,
             offset,
             exact_count,
@@ -1668,7 +2047,7 @@ impl QuillIndex {
         } else {
             TopDocsCollector::new(limit, offset)?
         };
-        for segment in snapshot.segments() {
+        for segment in keeper.segments() {
             check_cancel(cx, "search")?;
             let score_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
@@ -1680,15 +2059,43 @@ impl QuillIndex {
             );
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
             let _score_entered = score_span.enter();
-            let mut scorer = lower_query(&parsed.query, 1.0, segment, snapshot, self.schema)?;
+            let mut scorer = lower_query(
+                &parsed.query,
+                1.0,
+                QueryLeaf::Sealed(segment),
+                snapshot,
+                self.schema,
+            )?;
             collector.collect(&mut scorer, segment)?;
+        }
+        for delta in snapshot.delta_snapshots() {
+            check_cancel(cx, "search")?;
+            let score_span = tracing::info_span!(
+                target: crate::tracing_conventions::TARGET,
+                crate::tracing_conventions::ARGUS_SCORE,
+                phase = "score",
+                residency = "delta",
+                lease_base = delta.lease_base(),
+                doc_count = delta.live_document_count(),
+                duration_us = tracing::field::Empty,
+            );
+            let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
+            let _score_entered = score_span.enter();
+            let mut scorer = lower_query(
+                &parsed.query,
+                1.0,
+                QueryLeaf::Delta(delta),
+                snapshot,
+                self.schema,
+            )?;
+            collector.collect(&mut scorer, delta.as_ref())?;
         }
         let collect_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_COLLECT,
             phase = "collect",
-            segment_count = snapshot.segments().len(),
-            doc_count = snapshot.doc_count(),
+            segment_count,
+            doc_count = snapshot.live_doc_count(),
             result_count = tracing::field::Empty,
             total_count = tracing::field::Empty,
             duration_us = tracing::field::Empty,
@@ -1722,7 +2129,7 @@ impl QuillIndex {
         Ok(QuillSearchResult {
             hits,
             total_count,
-            doc_count: snapshot.doc_count(),
+            doc_count: snapshot.live_doc_count(),
             diagnostics: parsed.diagnostics,
         })
     }
@@ -1731,8 +2138,9 @@ impl QuillIndex {
     ///
     /// This is the scoreless collector lane: it lowers the same canonical
     /// default-parser tree as [`Self::search_paginated`], traverses every
-    /// committed segment without ranking, and returns sorted unique Q1 IDs.
-    /// Uncommitted documents remain invisible.
+    /// Keeper and published process-local Delta leaf without ranking, and
+    /// returns sorted unique Q1 IDs. Scalar accumulator documents remain
+    /// invisible.
     ///
     /// # Errors
     ///
@@ -1740,15 +2148,20 @@ impl QuillIndex {
     /// failures.
     pub fn collect_docids(&self, cx: &Cx, query: &str) -> Result<Vec<u32>, QuillIndexError> {
         let published = self.published_snapshot.load();
-        let snapshot = published.keeper_snapshot();
+        let snapshot = published.as_ref();
+        let keeper = snapshot.keeper_snapshot();
+        let segment_count = keeper
+            .segments()
+            .len()
+            .saturating_add(snapshot.delta_count());
         let query_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_QUERY,
             phase = "query",
             collector = "docset",
             query_len = query.len(),
-            segment_count = snapshot.segments().len(),
-            doc_count = snapshot.doc_count(),
+            segment_count,
+            doc_count = snapshot.live_doc_count(),
             result_count = tracing::field::Empty,
             duration_us = tracing::field::Empty,
         );
@@ -1777,7 +2190,7 @@ impl QuillIndex {
             parsed
         };
         let mut collector = DocSetCollector::new();
-        for segment in snapshot.segments() {
+        for segment in keeper.segments() {
             check_cancel(cx, "collect_docids")?;
             let score_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
@@ -1790,17 +2203,45 @@ impl QuillIndex {
             );
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
             let _score_entered = score_span.enter();
-            let mut scorer =
-                lower_query_unscored(&parsed.query, 1.0, segment, snapshot, self.schema)?;
+            let mut scorer = lower_query_unscored(
+                &parsed.query,
+                1.0,
+                QueryLeaf::Sealed(segment),
+                snapshot,
+                self.schema,
+            )?;
             collector.collect(&mut scorer, segment)?;
+        }
+        for delta in snapshot.delta_snapshots() {
+            check_cancel(cx, "collect_docids")?;
+            let score_span = tracing::info_span!(
+                target: crate::tracing_conventions::TARGET,
+                crate::tracing_conventions::ARGUS_SCORE,
+                phase = "score",
+                collector = "docset",
+                residency = "delta",
+                lease_base = delta.lease_base(),
+                doc_count = delta.live_document_count(),
+                duration_us = tracing::field::Empty,
+            );
+            let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
+            let _score_entered = score_span.enter();
+            let mut scorer = lower_query_unscored(
+                &parsed.query,
+                1.0,
+                QueryLeaf::Delta(delta),
+                snapshot,
+                self.schema,
+            )?;
+            collector.collect(&mut scorer, delta.as_ref())?;
         }
         let collect_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_COLLECT,
             phase = "collect",
             collector = "docset",
-            segment_count = snapshot.segments().len(),
-            doc_count = snapshot.doc_count(),
+            segment_count,
+            doc_count = snapshot.live_doc_count(),
             result_count = tracing::field::Empty,
             duration_us = tracing::field::Empty,
         );
@@ -2049,34 +2490,60 @@ impl PositionsReader for OwnedPostingCursor {
     }
 }
 
-fn lower_query(
+#[derive(Clone, Copy)]
+enum QueryLeaf<'a> {
+    Sealed(&'a RecoveredSegment),
+    Delta(&'a DeltaSnapshot),
+}
+
+impl QueryLeaf<'_> {
+    fn docid_range(self) -> (u64, u64) {
+        match self {
+            Self::Sealed(segment) => (segment.manifest().docid_lo, segment.manifest().docid_hi),
+            Self::Delta(delta) => delta.occupied_docid_range().unwrap_or_else(|| {
+                let lease_base = delta.lease_base();
+                (lease_base, lease_base)
+            }),
+        }
+    }
+
+    fn live_document_count(self) -> Result<u32, QuillIndexError> {
+        match self {
+            Self::Sealed(segment) => Ok(segment.doc_count()),
+            Self::Delta(delta) => u32::try_from(delta.live_document_count())
+                .map_err(|_| invalid_state("Delta live document count does not fit u32")),
+        }
+    }
+}
+
+fn lower_query<'a>(
     query: &Query,
     inherited_boost: f32,
-    segment: &RecoveredSegment,
-    snapshot: &KeeperSnapshot,
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
-) -> Result<ReferenceScorer<'static>, QuillIndexError> {
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         query,
         inherited_boost,
-        segment,
+        leaf,
         snapshot,
         schema,
         QueryLoweringMode::Scored,
     )
 }
 
-fn lower_query_unscored(
+fn lower_query_unscored<'a>(
     query: &Query,
     inherited_boost: f32,
-    segment: &RecoveredSegment,
-    snapshot: &KeeperSnapshot,
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
-) -> Result<ReferenceScorer<'static>, QuillIndexError> {
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         query,
         inherited_boost,
-        segment,
+        leaf,
         snapshot,
         schema,
         QueryLoweringMode::Unscored,
@@ -2100,30 +2567,33 @@ fn lower_boolean(
     .map_err(QuillIndexError::from)
 }
 
-fn lower_query_with_mode(
+fn lower_query_with_mode<'a>(
     query: &Query,
     inherited_boost: f32,
-    segment: &RecoveredSegment,
-    snapshot: &KeeperSnapshot,
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
     mode: QueryLoweringMode,
-) -> Result<ReferenceScorer<'static>, QuillIndexError> {
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     match query {
         Query::Empty => Ok(ReferenceScorer::empty()),
-        Query::All => Ok(ReferenceScorer::all_with_boost(
-            segment.manifest().docid_lo,
-            segment.manifest().docid_hi,
-            segment.doc_count(),
-            inherited_boost,
-        )?),
+        Query::All => {
+            let (docid_lo, docid_hi) = leaf.docid_range();
+            Ok(ReferenceScorer::all_with_boost(
+                docid_lo,
+                docid_hi,
+                leaf.live_document_count()?,
+                inherited_boost,
+            )?)
+        }
         Query::Term { fields, text } => {
             let mut clauses = Vec::new();
             clauses
                 .try_reserve_exact(fields.len())
                 .map_err(|_| invalid_state("could not allocate expanded term clauses"))?;
             for field in fields {
-                clauses.push(ScorerClause::should(lower_term(
-                    segment,
+                clauses.push(ScorerClause::should(lower_leaf_term(
+                    leaf,
                     snapshot,
                     schema,
                     field.field_id,
@@ -2148,8 +2618,8 @@ fn lower_query_with_mode(
                 let term = &terms[0];
                 let mut clauses = Vec::new();
                 for field in fields {
-                    clauses.push(ScorerClause::should(lower_term(
-                        segment,
+                    clauses.push(ScorerClause::should(lower_leaf_term(
+                        leaf,
                         snapshot,
                         schema,
                         field.field_id,
@@ -2161,35 +2631,51 @@ fn lower_query_with_mode(
             }
             let mut clauses = Vec::new();
             for field in fields {
-                let stats = snapshot_field(snapshot, field.field_id)?;
-                let mut phrase_terms = Vec::new();
+                let stats = composite_snapshot_field(snapshot, field.field_id)?;
+                let mut phrase_terms: Vec<PhraseTerm<'a>> = Vec::new();
                 phrase_terms
                     .try_reserve_exact(terms.len())
                     .map_err(|_| invalid_state("could not allocate phrase terms"))?;
                 for term in terms {
                     let snapshot_doc_freq =
-                        snapshot_doc_freq(snapshot, schema, field.field_id, term.text.as_bytes())?;
-                    let cursor = open_owned_cursor(
-                        segment,
-                        schema,
-                        field.field_id,
-                        term.text.as_bytes(),
-                        true,
-                    )?;
-                    phrase_terms.push(PhraseTerm::new(
-                        field.field_id,
-                        term.position,
-                        cursor,
-                        snapshot_doc_freq,
-                    ));
+                        snapshot.bm25_doc_freq(field.field_id, term.text.as_bytes())?;
+                    phrase_terms.push(match leaf {
+                        QueryLeaf::Sealed(segment) => PhraseTerm::new(
+                            field.field_id,
+                            term.position,
+                            open_owned_cursor(
+                                segment,
+                                schema,
+                                field.field_id,
+                                term.text.as_bytes(),
+                                true,
+                            )?,
+                            snapshot_doc_freq,
+                        ),
+                        QueryLeaf::Delta(delta) => PhraseTerm::new(
+                            field.field_id,
+                            term.position,
+                            DeltaPostingCursor::new(delta, field.field_id, term.text.as_bytes())?,
+                            snapshot_doc_freq,
+                        ),
+                    });
                 }
-                let norms = owned_fieldnorms(segment, schema, field.field_id)?;
-                let scorer = PhraseScorer::new(
-                    phrase_terms,
-                    norms,
-                    Bm25FieldSnapshot::new(stats)?,
-                    inherited_boost * field.boost,
-                )?;
+                let bm25 = Bm25FieldSnapshot::new(stats)?;
+                let boost = inherited_boost * field.boost;
+                let scorer = match leaf {
+                    QueryLeaf::Sealed(segment) => PhraseScorer::new(
+                        phrase_terms,
+                        owned_fieldnorms(segment, schema, field.field_id)?,
+                        bm25,
+                        boost,
+                    )?,
+                    QueryLeaf::Delta(delta) => PhraseScorer::new(
+                        phrase_terms,
+                        DeltaFieldNorms::new(delta, field.field_id),
+                        bm25,
+                        boost,
+                    )?,
+                };
                 clauses.push(ScorerClause::should(ReferenceScorer::phrase(scorer)));
             }
             lower_boolean(clauses, mode)
@@ -2205,7 +2691,7 @@ fn lower_query_with_mode(
                     lower_query_with_mode(
                         &clause.query,
                         inherited_boost,
-                        segment,
+                        leaf,
                         snapshot,
                         schema,
                         mode,
@@ -2221,7 +2707,7 @@ fn lower_query_with_mode(
                     detail: format!("non-finite cumulative boost bits 0x{:08x}", boost.to_bits()),
                 });
             }
-            lower_query_with_mode(query, boost, segment, snapshot, schema, mode)
+            lower_query_with_mode(query, boost, leaf, snapshot, schema, mode)
         }
         Query::Range { .. } | Query::Set { .. } | Query::Glob { .. } => {
             Err(QuillIndexError::UnsupportedQuery {
@@ -2231,6 +2717,44 @@ fn lower_query_with_mode(
     }
 }
 
+fn lower_leaf_term<'a>(
+    leaf: QueryLeaf<'a>,
+    snapshot: &QuillSearchSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    term: &[u8],
+    boost: f32,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
+    let stats = composite_snapshot_field(snapshot, field_ord)?;
+    let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
+    match leaf {
+        QueryLeaf::Sealed(segment) => build_term_scorer(
+            open_owned_cursor(segment, schema, field_ord, term, false)?,
+            owned_fieldnorms(segment, schema, field_ord)?,
+            stats,
+            doc_freq,
+            boost,
+        ),
+        QueryLeaf::Delta(delta) => build_term_scorer(
+            DeltaPostingCursor::new(delta, field_ord, term)?,
+            DeltaFieldNorms::new(delta, field_ord),
+            stats,
+            doc_freq,
+            boost,
+        ),
+    }
+}
+
+fn composite_snapshot_field(
+    snapshot: &QuillSearchSnapshot,
+    field_ord: u16,
+) -> Result<SnapshotFieldStats, QuillIndexError> {
+    snapshot
+        .bm25_field_stats(field_ord)
+        .ok_or_else(|| invalid_state(format!("snapshot has no field statistics for {field_ord}")))
+}
+
+#[cfg(test)]
 fn lower_term(
     segment: &RecoveredSegment,
     snapshot: &KeeperSnapshot,
@@ -2305,6 +2829,7 @@ fn lower_delta_term<'a>(
     )
 }
 
+#[cfg(test)]
 fn snapshot_field(
     snapshot: &KeeperSnapshot,
     field_ord: u16,
@@ -2483,6 +3008,7 @@ mod tests {
     use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
 
     use asupersync::runtime::yield_now;
     use asupersync::types::Budget;
@@ -2492,12 +3018,15 @@ mod tests {
 
     use super::*;
     use crate::contract::fieldnorm_to_id;
-    use crate::delta::{DeltaFieldNorm, DeltaSegment, DeltaTermPosting};
+    use crate::delta::{
+        DeltaFieldNorm, DeltaNumericValue, DeltaSegment, DeltaStoredValue, DeltaTermPosting,
+    };
     use crate::keeper::ConcatMergeError;
     use crate::quiver::{
         EncodedPositionList, EncodedPostingList, StatsSection, aggregate_field_stats,
     };
-    use crate::schema::FSFS_CHUNK_SCHEMA;
+    use crate::schema::{Analyzer, FSFS_CHUNK_SCHEMA, FieldDescriptor};
+    use crate::scribe::IndexedNumericValue;
 
     const CONCAT_MERGE_QUERIES: [&str; 4] =
         ["rust", "python", "rust OR python", "\"rust ownership\""];
@@ -2520,6 +3049,42 @@ mod tests {
         SectionKind::STOREDMETA,
         SectionKind::STATS,
     ];
+    const DELTA_PARITY_FIELDS: [FieldDescriptor; 4] = [
+        FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "rank",
+            kind: FieldKind::U64 {
+                indexed: true,
+                fast: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "opaque",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+    ];
+    const DELTA_PARITY_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "delta-seal-parity-v1",
+        fields: &DELTA_PARITY_FIELDS,
+    };
 
     fn run_with_cx<F, Fut>(test: F)
     where
@@ -2529,11 +3094,33 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(test);
     }
 
+    fn run_with_blocking_cx<F, Fut>(test: F)
+    where
+        F: FnOnce(Cx) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("build test runtime with a blocking pool");
+        runtime.block_on(test(cx));
+    }
+
     fn deterministic_config() -> QuillConfig {
         QuillConfig {
             deterministic_ingest: true,
             ..QuillConfig::default()
         }
+    }
+
+    fn shipping_content_hash(document_id: &str, content: &str) -> u64 {
+        let document = IndexableDocument::new(document_id, content);
+        let metadata = canonical_metadata(&document.metadata).expect("canonical fixture metadata");
+        xxh3_64(
+            &canonical_document_preimage(&document, &metadata)
+                .expect("canonical fixture document preimage"),
+        )
     }
 
     fn fixture_documents() -> Vec<IndexableDocument> {
@@ -2556,7 +3143,24 @@ mod tests {
         document_id: &str,
         content_frequency: u32,
     ) {
+        apply_sealable_delta_document(delta, global_docid, document_id, "alpha", content_frequency);
+    }
+
+    fn apply_sealable_delta_document(
+        delta: &mut DeltaSegment,
+        global_docid: u32,
+        document_id: &str,
+        content_term: &str,
+        content_frequency: u32,
+    ) {
         let positions = (0..content_frequency).collect::<Vec<_>>();
+        let content = std::iter::repeat_n(
+            content_term,
+            usize::try_from(content_frequency).expect("fixture frequency fits usize"),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+        let ordinal = u64::from(global_docid).to_le_bytes();
         let fieldnorms = [
             DeltaFieldNorm {
                 field_ord: ID_FIELD,
@@ -2583,19 +3187,103 @@ mod tests {
             },
             DeltaTermPosting {
                 field_ord: CONTENT_FIELD,
-                term: b"alpha",
+                term: content_term.as_bytes(),
                 frequency: content_frequency,
                 positions: Some(&positions),
             },
         ];
+        let stored = [
+            DeltaStoredValue::new(ID_FIELD, document_id.as_bytes()),
+            DeltaStoredValue::new(CONTENT_FIELD, content.as_bytes()),
+            DeltaStoredValue::new(TITLE_FIELD, b""),
+            DeltaStoredValue::new(METADATA_FIELD, b"{}"),
+            DeltaStoredValue::new(ORD_FIELD, &ordinal),
+        ];
         delta
-            .apply_document(
+            .apply_document_with_values(
                 global_docid,
                 frankensearch_core::DocId::from(document_id),
+                shipping_content_hash(document_id, &content),
                 &fieldnorms,
                 &postings,
+                &[],
+                &stored,
             )
             .expect("apply Delta fixture document");
+    }
+
+    fn apply_tokenized_delta_document(
+        delta: &mut DeltaSegment,
+        global_docid: u32,
+        document_id: &str,
+        content: &str,
+    ) {
+        let mut term_positions = BTreeMap::<&str, Vec<u32>>::new();
+        for (position, term) in content.split_ascii_whitespace().enumerate() {
+            term_positions.entry(term).or_default().push(
+                u32::try_from(position).expect("fixture token position fits the Delta wire type"),
+            );
+        }
+        let token_count = term_positions
+            .values()
+            .map(Vec::len)
+            .try_fold(0_u32, |count, term_count| {
+                count.checked_add(
+                    u32::try_from(term_count).expect("fixture term frequency fits u32"),
+                )
+            })
+            .expect("fixture token count fits u32");
+        let fieldnorms = [
+            DeltaFieldNorm {
+                field_ord: ID_FIELD,
+                raw_length: 1,
+                fieldnorm_id: fieldnorm_to_id(1),
+            },
+            DeltaFieldNorm {
+                field_ord: CONTENT_FIELD,
+                raw_length: token_count,
+                fieldnorm_id: fieldnorm_to_id(token_count),
+            },
+            DeltaFieldNorm {
+                field_ord: TITLE_FIELD,
+                raw_length: 0,
+                fieldnorm_id: fieldnorm_to_id(0),
+            },
+        ];
+        let mut postings = Vec::with_capacity(term_positions.len() + 1);
+        postings.push(DeltaTermPosting {
+            field_ord: ID_FIELD,
+            term: document_id.as_bytes(),
+            frequency: 1,
+            positions: None,
+        });
+        for (term, positions) in &term_positions {
+            postings.push(DeltaTermPosting {
+                field_ord: CONTENT_FIELD,
+                term: term.as_bytes(),
+                frequency: u32::try_from(positions.len()).expect("fixture frequency fits u32"),
+                positions: Some(positions),
+            });
+        }
+        let ordinal = u64::from(global_docid).to_le_bytes();
+        let stored = [
+            DeltaStoredValue::new(ID_FIELD, document_id.as_bytes()),
+            DeltaStoredValue::new(CONTENT_FIELD, content.as_bytes()),
+            DeltaStoredValue::new(TITLE_FIELD, b""),
+            DeltaStoredValue::new(METADATA_FIELD, b"{}"),
+            DeltaStoredValue::new(ORD_FIELD, &ordinal),
+        ];
+        delta
+            .apply_document_with_values(
+                global_docid,
+                DocId::from(document_id),
+                shipping_content_hash(document_id, content),
+                &fieldnorms,
+                &postings,
+                &[],
+                &stored,
+            )
+            .expect("apply tokenized Delta fixture document");
     }
 
     fn alpha_snapshot_tuple(snapshot: &QuillSearchSnapshot) -> (u64, u64, u64, u64, u64) {
@@ -3065,7 +3753,7 @@ mod tests {
         let live_norms = DeltaFieldNorms::new(&frozen, CONTENT_FIELD);
 
         assert_eq!(live.size_hint(), 2);
-        assert_eq!(live.cost(), 4);
+        assert_eq!(live.cost(), 2);
         assert_eq!(live.segment_num_docs(), 2);
         assert_eq!(live_norms.fieldnorm_id(0), None);
         assert_eq!(live_norms.fieldnorm_id(1), Some(fieldnorm_to_id(2)));
@@ -3427,6 +4115,64 @@ mod tests {
     }
 
     #[test]
+    fn scalar_and_delta_writer_modes_cannot_discard_each_others_pending_state() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            index
+                .index_documents(&cx, &[IndexableDocument::new("scalar", "sealed first")])
+                .await
+                .expect("accumulate scalar row");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let empty_delta = Arc::new(
+                DeltaSegment::new(DEFAULT_SCHEMA, u64::from(DOC_ORDS_PER_LEASE), usize::MAX)
+                    .expect("empty Delta")
+                    .freeze(generation),
+            );
+            let Err(error) = index.publish_delta_table(vec![empty_delta]) else {
+                panic!("Delta publication overtook scalar pending state");
+            };
+            assert!(error.to_string().contains("fully committed"));
+            index.commit(&cx).await.expect("commit scalar row");
+
+            let lease_base = index
+                .snapshot()
+                .loaded_manifest()
+                .manifest
+                .docid_high_watermark;
+            let global_docid = u32::try_from(lease_base).expect("Delta docid");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let mut delta =
+                DeltaSegment::new(DEFAULT_SCHEMA, lease_base, usize::MAX).expect("live Delta");
+            apply_alpha_delta(&mut delta, global_docid, "delta", 1);
+            index
+                .publish_delta_table(vec![Arc::new(delta.freeze(generation))])
+                .expect("publish live Delta");
+            let before = index.search_snapshot();
+
+            let error = index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new("forbidden", "scalar overlap")],
+                )
+                .await
+                .expect_err("scalar ingest must reject an active Delta epoch");
+            assert!(error.to_string().contains("Delta epochs are active"));
+            let Err(error) = index.commit(&cx).await else {
+                panic!("scalar commit accepted an active Delta epoch");
+            };
+            assert!(error.to_string().contains("Delta epochs are active"));
+
+            let after = index.search_snapshot();
+            assert!(Arc::ptr_eq(&before, &after));
+            assert_eq!(
+                after.materialize_document_id(global_docid).as_deref(),
+                Some("delta")
+            );
+            assert_eq!(after.bm25_doc_freq(CONTENT_FIELD, b"alpha").unwrap(), 1);
+        });
+    }
+
+    #[test]
     fn publisher_retains_a_held_epoch_until_its_last_reader_drops() {
         let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
         let generation = keeper.loaded_manifest().manifest.generation;
@@ -3526,6 +4272,1152 @@ mod tests {
         assert!(report.quiescent, "LabRuntime must reach quiescence");
         assert!(report.oracle_report.all_passed(), "oracles must pass");
         assert!(report.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn tombstone_folded_delta_seal_is_byte_identical_to_direct_scribe_flush() {
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta lease");
+        apply_sealable_delta_document(&mut delta, 0, "dead-a", "ghost", 1);
+        apply_sealable_delta_document(&mut delta, 1, "live-a", "alpha", 2);
+        apply_sealable_delta_document(&mut delta, 2, "dead-b", "ghost", 2);
+        apply_sealable_delta_document(&mut delta, 3, "live-b", "beta", 1);
+        assert_eq!(delta.delete_delta_id("dead-a"), Some(0));
+        assert_eq!(delta.delete_delta_id("dead-b"), Some(2));
+        let frozen = delta.freeze(1);
+
+        let metadata = b"{}";
+        let ordinal_a = 1_u64.to_le_bytes();
+        let ordinal_b = 3_u64.to_le_bytes();
+        let mut direct = ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("direct accumulator");
+        direct
+            .add_document_with_values(
+                1,
+                &[
+                    IndexedFieldValue::new(ID_FIELD, "live-a"),
+                    IndexedFieldValue::new(CONTENT_FIELD, "alpha alpha"),
+                    IndexedFieldValue::new(TITLE_FIELD, ""),
+                ],
+                &[],
+                &[
+                    StoredFieldValue::new(METADATA_FIELD, metadata),
+                    StoredFieldValue::new(ORD_FIELD, &ordinal_a),
+                ],
+            )
+            .expect("accumulate direct live-a");
+        direct
+            .add_document_with_values(
+                3,
+                &[
+                    IndexedFieldValue::new(ID_FIELD, "live-b"),
+                    IndexedFieldValue::new(CONTENT_FIELD, "beta"),
+                    IndexedFieldValue::new(TITLE_FIELD, ""),
+                ],
+                &[],
+                &[
+                    StoredFieldValue::new(METADATA_FIELD, metadata),
+                    StoredFieldValue::new(ORD_FIELD, &ordinal_b),
+                ],
+            )
+            .expect("accumulate direct live-b");
+        let documents = [
+            FlushDocumentInput::new(1, "live-a", shipping_content_hash("live-a", "alpha alpha")),
+            FlushDocumentInput::new(3, "live-b", shipping_content_hash("live-b", "beta")),
+        ];
+        let metadata = DeltaFlushInput {
+            segment_id: 0xe5_4000,
+            created_unix_s: 1_700_000_000,
+            engine_version: CURRENT_ENGINE_VERSION,
+        };
+        let direct_encoded = flush_accumulator_with_mode(
+            &direct,
+            FlushSegmentInput {
+                segment_id: metadata.segment_id,
+                lease_docid_base: 0,
+                created_unix_s: metadata.created_unix_s,
+                engine_version: metadata.engine_version,
+                documents: &documents,
+            },
+            FlushMode::Scalar,
+        )
+        .expect("flush direct Scribe fixture");
+        let delta_encoded = flush_delta_snapshot(&frozen, metadata)
+            .expect("flush tombstone-folded Delta")
+            .expect("live Delta emits a segment");
+        assert_eq!(delta_encoded.as_bytes(), direct_encoded.as_bytes());
+
+        let mut all_dead =
+            DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("all-dead Delta");
+        apply_sealable_delta_document(&mut all_dead, 0, "dead-only", "ghost", 1);
+        assert_eq!(all_dead.delete_delta_id("dead-only"), Some(0));
+        assert!(
+            flush_delta_snapshot(&all_dead.freeze(1), metadata)
+                .expect("all-dead seal result")
+                .is_none(),
+            "an all-tombstoned Delta must not emit an empty FSLX"
+        );
+    }
+
+    #[test]
+    fn convenience_delta_row_is_searchable_but_not_sealable_without_content_hash() {
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta lease");
+        let positions = [0];
+        let fieldnorms = [
+            DeltaFieldNorm {
+                field_ord: ID_FIELD,
+                raw_length: 1,
+                fieldnorm_id: fieldnorm_to_id(1),
+            },
+            DeltaFieldNorm {
+                field_ord: CONTENT_FIELD,
+                raw_length: 1,
+                fieldnorm_id: fieldnorm_to_id(1),
+            },
+            DeltaFieldNorm {
+                field_ord: TITLE_FIELD,
+                raw_length: 0,
+                fieldnorm_id: fieldnorm_to_id(0),
+            },
+        ];
+        let postings = [
+            DeltaTermPosting {
+                field_ord: ID_FIELD,
+                term: b"convenience",
+                frequency: 1,
+                positions: None,
+            },
+            DeltaTermPosting {
+                field_ord: CONTENT_FIELD,
+                term: b"alpha",
+                frequency: 1,
+                positions: Some(&positions),
+            },
+        ];
+        delta
+            .apply_document(0, DocId::from("convenience"), &fieldnorms, &postings)
+            .expect("apply process-local convenience row");
+        let frozen = delta.freeze(1);
+        assert_eq!(frozen.content_hash(0), None);
+        assert_eq!(
+            DeltaPostingCursor::new(&frozen, CONTENT_FIELD, b"alpha")
+                .expect("query convenience row")
+                .doc(),
+            Some(0)
+        );
+        assert!(matches!(
+            flush_delta_snapshot(
+                &frozen,
+                DeltaFlushInput {
+                    segment_id: 0xe5_4007,
+                    created_unix_s: 1_700_000_007,
+                    engine_version: CURRENT_ENGINE_VERSION,
+                },
+            ),
+            Err(FlushError::MissingDeltaContentHash { global_docid: 0 })
+        ));
+    }
+
+    #[test]
+    fn delta_seal_numeric_and_stored_sidecars_are_byte_identical_to_direct_scribe_flush() {
+        let mut delta =
+            DeltaSegment::new(DELTA_PARITY_SCHEMA, 0, usize::MAX).expect("Delta parity lease");
+        {
+            let mut add_delta =
+                |global_docid: u32, document_id: &str, frequency: u32, rank: u64, opaque: &[u8]| {
+                    let content = std::iter::repeat_n(
+                        "alpha",
+                        usize::try_from(frequency).expect("fixture frequency fits usize"),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                    let positions = (0..frequency).collect::<Vec<_>>();
+                    let fieldnorms = [
+                        DeltaFieldNorm {
+                            field_ord: 0,
+                            raw_length: 1,
+                            fieldnorm_id: fieldnorm_to_id(1),
+                        },
+                        DeltaFieldNorm {
+                            field_ord: 1,
+                            raw_length: frequency,
+                            fieldnorm_id: fieldnorm_to_id(frequency),
+                        },
+                    ];
+                    let postings = [
+                        DeltaTermPosting {
+                            field_ord: 0,
+                            term: document_id.as_bytes(),
+                            frequency: 1,
+                            positions: None,
+                        },
+                        DeltaTermPosting {
+                            field_ord: 1,
+                            term: b"alpha",
+                            frequency,
+                            positions: Some(&positions),
+                        },
+                    ];
+                    delta
+                        .apply_document_with_values(
+                            global_docid,
+                            DocId::from(document_id),
+                            shipping_content_hash(document_id, &content),
+                            &fieldnorms,
+                            &postings,
+                            &[DeltaNumericValue::u64(2, rank)],
+                            &[
+                                DeltaStoredValue::new(0, document_id.as_bytes()),
+                                DeltaStoredValue::new(1, content.as_bytes()),
+                                DeltaStoredValue::new(3, opaque),
+                            ],
+                        )
+                        .expect("apply typed Delta parity document");
+                };
+            add_delta(0, "dead", 1, 5, b"discarded");
+            add_delta(1, "live-a", 2, 11, b"opaque-a");
+            add_delta(3, "live-b", 1, u64::MAX, b"");
+        }
+        assert_eq!(delta.delete_delta_id("dead"), Some(0));
+        let frozen = delta.freeze(1);
+
+        let mut direct =
+            ColumnarAccumulator::new(DELTA_PARITY_SCHEMA).expect("direct typed accumulator");
+        for (doc_ord, document_id, content, rank, opaque) in [
+            (1, "live-a", "alpha alpha", 11, b"opaque-a".as_slice()),
+            (3, "live-b", "alpha", u64::MAX, b"".as_slice()),
+        ] {
+            direct
+                .add_document_with_values(
+                    doc_ord,
+                    &[
+                        IndexedFieldValue::new(0, document_id),
+                        IndexedFieldValue::new(1, content),
+                    ],
+                    &[IndexedNumericValue::u64(2, rank)],
+                    &[StoredFieldValue::new(3, opaque)],
+                )
+                .expect("accumulate direct typed parity document");
+        }
+        let documents = [
+            FlushDocumentInput::new(1, "live-a", shipping_content_hash("live-a", "alpha alpha")),
+            FlushDocumentInput::new(3, "live-b", shipping_content_hash("live-b", "alpha")),
+        ];
+        let metadata = DeltaFlushInput {
+            segment_id: 0xe5_4008,
+            created_unix_s: 1_700_000_008,
+            engine_version: CURRENT_ENGINE_VERSION,
+        };
+        let direct_encoded = flush_accumulator_with_mode(
+            &direct,
+            FlushSegmentInput {
+                segment_id: metadata.segment_id,
+                lease_docid_base: 0,
+                created_unix_s: metadata.created_unix_s,
+                engine_version: metadata.engine_version,
+                documents: &documents,
+            },
+            FlushMode::Scalar,
+        )
+        .expect("flush direct typed parity fixture");
+        let delta_encoded = flush_delta_snapshot(&frozen, metadata)
+            .expect("flush typed Delta parity fixture")
+            .expect("live typed Delta emits FSLX");
+        assert_eq!(delta_encoded.as_bytes(), direct_encoded.as_bytes());
+    }
+
+    #[test]
+    fn delta_seal_transaction_has_no_gap_and_never_crosses_a_lease() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let first_generation = index.snapshot().loaded_manifest().manifest.generation;
+            let first_docid = DOC_ORDS_PER_LEASE - 1;
+            let mut first_delta =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("first Delta lease");
+            let dead_docid = DOC_ORDS_PER_LEASE - 3;
+            apply_sealable_delta_document(&mut first_delta, dead_docid, "dead", "ghost", 1);
+            apply_alpha_delta(&mut first_delta, first_docid, "lease-zero", 1);
+            assert_eq!(first_delta.delete_delta_id("dead"), Some(dead_docid));
+            let first_sealed = Arc::new(first_delta.freeze(first_generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&first_sealed)])
+                .expect("publish first Delta epoch");
+            let held_first = index.search_snapshot();
+            let first_pre_search = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("search first Delta epoch");
+            let first_pre_all = index
+                .search_paginated(&cx, "*", 10, 0, true)
+                .expect("match all first Delta epoch");
+            let first_pre_docids = index
+                .collect_docids(&cx, "alpha")
+                .expect("collect first Delta epoch");
+            assert_eq!(first_pre_search.hits[0].document_id, "lease-zero");
+            assert_eq!(first_pre_all.hits.len(), 1);
+            assert_eq!(first_pre_all.total_count, Some(1));
+            assert_eq!(first_pre_docids, vec![first_docid]);
+
+            let second_lease = u64::from(DOC_ORDS_PER_LEASE);
+            let empty_second = Arc::new(
+                DeltaSegment::new(DEFAULT_SCHEMA, second_lease, usize::MAX)
+                    .expect("second empty Delta")
+                    .freeze(first_generation + 1),
+            );
+            let installed_first = index
+                .seal_delta_snapshot(
+                    &cx,
+                    Arc::clone(&first_sealed),
+                    vec![empty_second],
+                    DeltaFlushInput {
+                        segment_id: 0xe5_4001,
+                        created_unix_s: 1_700_000_001,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .await
+                .expect("seal first Delta lease");
+
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("search sealed first epoch"),
+                first_pre_search,
+                "public ranking, score bits, ids, and counts must cross the first seal unchanged"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "*", 10, 0, true)
+                    .expect("match all sealed first epoch"),
+                first_pre_all,
+                "Delta tombstones and lease holes must remain hidden after sealing"
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "alpha")
+                    .expect("collect sealed first epoch"),
+                first_pre_docids
+            );
+
+            assert_eq!(
+                held_first.bm25_doc_freq(CONTENT_FIELD, b"alpha").unwrap(),
+                1
+            );
+            assert_eq!(
+                installed_first
+                    .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                    .unwrap(),
+                1
+            );
+            assert_eq!(held_first.keeper_snapshot().segments().len(), 0);
+            assert_eq!(held_first.delta_snapshots()[0].live_document_count(), 1);
+            assert_eq!(installed_first.keeper_snapshot().segments().len(), 1);
+            assert_eq!(
+                installed_first.delta_snapshots()[0].live_document_count(),
+                0
+            );
+            assert_eq!(
+                installed_first
+                    .keeper_snapshot()
+                    .materialize_document_id(first_docid)
+                    .as_deref(),
+                Some("lease-zero")
+            );
+
+            let second_generation = index.snapshot().loaded_manifest().manifest.generation;
+            let second_docid = DOC_ORDS_PER_LEASE;
+            let mut second_delta = DeltaSegment::new(DEFAULT_SCHEMA, second_lease, usize::MAX)
+                .expect("second Delta lease");
+            apply_alpha_delta(&mut second_delta, second_docid, "lease-one", 1);
+            let second_sealed = Arc::new(second_delta.freeze(second_generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&second_sealed)])
+                .expect("publish second Delta epoch");
+            let held_second = index.search_snapshot();
+            let second_pre_search = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("search second Delta epoch");
+            let second_pre_docids = index
+                .collect_docids(&cx, "alpha")
+                .expect("collect second Delta epoch");
+
+            let third_lease = second_lease + u64::from(DOC_ORDS_PER_LEASE);
+            let empty_third = Arc::new(
+                DeltaSegment::new(DEFAULT_SCHEMA, third_lease, usize::MAX)
+                    .expect("third empty Delta")
+                    .freeze(second_generation + 1),
+            );
+            let installed_second = index
+                .seal_delta_snapshot(
+                    &cx,
+                    Arc::clone(&second_sealed),
+                    vec![empty_third],
+                    DeltaFlushInput {
+                        segment_id: 0xe5_4002,
+                        created_unix_s: 1_700_000_002,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .await
+                .expect("seal second Delta lease");
+
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("search sealed second epoch"),
+                second_pre_search,
+                "global public ranking must cross a mixed Keeper/Delta seal unchanged"
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "alpha")
+                    .expect("collect sealed second epoch"),
+                second_pre_docids
+            );
+
+            assert_eq!(
+                held_second.bm25_doc_freq(CONTENT_FIELD, b"alpha").unwrap(),
+                2
+            );
+            assert_eq!(
+                installed_second
+                    .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                    .unwrap(),
+                2
+            );
+            let segments = &installed_second
+                .keeper_snapshot()
+                .loaded_manifest()
+                .manifest
+                .segments;
+            assert_eq!(segments.len(), 2);
+            assert_eq!(
+                (segments[0].docid_lo, segments[0].docid_hi),
+                (65_535, 65_536)
+            );
+            assert_eq!(
+                (segments[1].docid_lo, segments[1].docid_hi),
+                (65_536, 65_537)
+            );
+            for segment in segments {
+                assert_eq!(
+                    segment.docid_lo / u64::from(DOC_ORDS_PER_LEASE),
+                    (segment.docid_hi - 1) / u64::from(DOC_ORDS_PER_LEASE),
+                    "one sealed segment must stay inside one Q1 lease"
+                );
+            }
+
+            let post_survivor_watermark = third_lease + u64::from(DOC_ORDS_PER_LEASE);
+            assert_eq!(
+                installed_second
+                    .keeper_snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .docid_high_watermark,
+                post_survivor_watermark,
+                "the durable watermark must cover every allocated replacement lease"
+            );
+            let mut reopened = QuillIndex::from_backend(
+                IndexBackend::Memory(index.snapshot().clone()),
+                DEFAULT_SCHEMA,
+                deterministic_config(),
+            )
+            .expect("reopen sealed Keeper snapshot");
+            assert_eq!(reopened.next_lease_base, post_survivor_watermark);
+            reopened
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new("after-reopen", "fresh allocation")],
+                )
+                .await
+                .expect("index after reopen");
+            reopened.commit(&cx).await.expect("commit after reopen");
+            assert_eq!(
+                reopened
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .segments
+                    .last()
+                    .expect("post-reopen segment")
+                    .docid_lo,
+                post_survivor_watermark,
+                "reopen must not reuse any Delta-owned lease"
+            );
+        });
+    }
+
+    #[test]
+    fn delta_seal_rejects_an_omitted_surviving_shard_epoch() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let mut source =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("source Delta shard");
+            apply_sealable_delta_document(&mut source, 0, "source", "alpha", 1);
+            let source = Arc::new(source.freeze(generation));
+            let survivor_base = u64::from(DOC_ORDS_PER_LEASE);
+            let survivor_docid = DOC_ORDS_PER_LEASE;
+            let mut survivor = DeltaSegment::new(DEFAULT_SCHEMA, survivor_base, usize::MAX)
+                .expect("surviving Delta shard");
+            apply_sealable_delta_document(&mut survivor, survivor_docid, "survivor", "beta", 1);
+            let survivor = Arc::new(survivor.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&source), Arc::clone(&survivor)])
+                .expect("publish two-shard Delta table");
+            let before = index
+                .search_paginated(&cx, "alpha OR beta", 10, 0, true)
+                .expect("query both Delta shards");
+
+            let Err(error) = index
+                .seal_delta_snapshot(
+                    &cx,
+                    Arc::clone(&source),
+                    Vec::new(),
+                    DeltaFlushInput {
+                        segment_id: 0xe5_4003,
+                        created_unix_s: 1_700_000_003,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .await
+            else {
+                panic!("seal must not discard an independently published shard");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Snapshot(SnapshotError::MissingDeltaRebind {
+                    lease_base,
+                    lease_end,
+                }) if lease_base == survivor_base
+                    && lease_end == survivor_base + u64::from(DOC_ORDS_PER_LEASE)
+            ));
+            assert!(index.pending_delta_seal.is_none());
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha OR beta", 10, 0, true)
+                    .expect("failed seal leaves complete table visible"),
+                before
+            );
+
+            let rebound = Arc::new(survivor.rebind_keeper_generation(generation + 1));
+            index
+                .seal_delta_snapshot(
+                    &cx,
+                    source,
+                    vec![rebound],
+                    DeltaFlushInput {
+                        segment_id: 0xe5_4003,
+                        created_unix_s: 1_700_000_003,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .await
+                .expect("complete successor table seals source shard");
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha OR beta", 10, 0, true)
+                    .expect("successful seal retains surviving shard"),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn delta_seal_rejects_a_stale_earlier_freeze_of_a_surviving_shard() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let mut source =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("source Delta shard");
+            apply_sealable_delta_document(&mut source, 0, "source", "alpha", 1);
+            let source = Arc::new(source.freeze(generation));
+
+            let survivor_base = u64::from(DOC_ORDS_PER_LEASE);
+            let mut survivor = DeltaSegment::new(DEFAULT_SCHEMA, survivor_base, usize::MAX)
+                .expect("surviving Delta shard");
+            apply_sealable_delta_document(
+                &mut survivor,
+                DOC_ORDS_PER_LEASE,
+                "survivor-first",
+                "beta",
+                1,
+            );
+            let stale_survivor = Arc::new(survivor.freeze(generation));
+            apply_sealable_delta_document(
+                &mut survivor,
+                DOC_ORDS_PER_LEASE + 1,
+                "survivor-latest",
+                "gamma",
+                1,
+            );
+            let latest_survivor = Arc::new(survivor.freeze(generation));
+            assert_ne!(
+                stale_survivor.publication_lineage(),
+                latest_survivor.publication_lineage(),
+                "successive freezes must name distinct immutable epochs"
+            );
+
+            index
+                .publish_delta_table(vec![Arc::clone(&source), Arc::clone(&latest_survivor)])
+                .expect("publish source and latest surviving epoch");
+            let before = index
+                .search_paginated(&cx, "alpha OR beta OR gamma", 10, 0, true)
+                .expect("query complete pre-seal view");
+            assert_eq!(before.total_count, Some(3));
+
+            let stale_rebound = Arc::new(stale_survivor.rebind_keeper_generation(generation + 1));
+            let Err(error) = index
+                .seal_delta_snapshot(
+                    &cx,
+                    Arc::clone(&source),
+                    vec![stale_rebound],
+                    DeltaFlushInput {
+                        segment_id: 0xe5_4004,
+                        created_unix_s: 1_700_000_004,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .await
+            else {
+                panic!("seal must reject an older freeze of the surviving shard");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Snapshot(SnapshotError::MissingDeltaRebind {
+                    lease_base,
+                    lease_end,
+                }) if lease_base == survivor_base
+                    && lease_end == survivor_base + u64::from(DOC_ORDS_PER_LEASE)
+            ));
+            assert!(index.pending_delta_seal.is_none());
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha OR beta OR gamma", 10, 0, true)
+                    .expect("rejected stale replacement leaves complete view visible"),
+                before
+            );
+
+            let latest_rebound = Arc::new(latest_survivor.rebind_keeper_generation(generation + 1));
+            index
+                .seal_delta_snapshot(
+                    &cx,
+                    source,
+                    vec![latest_rebound],
+                    DeltaFlushInput {
+                        segment_id: 0xe5_4004,
+                        created_unix_s: 1_700_000_004,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .await
+                .expect("exact surviving epoch rebind seals source shard");
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha OR beta OR gamma", 10, 0, true)
+                    .expect("successful seal retains latest surviving epoch"),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn labruntime_delta_to_keeper_swap_has_no_visibility_gap() {
+        let keeper = Arc::new(KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("genesis Keeper"));
+        let generation = keeper.loaded_manifest().manifest.generation;
+        let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("Delta lease");
+        apply_alpha_delta(&mut delta, 0, "continuous", 1);
+        let sealed = Arc::new(delta.freeze(generation));
+        let replacement_base = u64::from(DOC_ORDS_PER_LEASE);
+        let replacement_docid = u32::try_from(replacement_base).expect("replacement docid");
+        let mut current_survivor = DeltaSegment::new(DEFAULT_SCHEMA, replacement_base, usize::MAX)
+            .expect("current surviving Delta");
+        apply_sealable_delta_document(
+            &mut current_survivor,
+            replacement_docid,
+            "surviving",
+            "beta",
+            2,
+        );
+        let current_survivor = Arc::new(current_survivor.freeze(generation));
+        let publisher = SnapshotPublisher::new(
+            Arc::clone(&keeper),
+            vec![Arc::clone(&sealed), Arc::clone(&current_survivor)],
+        )
+        .expect("snapshot publisher");
+        let encoded = flush_delta_snapshot(
+            &sealed,
+            DeltaFlushInput {
+                segment_id: 0xe5_4010,
+                created_unix_s: 1_700_000_010,
+                engine_version: CURRENT_ENGINE_VERSION,
+            },
+        )
+        .expect("build Delta seal")
+        .expect("live Delta emits a segment");
+        let mut manifest = keeper.next_manifest().expect("successor manifest");
+        manifest.segments.push(manifest_segment(&encoded, 1));
+        manifest.docid_high_watermark = sealed.lease_end();
+        let mut pending = BTreeMap::new();
+        for field in DEFAULT_SCHEMA
+            .fields
+            .iter()
+            .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+        {
+            pending.insert(
+                field.id,
+                (
+                    sealed
+                        .live_total_tokens(field.id)
+                        .expect("Delta field stats"),
+                    1,
+                ),
+            );
+        }
+        manifest.field_stats =
+            merge_field_stats(&manifest.field_stats, &pending).expect("merge Delta field stats");
+        let successor = Arc::new(
+            keeper
+                .publish_owned_segments(&manifest, vec![encoded])
+                .expect("publish owned successor"),
+        );
+        let replacement = Arc::new(current_survivor.rebind_keeper_generation(manifest.generation));
+        let prepared = publisher
+            .prepare_sealed_manifest_with_deltas(DEFAULT_SCHEMA, &manifest, vec![replacement])
+            .expect("prepare complete Delta seal publication");
+        let publisher = Arc::new(publisher);
+        let reader_started = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::new(AtomicBool::new(false));
+
+        let mut lab = LabRuntime::new(LabConfig::new(0xe5_4004).max_steps(100_000));
+        let region = lab.state.create_root_region(Budget::INFINITE);
+        let reader_publisher = Arc::clone(&publisher);
+        let reader_started_flag = Arc::clone(&reader_started);
+        let reader_done = Arc::clone(&writer_done);
+        let (reader, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                reader_started_flag.store(true, Ordering::SeqCst);
+                while !reader_done.load(Ordering::SeqCst) {
+                    let observed = reader_publisher.load();
+                    assert_eq!(
+                        observed
+                            .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                            .expect("alpha frequency"),
+                        1
+                    );
+                    assert_eq!(
+                        observed
+                            .bm25_doc_freq(CONTENT_FIELD, b"beta")
+                            .expect("beta frequency"),
+                        1
+                    );
+                    let residency = (
+                        observed.keeper_snapshot().segments().len(),
+                        observed
+                            .delta_snapshots()
+                            .iter()
+                            .map(|delta| delta.live_document_count())
+                            .sum::<usize>(),
+                    );
+                    assert!(
+                        residency == (0, 2) || residency == (1, 1),
+                        "reader observed a visibility gap or duplicate: {residency:?}"
+                    );
+                    yield_now().await;
+                }
+                let observed = reader_publisher.load();
+                assert_eq!(observed.keeper_snapshot().segments().len(), 1);
+                assert_eq!(observed.delta_snapshots()[0].live_document_count(), 1);
+            })
+            .expect("create seal reader");
+
+        let writer_publisher = Arc::clone(&publisher);
+        let writer_started = Arc::clone(&reader_started);
+        let writer_finished = Arc::clone(&writer_done);
+        let (writer, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while !writer_started.load(Ordering::SeqCst) {
+                    yield_now().await;
+                }
+                writer_publisher.install_prepared_sealed(successor, prepared);
+                writer_finished.store(true, Ordering::SeqCst);
+            })
+            .expect("create seal writer");
+
+        lab.scheduler.lock().schedule(reader, 0);
+        lab.step_for_test();
+        assert!(reader_started.load(Ordering::SeqCst));
+        lab.scheduler.lock().schedule(writer, 0);
+        let report = lab.run_until_quiescent_with_report();
+        assert!(report.quiescent);
+        assert!(report.oracle_report.all_passed());
+        assert!(report.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn installed_delta_segment_without_manifest_is_not_durable_visibility() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary Keeper directory");
+            let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let mut delta =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("uncommitted Delta");
+            apply_alpha_delta(&mut delta, 0, "visible-not-durable", 1);
+            let frozen = Arc::new(delta.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&frozen)])
+                .expect("publish process-local Delta");
+            let encoded = flush_delta_snapshot(
+                &frozen,
+                DeltaFlushInput {
+                    segment_id: 0xe5_4020,
+                    created_unix_s: 1_700_000_020,
+                    engine_version: CURRENT_ENGINE_VERSION,
+                },
+            )
+            .expect("build uncommitted segment")
+            .expect("live Delta emits a segment");
+            let writer = match &mut index.backend {
+                IndexBackend::Durable(writer) => writer,
+                IndexBackend::Memory(_) => panic!("fixture must use a durable Keeper"),
+            };
+            let pending = encoded
+                .write_temp_retryable(directory.path())
+                .expect("sync retryable segment");
+            writer
+                .publish_segment(&cx, pending)
+                .await
+                .expect("install unreferenced segment");
+
+            assert_eq!(
+                index
+                    .search_snapshot()
+                    .bm25_doc_freq(CONTENT_FIELD, b"alpha")
+                    .expect("process-local alpha frequency"),
+                1,
+                "the writer process sees its published Delta before commit"
+            );
+            let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                .expect("read old authoritative MANIFEST");
+            assert_eq!(reopened.doc_count(), 0);
+            assert!(reopened.segments().is_empty());
+            assert_eq!(reopened.materialize_document_id(0), None);
+        });
+    }
+
+    #[test]
+    fn retained_delta_seal_reconciles_an_ambiguously_installed_segment_without_a_new_temp() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary Keeper directory");
+            let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let mut delta =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("retained Delta source");
+            apply_alpha_delta(&mut delta, 0, "retained", 1);
+            let sealed = Arc::new(delta.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&sealed)])
+                .expect("publish retained Delta source");
+            let before = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("query pre-seal Delta");
+
+            let encoded = Arc::new(
+                flush_delta_snapshot(
+                    &sealed,
+                    DeltaFlushInput {
+                        segment_id: 0xe5_4030,
+                        created_unix_s: 1_700_000_030,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .expect("build retained seal")
+                .expect("live Delta emits FSLX"),
+            );
+            let mut manifest = index
+                .snapshot()
+                .next_manifest()
+                .expect("successor MANIFEST");
+            manifest.last_publish_unix_s = 0;
+            manifest.segments.push(manifest_segment(&encoded, 1));
+            manifest.docid_high_watermark = sealed.lease_end();
+            let mut pending_field_stats = BTreeMap::new();
+            for field in DEFAULT_SCHEMA
+                .fields
+                .iter()
+                .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+            {
+                pending_field_stats.insert(
+                    field.id,
+                    (
+                        sealed
+                            .live_total_tokens(field.id)
+                            .expect("retained Delta field stats"),
+                        1,
+                    ),
+                );
+            }
+            manifest.field_stats = merge_field_stats(&manifest.field_stats, &pending_field_stats)
+                .expect("merge retained Delta field stats");
+            let prepared = index
+                .published_snapshot
+                .prepare_sealed_manifest(DEFAULT_SCHEMA, &manifest)
+                .expect("prepare retained local swap");
+            index.pending_delta_seal = Some(PendingDeltaSeal {
+                encoded: Some(Arc::clone(&encoded)),
+                segment_installed: false,
+                manifest,
+                prepared,
+                next_seal_seq: 2,
+                successor_watermark: sealed.lease_end(),
+            });
+
+            let writer = match &mut index.backend {
+                IndexBackend::Durable(writer) => writer,
+                IndexBackend::Memory(_) => panic!("fixture must use a durable Keeper"),
+            };
+            writer
+                .publish_encoded_segment_retryable(&cx, Arc::clone(&encoded))
+                .await
+                .expect("simulate install whose caller future lost completion");
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation,
+                "segment installation alone must not advance durable authority"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("old Delta remains visible while reconciliation is pending"),
+                before
+            );
+
+            index
+                .resume_pending_delta_seal(&cx)
+                .await
+                .expect("reconcile exact canonical segment and publish retained MANIFEST");
+            assert!(index.pending_delta_seal.is_none());
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("query reconciled Keeper"),
+                before
+            );
+            assert!(
+                index
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .last_publish_unix_s
+                    > 0,
+                "Keeper must stamp the retained zero-timestamp proposal exactly once"
+            );
+            assert!(
+                !std::fs::read_dir(directory.path())
+                    .expect("inspect retained-seal directory")
+                    .filter_map(Result::ok)
+                    .any(|entry| entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".tmp-segment-")),
+                "exact canonical reconciliation must not manufacture a redundant retry temp"
+            );
+        });
+    }
+
+    #[test]
+    fn dropped_delta_seal_after_manifest_install_resumes_exact_generation() {
+        // This fixture intentionally pauses inside real blocking filesystem
+        // choreography. A configured blocking pool keeps the executor free to
+        // observe and release that checkpoint; the lightweight default test
+        // runtime otherwise executes spawn_blocking inline by design.
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary Keeper directory");
+            let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let next_seal_seq = index.next_seal_seq;
+            let mut delta =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("drop-test Delta source");
+            apply_alpha_delta(&mut delta, 0, "drop-survivor", 1);
+            let sealed = Arc::new(delta.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&sealed)])
+                .expect("publish drop-test Delta");
+            let before = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("query drop-test Delta before seal");
+
+            let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                crate::keeper::PublishCheckpoint::TempMovedToCurrent,
+            );
+            let mut seal = Box::pin(index.seal_delta_snapshot(
+                &cx,
+                Arc::clone(&sealed),
+                Vec::new(),
+                DeltaFlushInput {
+                    segment_id: 0xe5_4031,
+                    created_unix_s: 1_700_000_031,
+                    engine_version: CURRENT_ENGINE_VERSION,
+                },
+            ));
+            std::future::poll_fn(|task_cx| {
+                if pause.is_reached() {
+                    return Poll::Ready(());
+                }
+                match seal.as_mut().poll(task_cx) {
+                    Poll::Pending => {
+                        task_cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Poll::Ready(_) => {
+                        panic!("Delta seal completed before the armed checkpoint")
+                    }
+                }
+            })
+            .await;
+            drop(seal);
+
+            assert!(
+                index.pending_delta_seal.is_some(),
+                "the actual dropped future must leave its complete proposal retained"
+            );
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation,
+                "KeeperWriter must still hold the pre-publish reader snapshot"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("old Delta remains visible after the dropped future"),
+                before
+            );
+            let installed = Manifest::from_bytes(
+                &std::fs::read(directory.path().join("MANIFEST"))
+                    .expect("read renamed successor MANIFEST"),
+            )
+            .expect("decode renamed successor MANIFEST");
+            assert_eq!(
+                installed.generation,
+                generation + 1,
+                "the real blocking publisher must have installed generation N+1"
+            );
+
+            pause.release();
+            let resumed = index
+                .resume_pending_delta_seal(&cx)
+                .await
+                .expect("reconcile stale writer snapshot and finish the local swap");
+            assert!(index.pending_delta_seal.is_none());
+            assert_eq!(resumed.keeper_generation(), generation + 1);
+            assert_eq!(resumed.delta_count(), 0);
+            assert_eq!(index.next_seal_seq, next_seal_seq + 1);
+            assert_eq!(index.next_lease_base, sealed.lease_end());
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation + 1,
+                "resume must reconcile N+1 rather than publishing N+2"
+            );
+            assert_eq!(
+                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                    .expect("reopen exactly reconciled Keeper")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                generation + 1
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("query Keeper after exact resume"),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn tombstone_fold_keeps_multi_must_score_bits_across_delta_seal() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let mut delta =
+                DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX).expect("score-order Delta");
+
+            for global_docid in 0..3 {
+                apply_tokenized_delta_document(
+                    &mut delta,
+                    global_docid,
+                    &format!("dead-a-{global_docid}"),
+                    "a",
+                );
+            }
+            apply_tokenized_delta_document(&mut delta, 3, "target", "a b b c c x x");
+            apply_tokenized_delta_document(&mut delta, 4, "live-bc", "b c x x");
+            apply_tokenized_delta_document(&mut delta, 5, "live-c", "c x x x");
+            for document_id in ["dead-a-0", "dead-a-1", "dead-a-2"] {
+                assert!(delta.delete_delta_id(document_id).is_some());
+            }
+            let sealed = Arc::new(delta.freeze(generation));
+            let a = sealed
+                .find_term(CONTENT_FIELD, b"a")
+                .expect("physical a term");
+            assert_eq!(a.physical_doc_freq(), 4);
+            assert_eq!(a.live_doc_freq(), 1);
+            assert_eq!(
+                DeltaPostingCursor::new(&sealed, CONTENT_FIELD, b"a")
+                    .expect("live a cursor")
+                    .cost(),
+                1,
+                "Delta traversal cost must match the sealed live posting count"
+            );
+            index
+                .publish_delta_table(vec![Arc::clone(&sealed)])
+                .expect("publish score-order Delta");
+            let query = "content:a AND content:b AND content:c";
+            let before = index
+                .search_paginated(&cx, query, 10, 0, true)
+                .expect("query multi-MUST Delta");
+            assert_eq!(before.hits.len(), 1);
+            assert_eq!(before.hits[0].document_id, "target");
+
+            index
+                .seal_delta_snapshot(
+                    &cx,
+                    Arc::clone(&sealed),
+                    Vec::new(),
+                    DeltaFlushInput {
+                        segment_id: 0xe5_4032,
+                        created_unix_s: 1_700_000_032,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .await
+                .expect("seal score-order Delta");
+            let after = index
+                .search_paginated(&cx, query, 10, 0, true)
+                .expect("query multi-MUST Keeper");
+            assert_eq!(after.hits.len(), 1);
+            assert_eq!(after.hits[0].document_id, "target");
+            assert_eq!(
+                before.hits[0].score.to_bits(),
+                after.hits[0].score.to_bits()
+            );
+            assert_eq!(before, after);
+        });
     }
 
     #[test]
@@ -3664,8 +5556,11 @@ mod tests {
             let delta_docid = u32::try_from(delta_base).expect("second lease fits u32");
             let mut delta =
                 DeltaSegment::new(DEFAULT_SCHEMA, delta_base, usize::MAX).expect("Delta shard");
-            apply_alpha_delta(&mut delta, delta_docid, "delta", 3);
+            apply_alpha_delta(&mut delta, delta_docid, "delta", 1);
             let frozen = Arc::new(delta.freeze(generation));
+            mixed
+                .publish_delta_table(vec![Arc::clone(&frozen)])
+                .expect("publish mixed Delta leaf");
             let composite =
                 QuillSearchSnapshot::compose(0, Arc::clone(&keeper), vec![Arc::clone(&frozen)])
                     .expect("mixed composite snapshot");
@@ -3675,7 +5570,7 @@ mod tests {
                     .bm25_field_stats(CONTENT_FIELD)
                     .expect("content stats")
                     .total_tokens,
-                4
+                2
             );
             assert_eq!(
                 composite
@@ -3706,7 +5601,7 @@ mod tests {
                     &cx,
                     &[
                         IndexableDocument::new("sealed", "alpha"),
-                        IndexableDocument::new("delta", "alpha alpha alpha"),
+                        IndexableDocument::new("delta", "alpha"),
                     ],
                 )
                 .await
@@ -3734,7 +5629,40 @@ mod tests {
                 mixed_delta_score.to_bits(),
                 oracle.score().expect("score second oracle row").to_bits()
             );
-            assert!(mixed_delta_score > mixed_sealed_score);
+            assert_eq!(mixed_delta_score.to_bits(), mixed_sealed_score.to_bits());
+
+            let mixed_results = mixed
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("execute public mixed query");
+            let oracle_results = all_sealed
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("execute public all-sealed oracle");
+            let mixed_rows = mixed_results
+                .hits
+                .iter()
+                .map(|hit| (hit.document_id.as_str(), hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            let oracle_rows = oracle_results
+                .hits
+                .iter()
+                .map(|hit| (hit.document_id.as_str(), hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            assert_eq!(mixed_rows, oracle_rows);
+            assert_eq!(mixed_results.total_count, oracle_results.total_count);
+            assert_eq!(mixed_results.doc_count, oracle_results.doc_count);
+            assert_eq!(
+                mixed
+                    .search_paginated(&cx, "alpha", 1, 1, true)
+                    .expect("paginate mixed tie")
+                    .hits[0]
+                    .document_id,
+                "delta",
+                "global docid ascending must break equal-score cross-residency ties before offset"
+            );
+            assert_eq!(
+                mixed.collect_docids(&cx, "alpha").expect("mixed docset"),
+                vec![0, delta_docid]
+            );
         });
     }
 

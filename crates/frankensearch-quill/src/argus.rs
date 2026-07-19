@@ -496,14 +496,12 @@ impl<'a> DeltaPostingCursor<'a> {
         let size_hint = u32::try_from(live_doc_freq).map_err(|_| {
             ArgusError::CursorInvariant("Delta live document frequency exceeds u32")
         })?;
-        let physical_doc_freq = term.map_or(0, DeltaTerm::physical_doc_freq);
-        let cost = if live_doc_freq == 0 {
-            0
-        } else {
-            u64::try_from(physical_doc_freq).map_err(|_| {
-                ArgusError::CursorInvariant("Delta physical document frequency exceeds u64")
-            })?
-        };
+        // Intersection ordering also fixes the f32 score-accumulation order.
+        // Use the same live document frequency emitted by a sealed cursor so
+        // folding Delta tombstones cannot perturb score bits across a seal.
+        let cost = u64::try_from(live_doc_freq).map_err(|_| {
+            ArgusError::CursorInvariant("Delta live document frequency exceeds u64")
+        })?;
         let segment_num_docs = u32::try_from(delta.live_document_count())
             .map_err(|_| ArgusError::CursorInvariant("Delta live document count exceeds u32"))?;
         let remaining = term.map(DeltaTerm::postings);

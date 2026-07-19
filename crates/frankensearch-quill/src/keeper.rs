@@ -431,6 +431,13 @@ pub enum KeeperError {
         #[source]
         source: QuillError,
     },
+    /// Canonical segment bytes could not be staged for an idempotent install.
+    #[error("cannot stage Quill segment for publication: {source}")]
+    SegmentInstall {
+        /// Segment-layer write or validation diagnosis.
+        #[source]
+        source: QuillError,
+    },
     /// A segment disagrees with its immutable MANIFEST witnesses.
     #[error("Quill segment metadata mismatch at {path}: {detail}")]
     SegmentMetadataMismatch {
@@ -2881,6 +2888,49 @@ impl KeeperWriter {
         .await
     }
 
+    /// Reconcile or install retained canonical bytes under one mutation guard.
+    ///
+    /// Unlike a caller-created [`PendingSegmentFile`], this operation acquires
+    /// the process-wide writer guard before inspecting either the canonical
+    /// destination or retry temp. A dropped future may leave its blocking
+    /// closure running, but a retry cannot race that closure or manufacture a
+    /// redundant temp after the exact canonical file already won.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed lock, byte-conflict, segment-write, sidecar, or fsync
+    /// failure. Existing differing artifacts are preserved.
+    pub(crate) async fn publish_encoded_segment_retryable(
+        &self,
+        cx: &Cx,
+        encoded: Arc<EncodedSegment>,
+    ) -> Result<PathBuf, KeeperError> {
+        let guard = writer_mutation_guard(cx).await?;
+        let admission = Arc::clone(&self.admission);
+        let protection = self.protection.clone();
+        spawn_blocking(move || {
+            let _guard = guard;
+            admission.ensure_directory_identity()?;
+            if let Some(published) = reconcile_encoded_segment(&admission, &protection, &encoded)? {
+                admission.ensure_directory_identity()?;
+                return Ok(published);
+            }
+            let pending = encoded
+                .write_temp_retryable(&admission.directory)
+                .map_err(|source| KeeperError::SegmentInstall { source })?;
+            let published = match &protection {
+                WriterProtection::Disabled => publish_pending_segment(pending),
+                #[cfg(feature = "durability")]
+                WriterProtection::Enabled(protector) => {
+                    publish_pending_segment_durable(pending, protector)
+                }
+            }?;
+            admission.ensure_directory_identity()?;
+            Ok(published)
+        })
+        .await
+    }
+
     /// Build, install, and atomically publish one Q1-preserving concat merge.
     ///
     /// Source ids are interpreted in caller order and must name exactly one
@@ -4114,6 +4164,68 @@ fn reconcile_published_segment(
             source: io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "published segment differs from the retry temp",
+            ),
+        });
+    }
+    File::open(&published)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| KeeperError::Io {
+            operation: "sync reconciled segment",
+            path: published.clone(),
+            source,
+        })?;
+    sync_directory(&admission.directory)?;
+    #[cfg(feature = "durability")]
+    if let WriterProtection::Enabled(protector) = protection {
+        ensure_matching_durability_sidecar(admission, protector, &published, &actual)?;
+        sync_directory(&admission.directory)?;
+    }
+    #[cfg(not(feature = "durability"))]
+    let _ = protection;
+    Ok(Some(published))
+}
+
+fn reconcile_encoded_segment(
+    admission: &WriterAdmissionInner,
+    protection: &WriterProtection,
+    encoded: &EncodedSegment,
+) -> Result<Option<PathBuf>, KeeperError> {
+    let published = admission
+        .directory
+        .join(canonical_segment_name(encoded.header().segment_id));
+    let metadata = match std::fs::symlink_metadata(&published) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "inspect retry segment destination",
+                path: published,
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.len() != encoded.file_len() {
+        return Err(KeeperError::Io {
+            operation: "reconcile encoded segment",
+            path: published,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "published segment is not the exact expected regular file",
+            ),
+        });
+    }
+    let actual = std::fs::read(&published).map_err(|source| KeeperError::Io {
+        operation: "read retry segment destination",
+        path: published.clone(),
+        source,
+    })?;
+    if actual.as_slice() != encoded.as_bytes() {
+        return Err(KeeperError::Io {
+            operation: "reconcile encoded segment",
+            path: published,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "published segment differs from the retained canonical bytes",
             ),
         });
     }
@@ -7695,7 +7807,18 @@ fn publish_manifest_locked<C, F>(
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
-    publish_manifest_choreography(directory, bytes, claim, |_, _| Ok(()))
+    #[cfg(test)]
+    {
+        let observed_directory = directory.clone();
+        publish_manifest_choreography(directory, bytes, claim, move |checkpoint, _| {
+            observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint);
+            Ok(())
+        })
+    }
+    #[cfg(not(test))]
+    {
+        publish_manifest_choreography(directory, bytes, claim, |_, _| Ok(()))
+    }
 }
 
 #[cfg(feature = "durability")]
@@ -7709,17 +7832,144 @@ fn publish_manifest_durable_locked<C, F>(
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
-    publish_manifest_durable_choreography(directory, bytes, claim, protector, |_, _| Ok(()))
+    #[cfg(test)]
+    {
+        let observed_directory = directory.clone();
+        publish_manifest_durable_choreography(
+            directory,
+            bytes,
+            claim,
+            protector,
+            move |checkpoint, _| {
+                observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint);
+                Ok(())
+            },
+        )
+    }
+    #[cfg(not(test))]
+    {
+        publish_manifest_durable_choreography(directory, bytes, claim, protector, |_, _| Ok(()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublishCheckpoint {
+pub(crate) enum PublishCheckpoint {
     TempWritten,
     TempSynced,
     GenerationClaimed,
     CurrentMovedToPrevious,
     TempMovedToCurrent,
     DirectorySynced,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ManifestPublishPause {
+    checkpoint: PublishCheckpoint,
+    reached: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// One-shot control for pausing real MANIFEST choreography in cancellation
+/// tests after a named filesystem checkpoint has completed.
+#[cfg(test)]
+pub(crate) struct ManifestPublishPauseControl {
+    directory: PathBuf,
+    reached: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+static MANIFEST_PUBLISH_PAUSES: OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn manifest_publish_pauses() -> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>> {
+    MANIFEST_PUBLISH_PAUSES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Arm one real MANIFEST publisher checkpoint for a single directory.
+#[cfg(test)]
+pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
+    directory: &Path,
+    checkpoint: PublishCheckpoint,
+) -> ManifestPublishPauseControl {
+    let directory = normalize_publish_directory(directory.to_path_buf());
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let pause = ManifestPublishPause {
+        checkpoint,
+        reached: Arc::clone(&reached),
+        released: Arc::clone(&released),
+    };
+    let previous = manifest_publish_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(directory.clone(), pause);
+    assert!(
+        previous.is_none(),
+        "only one MANIFEST checkpoint pause may be armed per directory"
+    );
+    ManifestPublishPauseControl {
+        directory,
+        reached,
+        released,
+    }
+}
+
+#[cfg(test)]
+impl ManifestPublishPauseControl {
+    /// Whether the blocking publisher has completed the armed checkpoint.
+    pub(crate) fn is_reached(&self) -> bool {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Release the blocked choreography. Calling this more than once is safe.
+    pub(crate) fn release(&self) {
+        manifest_publish_pauses()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.directory);
+        let (released, wake) = self.released.as_ref();
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ManifestPublishPauseControl {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: PublishCheckpoint) {
+    let pause = manifest_publish_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(directory)
+        .filter(|pause| pause.checkpoint == checkpoint)
+        .cloned();
+    let Some(pause) = pause else {
+        return;
+    };
+    pause
+        .reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (released, wake) = pause.released.as_ref();
+    let mut released = released
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !*released {
+        released = wake
+            .wait(released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    drop(released);
 }
 
 fn publish_manifest_choreography<C, F, O>(

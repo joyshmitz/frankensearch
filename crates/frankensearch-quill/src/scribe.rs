@@ -42,10 +42,12 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
 
+use frankensearch_core::DocId;
 use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::contract::fieldnorm_to_id;
+use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
 use crate::grimoire::{
     ByteSpan, EncodedTermDictionary, MAX_TERM_BYTES, TermDictionaryError, TermInput, TermMetadata,
@@ -55,8 +57,8 @@ use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenFieldInput, EncodedDocLenSection, EncodedIdHashSection,
     EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
     EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError,
-    IdMapEntryInput, NumericCodecError, NumericValue, PositionCodecError, Posting, StatsCodecError,
-    StoredMetaCodecError,
+    IdMapEntryInput, NumericCodecError, NumericEntry, NumericFieldInput, NumericValue,
+    PositionCodecError, Posting, StatsCodecError, StoredMetaCodecError, StoredMetaFieldInput,
 };
 use crate::schema::{Analyzer as AnalyzerKind, FieldKind, SchemaDescriptor};
 use crate::segment::{EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput};
@@ -2354,6 +2356,22 @@ pub struct FlushSegmentInput<'a> {
     pub documents: &'a [FlushDocumentInput<'a>],
 }
 
+/// Fixed metadata for sealing one immutable Delta epoch.
+///
+/// Delta owns its lease, live identity rows, and canonical per-document seal
+/// sidecars, so callers supply only the values persisted in the FSLX header.
+/// Supplying these values explicitly also makes Delta and accumulator seals
+/// byte-comparable under deterministic tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaFlushInput {
+    /// Collision-checked immutable segment identifier.
+    pub segment_id: u64,
+    /// Informational creation timestamp persisted in the segment header.
+    pub created_unix_s: i64,
+    /// Packed engine version persisted in the segment header.
+    pub engine_version: u32,
+}
+
 /// Execution strategy for the stable radix partition used during a Scribe flush.
 ///
 /// [`FlushMode::Automatic`] preserves the shipping behavior and may use Rayon
@@ -2404,6 +2422,20 @@ pub enum FlushError {
         expected: u32,
         /// Sidecar ordinal at this index.
         actual: u32,
+    },
+    /// Every live Delta identity must retain its canonical IDMAP witness.
+    #[error("live Delta document {global_docid} has no canonical content hash")]
+    MissingDeltaContentHash {
+        /// Global document identifier whose seal sidecar is incomplete.
+        global_docid: u32,
+    },
+    /// Every live Delta row must retain one raw length per indexed string field.
+    #[error("live Delta document {global_docid} has no raw length for field {field_ord}")]
+    MissingDeltaFieldLength {
+        /// Indexed string field ordinal.
+        field_ord: u16,
+        /// Global document identifier whose seal sidecar is incomplete.
+        global_docid: u32,
     },
     /// Rebase would leave the FSLX u32 global-document domain.
     #[error(
@@ -2636,14 +2668,6 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
             docid_lo,
             &doclen_columns,
         )?;
-    let term_sections = TermSectionLengths {
-        postings: durable_len(&postings_bytes, "POSTINGS length")?,
-        positions: schema_has_positions(schema)
-            .then(|| durable_len(&positions_bytes, "POSITIONS length"))
-            .transpose()?,
-        blockmax: durable_len(&blockmax_bytes, "BLOCKMAX length")?,
-    };
-    let termdict = EncodedTermDictionary::encode_sorted(schema, term_sections, &term_inputs)?;
 
     let doclen_inputs = expected_field_ords
         .iter()
@@ -2691,6 +2715,373 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
         .map(|field| FieldStats::new(field.field_ord(), field.total_tokens(), doc_count))
         .collect::<Vec<_>>();
     let stats = EncodedStatsSection::encode(&expected_field_ords, &stats_rows, doc_count)?;
+    let encoded = encode_canonical_segment(
+        DeltaFlushInput {
+            segment_id: input.segment_id,
+            created_unix_s: input.created_unix_s,
+            engine_version: input.engine_version,
+        },
+        schema,
+        docid_lo,
+        docid_hi,
+        doc_count,
+        (postings_bytes, positions_bytes, blockmax_bytes, term_inputs),
+        &doclen,
+        &id_map,
+        &id_hash,
+        numeric.as_ref(),
+        stored_meta.as_ref(),
+        &stats,
+    )?;
+    flush_span.record("result_count", u64::from(doc_count));
+    flush_span.record("output_bytes", encoded.file_len());
+    Ok(encoded)
+}
+
+/// Seal one immutable Delta epoch into the canonical FSLX mini-segment format.
+///
+/// Delta chains are already grouped by term, so this path skips only Scribe's
+/// token-row radix partition. It sorts terms by the shared interner's canonical
+/// composite bytes, folds Delta-local tombstones into holes, and then enters
+/// the same posting/block-max append and final section assembly used by
+/// [`flush_accumulator`]. The snapshot is borrowed for the complete build and
+/// remains independently publishable until Keeper makes the returned bytes
+/// durable.
+///
+/// # Errors
+///
+/// Returns [`FlushError`] when a live Delta row lacks a required seal sidecar,
+/// when an immutable Delta invariant is inconsistent, or when any canonical
+/// section codec rejects the lowered rows.
+pub fn flush_delta_snapshot(
+    snapshot: &DeltaSnapshot,
+    input: DeltaFlushInput,
+) -> Result<Option<EncodedSegment>, FlushError> {
+    let mut live_documents = Vec::new();
+    live_documents
+        .try_reserve_exact(snapshot.live_document_count())
+        .map_err(|_| FlushError::Allocation {
+            resource: "live Delta document table",
+            count: snapshot.live_document_count(),
+        })?;
+    live_documents.extend(snapshot.live_documents());
+    let Some(&(first_docid, _)) = live_documents.first() else {
+        return Ok(None);
+    };
+    let &(last_docid, _) = live_documents
+        .last()
+        .expect("a nonempty live Delta document table has a final row");
+    let docid_lo = u64::from(first_docid);
+    let docid_hi = u64::from(last_docid)
+        .checked_add(1)
+        .ok_or(FlushError::ArithmeticOverflow {
+            field: "exclusive Delta document high bound",
+        })?;
+    let span =
+        usize::try_from(docid_hi - docid_lo).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "Delta document span host size",
+        })?;
+    let doc_count =
+        u32::try_from(live_documents.len()).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "Delta segment document count",
+        })?;
+    let schema = snapshot.schema();
+
+    let (expected_field_ords, doclen_columns, stats_rows) =
+        build_delta_doclen_and_stats(snapshot, &live_documents, docid_lo, span, doc_count)?;
+    let term_streams =
+        encode_delta_term_streams(snapshot, docid_lo, &expected_field_ords, &doclen_columns)?;
+    let doclen_inputs = expected_field_ords
+        .iter()
+        .copied()
+        .zip(&doclen_columns)
+        .map(|(field_ord, values)| DocLenFieldInput::new(field_ord, values))
+        .collect::<Vec<_>>();
+    let doclen =
+        EncodedDocLenSection::encode(docid_lo, docid_hi, &expected_field_ords, &doclen_inputs)?;
+
+    let id_map_inputs = build_delta_id_map_inputs(snapshot, &live_documents, docid_lo, span)?;
+    let id_map = EncodedIdMapSection::encode(docid_lo, docid_hi, &id_map_inputs)?;
+    let id_hash = EncodedIdHashSection::encode(id_map.section()?)?;
+    let numeric = encode_delta_numeric(snapshot, &live_documents, docid_lo, docid_hi)?;
+    let stored_meta =
+        encode_delta_stored_meta(snapshot, &live_documents, docid_lo, docid_hi, span)?;
+    let stats = EncodedStatsSection::encode(&expected_field_ords, &stats_rows, doc_count)?;
+
+    encode_canonical_segment(
+        input,
+        schema,
+        docid_lo,
+        docid_hi,
+        doc_count,
+        term_streams,
+        &doclen,
+        &id_map,
+        &id_hash,
+        numeric.as_ref(),
+        stored_meta.as_ref(),
+        &stats,
+    )
+    .map(Some)
+}
+
+type LiveDeltaDocument<'a> = (u32, &'a DocId);
+type DeltaDoclenAndStats = (Vec<u16>, Vec<Vec<Option<u32>>>, Vec<FieldStats>);
+
+fn build_delta_doclen_and_stats(
+    snapshot: &DeltaSnapshot,
+    live_documents: &[LiveDeltaDocument<'_>],
+    docid_lo: u64,
+    span: usize,
+    doc_count: u32,
+) -> Result<DeltaDoclenAndStats, FlushError> {
+    let mut field_ords = Vec::new();
+    let indexed_field_count = snapshot
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+        .count();
+    field_ords
+        .try_reserve_exact(indexed_field_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta DOCLEN field ordinals",
+            count: indexed_field_count,
+        })?;
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(indexed_field_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta DOCLEN columns",
+            count: indexed_field_count,
+        })?;
+    let mut stats_rows = Vec::new();
+    stats_rows
+        .try_reserve_exact(indexed_field_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta STATS rows",
+            count: indexed_field_count,
+        })?;
+
+    for field in snapshot
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+    {
+        let mut column = filled_vec(span, None, "Delta DOCLEN span")?;
+        let mut total_tokens = 0_u64;
+        for &(global_docid, _) in live_documents {
+            let relative = u64::from(global_docid).checked_sub(docid_lo).ok_or(
+                FlushError::ArithmeticOverflow {
+                    field: "Delta DOCLEN relative document index",
+                },
+            )?;
+            let relative =
+                usize::try_from(relative).map_err(|_| FlushError::ArithmeticOverflow {
+                    field: "Delta DOCLEN relative document host index",
+                })?;
+            let raw_length = snapshot
+                .segment()
+                .raw_field_length(field.id, global_docid)
+                .ok_or(FlushError::MissingDeltaFieldLength {
+                    field_ord: field.id,
+                    global_docid,
+                })?;
+            let slot = column
+                .get_mut(relative)
+                .ok_or(FlushError::ArithmeticOverflow {
+                    field: "Delta DOCLEN document span",
+                })?;
+            *slot = Some(raw_length);
+            total_tokens = total_tokens.checked_add(u64::from(raw_length)).ok_or(
+                FlushError::ArithmeticOverflow {
+                    field: "Delta STATS token numerator",
+                },
+            )?;
+        }
+        field_ords.push(field.id);
+        columns.push(column);
+        stats_rows.push(FieldStats::new(field.id, total_tokens, doc_count));
+    }
+    Ok((field_ords, columns, stats_rows))
+}
+
+fn build_delta_id_map_inputs<'a>(
+    snapshot: &'a DeltaSnapshot,
+    live_documents: &[LiveDeltaDocument<'a>],
+    docid_lo: u64,
+    span: usize,
+) -> Result<Vec<Option<IdMapEntryInput<'a>>>, FlushError> {
+    let mut entries = filled_vec(span, None, "Delta IDMAP span")?;
+    for &(global_docid, document_id) in live_documents {
+        let relative = u64::from(global_docid).checked_sub(docid_lo).ok_or(
+            FlushError::ArithmeticOverflow {
+                field: "Delta IDMAP relative document index",
+            },
+        )?;
+        let relative = usize::try_from(relative).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "Delta IDMAP relative document host index",
+        })?;
+        let content_hash = snapshot
+            .content_hash(global_docid)
+            .ok_or(FlushError::MissingDeltaContentHash { global_docid })?;
+        let slot = entries
+            .get_mut(relative)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "Delta IDMAP document span",
+            })?;
+        *slot = Some(IdMapEntryInput::new(document_id.as_str(), content_hash));
+    }
+    Ok(entries)
+}
+
+fn encode_delta_numeric(
+    snapshot: &DeltaSnapshot,
+    live_documents: &[LiveDeltaDocument<'_>],
+    docid_lo: u64,
+    docid_hi: u64,
+) -> Result<Option<EncodedNumericSection>, FlushError> {
+    let numeric_fields = snapshot
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.kind,
+                FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    if numeric_fields.is_empty() {
+        return Ok(None);
+    }
+
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(numeric_fields.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta NUMERIC columns",
+            count: numeric_fields.len(),
+        })?;
+    for field in &numeric_fields {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(live_documents.len())
+            .map_err(|_| FlushError::Allocation {
+                resource: "Delta NUMERIC entries",
+                count: live_documents.len(),
+            })?;
+        for &(global_docid, _) in live_documents {
+            let Some(value) = snapshot.numeric_value(field.id, global_docid) else {
+                continue;
+            };
+            entries.push(match value {
+                NumericValue::I64(value) => NumericEntry::i64(value, global_docid),
+                NumericValue::U64(value) => NumericEntry::u64(value, global_docid),
+            });
+        }
+        columns.push(entries);
+    }
+    let inputs = numeric_fields
+        .iter()
+        .zip(&columns)
+        .map(|(field, entries)| NumericFieldInput::new(field.id, entries))
+        .collect::<Vec<_>>();
+    Ok(Some(EncodedNumericSection::encode(
+        snapshot.schema(),
+        docid_lo,
+        docid_hi,
+        &inputs,
+    )?))
+}
+
+fn encode_delta_stored_meta<'a>(
+    snapshot: &'a DeltaSnapshot,
+    live_documents: &[LiveDeltaDocument<'a>],
+    docid_lo: u64,
+    docid_hi: u64,
+    span: usize,
+) -> Result<Option<EncodedStoredMetaSection>, FlushError> {
+    let stored_fields = snapshot
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| field.stored)
+        .collect::<Vec<_>>();
+    if stored_fields.is_empty() {
+        return Ok(None);
+    }
+
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(stored_fields.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta STOREDMETA columns",
+            count: stored_fields.len(),
+        })?;
+    for field in &stored_fields {
+        let mut values = filled_vec(span, None, "Delta STOREDMETA span")?;
+        for &(global_docid, _) in live_documents {
+            let relative = u64::from(global_docid).checked_sub(docid_lo).ok_or(
+                FlushError::ArithmeticOverflow {
+                    field: "Delta STOREDMETA relative document index",
+                },
+            )?;
+            let relative =
+                usize::try_from(relative).map_err(|_| FlushError::ArithmeticOverflow {
+                    field: "Delta STOREDMETA relative document host index",
+                })?;
+            let slot = values
+                .get_mut(relative)
+                .ok_or(FlushError::ArithmeticOverflow {
+                    field: "Delta STOREDMETA document span",
+                })?;
+            *slot = snapshot.stored_value(field.id, global_docid);
+        }
+        columns.push(values);
+    }
+    let expected_field_ords = stored_fields
+        .iter()
+        .map(|field| field.id)
+        .collect::<Vec<_>>();
+    let inputs = stored_fields
+        .iter()
+        .zip(&columns)
+        .map(|(field, values)| StoredMetaFieldInput::new(field.id, values))
+        .collect::<Vec<_>>();
+    Ok(Some(EncodedStoredMetaSection::encode(
+        docid_lo,
+        docid_hi,
+        &expected_field_ords,
+        &inputs,
+    )?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_canonical_segment(
+    input: DeltaFlushInput,
+    schema: SchemaDescriptor,
+    docid_lo: u64,
+    docid_hi: u64,
+    doc_count: u32,
+    term_streams: OrderedTermStreams<'_>,
+    doclen: &EncodedDocLenSection,
+    id_map: &EncodedIdMapSection,
+    id_hash: &EncodedIdHashSection,
+    numeric: Option<&EncodedNumericSection>,
+    stored_meta: Option<&EncodedStoredMetaSection>,
+    stats: &EncodedStatsSection,
+) -> Result<EncodedSegment, FlushError> {
+    let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) = term_streams;
+    let term_sections = TermSectionLengths {
+        postings: durable_len(&postings_bytes, "POSTINGS length")?,
+        positions: schema_has_positions(schema)
+            .then(|| durable_len(&positions_bytes, "POSITIONS length"))
+            .transpose()?,
+        blockmax: durable_len(&blockmax_bytes, "BLOCKMAX length")?,
+    };
+    let termdict = EncodedTermDictionary::encode_sorted(schema, term_sections, &term_inputs)?;
 
     let mut sections = Vec::new();
     sections
@@ -2711,10 +3102,10 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
     sections.push(SectionInput::new(SectionKind::DOCLEN, doclen.as_bytes()));
     sections.push(SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()));
     sections.push(SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()));
-    if let Some(numeric) = &numeric {
+    if let Some(numeric) = numeric {
         sections.push(SectionInput::new(SectionKind::NUMERIC, numeric.as_bytes()));
     }
-    if let Some(stored_meta) = &stored_meta {
+    if let Some(stored_meta) = stored_meta {
         sections.push(SectionInput::new(
             SectionKind::STOREDMETA,
             stored_meta.as_bytes(),
@@ -2722,7 +3113,7 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
     }
     sections.push(SectionInput::new(SectionKind::STATS, stats.as_bytes()));
 
-    let encoded = EncodedSegment::encode(
+    EncodedSegment::encode(
         SegmentHeaderInput {
             segment_id: input.segment_id,
             schema,
@@ -2734,10 +3125,7 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
         },
         &sections,
     )
-    .map_err(FlushError::from)?;
-    flush_span.record("result_count", u64::from(doc_count));
-    flush_span.record("output_bytes", encoded.file_len());
-    Ok(encoded)
+    .map_err(FlushError::from)
 }
 
 fn schema_has_positions(schema: SchemaDescriptor) -> bool {
@@ -3319,45 +3707,164 @@ fn encode_ordered_term_streams<'a, A: TokenAnalyzer>(
                     field_ord,
                     detail: "missing DOCLEN source column",
                 })?;
-        let (encoded_postings, encoded_blockmax) =
-            EncodedPostingList::encode_with_block_max(&postings, |global_docid| {
-                let relative = u64::from(global_docid).checked_sub(docid_lo)?;
-                let relative = usize::try_from(relative).ok()?;
-                field_doclens
-                    .get(relative)
-                    .copied()
-                    .flatten()
-                    .map(fieldnorm_to_id)
-            })?;
-        let encoded_positions = positions
-            .as_deref()
-            .map(|values| EncodedPositionList::encode(&postings, values))
-            .transpose()?;
-        let postings_span = append_span(
-            &mut postings_bytes,
-            encoded_postings.as_bytes(),
-            "POSTINGS span",
-        )?;
-        let positions_span = encoded_positions
-            .as_ref()
-            .map(|encoded| append_span(&mut positions_bytes, encoded.as_bytes(), "POSITIONS span"))
-            .transpose()?;
-        let blockmax_span = append_span(
-            &mut blockmax_bytes,
-            encoded_blockmax.as_bytes(),
-            "BLOCKMAX span",
-        )?;
-        let doc_freq = encoded_postings.doc_freq();
-        let metadata = positions_span.map_or_else(
-            || TermMetadata::without_positions(doc_freq, postings_span, blockmax_span),
-            |positions_span| {
-                TermMetadata::with_positions(doc_freq, postings_span, positions_span, blockmax_span)
-            },
-        );
         let (field_ord, term) = accumulator.terms().field_and_term(term_id_u32);
-        inputs.push(TermInput::new(field_ord, term, metadata));
+        append_canonical_term(
+            &mut postings_bytes,
+            &mut positions_bytes,
+            &mut blockmax_bytes,
+            &mut inputs,
+            field_ord,
+            term,
+            &postings,
+            positions.as_deref(),
+            docid_lo,
+            field_doclens,
+        )?;
     }
     Ok((postings_bytes, positions_bytes, blockmax_bytes, inputs))
+}
+
+fn encode_delta_term_streams<'a>(
+    snapshot: &'a DeltaSnapshot,
+    docid_lo: u64,
+    expected_field_ords: &[u16],
+    doclen_columns: &[Vec<Option<u32>>],
+) -> Result<OrderedTermStreams<'a>, FlushError> {
+    let sorted_terms = snapshot.segment().sorted_terms();
+    let mut postings_bytes = Vec::new();
+    let mut positions_bytes = Vec::new();
+    let mut blockmax_bytes = Vec::new();
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(sorted_terms.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta TERMDICT inputs",
+            count: sorted_terms.len(),
+        })?;
+
+    for term in sorted_terms {
+        let field_ord = term.field_ord();
+        let field_index = expected_field_ords.binary_search(&field_ord).map_err(|_| {
+            FlushError::InvalidTokenColumn {
+                field_ord,
+                detail: "Delta term references a non-indexed field",
+            }
+        })?;
+        let field_doclens =
+            doclen_columns
+                .get(field_index)
+                .ok_or(FlushError::InvalidTokenColumn {
+                    field_ord,
+                    detail: "missing Delta DOCLEN source column",
+                })?;
+        let stores_positions = snapshot
+            .schema()
+            .fields
+            .get(usize::from(field_ord))
+            .is_some_and(|field| {
+                matches!(
+                    field.kind,
+                    FieldKind::Text {
+                        positions: true,
+                        ..
+                    }
+                )
+            });
+        let live_doc_freq = term.live_doc_freq();
+        if live_doc_freq == 0 {
+            continue;
+        }
+        let mut postings = Vec::new();
+        postings
+            .try_reserve_exact(live_doc_freq)
+            .map_err(|_| FlushError::Allocation {
+                resource: "Delta term postings",
+                count: live_doc_freq,
+            })?;
+        let mut positions = stores_positions.then(Vec::new);
+        for posting in term.postings() {
+            if !term.is_live(posting) {
+                continue;
+            }
+            postings.push(Posting::new(posting.global_docid, posting.frequency));
+            if let Some(values) = &mut positions {
+                let count = usize::try_from(posting.frequency).map_err(|_| {
+                    FlushError::ArithmeticOverflow {
+                        field: "Delta term position count",
+                    }
+                })?;
+                values
+                    .try_reserve(count)
+                    .map_err(|_| FlushError::Allocation {
+                        resource: "Delta term positions",
+                        count,
+                    })?;
+                let resolved = term
+                    .positions(posting)
+                    .ok_or(FlushError::InvalidTokenColumn {
+                        field_ord,
+                        detail: "position-indexed live Delta posting omitted positions",
+                    })?;
+                values.extend(resolved);
+            }
+        }
+        append_canonical_term(
+            &mut postings_bytes,
+            &mut positions_bytes,
+            &mut blockmax_bytes,
+            &mut inputs,
+            field_ord,
+            term.term(),
+            &postings,
+            positions.as_deref(),
+            docid_lo,
+            field_doclens,
+        )?;
+    }
+    Ok((postings_bytes, positions_bytes, blockmax_bytes, inputs))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_canonical_term<'a>(
+    postings_bytes: &mut Vec<u8>,
+    positions_bytes: &mut Vec<u8>,
+    blockmax_bytes: &mut Vec<u8>,
+    inputs: &mut Vec<TermInput<'a>>,
+    field_ord: u16,
+    term: &'a [u8],
+    postings: &[Posting],
+    positions: Option<&[u32]>,
+    docid_lo: u64,
+    field_doclens: &[Option<u32>],
+) -> Result<(), FlushError> {
+    let (encoded_postings, encoded_blockmax) =
+        EncodedPostingList::encode_with_block_max(postings, |global_docid| {
+            let relative = u64::from(global_docid).checked_sub(docid_lo)?;
+            let relative = usize::try_from(relative).ok()?;
+            field_doclens
+                .get(relative)
+                .copied()
+                .flatten()
+                .map(fieldnorm_to_id)
+        })?;
+    let encoded_positions = positions
+        .map(|values| EncodedPositionList::encode(postings, values))
+        .transpose()?;
+    let postings_span = append_span(postings_bytes, encoded_postings.as_bytes(), "POSTINGS span")?;
+    let positions_span = encoded_positions
+        .as_ref()
+        .map(|encoded| append_span(positions_bytes, encoded.as_bytes(), "POSITIONS span"))
+        .transpose()?;
+    let blockmax_span = append_span(blockmax_bytes, encoded_blockmax.as_bytes(), "BLOCKMAX span")?;
+    let doc_freq = encoded_postings.doc_freq();
+    let metadata = positions_span.map_or_else(
+        || TermMetadata::without_positions(doc_freq, postings_span, blockmax_span),
+        |positions_span| {
+            TermMetadata::with_positions(doc_freq, postings_span, positions_span, blockmax_span)
+        },
+    );
+    inputs.push(TermInput::new(field_ord, term, metadata));
+    Ok(())
 }
 
 fn build_term_rows(

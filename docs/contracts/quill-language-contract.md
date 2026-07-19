@@ -295,3 +295,53 @@ Fixture IDs are stable and additive. Editing expected behavior requires a contra
 ### 9.4 Honest-topology measurement rule
 
 Any update-to-searchable latency claim (QG-3 in `quill-perf-gates.toml`) must be measured in **both** topologies: (a) in-process reader (delta-visible), and (b) fresh-process reader (publish-visible). Publishing only the in-process number as "the" freshness figure is a contract violation: it is the topology almost no deployment runs.
+
+### 9.5 Visibility is not durability
+
+A published process-local Delta epoch is visible but uncommitted. A process
+failure may therefore lose that epoch even after its FSLX bytes have been
+fsynced and installed under their canonical segment name: the segment becomes
+durable authority only when a successor MANIFEST references it. Recovery must
+ignore an installed-but-unreferenced segment. The configured commit cadence
+and `max_visibility_lag_ms` bound this loss window; immediate InProcess
+visibility does not shorten it.
+
+A successful seal uses one ordered transition: retain the frozen Delta, build
+and fsync the segment, install it, durably publish the successor MANIFEST, then
+atomically replace the process-local view with `(new Keeper, replacement
+Deltas)`. No cancellation point is allowed between durable MANIFEST authority
+and the local epoch swap. Readers that already pinned the old epoch retain the
+old Delta; later readers see the sealed Keeper. Thus seal publication has no
+visibility gap even though visibility and durability remain distinct states.
+
+The public scorer and collectors execute the currently supported query tree
+(`All`, term, exact phrase, Boolean, and boost) over Keeper leaves and every
+frozen Delta leaf through one composite BM25 statistics snapshot. Winners are
+globally merged and external IDs are materialized from either residency. The
+seal guarantee therefore means continuous query findability, ranking, counts,
+pagination, and doc-set membership, not merely continuous internal residency.
+
+Once FSLX construction has produced a complete proposal, the writer retains
+the canonical bytes, a zero-timestamp successor MANIFEST, the complete
+replacement-Delta table, and the prepared local swap as one pending
+transaction. Every currently published non-source shard must appear through
+the private-lineage rebind of that exact frozen epoch in the replacement
+table; omission and an earlier freeze of the same mutable shard are rejected
+before construction so a seal cannot make newer Delta rows disappear. All other
+writer mutations are rejected until that transaction finishes. Segment
+reconciliation or temp write/fsync/install runs under one
+writer mutation guard, so a dropped await cannot race its retry or create a
+second temp after the exact canonical segment won. A cancellation before
+MANIFEST publication leaves the old Delta visible; `resume_pending_delta_seal`
+reuses the retained bytes and logical MANIFEST exactly. Keeper alone stamps the
+MANIFEST timestamp and normalizes it when reconciling an ambiguous prior
+publication. After MANIFEST success, the local swap and writer-counter advance
+contain no await or cancellation checkpoint.
+
+Dropping the seal future during the earlier FSLX-build await is also safe: no
+filesystem authority or local visibility has changed. The original seal
+request may be submitted again when the caller retained, or can reconstruct,
+its sealed and replacement-Delta inputs. The resumable pending-transaction
+state begins only after those canonical bytes and the successor proposal have
+been retained; calling `resume_pending_delta_seal` before that point correctly
+reports that no proposal awaits reconciliation.
