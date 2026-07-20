@@ -5748,6 +5748,17 @@ pub struct EncodedIdMapSection {
     present_count: usize,
 }
 
+/// Validated exact layout for directly concatenating IDMAP source views.
+pub(crate) struct IdMapConcatPlan {
+    docid_lo: u64,
+    docid_hi: u64,
+    span: usize,
+    blob_offset: usize,
+    blob_len: usize,
+    total_len: usize,
+    present_count: usize,
+}
+
 impl EncodedIdMapSection {
     /// Encode span-aligned document identifiers and canonical-content hashes.
     ///
@@ -6303,6 +6314,13 @@ impl EncodedIdMapSection {
         Self::concatenate_with_limits(sections, IdMapLimits::default())
     }
 
+    /// Preflight an ordinary concat for direct emission into a larger buffer.
+    pub(crate) fn plan_concatenate(
+        sections: &[IdMapSection<'_>],
+    ) -> Result<IdMapConcatPlan, IdMapCodecError> {
+        IdMapConcatPlan::new(sections, IdMapLimits::default())
+    }
+
     /// Concatenate with caller-selected validation and allocation ceilings.
     ///
     /// # Errors
@@ -6312,6 +6330,26 @@ impl EncodedIdMapSection {
         sections: &[IdMapSection<'_>],
         limits: IdMapLimits,
     ) -> Result<Self, IdMapCodecError> {
+        let plan = IdMapConcatPlan::new(sections, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(plan.total_len)
+            .map_err(|_| IdMapCodecError::Allocation {
+                resource: "concatenated section bytes",
+                bytes: plan.total_len,
+            })?;
+        plan.append_to(sections, &mut bytes);
+        Ok(Self {
+            bytes,
+            docid_lo: plan.docid_lo,
+            docid_hi: plan.docid_hi,
+            present_count: plan.present_count,
+        })
+    }
+}
+
+impl IdMapConcatPlan {
+    fn new(sections: &[IdMapSection<'_>], limits: IdMapLimits) -> Result<Self, IdMapCodecError> {
         let Some(first) = sections.first().copied() else {
             return Err(IdMapCodecError::EmptyConcat);
         };
@@ -6356,112 +6394,106 @@ impl EncodedIdMapSection {
         }
         validate_id_map_blob_len(blob_len, limits)?;
         let (blob_offset, total_len) = id_map_layout(span, blob_len, limits)?;
-        let offsets_capacity = span
-            .checked_add(1)
-            .ok_or(IdMapCodecError::ArithmeticOverflow {
-                field: "concat offset count",
-            })?;
-        let mut offsets = Vec::new();
-        offsets
-            .try_reserve_exact(offsets_capacity)
-            .map_err(|_| IdMapCodecError::Allocation {
-                resource: "concat offsets",
-                bytes: offsets_capacity.saturating_mul(std::mem::size_of::<u32>()),
-            })?;
-        let mut hashes = Vec::new();
-        hashes
-            .try_reserve_exact(span)
-            .map_err(|_| IdMapCodecError::Allocation {
-                resource: "concat hashes",
-                bytes: span.saturating_mul(std::mem::size_of::<u64>()),
-            })?;
+        Ok(Self {
+            docid_lo,
+            docid_hi,
+            span,
+            blob_offset,
+            blob_len,
+            total_len,
+            present_count,
+        })
+    }
+
+    /// Exact canonical byte length of the merged IDMAP payload.
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.total_len
+    }
+
+    /// Inclusive lower global docid bound of the conceptual merged IDMAP.
+    pub(crate) const fn docid_lo(&self) -> u64 {
+        self.docid_lo
+    }
+
+    /// Append the canonical payload after [`Self::new`] validated the sources.
+    pub(crate) fn append_to(&self, sections: &[IdMapSection<'_>], bytes: &mut Vec<u8>) {
+        let section_start = bytes.len();
+        let entry_count = u32::try_from(self.span).expect("validated IDMAP span fits u32");
+        let blob_offset =
+            u32::try_from(self.blob_offset).expect("validated IDMAP blob offset fits u32");
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(&blob_offset.to_le_bytes());
+
         let mut current_offset = 0_u32;
-        offsets.push(current_offset);
-        let mut cursor = docid_lo;
-        for (section_index, section) in sections.iter().copied().enumerate() {
+        bytes.extend_from_slice(&current_offset.to_le_bytes());
+        let mut cursor = self.docid_lo;
+        for section in sections.iter().copied() {
             let gap =
-                section
-                    .docid_lo
-                    .checked_sub(cursor)
-                    .ok_or(IdMapCodecError::ConcatRangeOrder {
-                        index: section_index,
-                        previous_hi: cursor,
-                        current_lo: section.docid_lo,
-                    })?;
-            let gap = usize::try_from(gap).map_err(|_| IdMapCodecError::ResourceLimit {
-                resource: "concat gap",
-                actual: gap,
-                limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
-            })?;
-            for _ in 0..gap {
-                offsets.push(current_offset);
-                hashes.push(0);
-            }
+                usize::try_from(section.docid_lo - cursor).expect("validated IDMAP gap fits usize");
+            append_repeated_u32(bytes, current_offset, gap);
             for ordinal in 0..section.offset_count() {
                 let start =
-                    id_map_offset(section.offsets, ordinal).ok_or(IdMapCodecError::Truncated {
-                        expected: (ordinal + 1) * ID_MAP_OFFSET_LEN,
-                        actual: section.offsets.len(),
-                    })?;
-                let end = id_map_offset(section.offsets, ordinal + 1).ok_or(
-                    IdMapCodecError::Truncated {
-                        expected: (ordinal + 2) * ID_MAP_OFFSET_LEN,
-                        actual: section.offsets.len(),
-                    },
-                )?;
-                current_offset = current_offset.checked_add(end - start).ok_or(
-                    IdMapCodecError::ArithmeticOverflow {
-                        field: "concatenated identifier offset",
-                    },
-                )?;
-                offsets.push(current_offset);
-                hashes.push(id_map_hash(section.hashes, ordinal).ok_or(
-                    IdMapCodecError::Truncated {
-                        expected: (ordinal + 1) * ID_MAP_HASH_LEN,
-                        actual: section.hashes.len(),
-                    },
-                )?);
+                    id_map_offset(section.offsets, ordinal).expect("validated IDMAP source offset");
+                let end = id_map_offset(section.offsets, ordinal + 1)
+                    .expect("validated IDMAP source offset end");
+                current_offset = current_offset
+                    .checked_add(end - start)
+                    .expect("validated IDMAP blob length fits u32");
+                bytes.extend_from_slice(&current_offset.to_le_bytes());
             }
             cursor = section.docid_hi;
         }
-        debug_assert_eq!(offsets.len(), offsets_capacity);
-        debug_assert_eq!(hashes.len(), span);
-        debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(total_len)
-            .map_err(|_| IdMapCodecError::Allocation {
-                resource: "concatenated section bytes",
-                bytes: total_len,
-            })?;
-        let entry_count = u32::try_from(span).map_err(|_| IdMapCodecError::ResourceLimit {
-            resource: "durable entry count",
-            actual: u64::try_from(span).unwrap_or(u64::MAX),
-            limit: u64::from(u32::MAX),
-        })?;
-        let blob_offset_u32 =
-            u32::try_from(blob_offset).map_err(|_| IdMapCodecError::OffsetUnrepresentable {
-                offset: blob_offset,
-            })?;
-        bytes.extend_from_slice(&entry_count.to_le_bytes());
-        bytes.extend_from_slice(&blob_offset_u32.to_le_bytes());
-        for offset in offsets {
-            bytes.extend_from_slice(&offset.to_le_bytes());
+        debug_assert_eq!(usize::try_from(current_offset).ok(), Some(self.blob_len));
+
+        let mut cursor = self.docid_lo;
+        for section in sections.iter().copied() {
+            let gap =
+                usize::try_from(section.docid_lo - cursor).expect("validated IDMAP gap fits usize");
+            let gap_bytes = gap
+                .checked_mul(std::mem::size_of::<u64>())
+                .expect("validated IDMAP gap hash bytes");
+            bytes.resize(
+                bytes
+                    .len()
+                    .checked_add(gap_bytes)
+                    .expect("validated IDMAP gap hash end"),
+                0,
+            );
+            for ordinal in 0..section.offset_count() {
+                let content_hash =
+                    id_map_hash(section.hashes, ordinal).expect("validated IDMAP source hash");
+                bytes.extend_from_slice(&content_hash.to_le_bytes());
+            }
+            cursor = section.docid_hi;
         }
-        for content_hash in hashes {
-            bytes.extend_from_slice(&content_hash.to_le_bytes());
-        }
-        debug_assert_eq!(bytes.len(), blob_offset);
+        debug_assert_eq!(bytes.len() - section_start, self.blob_offset);
         for section in sections {
             bytes.extend_from_slice(section.blob.as_bytes());
         }
-        debug_assert_eq!(bytes.len(), total_len);
-        Ok(Self {
-            bytes,
-            docid_lo,
-            docid_hi,
-            present_count,
-        })
+        debug_assert_eq!(bytes.len() - section_start, self.total_len);
+    }
+}
+
+fn append_repeated_u32(bytes: &mut Vec<u8>, value: u32, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let byte_count = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .expect("validated repeated-u32 byte count");
+    let start = bytes.len();
+    let end = start
+        .checked_add(byte_count)
+        .expect("validated repeated-u32 end");
+    if value == 0 {
+        bytes.resize(end, 0);
+        return;
+    }
+    bytes.extend_from_slice(&value.to_le_bytes());
+    while bytes.len() < end {
+        let initialized = bytes.len() - start;
+        let copied = initialized.min(end - bytes.len());
+        bytes.extend_from_within(start..start + copied);
     }
 }
 
@@ -6857,6 +6889,29 @@ impl EncodedIdHashSection {
         )
     }
 
+    /// Rebuild IDHASH directly from the validated sources of a conceptual
+    /// merged IDMAP, without first materializing that IDMAP's durable bytes.
+    pub(crate) fn encode_resolved_concat(
+        id_maps: &[IdMapSection<'_>],
+        id_map_plan: &IdMapConcatPlan,
+        representative_ordinals: &[u32],
+    ) -> Result<Self, IdHashCodecError> {
+        let docid_lo = id_map_plan.docid_lo;
+        encode_resolved_id_hash_with_domain(
+            docid_lo,
+            id_map_plan.span,
+            id_map_plan.present_count,
+            |ordinal| concat_id_map_document_id_at_ordinal(id_maps, docid_lo, ordinal),
+            id_maps
+                .iter()
+                .copied()
+                .flat_map(|id_map| id_map.document_ids()),
+            representative_ordinals,
+            IdHashLimits::default(),
+            seeded_id_hash,
+        )
+    }
+
     /// Rebuild from externally resolved representatives with caller-selected ceilings.
     ///
     /// # Errors
@@ -7218,13 +7273,60 @@ fn encode_resolved_id_hash_with_hasher<F>(
 where
     F: Fn(&[u8]) -> u64 + Copy,
 {
+    encode_resolved_id_hash_with_domain(
+        id_map.docid_lo,
+        id_map.offset_count(),
+        id_map.present_count,
+        |ordinal| id_map.document_id_at_ordinal(ordinal),
+        id_map.document_ids(),
+        representative_ordinals,
+        limits,
+        hash,
+    )
+}
+
+fn concat_id_map_document_id_at_ordinal<'a>(
+    id_maps: &[IdMapSection<'a>],
+    docid_lo: u64,
+    ordinal: usize,
+) -> Option<&'a str> {
+    let global_docid = docid_lo.checked_add(u64::try_from(ordinal).ok()?)?;
+    let section_index = id_maps.partition_point(|id_map| id_map.docid_hi() <= global_docid);
+    id_maps
+        .get(section_index)
+        .copied()?
+        .get(global_docid)
+        .map(|entry| entry.document_id())
+}
+
+fn encode_resolved_id_hash_with_domain<'a, F, I, G>(
+    docid_lo: u64,
+    span: usize,
+    present_count: usize,
+    document_id_at_ordinal: G,
+    document_ids: I,
+    representative_ordinals: &[u32],
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<EncodedIdHashSection, IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+    G: Fn(usize) -> Option<&'a str> + Copy,
+    I: IntoIterator<Item = (u64, &'a str)>,
+{
     // Validation examines the complete physical IDMAP even though the durable
     // table contains only one externally selected row per exact identifier.
-    validate_id_hash_entry_limit(id_map.present_count, limits)?;
+    validate_id_hash_entry_limit(present_count, limits)?;
     validate_id_hash_entry_limit(representative_ordinals.len(), limits)?;
     let capacity = canonical_id_hash_capacity(representative_ordinals.len(), limits)?;
-    let entries =
-        build_resolved_id_hash_entries(id_map, representative_ordinals, capacity, limits, hash)?;
+    let entries = build_resolved_id_hash_entries(
+        span,
+        document_id_at_ordinal,
+        representative_ordinals,
+        capacity,
+        limits,
+        hash,
+    )?;
     let total_len = id_hash_section_len(capacity, limits)?;
     let mut bytes = Vec::new();
     bytes
@@ -7248,12 +7350,22 @@ where
     };
     // This proves that the externally supplied set covers every exact IDMAP
     // identifier and that its durable bytes satisfy the same reader contract.
-    parse_id_hash_with_hasher(encoded.as_bytes(), id_map, limits, hash)?;
+    validate_id_hash_with_domain(
+        encoded.as_bytes(),
+        docid_lo,
+        span,
+        present_count,
+        document_id_at_ordinal,
+        document_ids,
+        limits,
+        hash,
+    )?;
     Ok(encoded)
 }
 
-fn build_resolved_id_hash_entries<F>(
-    id_map: IdMapSection<'_>,
+fn build_resolved_id_hash_entries<'a, F, G>(
+    span: usize,
+    document_id_at_ordinal: G,
     representative_ordinals: &[u32],
     capacity: usize,
     limits: IdHashLimits,
@@ -7261,6 +7373,7 @@ fn build_resolved_id_hash_entries<F>(
 ) -> Result<Vec<u8>, IdHashCodecError>
 where
     F: Fn(&[u8]) -> u64 + Copy,
+    G: Fn(usize) -> Option<&'a str> + Copy,
 {
     let entries_len =
         capacity
@@ -7298,18 +7411,17 @@ where
                 ordinal: ordinal_u32,
             }
         })?;
-        if ordinal >= id_map.offset_count() {
+        if ordinal >= span {
             return Err(IdHashCodecError::RepresentativeOrdinalOutOfRange {
                 index,
                 ordinal: ordinal_u32,
             });
         }
-        let document_id = id_map.document_id_at_ordinal(ordinal).ok_or(
-            IdHashCodecError::RepresentativeOrdinalHole {
+        let document_id =
+            document_id_at_ordinal(ordinal).ok_or(IdHashCodecError::RepresentativeOrdinalHole {
                 index,
                 ordinal: ordinal_u32,
-            },
-        )?;
+            })?;
         let doc_ord_plus1 = ordinal_u32.checked_add(1).ok_or(
             IdHashCodecError::RepresentativeOrdinalOutOfRange {
                 index,
@@ -7339,7 +7451,7 @@ where
                         field: "stored resolved-representative ordinal",
                     }
                 })?;
-                let stored_document_id = id_map.document_id_at_ordinal(stored_ordinal).ok_or(
+                let stored_document_id = document_id_at_ordinal(stored_ordinal).ok_or(
                     IdHashCodecError::OrdinalHole {
                         slot,
                         ordinal: stored_plus1 - 1,
@@ -7456,6 +7568,12 @@ where
     Ok((entries, occupied))
 }
 
+struct ValidatedIdHash<'a> {
+    entries: &'a [u8],
+    capacity: usize,
+    occupied: usize,
+}
+
 fn parse_id_hash_with_hasher<'a, F>(
     bytes: &'a [u8],
     id_map: IdMapSection<'a>,
@@ -7465,7 +7583,41 @@ fn parse_id_hash_with_hasher<'a, F>(
 where
     F: Fn(&[u8]) -> u64 + Copy,
 {
-    validate_id_hash_entry_limit(id_map.present_count, limits)?;
+    let validated = validate_id_hash_with_domain(
+        bytes,
+        id_map.docid_lo,
+        id_map.offset_count(),
+        id_map.present_count,
+        |ordinal| id_map.document_id_at_ordinal(ordinal),
+        id_map.document_ids(),
+        limits,
+        hash,
+    )?;
+    Ok(IdHashSection {
+        bytes,
+        entries: validated.entries,
+        capacity: validated.capacity,
+        occupied: validated.occupied,
+        id_map,
+    })
+}
+
+fn validate_id_hash_with_domain<'bytes, 'ids, F, I, G>(
+    bytes: &'bytes [u8],
+    docid_lo: u64,
+    span: usize,
+    present_count: usize,
+    document_id_at_ordinal: G,
+    document_ids: I,
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<ValidatedIdHash<'bytes>, IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+    G: Fn(usize) -> Option<&'ids str> + Copy,
+    I: IntoIterator<Item = (u64, &'ids str)>,
+{
+    validate_id_hash_entry_limit(present_count, limits)?;
     if bytes.len() < ID_HASH_HEADER_LEN {
         return Err(IdHashCodecError::Truncated {
             expected: ID_HASH_HEADER_LEN,
@@ -7536,19 +7688,16 @@ where
                 slot,
                 ordinal: ordinal_u32,
             })?;
-        if ordinal >= id_map.offset_count() {
+        if ordinal >= span {
             return Err(IdHashCodecError::OrdinalOutOfRange {
                 slot,
                 ordinal: ordinal_u32,
             });
         }
-        let document_id =
-            id_map
-                .document_id_at_ordinal(ordinal)
-                .ok_or(IdHashCodecError::OrdinalHole {
-                    slot,
-                    ordinal: ordinal_u32,
-                })?;
+        let document_id = document_id_at_ordinal(ordinal).ok_or(IdHashCodecError::OrdinalHole {
+            slot,
+            ordinal: ordinal_u32,
+        })?;
         let expected_hash = hash(document_id.as_bytes());
         if key_hash != expected_hash {
             return Err(IdHashCodecError::KeyHashMismatch {
@@ -7574,13 +7723,6 @@ where
             expected: u32::try_from(canonical_capacity).unwrap_or(u32::MAX),
         });
     }
-    let section = IdHashSection {
-        bytes,
-        entries,
-        capacity,
-        occupied,
-        id_map,
-    };
     // Validate exact ascending-selected-ordinal insertion without allocating a
     // mirror table. One bounded probe per physical IDMAP row both finds its
     // exact representative and proves that every preceding cluster ordinal was
@@ -7589,13 +7731,13 @@ where
     let mask = capacity - 1;
     let mut selected = 0_usize;
     let mut probe_steps = 0_u64;
-    for (global_docid, document_id) in id_map.document_ids() {
+    for (global_docid, document_id) in document_ids {
         let ordinal = global_docid
-            .checked_sub(id_map.docid_lo)
+            .checked_sub(docid_lo)
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(IdHashCodecError::DocIdOverflow {
                 ordinal: 0,
-                docid_lo: id_map.docid_lo,
+                docid_lo,
             })?;
         let key_hash = hash(document_id.as_bytes());
         let mut slot = usize::try_from(key_hash & u64::try_from(mask).unwrap_or(u64::MAX))
@@ -7621,7 +7763,7 @@ where
                 }
             })?;
             if durable_hash == key_hash {
-                let durable_document_id = id_map.document_id_at_ordinal(durable_ordinal).ok_or(
+                let durable_document_id = document_id_at_ordinal(durable_ordinal).ok_or(
                     IdHashCodecError::OrdinalHole {
                         slot,
                         ordinal: doc_ord_plus1 - 1,
@@ -7655,7 +7797,11 @@ where
     if occupied != selected {
         return Err(IdHashCodecError::SelectedCountMismatch { occupied, selected });
     }
-    Ok(section)
+    Ok(ValidatedIdHash {
+        entries,
+        capacity,
+        occupied,
+    })
 }
 
 fn validate_id_hash_entry_limit(
@@ -9501,6 +9647,18 @@ pub struct EncodedStoredMetaSection {
     blob_bytes: u64,
 }
 
+/// Validated exact layout for directly concatenating STOREDMETA source views.
+pub(crate) struct StoredMetaConcatPlan {
+    docid_lo: u64,
+    docid_hi: u64,
+    span: usize,
+    presence_len: usize,
+    blob_lengths: Vec<usize>,
+    field_offsets: Vec<usize>,
+    total_len: usize,
+    total_blob_bytes: u64,
+}
+
 impl EncodedStoredMetaSection {
     /// Encode schema-derived opaque stored columns.
     ///
@@ -9983,12 +10141,86 @@ impl EncodedStoredMetaSection {
         Self::concatenate_with_limits(sections, expected_field_ords, StoredMetaLimits::default())
     }
 
+    /// Preflight an ordinary concat for direct emission into a larger buffer.
+    pub(crate) fn plan_concatenate(
+        sections: &[StoredMetaSection<'_>],
+        expected_field_ords: &[u16],
+    ) -> Result<StoredMetaConcatPlan, StoredMetaCodecError> {
+        StoredMetaConcatPlan::new(sections, expected_field_ords, StoredMetaLimits::default())
+    }
+
     /// Concatenate with caller-selected validation and allocation ceilings.
     ///
     /// # Errors
     ///
     /// Returns the same typed failures as [`Self::concatenate`].
     pub fn concatenate_with_limits(
+        sections: &[StoredMetaSection<'_>],
+        expected_field_ords: &[u16],
+        limits: StoredMetaLimits,
+    ) -> Result<Self, StoredMetaCodecError> {
+        let plan = StoredMetaConcatPlan::new(sections, expected_field_ords, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(plan.total_len)
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "section bytes",
+                bytes: plan.total_len,
+            })?;
+        plan.append_to(sections, expected_field_ords, &mut bytes);
+        Ok(Self {
+            bytes,
+            docid_lo: plan.docid_lo,
+            docid_hi: plan.docid_hi,
+            field_count: expected_field_ords.len(),
+            blob_bytes: plan.total_blob_bytes,
+        })
+    }
+
+    /// Borrow the exact canonical durable bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the wrapper and return its durable bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Number of schema-stored fields.
+    #[must_use]
+    pub const fn field_count(&self) -> usize {
+        self.field_count
+    }
+
+    /// Sum of opaque field blob bytes, excluding directories and offsets.
+    #[must_use]
+    pub const fn blob_bytes(&self) -> u64 {
+        self.blob_bytes
+    }
+
+    /// Re-open the owned bytes through the validating zero-copy reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an internal invariant was violated.
+    pub fn section(
+        &self,
+        expected_field_ords: &[u16],
+    ) -> Result<StoredMetaSection<'_>, StoredMetaCodecError> {
+        StoredMetaSection::parse(
+            &self.bytes,
+            self.docid_lo,
+            self.docid_hi,
+            expected_field_ords,
+        )
+    }
+}
+
+impl StoredMetaConcatPlan {
+    fn new(
         sections: &[StoredMetaSection<'_>],
         expected_field_ords: &[u16],
         limits: StoredMetaLimits,
@@ -10028,9 +10260,6 @@ impl EncodedStoredMetaSection {
             .ok_or(StoredMetaCodecError::EmptyConcat)?;
         let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
 
-        // Preflight the exact packed output before allocating it. Concat does
-        // not materialize values: it validates offset deltas under the target
-        // limits, then copies each opaque source blob exactly once.
         let mut blob_lengths = Vec::new();
         blob_lengths
             .try_reserve_exact(expected_field_ords.len())
@@ -10112,114 +10341,83 @@ impl EncodedStoredMetaSection {
 
         let (field_offsets, total_len) =
             stored_meta_layout(expected_field_ords, span, &blob_lengths, limits)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(total_len)
-            .map_err(|_| StoredMetaCodecError::Allocation {
-                resource: "section bytes",
-                bytes: total_len,
-            })?;
-        for (&field_ord, &offset) in expected_field_ords.iter().zip(&field_offsets) {
+        Ok(Self {
+            docid_lo,
+            docid_hi,
+            span,
+            presence_len: stored_meta_presence_len(span)?,
+            blob_lengths,
+            field_offsets,
+            total_len,
+            total_blob_bytes,
+        })
+    }
+
+    /// Exact canonical byte length of the merged STOREDMETA payload.
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.total_len
+    }
+
+    /// Append the canonical payload after [`Self::new`] validated the sources.
+    pub(crate) fn append_to(
+        &self,
+        sections: &[StoredMetaSection<'_>],
+        expected_field_ords: &[u16],
+        bytes: &mut Vec<u8>,
+    ) {
+        let section_start = bytes.len();
+        for (&field_ord, &offset) in expected_field_ords.iter().zip(&self.field_offsets) {
             bytes.extend_from_slice(&field_ord.to_le_bytes());
-            let offset = u32::try_from(offset)
-                .map_err(|_| StoredMetaCodecError::OffsetUnrepresentable { field_ord, offset })?;
+            let offset = u32::try_from(offset).expect("validated STOREDMETA field offset fits u32");
             bytes.extend_from_slice(&offset.to_le_bytes());
         }
 
-        let presence_len = stored_meta_presence_len(span)?;
         for (field_index, ((&field_ord, &field_offset), &blob_len)) in expected_field_ords
             .iter()
-            .zip(&field_offsets)
-            .zip(&blob_lengths)
+            .zip(&self.field_offsets)
+            .zip(&self.blob_lengths)
             .enumerate()
         {
-            debug_assert_eq!(bytes.len(), field_offset);
+            debug_assert_eq!(bytes.len() - section_start, field_offset);
             let presence_start = bytes.len();
-            let presence_end = presence_start.checked_add(presence_len).ok_or(
-                StoredMetaCodecError::ArithmeticOverflow {
-                    field: "presence end",
-                },
-            )?;
-            bytes.resize(presence_end, 0);
+            bytes.resize(presence_start + self.presence_len, 0);
             let mut current_offset = 0_u32;
             bytes.extend_from_slice(&current_offset.to_le_bytes());
             let mut output_ordinal = 0_usize;
-            let mut cursor = docid_lo;
+            let mut cursor = self.docid_lo;
             for section in sections {
-                let gap = section.docid_lo.checked_sub(cursor).ok_or(
-                    StoredMetaCodecError::ConcatRangeOrder {
-                        index: 0,
-                        previous_hi: cursor,
-                        current_lo: section.docid_lo,
-                    },
-                )?;
-                let gap =
-                    usize::try_from(gap).map_err(|_| StoredMetaCodecError::ResourceLimit {
-                        resource: "concat gap",
-                        actual: gap,
-                        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
-                    })?;
-                output_ordinal = output_ordinal.checked_add(gap).ok_or(
-                    StoredMetaCodecError::ArithmeticOverflow {
-                        field: "concat gap end",
-                    },
-                )?;
-                for _ in 0..gap {
-                    bytes.extend_from_slice(&current_offset.to_le_bytes());
-                }
+                let gap = usize::try_from(section.docid_lo - cursor)
+                    .expect("validated STOREDMETA gap fits usize");
+                output_ordinal += gap;
+                append_repeated_u32(bytes, current_offset, gap);
 
-                let field =
-                    section
-                        .field_at(field_index)
-                        .ok_or(StoredMetaCodecError::UnexpectedField {
-                            index: field_index,
-                            expected: Some(field_ord),
-                            actual: None,
-                        })?;
-                let source_span = usize::try_from(section.span()).map_err(|_| {
-                    StoredMetaCodecError::ResourceLimit {
-                        resource: "source docid span",
-                        actual: section.span(),
-                        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
-                    }
-                })?;
+                let field = section
+                    .field_at(field_index)
+                    .expect("validated STOREDMETA source field");
+                let source_span =
+                    usize::try_from(section.span()).expect("validated STOREDMETA span fits usize");
                 for ordinal in 0..source_span {
                     if stored_meta_presence_bit(field.presence, ordinal).unwrap_or(false) {
                         bytes[presence_start + output_ordinal / 8] |= 1 << (output_ordinal % 8);
                     }
-                    let start = stored_meta_offset(field.offsets, ordinal).ok_or_else(|| {
-                        StoredMetaCodecError::Truncated {
-                            expected: (ordinal + 1).saturating_mul(std::mem::size_of::<u32>()),
-                            actual: field.offsets.len(),
-                        }
-                    })?;
-                    let end = stored_meta_offset(field.offsets, ordinal + 1).ok_or_else(|| {
-                        StoredMetaCodecError::Truncated {
-                            expected: (ordinal + 2).saturating_mul(std::mem::size_of::<u32>()),
-                            actual: field.offsets.len(),
-                        }
-                    })?;
-                    current_offset = current_offset.checked_add(end - start).ok_or(
-                        StoredMetaCodecError::ArithmeticOverflow {
-                            field: "concatenated value offset",
-                        },
-                    )?;
+                    let start = stored_meta_offset(field.offsets, ordinal)
+                        .expect("validated STOREDMETA source offset");
+                    let end = stored_meta_offset(field.offsets, ordinal + 1)
+                        .expect("validated STOREDMETA source offset end");
+                    current_offset = current_offset
+                        .checked_add(end - start)
+                        .expect("validated STOREDMETA blob length fits u32");
                     bytes.extend_from_slice(&current_offset.to_le_bytes());
                     output_ordinal += 1;
                 }
                 cursor = section.docid_hi;
             }
-            debug_assert_eq!(output_ordinal, span);
+            debug_assert_eq!(output_ordinal, self.span);
             debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
             for section in sections {
-                let field =
-                    section
-                        .field_at(field_index)
-                        .ok_or(StoredMetaCodecError::UnexpectedField {
-                            index: field_index,
-                            expected: Some(field_ord),
-                            actual: None,
-                        })?;
+                let field = section
+                    .field_at(field_index)
+                    .expect("validated STOREDMETA source field");
                 bytes.extend_from_slice(field.blob);
             }
             tracing::debug!(
@@ -10229,62 +10427,14 @@ impl EncodedStoredMetaSection {
                 "concatenated Quill STOREDMETA field blob"
             );
         }
-        debug_assert_eq!(bytes.len(), total_len);
+        debug_assert_eq!(bytes.len() - section_start, self.total_len);
         tracing::debug!(
             field_count = expected_field_ords.len(),
-            blob_bytes = total_blob_bytes,
-            section_bytes = total_len,
+            blob_bytes = self.total_blob_bytes,
+            section_bytes = self.total_len,
             source_segments = sections.len(),
             "concatenated Quill STOREDMETA section"
         );
-        Ok(Self {
-            bytes,
-            docid_lo,
-            docid_hi,
-            field_count: expected_field_ords.len(),
-            blob_bytes: total_blob_bytes,
-        })
-    }
-
-    /// Borrow the exact canonical durable bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Consume the wrapper and return its durable bytes.
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    /// Number of schema-stored fields.
-    #[must_use]
-    pub const fn field_count(&self) -> usize {
-        self.field_count
-    }
-
-    /// Sum of opaque field blob bytes, excluding directories and offsets.
-    #[must_use]
-    pub const fn blob_bytes(&self) -> u64 {
-        self.blob_bytes
-    }
-
-    /// Re-open the owned bytes through the validating zero-copy reader.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if an internal invariant was violated.
-    pub fn section(
-        &self,
-        expected_field_ords: &[u16],
-    ) -> Result<StoredMetaSection<'_>, StoredMetaCodecError> {
-        StoredMetaSection::parse(
-            &self.bytes,
-            self.docid_lo,
-            self.docid_hi,
-            expected_field_ords,
-        )
     }
 }
 
@@ -14562,6 +14712,49 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_id_hash_concat_domain_matches_monolithic_id_map_bytes() -> TestResult {
+        let left_inputs = [Some(IdMapEntryInput::new("same", 1)), None];
+        let middle_inputs = [Some(IdMapEntryInput::new("β", 2))];
+        let right_inputs = [
+            Some(IdMapEntryInput::new("same", 3)),
+            Some(IdMapEntryInput::new("z", 4)),
+        ];
+        let left = EncodedIdMapSection::encode(10, 12, &left_inputs)?;
+        let middle = EncodedIdMapSection::encode(14, 15, &middle_inputs)?;
+        let right = EncodedIdMapSection::encode(16, 18, &right_inputs)?;
+        let id_maps = [left.section()?, middle.section()?, right.section()?];
+        let concat_plan = EncodedIdMapSection::plan_concatenate(&id_maps)?;
+
+        let monolithic_inputs = [
+            Some(IdMapEntryInput::new("same", 1)),
+            None,
+            None,
+            None,
+            Some(IdMapEntryInput::new("β", 2)),
+            None,
+            Some(IdMapEntryInput::new("same", 3)),
+            Some(IdMapEntryInput::new("z", 4)),
+        ];
+        let monolithic = EncodedIdMapSection::encode(10, 18, &monolithic_inputs)?;
+        let representative_ordinals = [4, 6, 7];
+        let expected = EncodedIdHashSection::encode_resolved_representatives(
+            monolithic.section()?,
+            &representative_ordinals,
+        )?;
+        let actual = EncodedIdHashSection::encode_resolved_concat(
+            &id_maps,
+            &concat_plan,
+            &representative_ordinals,
+        )?;
+
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+        assert_eq!(actual.capacity(), expected.capacity());
+        assert_eq!(actual.occupied(), expected.occupied());
+        actual.section(monolithic.section()?)?;
         Ok(())
     }
 

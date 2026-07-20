@@ -6150,3 +6150,45 @@ The rejected nested-union attempt and its 19–26% regression are retained in
 **Decision: KEEP.** Ship direct-term MaxScore, direct high-clause BMW, the
 bounded validated-metadata cache, exact-count bypass, structural/runtime
 fail-closed gates, and the retained ignored profile.
+
+## 2026-07-19 — One-pass Quill concat assembly, partial keep (`bd-quill-e3-keeper-ndtk.5`, SapphireHill)
+
+The retained concat path preflights exact IDMAP and STOREDMETA layouts, then
+emits both directly into one pre-sized final FSLX allocation. A generalized
+IDHASH builder validates the conceptual source-domain IDMAP without first
+materializing its durable bytes; Keeper then reparses the emitted IDMAP and
+cross-validates that same IDHASH before final segment verification. This removes
+the dominant intermediate-buffer and page-fault churn while preserving the
+canonical writer's byte layout.
+
+The authoritative comparison used one strict-remote release-LTO binary on
+pinned RCH worker `ovh-a` (`51.222.245.56`), SHA-256
+`9852128d3075bcd58df4452edc33e0a157fd90e4da8c15729c4411800027d06b`.
+The corrected Criterion harness used 20 flat samples, 500 ms warm-up, and 5 s
+measurement; every sample retained all immutable outputs until after the
+stopwatch read. Physical bytes are exact source FSLX plus merged-output FSLX.
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| sources | physical bytes | restored-control median | one-pass median | one-pass ns/B | improvement |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 2,745,208 | 4,248,149.542 ns | 2,398,286.155 ns | 0.873626390 | **43.55%** |
+| 4 | 7,277,512 | 10,576,223.174 ns | 4,082,846.360 ns | 0.561022278 | **61.40%** |
+| 8 | 16,354,280 | 24,303,723.300 ns | 10,209,196.348 ns | 0.624252266 | **57.99%** |
+| 16 | 34,543,016 | 67,813,377.125 ns | 22,033,773.409 ns | 0.637864783 | **67.51%** |
+
+Criterion classified every arm as improved (`p = 0.00`). The final rebased
+strict-remote Quill suite passed **437 tests, 0 failed, 2 ignored**. Exact
+oracles cover final FSLX bytes, IDMAP and STOREDMETA concat bytes, IDHASH
+source-domain equivalence, and short/long/out-of-order assembler writes. A
+separate fresh-eyes review found no blocker.
+
+**Decision: PARTIAL KEEP.** Ship the absolute throughput win and reproducible
+benchmark correction, but do not close E3.5: normalized max/min spread is
+`1.557204454x`, above the bead's `1.35x` flatness gate. The remaining fixed-cost
+problem is now at two-source fan-in; closure evidence is recorded in
+`docs/NEGATIVE_EVIDENCE.md`.

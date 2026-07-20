@@ -23,6 +23,9 @@
 //! Criterion's median elapsed time is the CPU-cost proxy; this benchmark
 //! declares the tolerance and prints it before registering any timed case, but
 //! result comparison remains an analysis step over Criterion's estimates.
+//! Timed outputs are retained until the sample stopwatch stops so allocator
+//! reuse versus mmap/munmap thresholds cannot bias one fan-in. Flat sampling
+//! keeps retained resident bytes approximately constant across each sample.
 //!
 //! ```bash
 //! RCH_REQUIRE_REMOTE=1 RCH_WORKER=<pinned-worker> \
@@ -33,9 +36,11 @@
 use std::fmt::Display;
 use std::hint::black_box;
 use std::mem::size_of;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
+};
 use frankensearch_quill::quiver::{StatsSection, aggregate_field_stats};
 use frankensearch_quill::scribe::{
     ColumnarAccumulator, DOC_ORDS_PER_LEASE, FlushDocumentInput, FlushMode, FlushSegmentInput,
@@ -642,24 +647,38 @@ fn bench_concat_merge(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("concat_merge_owned_fixed_logical_work");
-    group.sample_size(10);
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
+    group.sample_size(20);
+    group.sampling_mode(SamplingMode::Flat);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
     for fixture in &fixtures {
         group.throughput(Throughput::Bytes(fixture.physical_io_bytes));
         group.bench_with_input(
             BenchmarkId::new("source_segments", fixture.segment_count),
             fixture,
             |b, fixture| {
-                b.iter(|| {
-                    black_box(require(
-                        "timed concat merge",
-                        black_box(&fixture.snapshot).concat_merge_owned(
-                            black_box(fixture.source_segment_ids.as_slice()),
-                            black_box(fixture.output_segment_id),
-                            black_box(CREATED_UNIX_S),
-                        ),
-                    ))
+                b.iter_custom(|iterations| {
+                    let capacity = usize::try_from(iterations)
+                        .expect("Criterion iteration count must fit usize");
+                    let mut retained = Vec::new();
+                    retained
+                        .try_reserve_exact(capacity)
+                        .expect("timed output retention allocation must succeed");
+                    let started = Instant::now();
+                    for _ in 0..iterations {
+                        retained.push(require(
+                            "timed concat merge",
+                            black_box(&fixture.snapshot).concat_merge_owned(
+                                black_box(fixture.source_segment_ids.as_slice()),
+                                black_box(fixture.output_segment_id),
+                                black_box(CREATED_UNIX_S),
+                            ),
+                        ));
+                    }
+                    let elapsed = started.elapsed();
+                    black_box(&retained);
+                    drop(retained);
+                    elapsed
                 });
             },
         );

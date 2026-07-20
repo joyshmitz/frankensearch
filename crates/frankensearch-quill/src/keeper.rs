@@ -36,13 +36,14 @@ use crate::quiver::{
     BlockMaxConcatList, DocLenSection, EncodedBlockMax, EncodedDocLenSection, EncodedIdHashSection,
     EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
     EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdHashLookupPlan,
-    IdHashSection, IdMapCodecError, IdMapSection, NumericSection, PositionList, PostingList,
-    StatsSection, StoredMetaSection, ValidatedTermPruningMetadata, aggregate_field_stats,
+    IdHashSection, IdMapCodecError, IdMapEntry, IdMapSection, NumericSection, PositionList,
+    PostingList, StatsSection, StoredMetaSection, ValidatedTermPruningMetadata,
+    aggregate_field_stats,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{
-    EncodedSegment, PendingSegmentFile, SectionEntry, SectionInput, SectionKind, SegmentHeader,
-    SegmentHeaderInput, SegmentReader,
+    EncodedSegment, PendingSegmentFile, PlannedSection, SectionEntry, SectionKind,
+    SegmentAssembler, SegmentHeader, SegmentHeaderInput, SegmentReader,
 };
 
 pub use crate::stats::{SegmentStats, SegmentStatsProvider};
@@ -3375,10 +3376,7 @@ fn build_concat_merge(
             count: sources.len(),
         })?;
     id_map_sections.extend(sources.iter().map(|source| source.id_map));
-    let id_map = EncodedIdMapSection::concatenate(&id_map_sections)
-        .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
-    let merged_id_map = id_map
-        .section()
+    let id_map_plan = EncodedIdMapSection::plan_concatenate(&id_map_sections)
         .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
 
     let tombstone_docids = collect_concat_tombstones(&sources)?;
@@ -3387,15 +3385,17 @@ fn build_concat_merge(
             detail: error.to_string(),
         }
     })?;
-    let representative_ordinals = resolve_concat_representatives(merged_id_map, &tombstone_docids)?;
-    let id_hash = EncodedIdHashSection::encode_resolved_representatives(
-        merged_id_map,
+    let representative_ordinals = resolve_concat_representatives_from_sources(
+        &id_map_sections,
+        id_map_plan.docid_lo(),
+        &tombstone_docids,
+    )?;
+    let id_hash = EncodedIdHashSection::encode_resolved_concat(
+        &id_map_sections,
+        &id_map_plan,
         &representative_ordinals,
     )
     .map_err(|error| concat_codec(SectionKind::IDHASH, error))?;
-    id_hash
-        .section(merged_id_map)
-        .map_err(|error| concat_codec(SectionKind::IDHASH, error))?;
 
     let numeric = if has_numeric {
         let mut numeric_sections = Vec::new();
@@ -3420,11 +3420,11 @@ fn build_concat_merge(
     } else {
         None
     };
-    let stored_meta =
+    let mut stored_sections = Vec::new();
+    let stored_meta_plan =
         if stored_fields.is_empty() {
             None
         } else {
-            let mut stored_sections = Vec::new();
             stored_sections
                 .try_reserve_exact(sources.len())
                 .map_err(|_| ConcatMergeError::Allocation {
@@ -3437,7 +3437,7 @@ fn build_concat_merge(
                 })?);
             }
             Some(
-                EncodedStoredMetaSection::concatenate(&stored_sections, &stored_fields)
+                EncodedStoredMetaSection::plan_concatenate(&stored_sections, &stored_fields)
                     .map_err(|error| concat_codec(SectionKind::STOREDMETA, error))?,
             )
         };
@@ -3466,37 +3466,52 @@ fn build_concat_merge(
     let stats = EncodedStatsSection::encode(&term_fields, &stats_rows, doc_count)
         .map_err(|error| concat_codec(SectionKind::STATS, error))?;
 
-    let mut section_inputs = Vec::new();
-    section_inputs
+    let mut section_plan = Vec::new();
+    section_plan
         .try_reserve_exact(10)
         .map_err(|_| ConcatMergeError::Allocation {
-            resource: "FSLX section inputs",
+            resource: "FSLX section plan",
             count: 10,
         })?;
-    section_inputs.push(SectionInput::new(
+    section_plan.push(PlannedSection::new(
         SectionKind::TERMDICT,
-        termdict.as_bytes(),
+        termdict.as_bytes().len(),
     ));
-    section_inputs.push(SectionInput::new(SectionKind::POSTINGS, &postings));
+    section_plan.push(PlannedSection::new(SectionKind::POSTINGS, postings.len()));
     if has_positions {
-        section_inputs.push(SectionInput::new(SectionKind::POSITIONS, &positions));
+        section_plan.push(PlannedSection::new(SectionKind::POSITIONS, positions.len()));
     }
-    section_inputs.push(SectionInput::new(SectionKind::BLOCKMAX, &blockmax));
-    section_inputs.push(SectionInput::new(SectionKind::DOCLEN, doclen.as_bytes()));
-    section_inputs.push(SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()));
-    section_inputs.push(SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()));
+    section_plan.push(PlannedSection::new(SectionKind::BLOCKMAX, blockmax.len()));
+    section_plan.push(PlannedSection::new(
+        SectionKind::DOCLEN,
+        doclen.as_bytes().len(),
+    ));
+    section_plan.push(PlannedSection::new(
+        SectionKind::IDMAP,
+        id_map_plan.encoded_len(),
+    ));
+    section_plan.push(PlannedSection::new(
+        SectionKind::IDHASH,
+        id_hash.as_bytes().len(),
+    ));
     if let Some(numeric) = &numeric {
-        section_inputs.push(SectionInput::new(SectionKind::NUMERIC, numeric.as_bytes()));
-    }
-    if let Some(stored_meta) = &stored_meta {
-        section_inputs.push(SectionInput::new(
-            SectionKind::STOREDMETA,
-            stored_meta.as_bytes(),
+        section_plan.push(PlannedSection::new(
+            SectionKind::NUMERIC,
+            numeric.as_bytes().len(),
         ));
     }
-    section_inputs.push(SectionInput::new(SectionKind::STATS, stats.as_bytes()));
+    if let Some(stored_meta_plan) = &stored_meta_plan {
+        section_plan.push(PlannedSection::new(
+            SectionKind::STOREDMETA,
+            stored_meta_plan.encoded_len(),
+        ));
+    }
+    section_plan.push(PlannedSection::new(
+        SectionKind::STATS,
+        stats.as_bytes().len(),
+    ));
 
-    let encoded = EncodedSegment::encode(
+    let mut assembler = SegmentAssembler::new(
         SegmentHeaderInput {
             segment_id: output_segment_id,
             schema,
@@ -3506,9 +3521,63 @@ fn build_concat_merge(
             created_unix_s,
             engine_version: CURRENT_ENGINE_VERSION,
         },
-        &section_inputs,
+        &section_plan,
     )
     .map_err(|source| ConcatMergeError::Segment { source })?;
+    assembler
+        .copy_section(SectionKind::TERMDICT, termdict.as_bytes())
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    assembler
+        .copy_section(SectionKind::POSTINGS, &postings)
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    if has_positions {
+        assembler
+            .copy_section(SectionKind::POSITIONS, &positions)
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+    }
+    assembler
+        .copy_section(SectionKind::BLOCKMAX, &blockmax)
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    assembler
+        .copy_section(SectionKind::DOCLEN, doclen.as_bytes())
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    assembler
+        .write_section(SectionKind::IDMAP, |bytes| {
+            id_map_plan.append_to(&id_map_sections, bytes);
+        })
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+
+    {
+        let id_map_bytes = assembler
+            .written_section(SectionKind::IDMAP)
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+        let merged_id_map = IdMapSection::parse(id_map_bytes, docid_lo, docid_hi)
+            .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
+        id_hash
+            .section(merged_id_map)
+            .map_err(|error| concat_codec(SectionKind::IDHASH, error))?;
+    }
+    assembler
+        .copy_section(SectionKind::IDHASH, id_hash.as_bytes())
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    if let Some(numeric) = &numeric {
+        assembler
+            .copy_section(SectionKind::NUMERIC, numeric.as_bytes())
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+    }
+    if let Some(stored_meta_plan) = &stored_meta_plan {
+        assembler
+            .write_section(SectionKind::STOREDMETA, |bytes| {
+                stored_meta_plan.append_to(&stored_sections, &stored_fields, bytes);
+            })
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+    }
+    assembler
+        .copy_section(SectionKind::STATS, stats.as_bytes())
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    let encoded = assembler
+        .finish()
+        .map_err(|source| ConcatMergeError::Segment { source })?;
     let reader = SegmentReader::from_bytes(encoded.as_bytes(), schema)
         .map_err(|source| ConcatMergeError::Segment { source })?;
     reader
@@ -4018,13 +4087,38 @@ fn collect_concat_tombstones(sources: &[ConcatSource<'_>]) -> Result<Vec<u32>, C
     Ok(output)
 }
 
+#[cfg(test)]
 fn resolve_concat_representatives(
     id_map: IdMapSection<'_>,
     tombstone_docids: &[u32],
 ) -> Result<Vec<u32>, ConcatMergeError> {
+    resolve_concat_representatives_from_entries(
+        id_map.docid_lo(),
+        id_map.entries(),
+        tombstone_docids,
+    )
+}
+
+fn resolve_concat_representatives_from_sources(
+    id_maps: &[IdMapSection<'_>],
+    docid_lo: u64,
+    tombstone_docids: &[u32],
+) -> Result<Vec<u32>, ConcatMergeError> {
+    resolve_concat_representatives_from_entries(
+        docid_lo,
+        id_maps.iter().copied().flat_map(|id_map| id_map.entries()),
+        tombstone_docids,
+    )
+}
+
+fn resolve_concat_representatives_from_entries<'a>(
+    docid_lo: u64,
+    entries: impl IntoIterator<Item = (u64, IdMapEntry<'a>)>,
+    tombstone_docids: &[u32],
+) -> Result<Vec<u32>, ConcatMergeError> {
     let mut representatives = BTreeMap::<&str, IdentityRepresentative>::new();
     let mut tombstones = tombstone_docids.iter().copied().peekable();
-    for (global_docid, entry) in id_map.entries() {
+    for (global_docid, entry) in entries {
         let global_docid =
             u32::try_from(global_docid).map_err(|_| ConcatMergeError::ArithmeticOverflow {
                 field: "IDHASH representative global docid",
@@ -4096,11 +4190,11 @@ fn resolve_concat_representatives(
         let global_docid = representative
             .live_global_docid
             .unwrap_or(representative.lowest_global_docid);
-        let ordinal = u64::from(global_docid)
-            .checked_sub(id_map.docid_lo())
-            .ok_or(ConcatMergeError::ArithmeticOverflow {
+        let ordinal = u64::from(global_docid).checked_sub(docid_lo).ok_or(
+            ConcatMergeError::ArithmeticOverflow {
                 field: "IDHASH representative ordinal",
-            })?;
+            },
+        )?;
         ordinals.push(u32::try_from(ordinal).map_err(|_| {
             ConcatMergeError::ArithmeticOverflow {
                 field: "durable IDHASH representative ordinal",

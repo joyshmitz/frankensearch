@@ -15683,3 +15683,45 @@ collection unless a 2–8-clause MaxScore root has direct term children. Direct
 term MaxScore and direct 9+-term BMW are measured separately in
 `docs/PERF_LEDGER.md`; a future nested attempt must first introduce deferred
 group scoring and beat this same setup-inclusive null-controlled comparator.
+
+### 2026-07-19 — PARTIAL KEEP / closure HOLD: one-pass concat removes the 16-source cliff but remains above E3.5's spread gate (`bd-quill-e3-keeper-ndtk.5`)
+
+The final current-main candidate replaced IDMAP and STOREDMETA intermediate
+buffers with exact-plan direct emission into one final FSLX allocation. IDHASH
+is built against the validated conceptual source domain and then checked again
+against the actual emitted, reparsed IDMAP. This is the same semantic lever as
+the earlier one-pass experiment, but the evidence below supersedes its
+allocator-biased harness: Criterion now uses 20 flat samples, retains every
+sample's immutable outputs until after `elapsed()`, warms for 500 ms, and
+measures for 5 s. An initial run that still printed 10 samples / 200 ms / 1 s
+was discarded before any decision.
+
+One strict-remote release-LTO run on pinned worker `ovh-a` used exact physical
+byte denominators of 2,745,208 / 7,277,512 / 16,354,280 / 34,543,016 for
+2 / 4 / 8 / 16 sources. Exact Criterion medians were read from the remote
+`estimates.json` after local artifact retrieval exhausted disk space:
+
+| sources | median | ns / physical byte |
+|---:|---:|---:|
+| 2 | 2,398,286.155 ns | 0.873626390 |
+| 4 | 4,082,846.360 ns | 0.561022278 |
+| 8 | 10,209,196.348 ns | 0.624252266 |
+| 16 | 22,033,773.409 ns | 0.637864783 |
+
+The normalized spread is therefore **1.557204454x — FAIL**, 15.35% above the
+predeclared `1.35x` ceiling. The former 16-source page-fault cliff is gone; the
+maximum is now the two-source fixed-cost case and the minimum is four sources.
+The same-worker restored control medians were 4,248,149.542 / 10,576,223.174 /
+24,303,723.300 / 67,813,377.125 ns, so the candidate still wins absolutely by
+43.55% / 61.40% / 57.99% / 67.51%. That independently decisive throughput win
+is retained and recorded in `docs/PERF_LEDGER.md`, but it is not E3.5 closure.
+
+The final rebased strict-remote Quill suite passed 437 tests (0 failed,
+2 ignored), and fresh-eyes review found no blocking correctness or methodology
+issue. The remote benchmark exited 0. Its post-timing local rsync warning
+(`No space left on device`) did not affect the complete remote measurements.
+
+**Decision: PARTIAL KEEP / HOLD E3.5 OPEN.** Retain the production lever and
+corrected benchmark, leave `bd-quill-e3-keeper-ndtk.5` `in_progress`, and target
+the residual two-source fixed overhead before claiming the flat CPU/physical-byte
+acceptance criterion.
