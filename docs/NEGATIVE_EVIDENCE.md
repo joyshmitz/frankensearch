@@ -15725,3 +15725,37 @@ issue. The remote benchmark exited 0. Its post-timing local rsync warning
 corrected benchmark, leave `bd-quill-e3-keeper-ndtk.5` `in_progress`, and target
 the residual two-source fixed overhead before claiming the flat CPU/physical-byte
 acceptance criterion.
+
+### 2026-07-19 — closure HOLD follow-up: the residual fixed-cost profile does not support another bounded concat lever (`bd-quill-e3-keeper-ndtk.5`)
+
+The accepted release binary's medians imply an approximately 1.377 ms fixed
+intercept between the two- and four-source cases. Because four sources remain
+the minimum at 0.561022278 ns/B, closing the `1.35x` spread gate would require
+the two-source median to fall by **319,120 ns (13.306%)** without moving that
+minimum.
+
+A same-source, release-LTO diagnostic build with symbols was sampled for five
+seconds on pinned worker `ovh-a`; it changes only debug/strip settings and is
+profile evidence, not timing evidence. DWARF callgraphs attributed 29.93% of
+cycles beneath anonymous page faults and 18.11% beneath canonical IDMAP
+repeated-offset emission, both proportional to the fixture's large durable hole
+span. The fixed-work candidates were much smaller: `merge_concat_terms` was
+4.56% inclusive, source-domain identity representative resolution was 5.24%,
+and validated IDMAP parsing was 5.55%. The proposed singleton-term direct-copy
+shortcut therefore cannot close the gate even if its entire inclusive cost
+disappears. Removing final checksum replay was already falsified above, and
+would remove byte-proportional rather than fixed work.
+
+The fixture deliberately holds 1,024 logical documents constant while its
+canonical output span grows from 66,048 to 983,104 rows, so the denominator
+mixes fixed logical work with required hole bytes. That explains why the 4/8/16
+subspread is already only 1.137x and the entire failure is the 2-to-4 boundary;
+it does not identify a safe production hotspot large enough for another narrow
+edit.
+
+**Decision: HOLD WITHOUT SOURCE CHANGE.** Do not speculate on the singleton
+path or weaken validation. Preserve the profile as negative evidence, keep
+E3.5 open with the retained absolute win, and move to the next actionable
+critical-path bead. A future E3.5 attempt must first add stage-attributed
+fixed-work evidence or a fixed-retained-byte control that isolates a single
+production cost of at least 13.306% in the two-source case.
