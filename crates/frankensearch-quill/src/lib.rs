@@ -44,9 +44,10 @@ pub use index::{
 };
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
-    ConcatMergeError, CurrentPointer, CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES,
-    GarbageCollectionOptions, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
-    LoadedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC, Manifest,
+    CompactionError, CompactionPolicy, CompactionReport, ConcatMergeError, CurrentPointer,
+    CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES, GarbageCollectionOptions,
+    GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter, LoadedManifest,
+    MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC, Manifest,
     ManifestCodecError, ManifestFieldStats, ManifestSegment, ManifestSource, RecoveredSegment,
     ResolvedCurrent, ResolvedDocumentId, TombstoneSet, WRITER_LOCK_FORMAT_VERSION,
     WRITER_LOCK_MAGIC, WRITER_LOCK_RECORD_BYTES, load_manifest_pair, pack_engine_version,
