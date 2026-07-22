@@ -6422,3 +6422,36 @@ representation eliminates the added state spills/branches, and an idle
 same-worker run produces an A/A band inside 0.97–1.03 with all decisive-arm
 CVs below 5%; require cached/shipping <=0.97 on short tokens and no long-token
 regression before reconsidering production.
+
+## 2026-07-22 — REJECT: legacy f16 dot-product A/A retrofit misses the <5% CV admission rule (`bd-dot-product-aa-null-wegn`, IndigoOtter)
+
+Negative-evidence mining showed that the f16/f32/i8 kernel families are
+already heavily explored, while the legacy `dot_product` Criterion target
+still lacked the same-binary A/A floor required to interpret its existing
+dispatch/generic comparison. A bench-only candidate added exact `to_bits()`
+parity checks plus interleaved shipping/shipping and AVX2-dispatch/generic
+measurements at dimensions 256 and 384; production code was untouched.
+
+Strict-remote release job `j-29942429901652321` completed on `vmi1149989`.
+Ratios below are first/second, so dispatch/generic values below one favor the
+shipping dispatch:
+
+| dimension | dispatch/dispatch A/A median [p5, p95] | dispatch/generic median [p5, p95] | dispatch Criterion interval | generic Criterion interval | raw CV dispatch/generic |
+|---:|---:|---:|---:|---:|---:|
+| 256 | 1.0055 [0.9154, 1.0743] | **0.2798 [0.2334, 0.4562]** | 286.06–308.79 us | 1.1273–1.2494 ms | **6.399% / 5.607%** |
+| 384 | 1.0292 [0.7778, 1.1771] | **0.4423 [0.2461, 0.6548]** | 418.15–509.40 us | 1.8671–1.9869 ms | **32.059% / 6.491%** |
+
+The direction is large and exact parity passed, but all four decisive-arm CVs
+exceed 5% and the 384-dimensional A/A band is especially wide. The benchmark
+therefore cannot support a KEEP under the admission rule. A warmed retry with
+30 samples and four inner iterations was requested, but RCH routed
+`j-29942429901652351` to the cold, disk-critical `hz1` worker instead of the
+warmed worker; it was cancelled before compilation or timing. All bench and
+Cargo edits were manually removed.
+
+**Decision: REJECT the measurement retrofit, not the shipping AVX2 kernel.**
+Reopen only on an idle, admissible worker with the same warmed build cache (or
+isolated CPU pinning), hard-code at least 30 samples and four inner iterations,
+and require both dimensional A/A bands within 0.97–1.03 plus every dispatch
+and generic CV below 5%. Exact bit parity remains mandatory; only then may the
+dispatch/generic speedup be cited from this legacy target.

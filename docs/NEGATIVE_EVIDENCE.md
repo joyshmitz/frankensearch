@@ -15887,3 +15887,33 @@ source and comparator edits were manually removed. Reopen only when a profile
 and disassembly demonstrate a representation with no added spills/branches,
 then require an idle same-worker A/A band within 0.97–1.03, every decisive-arm
 CV below 5%, short cached/shipping <=0.97, and no regression on long tokens.
+
+### 2026-07-22 — REJECT: legacy f16 dot-product A/A retrofit is too noisy to retain (`bd-dot-product-aa-null-wegn`, IndigoOtter)
+
+This was a measurement-infrastructure lever, not a new kernel. Ledger and
+recent-history mining found the f16/f32/i8 implementation families already
+well explored, but the legacy `dot_product` Criterion target lacked a null
+control. The candidate added exact bit-parity assertions and interleaved
+shipping/shipping A/A beside shipping-dispatch/generic A/B for dimensions 256
+and 384, without modifying production source.
+
+Strict-remote job `j-29942429901652321` on `vmi1149989` produced:
+
+| dimension | dispatch/dispatch A/A median [p5, p95] | dispatch/generic median [p5, p95] | raw dispatch/generic CV |
+|---:|---:|---:|---:|
+| 256 | 1.0055 [0.9154, 1.0743] | 0.2798 [0.2334, 0.4562] | **6.399% / 5.607%** |
+| 384 | 1.0292 [0.7778, 1.1771] | 0.4423 [0.2461, 0.6548] | **32.059% / 6.491%** |
+
+Exact `to_bits()` parity passed and the incumbent dispatch was directionally
+much faster, with Criterion intervals of 286.06–308.79 us versus
+1.1273–1.2494 ms at 256 dimensions and 418.15–509.40 us versus
+1.8671–1.9869 ms at 384. That does not override the mandatory noise gate: all
+four arm CVs exceed 5%, and the 384-dimensional null band is unusably wide.
+RCH then routed warmed retry `j-29942429901652351` to cold, disk-critical `hz1`;
+it was cancelled before compilation/timing rather than mixing workers. The
+bench/Cargo changes were manually removed.
+
+**Decision: REJECT the retrofit and retain the unchanged shipping kernel.**
+Retry only with an idle same-worker warmed cache or isolated CPU pinning,
+at least 30 samples and four inner iterations, dimensional A/A bands wholly
+inside 0.97–1.03, all dispatch/generic CVs below 5%, and exact bit parity.
