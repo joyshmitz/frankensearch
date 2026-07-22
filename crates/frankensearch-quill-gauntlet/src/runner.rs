@@ -733,11 +733,10 @@ impl CampaignProvenance {
         let cargo_lock_sha256 = hash_workspace_lockfile()?;
         let rustc_version_verbose = collect_rustc_verbose()?;
         let unicode_normalization_version = locked_crate_version("unicode-normalization")?;
-        let profile_bytes = serde_json::to_vec(selection).map_err(|error| {
-            GauntletError::InvalidCampaign {
+        let profile_bytes =
+            serde_json::to_vec(selection).map_err(|error| GauntletError::InvalidCampaign {
                 reason: format!("query profile serialization failed: {error}"),
-            }
-        })?;
+            })?;
         let query_profile_sha256 = sha256_hex(&profile_bytes);
         Ok(Self {
             subject_git_revision,
@@ -748,7 +747,9 @@ impl CampaignProvenance {
             rustc_version_verbose,
             unicode_version: format!(
                 "{}.{}.{}",
-                char::UNICODE_VERSION.0, char::UNICODE_VERSION.1, char::UNICODE_VERSION.2
+                char::UNICODE_VERSION.0,
+                char::UNICODE_VERSION.1,
+                char::UNICODE_VERSION.2
             ),
             unicode_normalization_version,
             query_profile_sha256,
@@ -757,18 +758,11 @@ impl CampaignProvenance {
     }
 }
 
-fn collect_git_state(
-    revision_env: &str,
-    dirty_env: &str,
-) -> Result<(String, bool), GauntletError> {
+fn collect_git_state(revision_env: &str, dirty_env: &str) -> Result<(String, bool), GauntletError> {
     if let (Ok(revision), Ok(dirty)) = (std::env::var(revision_env), std::env::var(dirty_env)) {
         return Ok((revision, dirty == "1" || dirty.eq_ignore_ascii_case("true")));
     }
-    let revision = run_capture(
-        "git",
-        &["rev-parse", "HEAD"],
-        revision_env,
-    )?;
+    let revision = run_capture("git", &["rev-parse", "HEAD"], revision_env)?;
     let porcelain = run_capture("git", &["status", "--porcelain"], dirty_env)?;
     Ok((revision.trim().to_owned(), !porcelain.trim().is_empty()))
 }
@@ -810,9 +804,10 @@ fn hash_workspace_lockfile() -> Result<String, GauntletError> {
 
 fn locked_crate_version(crate_name: &str) -> Result<String, GauntletError> {
     let path = workspace_root().join("Cargo.lock");
-    let contents = std::fs::read_to_string(&path).map_err(|error| GauntletError::InvalidCampaign {
-        reason: format!("cannot read {}: {error}", path.display()),
-    })?;
+    let contents =
+        std::fs::read_to_string(&path).map_err(|error| GauntletError::InvalidCampaign {
+            reason: format!("cannot read {}: {error}", path.display()),
+        })?;
     let needle = format!("name = \"{crate_name}\"");
     let mut lines = contents.lines();
     while let Some(line) = lines.next() {
@@ -6357,7 +6352,11 @@ mod tests {
             "e6.9-default-pr-lane",
         )
         .expect("live default-profile campaign must complete and pass");
-        assert!(report.passed, "default profile is green: {:?}", report.mismatches);
+        assert!(
+            report.passed,
+            "default profile is green: {:?}",
+            report.mismatches
+        );
         let provenance = report
             .provenance
             .as_ref()
@@ -6369,7 +6368,9 @@ mod tests {
             provenance.unicode_version,
             format!(
                 "{}.{}.{}",
-                char::UNICODE_VERSION.0, char::UNICODE_VERSION.1, char::UNICODE_VERSION.2
+                char::UNICODE_VERSION.0,
+                char::UNICODE_VERSION.1,
+                char::UNICODE_VERSION.2
             )
         );
         assert!(!provenance.unicode_normalization_version.is_empty());
@@ -6403,8 +6404,7 @@ mod tests {
         let bytes = std::fs::read(&reservation_path).expect("read reservation");
         let mut reservation: serde_json::Value =
             serde_json::from_slice(&bytes).expect("parse reservation");
-        reservation["provenance"]["cargo_lock_sha256"] =
-            serde_json::Value::String("00".repeat(32));
+        reservation["provenance"]["cargo_lock_sha256"] = serde_json::Value::String("00".repeat(32));
         std::fs::write(
             &reservation_path,
             serde_json::to_vec(&reservation).expect("serialize tampered"),
