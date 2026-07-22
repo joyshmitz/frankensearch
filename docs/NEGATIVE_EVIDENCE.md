@@ -15955,3 +15955,31 @@ enough for local cutoffs to stay weak, or (c) a profiled workload shows
 `refill_with_cutoff` block-skip rates materially below the serial path's on
 fanned queries. Measure the same three-mode A/B; require decidable <= 0.97 on
 union3 or phrase.
+
+### 2026-07-22 — BLOCKED / UNTIMED: top-k A/A CV revalidation cannot reach its timed path (`bd-3srq`, IndigoOtter)
+
+The mandatory ledger pass prevented a duplicate benchmark edit. The existing
+`int8_vs_f16_fast_ab` target already supplies the real-method f16/f16 A/A null,
+exact-f16/int8-two-pass A/B, recall@10=1.0000, and 32/32 exact-order proof that
+supported the shipped 2026-07-11 top-k win. This cycle attempted only the
+missing modern audit of per-arm Criterion CV below 5%.
+
+`scripts/rch-ensure-deps.sh --check` passed. Strict-remote release job
+`j-29942429901652363` was admitted on `vmi1264463` at 20:25:38Z after RCH
+ignored the warmed-worker hint. The cold worker synchronized the full project,
+downloaded/compiled dependencies, and reached the two frankensearch crates,
+then remained in final release linking for over ten minutes. It emitted no
+parity, null, Criterion, or timed row. With the hook still heartbeating, the
+job was cleanly cancelled at 20:47:00Z after 21 minutes 22 seconds total.
+Source and benchmark files were never modified.
+
+**Decision: BLOCKED / UNTIMED.** Do not reinterpret the absence of new CV data
+as a top-k REJECT; the previously shipped result stands. This exact cold
+release/LTO admission failure also prevents a responsible RRF A/A retrofit in
+the same cycle. Read-only mining found `rrf_merge_fuse` still has no
+interleaved null and asserts only length plus first/last IDs, but no RRF
+candidate was edited or timed. Reopen only on a worker with the release-bench
+graph already warm, or when the exact binary links within ten minutes. Require
+top-k's 32-query recall/order proof, A/A inside 0.97–1.03, and both arm CVs
+below 5%; for RRF require full `FusedHit` equality, map/map A/A, and every
+compared arm CV below 5%.
