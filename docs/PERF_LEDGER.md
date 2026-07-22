@@ -6537,3 +6537,45 @@ ten minutes. Top-k then requires the existing 32-query recall/order proof,
 A/A wholly within 0.97–1.03, and both Criterion arm CVs below 5%; RRF requires
 full `FusedHit` equality, an interleaved map/map A/A, and all compared arm CVs
 below 5% before retaining any harness change.
+
+## 2026-07-22 — BLOCKED / NO ADMISSIBLE VERDICT: short-token ASCII boundary selection mask (`bd-l5x3`, IndigoOtter)
+
+Alien-graveyard routing selected vectorized selection masks (§8.2) for the
+still-open short-token tokenizer gap. The candidate classified one eight-byte
+ASCII word, derived every alphanumeric/non-alphanumeric transition from that
+single lane mask, and enumerated the transition bits to emit token boundaries;
+Unicode-containing words retained the scalar char fallback. The exact retained
+shipping SWAR tokenizer stayed in the same binary. Before timing, three strict-
+remote tests passed: 4,000 randomized mixed-ASCII/Unicode strings, the existing
+lane-edge corpus, and every length from 1 through 129 bytes all matched both the
+retained SWAR token stream and scalar reference exactly, including token text,
+byte offsets, positions, position lengths, order, and lowercasing.
+
+The first completed release job, `j-29943190916169794` on `vmi1227854`,
+overlapped the segment-fanout benchmark on that worker. Its direction was
+promising but its null/CV evidence was inadmissible:
+
+| corpus | shipping/shipping A/A median [p5, p95] | candidate/shipping median [p5, p95] | shipping mean / CV | candidate mean / CV | mean ratio |
+|---|---:|---:|---:|---:|---:|
+| short 48 KiB | 0.9868 [0.8642, 1.0672] | **0.8190 [0.7589, 0.9014]** | 183.557 us / **5.694%** | 137.626 us / **10.128%** | **0.7498** |
+| long 48 KiB | 0.9969 [0.9118, 1.0651] | 1.0129 [0.9028, 1.0641] | 77.627 us / 3.891% | 77.577 us / **6.800%** | 0.9994 |
+
+Both A/A bands exceed the required 0.97–1.03 envelope and three decisive arms
+miss the CV-below-5% gate. The short direction therefore cannot be called a
+KEEP, while the contaminated control cannot honestly reject the primitive.
+The paired batch was increased symmetrically from 16 to 64 passes and an
+isolated retry requested every slot on an idle worker. Three idle alternatives
+failed closed before execution with `RCH-I004 alias_wrong_target`
+(`vmi1152480`: `/data`; `hz2` and `vmi1293453`: `/data/tmp`). Strict-remote job
+`j-29943190916169821` then reserved all 3/3 slots on `vmi1156319`, compiled the
+full release graph, reached the final benchmark link, and failed with
+`RCH-E104` after the 1,800-second SSH timeout without executing the binary or
+emitting a null, parity banner, or Criterion sample.
+
+**Decision: BLOCKED / NO ADMISSIBLE VERDICT, not REJECT.** The speculative
+production and comparator edits were manually removed. Retry only when an
+idle requested worker can reserve its full slot count and link or reuse the
+exact release benchmark binary within the remote timeout. Retain the exact
+SWAR/scalar parity gates and 64-pass interleaving; require both A/A p5–p95 bands
+wholly inside 0.97–1.03, every shipping/candidate Criterion CV below 5%, short
+candidate/shipping <=0.97, and no decidable long-token regression before KEEP.

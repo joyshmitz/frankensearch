@@ -16022,3 +16022,39 @@ honestly clears its realistic-density evidence requirement. Retry performance
 only after profiling the verified decode/re-encode stages, or against a full
 end-to-end canonical-storage rebuild with symmetric input acquisition, using
 the same null-controlled 5/20/50% matrix and never a 0% fixture.
+
+### 2026-07-22 — BLOCKED / NO ADMISSIBLE VERDICT: short-token ASCII boundary selection mask (`bd-l5x3`, IndigoOtter)
+
+The mandatory ledger and recent-log pass left the short-token tokenizer gap
+open while closing cached SWAR-window reuse, dot-product measurement noise,
+and the cold-link top-k/RRF retry. Alien-graveyard §8.2 supplied a different
+primitive: classify one eight-byte ASCII word, derive a selection mask for all
+token-run transitions, and enumerate those transitions rather than ping-pong
+between separate separator and token scans. Unicode-containing words retained
+the scalar char path. Exact proof passed before timing: 4,000 randomized mixed
+Unicode inputs, the existing lane-edge corpus, and every length 1–129 produced
+the same token text, lowercasing, offsets, positions, position lengths, and
+order as both the retained shipping SWAR implementation and scalar reference.
+
+Strict-remote release job `j-29943190916169794` completed on `vmi1227854` but
+overlapped the segment-fanout benchmark. Short candidate/shipping was 0.8190
+[0.7589, 0.9014] paired and 137.626/183.557 us = 0.7498 by Criterion means;
+long was 1.0129 [0.9028, 1.0641] paired and 77.577/77.627 us = 0.9994. Those
+directions are not admissible evidence because the short A/A was 0.9868
+[0.8642, 1.0672], long A/A was 0.9969 [0.9118, 1.0651], and the short shipping,
+short candidate, and long candidate raw CVs were respectively 5.694%, 10.128%,
+and 6.800% (long shipping alone passed at 3.891%).
+
+A symmetric 64-pass paired retry then sought full-worker isolation. Requested
+idle `vmi1152480`, `hz2`, and `vmi1293453` all failed closed before execution
+with `RCH-I004 alias_wrong_target`. Job `j-29943190916169821` successfully
+reserved all 3/3 slots on idle `vmi1156319`, reached final release linking, but
+never executed the benchmark: RCH returned `RCH-E104` when SSH hit its
+1,800-second timeout. No null or Criterion sample exists from the isolated run.
+
+**Decision: BLOCKED / NO ADMISSIBLE VERDICT, not REJECT.** All candidate source
+and benchmark edits were manually removed; shipping SWAR remains unchanged.
+Retry only when a fully reserved requested worker can link or reuse the exact
+release binary within the remote timeout. Require exact SWAR/scalar parity,
+64-pass A/A p5–p95 wholly within 0.97–1.03 for both corpora, every decisive-arm
+CV below 5%, short candidate/shipping <=0.97, and no decidable long regression.
