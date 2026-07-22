@@ -6304,7 +6304,7 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
-    fn run_live_default_profile_campaign(
+    async fn run_live_default_profile_campaign(
         cx: &Cx,
         root: &std::path::Path,
         run_id: &str,
@@ -6327,92 +6327,90 @@ mod tests {
         )
         .expect("live campaign runner")
         .with_provenance(provenance);
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
-            campaign
-                .run(
-                    cx,
-                    run_id,
-                    &mut subject,
-                    &mut oracle,
-                    &fixture.documents,
-                    &fixture.corpus_manifest,
-                    &fixture.query_suite,
-                )
-                .await
-        })
+        campaign
+            .run(
+                cx,
+                run_id,
+                &mut subject,
+                &mut oracle,
+                &fixture.documents,
+                &fixture.corpus_manifest,
+                &fixture.query_suite,
+            )
+            .await
     }
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn live_default_profile_campaign_stamps_provenance_and_reloads_verified() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let report = run_live_default_profile_campaign(
-            &asupersync::Cx::for_testing(),
-            temp.path(),
-            "e6.9-default-pr-lane",
-        )
-        .expect("live default-profile campaign must complete and pass");
-        assert!(
-            report.passed,
-            "default profile is green: {:?}",
-            report.mismatches
-        );
-        let provenance = report
-            .provenance
-            .as_ref()
-            .expect("production campaign stamps provenance");
-        assert!(!provenance.subject_git_revision.is_empty());
-        assert!(!provenance.cargo_lock_sha256.is_empty());
-        assert!(provenance.rustc_version_verbose.contains("release:"));
-        assert_eq!(
-            provenance.unicode_version,
-            format!(
-                "{}.{}.{}",
-                char::UNICODE_VERSION.0,
-                char::UNICODE_VERSION.1,
-                char::UNICODE_VERSION.2
-            )
-        );
-        assert!(!provenance.unicode_normalization_version.is_empty());
-        assert!(!provenance.query_profile_sha256.is_empty());
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let report =
+                run_live_default_profile_campaign(&cx, temp.path(), "e6.9-default-pr-lane")
+                    .await
+                    .expect("live default-profile campaign must complete and pass");
+            assert!(
+                report.passed,
+                "default profile is green: {:?}",
+                report.mismatches
+            );
+            let provenance = report
+                .provenance
+                .as_ref()
+                .expect("production campaign stamps provenance");
+            assert!(!provenance.subject_git_revision.is_empty());
+            assert!(!provenance.cargo_lock_sha256.is_empty());
+            assert!(provenance.rustc_version_verbose.contains("release:"));
+            assert_eq!(
+                provenance.unicode_version,
+                format!(
+                    "{}.{}.{}",
+                    char::UNICODE_VERSION.0,
+                    char::UNICODE_VERSION.1,
+                    char::UNICODE_VERSION.2
+                )
+            );
+            assert!(!provenance.unicode_normalization_version.is_empty());
+            assert!(!provenance.query_profile_sha256.is_empty());
 
-        // CI-grade acceptance: ONLY a verified reload counts as evidence.
-        let reloaded = ArtifactStore::new(temp.path())
-            .load_verified_campaign("e6.9-default-pr-lane")
-            .expect("verified reload accepts the completed campaign");
-        assert_eq!(reloaded, report);
-        assert_eq!(reloaded.provenance, report.provenance);
+            // CI-grade acceptance: ONLY a verified reload counts as evidence.
+            let reloaded = ArtifactStore::new(temp.path())
+                .load_verified_campaign("e6.9-default-pr-lane")
+                .expect("verified reload accepts the completed campaign");
+            assert_eq!(reloaded, report);
+            assert_eq!(reloaded.provenance, report.provenance);
+        });
     }
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn live_campaign_provenance_mismatch_fails_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
-        run_live_default_profile_campaign(
-            &asupersync::Cx::for_testing(),
-            temp.path(),
-            "e6.9-provenance-tamper",
-        )
-        .expect("campaign completes");
-        // Tamper with the reservation's provenance block: the verified reload
-        // must reject the campaign instead of trusting it.
-        let reservation_path = temp
-            .path()
-            .join("campaigns")
-            .join("e6.9-provenance-tamper")
-            .join("reservation.json");
-        let bytes = std::fs::read(&reservation_path).expect("read reservation");
-        let mut reservation: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("parse reservation");
-        reservation["provenance"]["cargo_lock_sha256"] = serde_json::Value::String("00".repeat(32));
-        std::fs::write(
-            &reservation_path,
-            serde_json::to_vec(&reservation).expect("serialize tampered"),
-        )
-        .expect("write tampered");
-        let rejected =
-            ArtifactStore::new(temp.path()).load_verified_campaign("e6.9-provenance-tamper");
-        assert!(rejected.is_err(), "tampered provenance fails closed");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            run_live_default_profile_campaign(&cx, temp.path(), "e6.9-provenance-tamper")
+                .await
+                .expect("campaign completes");
+            // Tamper with the reservation's provenance block: the verified reload
+            // must reject the campaign instead of trusting it.
+            let reservation_path = temp
+                .path()
+                .join("campaigns")
+                .join("e6.9-provenance-tamper")
+                .join("reservation.json");
+            let bytes = std::fs::read(&reservation_path).expect("read reservation");
+            let mut reservation: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("parse reservation");
+            reservation["provenance"]["cargo_lock_sha256"] =
+                serde_json::Value::String("00".repeat(32));
+            std::fs::write(
+                &reservation_path,
+                serde_json::to_vec(&reservation).expect("serialize tampered"),
+            )
+            .expect("write tampered");
+            let rejected =
+                ArtifactStore::new(temp.path()).load_verified_campaign("e6.9-provenance-tamper");
+            assert!(rejected.is_err(), "tampered provenance fails closed");
+        });
     }
 
     fn documents_content_hash(documents: &[GeneratedDocument]) -> String {
@@ -6444,14 +6442,14 @@ mod tests {
             zipf_exponent: ZipfExponent::S11,
             max_document_bytes: 2_048,
         };
-        let documents: Vec<_> = SyntheticCorpus::new(spec)
+        let documents: Vec<_> = SyntheticCorpus::new(spec.clone())
             .expect("synthetic spec")
             .iter()
             .collect();
         let corpus_manifest = CorpusManifest {
             schema_version: 1,
             generator_id: GENERATOR_ID.to_owned(),
-            source: crate::generator::CorpusSourceManifest::Synthetic { spec },
+            source: crate::generator::CorpusSourceManifest::Synthetic { spec: spec.clone() },
             document_count: u64::try_from(documents.len()).expect("doc count"),
             total_content_bytes: documents
                 .iter()
@@ -6488,10 +6486,10 @@ mod tests {
         )
         .expect("nightly campaign runner")
         .with_provenance(provenance);
-        let report = asupersync::test_utils::run_test_with_cx(|cx| async move {
-            campaign
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let report = campaign
                 .run(
-                    cx,
+                    &cx,
                     "e6.9-default-nightly-full",
                     &mut subject,
                     &mut oracle,
@@ -6500,11 +6498,11 @@ mod tests {
                     &query_suite,
                 )
                 .await
-        })
-        .expect("nightly full lane completes");
-        assert!(report.passed, "nightly lane green: {:?}", report.mismatches);
-        ArtifactStore::new(temp.path())
-            .load_verified_campaign("e6.9-default-nightly-full")
-            .expect("verified reload accepts the nightly campaign");
+                .expect("nightly full lane completes");
+            assert!(report.passed, "nightly lane green: {:?}", report.mismatches);
+            ArtifactStore::new(temp.path())
+                .load_verified_campaign("e6.9-default-nightly-full")
+                .expect("verified reload accepts the nightly campaign");
+        });
     }
 }

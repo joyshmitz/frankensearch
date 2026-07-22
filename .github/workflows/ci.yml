@@ -118,7 +118,7 @@ jobs:
           GAUNTLET_SUBJECT_DIRTY: "false"
           GAUNTLET_ORACLE_REVISION: ${{ github.sha }}
           GAUNTLET_ORACLE_DIRTY: "false"
-        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_default_profile_campaign_stamps_provenance_and_reloads_verified runner::tests::live_campaign_provenance_mismatch_fails_closed -- --exact --nocapture
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_ -- --nocapture
 
       - name: Quill oracle campaign nightly full lane (bd-quill-e6.9)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
