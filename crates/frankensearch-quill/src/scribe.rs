@@ -7087,6 +7087,443 @@ mod tests {
         assert_eq!(stored_field.get(65_541), Some(b"stored-b".as_slice()));
     }
 
+    // ── E1.8: Scribe unit/property tests (tokenizer/CASS parity, accumulator
+    //          invariants, radix-flush determinism). E2E ingest round-trip and
+    //          the LabRuntime cancellation leak-oracle live in
+    //          `crates/frankensearch-quill/tests/scribe_e2e.rs`.
+
+    /// First token-stream divergence as `(source byte offset, lane index mod 32)`
+    /// so a failing lane-edge sweep case pinpoints the straddling boundary.
+    fn first_divergent_offset(a: &[AnalyzedToken], b: &[AnalyzedToken]) -> Option<(usize, usize)> {
+        for (ta, tb) in a.iter().zip(b.iter()) {
+            if ta != tb {
+                return Some((ta.offset_from, ta.offset_from % 32));
+            }
+        }
+        if a.len() == b.len() {
+            return None;
+        }
+        let shared = a.len().min(b.len());
+        let off = a
+            .get(shared)
+            .or_else(|| b.get(shared))
+            .map_or(0, |token| token.offset_from);
+        Some((off, off % 32))
+    }
+
+    #[test]
+    fn e18_tokenizer_lane_edge_sweep_1_to_129_bytes_matches_scalar_and_incumbent() {
+        // Sweep a separator (hence a token start AND end) across every byte
+        // offset for inputs sized 1..=129 bytes, so a token boundary lands at
+        // every 8/16/32-byte SWAR lane edge. Parity vs the scalar char-walk
+        // oracle on every case; vs the shipping incumbent on the lane-edge
+        // subset to bound tokenizer-construction cost.
+        for len in 1..=129usize {
+            for sep_pos in 0..len {
+                let input: String = (0..len)
+                    .map(|i| if i == sep_pos { ' ' } else { 'a' })
+                    .collect();
+                let swar = analyzed_tokens(&input);
+                let scalar = scalar_reference_tokens(&input);
+                if let Some((off, lane)) = first_divergent_offset(&swar, &scalar) {
+                    panic!(
+                        "len={len} sep_pos={sep_pos}: SWAR diverged from the scalar reference at byte offset {off} (lane {lane}) for {input:?}"
+                    );
+                }
+                if sep_pos % 8 == 0 {
+                    let incumbent = incumbent_tokens(&input);
+                    if let Some((off, lane)) = first_divergent_offset(&swar, &incumbent) {
+                        panic!(
+                            "len={len} sep_pos={sep_pos}: SWAR diverged from the shipping incumbent at byte offset {off} (lane {lane}) for {input:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Multi-byte scalars (2/3/4 bytes) straddling every lane edge.
+        for mb in ['é', '中', '𠀀'] {
+            for pad in 0..40usize {
+                let mut input = "a".repeat(pad);
+                input.push(mb);
+                input.push_str("bb");
+                let swar = analyzed_tokens(&input);
+                let scalar = scalar_reference_tokens(&input);
+                if let Some((off, lane)) = first_divergent_offset(&swar, &scalar) {
+                    panic!(
+                        "mb={mb:?} pad={pad}: SWAR diverged from the scalar reference at byte offset {off} (lane {lane}) for {input:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn e18_cass_family_parity_including_cjk_extension_b() {
+        // CJK Extension-B (U+20000..=U+2A6DF, 4-byte UTF-8) is inside
+        // `is_cass_cjk`, so the native CASS families must bigram-decompose it
+        // exactly like the shipping incumbent. Mix Ext-B with ASCII, hyphens,
+        // and BMP CJK so hyphen-normalize and prefix-normalize both exercise it.
+        let cases = [
+            "\u{20000}\u{20001}\u{2A6DF}",
+            "alpha-\u{20000}\u{20001}",
+            "\u{20000}beta\u{4E00}\u{20002}",
+            "POL-358 \u{20000}\u{20001} gamma",
+            "\u{20000}-\u{20001}-code",
+            "mix\u{20000}東京\u{2A700}tail",
+        ];
+        for kind in [
+            AnalyzerKind::CassHyphenNormalize,
+            AnalyzerKind::CassPrefixNormalize,
+        ] {
+            for case in cases {
+                assert_eq!(
+                    cass_tokens(kind, case),
+                    incumbent_cass_tokens(kind, case),
+                    "native CASS {kind:?} diverged from the shipping incumbent for {case:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e18_accumulator_invariants_hold_under_randomized_doc_streams() {
+        // Randomized ascending-doc-ord streams must keep every parallel column
+        // aligned, doc ords monotonic, and the reset-reuse contract intact
+        // (logical state cleared, scratch capacity retained).
+        let mut rng = DeterministicRng(0x1f9a_c3d7_5e21_0b46);
+        for _round in 0..64 {
+            let mut accumulator =
+                ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+            let doc_count = 1 + rng.choose(24);
+            let mut previous: Option<u32> = None;
+            let mut expected_docs = 0_u32;
+            let mut expected_tokens = 0_usize;
+            for _ in 0..doc_count {
+                let doc_ord =
+                    previous.map_or(0, |prev| prev + 1 + u32::try_from(rng.choose(4)).unwrap());
+                previous = Some(doc_ord);
+                let keyword = randomized_text(&mut rng);
+                let positional = randomized_text(&mut rng);
+                let plain = randomized_text(&mut rng);
+                let accumulation = accumulator
+                    .add_document_with_stored(
+                        doc_ord,
+                        &[
+                            IndexedFieldValue::new(0, &keyword),
+                            IndexedFieldValue::new(1, &positional),
+                            IndexedFieldValue::new(2, &plain),
+                        ],
+                        &[StoredFieldValue::new(3, keyword.as_bytes())],
+                    )
+                    .expect("randomized document accumulates");
+                expected_docs += 1;
+                expected_tokens += usize::try_from(accumulation.admitted_tokens).unwrap();
+            }
+
+            assert_eq!(
+                accumulator.document_count(),
+                usize::try_from(expected_docs).unwrap()
+            );
+            assert_eq!(accumulator.token_count(), expected_tokens);
+            let ords = accumulator.document_ords();
+            assert!(
+                ords.windows(2).all(|pair| pair[0] < pair[1]),
+                "document ords must be strictly ascending: {ords:?}"
+            );
+            for field in accumulator.fields() {
+                let rows = field.term_ids().len();
+                assert_eq!(field.doc_ords().len(), rows, "doc_ords column width drift");
+                assert!(
+                    field.fieldnorm_ids().len() <= accumulator.document_count(),
+                    "fieldnorm ids cannot exceed one per document"
+                );
+                if let Some(positions) = field.positions() {
+                    assert_eq!(positions.len(), rows, "positions column width drift");
+                }
+                assert!(
+                    field.doc_ords().windows(2).all(|pair| pair[0] <= pair[1]),
+                    "per-field doc ords must be non-decreasing"
+                );
+            }
+            assert!(accumulator.bytes_reserved() >= accumulator.bytes_used());
+
+            // Reset-reuse: logical state clears, scratch capacity is retained,
+            // and the accumulator is immediately usable again.
+            let reserved_before = accumulator.bytes_reserved();
+            accumulator.reset();
+            assert_eq!(accumulator.document_count(), 0);
+            assert_eq!(accumulator.token_count(), 0);
+            assert!(accumulator.document_ords().is_empty());
+            assert!(
+                accumulator.bytes_reserved() >= reserved_before / 2,
+                "reset must retain most scratch capacity for reuse"
+            );
+            accumulator
+                .add_document(0, &[IndexedFieldValue::new(1, "reuse after reset")])
+                .expect("accumulator is reusable after reset");
+            assert_eq!(accumulator.document_count(), 1);
+        }
+    }
+
+    #[test]
+    fn e18_radix_flush_is_deterministic_across_100_seeds() {
+        // Same accumulator input -> byte-identical segment, and the Automatic
+        // (possibly Rayon) path matches the serial Scalar reference, over 100
+        // randomized seeds spanning the parallel-radix row-count threshold.
+        for seed in 0..100_u64 {
+            let mut rng = DeterministicRng(0xd1b5_4f00_a37e_c119 ^ seed.wrapping_mul(0x9E37_79B9));
+            let mut accumulator =
+                ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+            let doc_count = 4 + rng.choose(28);
+            let mut identities = Vec::with_capacity(doc_count);
+            let mut doc_ord = 0_u32;
+            for index in 0..doc_count {
+                doc_ord += u32::try_from(rng.choose(3)).unwrap();
+                let keyword = format!("doc-{seed}-{index}");
+                let positional = randomized_text(&mut rng);
+                let plain = randomized_text(&mut rng);
+                accumulator
+                    .add_document_with_stored(
+                        doc_ord,
+                        &[
+                            IndexedFieldValue::new(0, &keyword),
+                            IndexedFieldValue::new(1, &positional),
+                            IndexedFieldValue::new(2, &plain),
+                        ],
+                        &[StoredFieldValue::new(3, positional.as_bytes())],
+                    )
+                    .expect("seeded document accumulates");
+                identities.push((doc_ord, keyword));
+                doc_ord += 1;
+            }
+            let flush_docs: Vec<FlushDocumentInput<'_>> = identities
+                .iter()
+                .map(|(ord, id)| {
+                    FlushDocumentInput::from_canonical_content(*ord, id, id.as_bytes())
+                })
+                .collect();
+            let input = FlushSegmentInput {
+                segment_id: 0x5EED_0000 | seed,
+                lease_docid_base: 65_536,
+                created_unix_s: 1_700_000_000,
+                engine_version: 0x0001_0002,
+                documents: &flush_docs,
+            };
+
+            let scalar_a = flush_accumulator_with_mode(&accumulator, input, FlushMode::Scalar)
+                .expect("scalar flush a");
+            let scalar_b = flush_accumulator_with_mode(&accumulator, input, FlushMode::Scalar)
+                .expect("scalar flush b");
+            assert_eq!(
+                scalar_a.as_bytes(),
+                scalar_b.as_bytes(),
+                "seed {seed}: repeated scalar flush must be byte-identical"
+            );
+            let automatic = flush_accumulator_with_mode(&accumulator, input, FlushMode::Automatic)
+                .expect("automatic flush");
+            assert_eq!(
+                automatic.as_bytes(),
+                scalar_a.as_bytes(),
+                "seed {seed}: automatic radix flush must match the scalar reference"
+            );
+            SegmentReader::from_bytes(automatic.as_bytes(), MIXED_POSITION_SCHEMA)
+                .expect("seeded segment reopens")
+                .verify()
+                .expect("seeded segment witnesses verify");
+        }
+    }
+
+    #[test]
+    fn e18_e2e_ingest_roundtrip_reopens_idmap_doclens_and_postings() {
+        // Full accumulate -> flush -> reopen round-trip over a randomized 40-doc
+        // corpus: every document id round-trips through IDMAP, each indexed field
+        // reopens its DOCLEN, and every interned term's POSTINGS decode with the
+        // exact recorded doc_freq. (The 2-doc exhaustive exact-position readback
+        // is `radix_flush_is_byte_identical_and_reopens_every_section`; this
+        // covers scale + randomization.)
+        let mut rng = DeterministicRng(0x00e2_e0e2_face_1234);
+        let mut accumulator =
+            ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+        let doc_count = 40_usize;
+        let lease_base = 65_536_u64;
+        let mut doc_ord = 0_u32;
+        let mut identities = Vec::with_capacity(doc_count);
+        for index in 0..doc_count {
+            doc_ord += u32::try_from(rng.choose(3)).unwrap();
+            let id = format!("e2e-doc-{index}");
+            accumulator
+                .add_document_with_stored(
+                    doc_ord,
+                    &[
+                        IndexedFieldValue::new(0, &id),
+                        IndexedFieldValue::new(1, &randomized_text(&mut rng)),
+                        IndexedFieldValue::new(2, &randomized_text(&mut rng)),
+                    ],
+                    &[StoredFieldValue::new(3, id.as_bytes())],
+                )
+                .expect("e2e document accumulates");
+            identities.push((doc_ord, id));
+            doc_ord += 1;
+        }
+        let flush_docs: Vec<FlushDocumentInput<'_>> = identities
+            .iter()
+            .map(|(ord, id)| FlushDocumentInput::from_canonical_content(*ord, id, id.as_bytes()))
+            .collect();
+        let input = FlushSegmentInput {
+            segment_id: 0x00E2_E000,
+            lease_docid_base: lease_base,
+            created_unix_s: 1_700_000_000,
+            engine_version: 0x0001_0002,
+            documents: &flush_docs,
+        };
+        let segment = flush_accumulator(&accumulator, input).expect("e2e flush");
+        let reader = SegmentReader::from_bytes(segment.as_bytes(), MIXED_POSITION_SCHEMA)
+            .expect("segment reopens");
+        reader.verify().expect("all section witnesses verify");
+        assert_eq!(
+            reader.header().doc_count,
+            u32::try_from(doc_count).expect("doc count fits u32")
+        );
+
+        // IDMAP: every ingested document id round-trips at its global docid.
+        let id_map = IdMapSection::parse(
+            reader
+                .section(SectionKind::IDMAP)
+                .expect("IDMAP checksum")
+                .expect("IDMAP required"),
+            reader.header().docid_lo,
+            reader.header().docid_hi,
+        )
+        .expect("IDMAP reopens");
+        for (ord, id) in &identities {
+            let global = lease_base + u64::from(*ord);
+            assert_eq!(
+                id_map.get(global).expect("id present").document_id(),
+                id.as_str(),
+                "IDMAP round-trip drift at global docid {global}"
+            );
+        }
+
+        // DOCLEN: reopens (verify() already checked its witness) with the
+        // always-populated keyword field present, and returns a fieldnorm for
+        // every ingested keyword document. The fieldnorm array is indexed over
+        // the dense global-docid range, so its length tracks the range span, not
+        // the sparse document count.
+        let doclen = crate::quiver::DocLenSection::parse(
+            reader
+                .section(SectionKind::DOCLEN)
+                .expect("DOCLEN checksum")
+                .expect("DOCLEN required"),
+            reader.header().docid_lo,
+            reader.header().docid_hi,
+            &[0, 1, 2],
+        )
+        .expect("DOCLEN reopens");
+        let keyword_doclen = doclen.field(0).expect("keyword field DOCLEN reopens");
+        for (ord, _) in &identities {
+            let global = lease_base + u64::from(*ord);
+            assert!(
+                keyword_doclen.fieldnorm_id(global).is_some(),
+                "keyword fieldnorm missing for global docid {global}"
+            );
+        }
+
+        // POSTINGS: every interned term decodes with the recorded doc_freq.
+        let postings_bytes = reader
+            .section(SectionKind::POSTINGS)
+            .expect("POSTINGS checksum")
+            .expect("POSTINGS required");
+        let positions_bytes = reader
+            .section(SectionKind::POSITIONS)
+            .expect("POSITIONS checksum")
+            .expect("POSITIONS required");
+        let blockmax_bytes = reader
+            .section(SectionKind::BLOCKMAX)
+            .expect("BLOCKMAX checksum")
+            .expect("BLOCKMAX required");
+        let dictionary = TermDictionary::parse(
+            reader
+                .section(SectionKind::TERMDICT)
+                .expect("TERMDICT checksum")
+                .expect("TERMDICT required"),
+            MIXED_POSITION_SCHEMA,
+            TermSectionLengths {
+                postings: u64::try_from(postings_bytes.len()).expect("POSTINGS length"),
+                positions: Some(u64::try_from(positions_bytes.len()).expect("POSITIONS length")),
+                blockmax: u64::try_from(blockmax_bytes.len()).expect("BLOCKMAX length"),
+            },
+        )
+        .expect("TERMDICT reopens");
+        assert_eq!(dictionary.term_count() as usize, accumulator.terms().len());
+        for term_id in 0..u32::try_from(accumulator.terms().len()).expect("term count fits u32") {
+            let (field_ord, term) = accumulator.terms().field_and_term(term_id);
+            let metadata = dictionary
+                .lookup(field_ord, term)
+                .expect("term lookup is valid")
+                .expect("every interned term is emitted")
+                .metadata;
+            let start = usize::try_from(metadata.postings.offset).expect("posting offset");
+            let end = start + usize::try_from(metadata.postings.len).expect("posting length");
+            let posting_list = PostingList::parse(&postings_bytes[start..end], metadata.doc_freq)
+                .expect("posting list reopens");
+            assert_eq!(
+                posting_list.decode_all().expect("postings decode").len(),
+                usize::try_from(metadata.doc_freq).expect("doc freq fits usize"),
+                "doc_freq drift for field {field_ord} term {:?}",
+                String::from_utf8_lossy(term)
+            );
+        }
+    }
+
+    #[test]
+    fn e18_cancelled_commit_seals_no_segment_and_leaves_no_temp_files() {
+        // Leak oracle: a batch is ingested (accumulated in memory), then the
+        // seal/commit is cancelled mid-flight. commit() must return Cancelled and
+        // publish nothing — no `seg-*.fslx` and no staged temp file in the index
+        // directory; the accumulator arenas drop when the index drops. (The
+        // manifest-slot variant is
+        // keeper::tests::invalid_or_cancelled_proposal_creates_no_manifest_slot.)
+        use crate::index::{QuillIndex, QuillIndexError};
+        use frankensearch_core::IndexableDocument;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temp index directory");
+            let mut index =
+                QuillIndex::create(&cx, directory.path(), crate::config::QuillConfig::default())
+                    .await
+                    .expect("create shipping-schema index");
+            let documents = [
+                IndexableDocument::new("cancel-a", "alpha beta gamma alpha"),
+                IndexableDocument::new("cancel-b", "delta epsilon delta"),
+            ];
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("uncancelled ingest accumulates the batch");
+
+            cx.set_cancel_requested(true);
+            let cancelled = matches!(
+                index.commit(&cx).await,
+                Err(QuillIndexError::Cancelled { .. })
+            );
+            assert!(cancelled, "cancelled commit must return Cancelled");
+
+            let mut artifacts = Vec::new();
+            for entry in std::fs::read_dir(directory.path()).expect("read index directory") {
+                let entry = entry.expect("directory entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("seg-") || name.contains(".tmp") {
+                    artifacts.push(name);
+                }
+            }
+            assert!(
+                artifacts.is_empty(),
+                "cancelled commit sealed or staged segment artifacts: {artifacts:?}"
+            );
+        });
+    }
+
     #[test]
     fn scalar_and_automatic_flush_are_byte_identical_at_parallel_row_boundary() {
         assert_eq!(FlushMode::default(), FlushMode::Automatic);
