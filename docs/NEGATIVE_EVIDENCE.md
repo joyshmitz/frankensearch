@@ -15784,3 +15784,40 @@ inside ten minutes. Require one same-binary interleaved `cached/shipping` A/B,
 a `shipping/shipping` A/A null, both decisive-arm CVs below 5%, and the existing
 exact token-stream proof. Without those timed rows this remains BLOCKED, not a
 REJECT and not evidence that the primitive is exhausted.
+
+### 2026-07-22 — REJECT Delta hash chains as the medium/xlarge bulk seal; HOLD any whole-path columnar claim (`bd-quill-e1-scribe-bejd.7`)
+
+The retained same-binary `scribe_flush_ab` harness compared complete,
+byte-identical FSLX seals from frozen Delta hash/arena chains and the
+columnar/stable-radix path. Strict-remote release job
+`j-29942429901652045` ran on `vmi1149989` with five alternating paired rounds,
+an A/A Delta/Delta null in every cell, fixed 1-thread and 8-thread Rayon pools,
+and exact output-byte assertions before timing.
+
+Delta lost the isolated bulk-seal comparison at golden-medium by 1.29x at one
+thread and 1.46x at eight threads (`radix/hash = 0.7763` and `0.6858`), and at
+the 65,536-document max-lease xlarge surrogate by 1.14x and 1.49x (`0.8736`
+and `0.6697`). Every lever median cleared its cell's null p5. Delta also retained
+about 2.3x the memory of columnar at those profiles: 969,944,696 versus
+417,839,437 bytes at medium and 1,259,552,628 versus 553,452,349 bytes at
+xlarge. Exact output sizes were 266,830,326 and 372,706,294 bytes.
+
+Golden-small defines the retry boundary rather than a universal radix claim.
+On the primary worker radix measured `0.7266` at one thread and `0.6165` at
+eight, but an independent nine-round `ovh-a` run put the one-thread lever at
+`0.9714` inside its `0.9488..1.0241` null spread. Only its 8-thread result was
+decisive (`0.7489`, null `0.9625..1.0594`).
+
+**Decision: REJECT hash/arena chains as the bulk seal above the small-batch
+crossover.** Retry that topology only below roughly 10,000 live terms or for a
+one-thread small batch, using the same paired null-controlled harness; Delta
+already owns that incremental lane.
+
+This result does **not** prove an end-to-end columnar ingest win. The untimed
+setup diagnostic built columnar in 38.904 s versus Delta in 21.820 s at medium,
+and 113.910 s versus 30.346 s at xlarge. Those single observations are routing
+evidence, not a paired verdict. Retry a whole-path columnar claim only after a
+profile identifies and removes its accumulation hotspot, then time
+accumulation-plus-seal symmetrically with its own A/A null. Until then retain
+the current design: Delta for small/incremental construction, radix for bulk
+sealing.

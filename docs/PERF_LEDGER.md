@@ -6270,3 +6270,65 @@ same-binary `shipping SWAR` versus `cached start-window mask` comparator with
 41 interleaved rounds, its shipping-vs-shipping A/A null, and Criterion arms;
 KEEP only if the candidate interval clears the null floor and both decisive-arm
 CVs are below 5%. Otherwise record the numeric REJECT and its next predicate.
+
+## 2026-07-22 — Quill columnar/radix wins the bulk-seal lane (`bd-quill-e1-scribe-bejd.7`, RoseMaple)
+
+E1.7 compared the two already-shipping source representations in one binary.
+The old arm sealed a frozen Delta segment's term-keyed arena chains; the new
+arm sealed a `ColumnarAccumulator` through `FlushMode::Automatic` and its
+stable radix partition. Both arms received the same deterministic documents,
+metadata, segment identity, and fixed Rayon pool. Every cell asserted exact
+FSLX byte equality before timing. Accumulation time and retained bytes were
+reported outside the seal timer so work could not be silently shifted between
+the two representations.
+
+The primary full-profile run was strict-remote job `j-29942429901652045` on
+`vmi1149989`, one release-LTO binary, five alternating paired rounds per cell:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
+  rch --no-self-healing exec -- env \
+  QUILL_E17_SCALE=full QUILL_E17_PROFILE=all \
+  QUILL_E17_ROUNDS=5 QUILL_E17_THREADS=all \
+  cargo bench -p frankensearch-quill --features bench-internals \
+  --profile release --bench scribe_flush_ab
+```
+
+Ratios are `columnar/radix seal / Delta hash-chain seal`, so `< 1` favors
+radix. The null column is same-binary Delta/Delta:
+
+| profile | threads | A/A null median [p5, p95] | radix/hash median [p5, p95] | verdict |
+|---|---:|---:|---:|---|
+| golden-small, 5k docs / 1.45M tokens / 21,384 terms | 1 | 1.0310 [0.9951, 1.0892] | **0.7266 [0.6607, 0.9645]** | radix clears null floor |
+| golden-small | 8 | 0.9827 [0.9110, 0.9883] | **0.6165 [0.5100, 0.6551]** | radix clears null floor |
+| golden-medium, 50k / 17.5M / 181,072 | 1 | 0.9721 [0.8726, 1.0726] | **0.7763 [0.7568, 0.8006]** | radix clears null floor |
+| golden-medium | 8 | 1.0085 [0.9593, 1.0641] | **0.6858 [0.6171, 0.7337]** | radix clears null floor |
+| synthetic-xlarge-max-lease, 65,536 / 22.9376M / 327,680 | 1 | 1.0132 [0.9219, 1.0393] | **0.8736 [0.7872, 0.8868]** | radix clears null floor |
+| synthetic-xlarge-max-lease | 8 | 0.9949 [0.9289, 1.0638] | **0.6697 [0.6687, 0.7108]** | radix clears null floor |
+
+The xlarge cell is exactly one maximum Quill lease, not the pending E6.1
+one-million-document generator. An independent nine-round golden-small run on
+`ovh-a` exposed the expected crossover uncertainty: the 1-thread lever was
+`0.9714 [0.9343, 0.9817]` inside its `0.9979 [0.9488, 1.0241]` null spread
+(NOISE), while 8 threads remained decisive at `0.7489 [0.7162, 0.7810]`
+against null `0.9998 [0.9625, 1.0594]`. Small/1-thread is therefore not cited
+as a stable win.
+
+The untimed representation diagnostics explain the lane split:
+
+| profile | columnar accumulation | Delta accumulation | columnar retained bytes | Delta retained bytes | exact output bytes |
+|---|---:|---:|---:|---:|---:|
+| golden-small | 381.369 ms | 972.620 ms | 35,094,405 | 79,379,328 | 22,387,702 |
+| golden-medium | 38.904 s | 21.820 s | 417,839,437 | 969,944,696 | 266,830,326 |
+| synthetic-xlarge-max-lease | 113.910 s | 30.346 s | 553,452,349 | 1,259,552,628 | 372,706,294 |
+
+Columnar retained only about 43–44% of Delta's bytes, but its one-shot
+accumulation diagnostic crossed from faster at golden-small to 1.78x and 3.75x
+slower at medium and xlarge. Those setup observations are not paired timing
+claims.
+
+**Decision: KEEP the existing lane separation.** `FlushMode::Automatic` and
+the stable radix partition remain the bulk-seal winner, especially at 8
+threads; Delta remains the small/incremental construction path. The shipping
+code already has this separation, so E1.7 needs no production routing edit.
+The paired harness is retained for the E8 matrix and future crossover work.
