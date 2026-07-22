@@ -6192,7 +6192,58 @@ benchmark correction, but do not close E3.5: normalized max/min spread is
 `1.557204454x`, above the bead's `1.35x` flatness gate. The remaining fixed-cost
 problem is now at two-source fan-in; closure evidence is recorded in
 `docs/NEGATIVE_EVIDENCE.md`.
-## 2026-07-22 — LANDED: Quill SWAR default tokenizer — length-dependent, decidable win on long tokens (`bd-quill-e1-scribe-bejd.1`, FuchsiaMaple)
+
+## 2026-07-22 — KEEP: Quill segment-parallel query fan-out, ~2.8–3.6x on 4 rayon threads above the 10k gate (`bd-quill-e4-argus-3ycz.9`, cc)
+
+`QuillIndex::execute_ranked_query` now fans sealed-segment scoring across rayon when the snapshot
+has >= 2 sealed segments AND >= 10,000 total sealed live documents (`SEGMENT_FANOUT_THRESHOLD`,
+the house `PARALLEL_THRESHOLD` philosophy from `frankensearch-index/src/search.rs`). Each task
+scores one segment into a private `TopDocsCollector` built via the new `empty_like()`, and the
+partials fold back through the new `TopDocsCollector::merge()` in ascending segment order. Below
+the gate — and always for Delta snapshots (the small mutable tail) — the pre-change serial loop
+runs unchanged, so the delta-only small path never pays rayon overhead.
+
+DETERMINISM (correctness, not perf): the collector's heap discipline is a total order (score
+`total_cmp` desc, then global docid asc — `HeapEntry::cmp`), so the retained top-`limit+offset`
+set is unique and independent of both the rayon schedule and the merge order; `finish()` sorts
+with the same order. Rank pruning stays rank-safe under weaker per-segment local cutoffs (the
+shared cross-task cutoff is an explicit E8 follow-up lever, deliberately not in this change);
+exact-count mode already disables pruning, and per-partial counts merge by checked addition.
+Pinned by: `fanned_sealed_collection_matches_serial_exactly` (two fixtures — the 3-segment
+concat corpus and a seeded 5x64 xorshift corpus with heavy score ties — x 9 query shapes x 4
+limit/offset pages x exact-count on/off x 3 fanned repeats per cell, bit-exact docid+score-bits
+compare), `topdocs_merge_reproduces_single_collector_under_any_partition_and_order` (257-doc
+7-bucket tie-heavy stream, partitions {1,4,7} x every merge rotation, plus shape-mismatch
+fail-closed), and `sealed_segment_fanout_gate_thresholds`. 451/451 quill-lib tests green;
+clippy `--no-deps --lib --tests --bench segment_fanout_ab -D warnings` clean (the pre-existing
+`id_map_materialize_ab` lint drift is bd-xqhm, untouched); fsfs statistical lane
+`benchmark_baseline_matrix` 23/23 green.
+
+MEASURED (`segment_fanout_ab`, new bench, `paired_median_ratio` + A/A null, rounds=41 inner=4,
+`RAYON_NUM_THREADS=4`, worker vmi1149989, LTO release, ratio = fanned/serial, `<1` wins; every
+cell asserted bit-exact page parity between arms before timing):
+
+| shape | query | null [p5, p95] | lever [p5, p95] | serial -> fanned | decidable |
+|---|---|---|---|---|---|
+| gate8x2500 (20k docs) | high_df_term | 1.063 [0.819, 1.211] | **0.352** [0.291, 0.669] | 24.8ms -> 9.6ms | YES |
+| gate8x2500 | mid_df_term | 1.012 [0.862, 1.206] | **0.356** [0.289, 0.490] | 22.6ms -> 7.6ms | YES |
+| gate8x2500 | union3 (MaxScore/BMW) | 0.994 [0.869, 1.106] | **0.310** [0.274, 0.351] | 63.3ms -> 17.5ms | YES |
+| gate8x2500 | phrase | 0.972 [0.921, 1.101] | **0.289** [0.259, 0.316] | 499.2ms -> 172.2ms | YES |
+| gate4x12500 (50k docs) | high_df_term | 1.000 [0.857, 1.241] | **0.335** [0.271, 0.426] | 30.2ms -> 11.0ms | YES |
+| gate4x12500 | mid_df_term | 0.999 [0.869, 1.167] | **0.339** [0.282, 0.422] | 27.3ms -> 9.1ms | YES |
+| gate4x12500 | union3 | 0.998 [0.910, 1.205] | **0.326** [0.289, 0.357] | 85.4ms -> 27.0ms | YES |
+
+Disclosure: the harness's last two cells (gate4x12500/phrase and the informational
+below_gate2x500 shape) were cut from the captured output by the caller's pipe truncation; the
+seven cells above are complete and each is independently decidable. The below-gate overhead the
+threshold exists to avoid is documented by the smoke lane (rounds=5): forced fan-out at 2x100
+docs measured 2.96x WORSE on high_df_term — the production gate keeps that path serial, and the
+`below_gate` cell is not a shipping configuration.
+
+**Decision: KEEP.** Fan-out ships as the default above the gate. Route next (E8, separate
+bead): shared cross-task pruning cutoff via atomic score max; re-measure `union3`/`phrase`
+cells where local-only cutoffs leave pruning on the table.
+
 
 `FrankensearchTokenizer::analyze` (Quill's default analyzer, on the ingest and query hot paths)
 now finds token boundaries with a SWAR-on-u64 byte classifier that visits eight ASCII bytes per
@@ -6332,3 +6383,43 @@ the stable radix partition remain the bulk-seal winner, especially at 8
 threads; Delta remains the small/incremental construction path. The shipping
 code already has this separation, so E1.7 needs no production routing edit.
 The paired harness is retained for the E8 matrix and future crossover work.
+
+## 2026-07-22 — REJECT: caching the token-start SWAR word regresses short and long corpora (`bd-short-token-mask-reuse-cpn9`, IndigoOtter)
+
+This timed retry supersedes the earlier UNTIMED blocker. The single candidate
+carried the eight-byte ASCII word and its alphanumeric lane mask from
+`skip_separators` into `scan_token_end`, so a short token ending in that word
+could avoid one reload and one `swar_ascii_alnum_mark` call. The retained
+pre-change shipping SWAR path and candidate ran in one release binary. Before
+timing, strict-remote job `j-29942429901652220` passed all three focused
+behavior-isomorphism tests on `vmi1149989`: randomized mixed Unicode, lane-edge
+versus the scalar oracle, and lane-edge versus the retained shipping path
+(**3 passed, 0 failed**). Token text, positions, byte offsets, ordering, and
+lowercasing were exact.
+
+Strict-remote release job `j-29942429901652232` then completed on the same
+worker. Ratios are candidate/shipping, so values above one are regressions:
+
+| corpus | shipping/shipping A/A median [p5, p95] | cached/shipping median [p5, p95] | shipping Criterion interval | cached Criterion interval |
+|---|---:|---:|---:|---:|
+| short-token, 48 KiB | 0.9986 [0.7967, 1.2115] | **1.2030 [1.0739, 1.3024]** | 211.31–225.74 us | **271.73–282.93 us** |
+| long-token control, 48 KiB | 0.9957 [0.9483, 1.1542] | **1.1313 [1.1135, 1.1601]** | 81.930–86.646 us | **98.392–100.84 us** |
+
+Raw Criterion per-iteration sample CVs were respectively **7.119% / 8.691%**
+for short shipping/cached and **8.293% / 4.066%** for long shipping/cached.
+Those three above-5% CVs and the wide short A/A band prohibit any KEEP claim.
+They do not rescue the candidate: both paired medians point slower, and both
+independent Criterion intervals are disjoint in the slower direction. A warm
+repeat was attempted, but RCH ignored the `vmi1149989` soft pin and routed job
+`j-29942429901652267` to `vmi1153651`; it was cancelled before timing because
+cross-worker samples would not repair the same-worker evidence.
+
+**Decision: REJECT and retain shipping SWAR.** The extra `Option`-carried
+window state and control flow cost more than reloading/reclassifying an
+L1-resident eight-byte word: about 20.3% by the short paired median and 13.1%
+on the long control. All candidate source and benchmark edits were manually
+removed. Retry only if profile plus generated-code evidence shows a new
+representation eliminates the added state spills/branches, and an idle
+same-worker run produces an A/A band inside 0.97–1.03 with all decisive-arm
+CVs below 5%; require cached/shipping <=0.97 on short tokens and no long-token
+regression before reconsidering production.

@@ -17,6 +17,7 @@ use asupersync::runtime::spawn_blocking;
 use frankensearch_core::{DocId, IndexableDocument};
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
+use rayon::prelude::*;
 use thiserror::Error;
 use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -2245,6 +2246,47 @@ impl QuillIndex {
         self.execute_docid_query(cx, &canonical, published.as_ref())
     }
 
+    /// Bench-only: run one ranked sealed-segment collection with the fan-out
+    /// decision forced, bypassing [`sealed_segment_fanout`]
+    /// (bd-quill-e4-argus-3ycz.9 A/B). Returns `(global_docid, score_bits)`
+    /// pairs so arms can assert bit-exact parity before timing. Delta
+    /// snapshots are intentionally excluded: the lever under measurement is
+    /// sealed-segment scoring only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed parsing, lowering, collection, and cancellation
+    /// failures as [`Self::search_paginated`].
+    #[cfg(feature = "bench-internals")]
+    pub fn bench_search_sealed_forced(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        fan_out: bool,
+    ) -> Result<Vec<(u32, u32)>, QuillIndexError> {
+        let mut parsed = self.parser.parse_lenient(query);
+        let _canonicalization = canonicalize_query(&mut parsed.query);
+        let published = self.published_snapshot.load();
+        let snapshot = published.as_ref();
+        let rank_pruning = limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
+        let mut collector = TopDocsCollector::new(limit, 0)?;
+        self.collect_sealed_segments(
+            cx,
+            &mut collector,
+            &parsed.query,
+            snapshot,
+            rank_pruning,
+            fan_out,
+        )?;
+        let collected = collector.finish()?;
+        Ok(collected
+            .hits
+            .iter()
+            .map(|hit| (hit.global_docid, hit.score.to_bits()))
+            .collect())
+    }
+
     fn execute_ranked_query(
         &self,
         cx: &Cx,
@@ -2267,35 +2309,13 @@ impl QuillIndex {
             TopDocsCollector::new(limit, offset)?
         };
         let rank_pruning = !exact_count && limit != 0 && query_has_prunable_root_union(query, 1.0);
-        for segment in keeper.segments() {
-            check_cancel(cx, "search")?;
-            let score_span = tracing::info_span!(
-                target: crate::tracing_conventions::TARGET,
-                crate::tracing_conventions::ARGUS_SCORE,
-                phase = "score",
-                segment_id = segment.manifest().segment_id,
-                doc_count = segment.doc_count(),
-                plan = tracing::field::Empty,
-                segments_touched = 1_u64,
-                pruning_windows = tracing::field::Empty,
-                blocks_skipped = tracing::field::Empty,
-                candidate_docs = tracing::field::Empty,
-                duration_us = tracing::field::Empty,
-            );
-            let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
-            let _score_entered = score_span.enter();
-            let mut scorer = lower_query(
-                query,
-                1.0,
-                QueryLeaf::Sealed(segment),
-                snapshot,
-                self.schema,
-                self.config.glob_expansion_limit,
-                rank_pruning,
-            )?;
-            collector.collect(&mut scorer, segment)?;
-            record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
-        }
+        let sealed_docs: u64 = keeper
+            .segments()
+            .iter()
+            .map(|segment| u64::from(segment.doc_count()))
+            .sum();
+        let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs);
+        self.collect_sealed_segments(cx, &mut collector, query, snapshot, rank_pruning, fan_out)?;
         for delta in snapshot.delta_snapshots() {
             check_cancel(cx, "search")?;
             let score_span = tracing::info_span!(
@@ -2367,6 +2387,106 @@ impl QuillIndex {
             doc_count: snapshot.live_doc_count(),
             diagnostics,
         })
+    }
+
+    /// Score every sealed segment into `collector`, serially or fanned across
+    /// rayon (bd-quill-e4-argus-3ycz.9).
+    ///
+    /// Each fan-out task scores one segment into a private collector built
+    /// from `collector`'s shape via [`TopDocsCollector::empty_like`]; the
+    /// partials fold back in ascending segment order. The result is exactly
+    /// the serial path's: the collector's total order (score `total_cmp`
+    /// descending, then ascending global docid) makes the retained top set
+    /// unique, so it is independent of both the rayon schedule and the merge
+    /// order. Rank pruning stays rank-safe under the weaker per-segment local
+    /// cutoffs; a shared cross-task cutoff is an explicit E8 follow-up lever,
+    /// not part of this change. Delta snapshots never fan out: the mutable
+    /// tail is small and keeps the serial path free of rayon overhead.
+    fn collect_sealed_segments(
+        &self,
+        cx: &Cx,
+        collector: &mut TopDocsCollector,
+        query: &Query,
+        snapshot: &QuillSearchSnapshot,
+        rank_pruning: bool,
+        fan_out: bool,
+    ) -> Result<(), QuillIndexError> {
+        let keeper = snapshot.keeper_snapshot();
+        if fan_out {
+            check_cancel(cx, "search")?;
+            let template = collector.empty_like()?;
+            let schema = self.schema;
+            let glob_expansion_limit = self.config.glob_expansion_limit;
+            let partials = keeper
+                .segments()
+                .par_iter()
+                .map(|segment| {
+                    let mut local = template.empty_like()?;
+                    let score_span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        crate::tracing_conventions::ARGUS_SCORE,
+                        phase = "score",
+                        segment_id = segment.manifest().segment_id,
+                        doc_count = segment.doc_count(),
+                        plan = tracing::field::Empty,
+                        segments_touched = 1_u64,
+                        pruning_windows = tracing::field::Empty,
+                        blocks_skipped = tracing::field::Empty,
+                        candidate_docs = tracing::field::Empty,
+                        duration_us = tracing::field::Empty,
+                    );
+                    let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
+                    let _score_entered = score_span.enter();
+                    let mut scorer = lower_query(
+                        query,
+                        1.0,
+                        QueryLeaf::Sealed(segment),
+                        snapshot,
+                        schema,
+                        glob_expansion_limit,
+                        rank_pruning,
+                    )?;
+                    local.collect(&mut scorer, segment)?;
+                    record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
+                    Ok(local)
+                })
+                .collect::<Result<Vec<_>, QuillIndexError>>()?;
+            check_cancel(cx, "search")?;
+            for partial in partials {
+                collector.merge(partial)?;
+            }
+        } else {
+            for segment in keeper.segments() {
+                check_cancel(cx, "search")?;
+                let score_span = tracing::info_span!(
+                    target: crate::tracing_conventions::TARGET,
+                    crate::tracing_conventions::ARGUS_SCORE,
+                    phase = "score",
+                    segment_id = segment.manifest().segment_id,
+                    doc_count = segment.doc_count(),
+                    plan = tracing::field::Empty,
+                    segments_touched = 1_u64,
+                    pruning_windows = tracing::field::Empty,
+                    blocks_skipped = tracing::field::Empty,
+                    candidate_docs = tracing::field::Empty,
+                    duration_us = tracing::field::Empty,
+                );
+                let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
+                let _score_entered = score_span.enter();
+                let mut scorer = lower_query(
+                    query,
+                    1.0,
+                    QueryLeaf::Sealed(segment),
+                    snapshot,
+                    self.schema,
+                    self.config.glob_expansion_limit,
+                    rank_pruning,
+                )?;
+                collector.collect(&mut scorer, segment)?;
+                record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
+            }
+        }
+        Ok(())
     }
 
     fn execute_docid_query(
@@ -2480,6 +2600,21 @@ fn record_snapshot_fields(span: &tracing::Span, snapshot: &KeeperSnapshot) {
 
 fn validate_config(config: &QuillConfig) -> Result<(), QuillIndexError> {
     config.validate().map_err(QuillIndexError::Config)
+}
+
+/// Minimum total sealed live-document count before ranked queries fan
+/// per-segment scoring across rayon (bd-quill-e4-argus-3ycz.9). Follows the
+/// house `PARALLEL_THRESHOLD` philosophy from
+/// `frankensearch-index/src/search.rs`: picked by measurement, starting at
+/// the same 10k floor. Below the gate, per-task scorer and collector setup
+/// costs more than the fan-out returns.
+const SEGMENT_FANOUT_THRESHOLD: u64 = 10_000;
+
+/// Decide whether sealed-segment scoring fans across rayon. Single-segment
+/// snapshots never fan out (there is nothing to overlap), and neither do
+/// small corpora below [`SEGMENT_FANOUT_THRESHOLD`] total sealed documents.
+const fn sealed_segment_fanout(segment_count: usize, total_sealed_docs: u64) -> bool {
+    segment_count >= 2 && total_sealed_docs >= SEGMENT_FANOUT_THRESHOLD
 }
 
 fn check_cancel(cx: &Cx, phase: &'static str) -> Result<(), QuillIndexError> {
@@ -4476,6 +4611,7 @@ mod tests {
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig};
 
     use super::*;
+    use crate::argus::CollectedTopDocs;
     use crate::contract::fieldnorm_to_id;
     use crate::delta::{
         DeltaFieldNorm, DeltaNumericValue, DeltaSegment, DeltaStoredValue, DeltaTermPosting,
@@ -5196,6 +5332,178 @@ mod tests {
                     .expect("concat-merge fixture query")
             })
             .collect()
+    }
+
+    // ==== Segment-parallel query fan-out (bd-quill-e4-argus-3ycz.9) ====
+
+    const SEGMENT_FANOUT_QUERIES: [&str; 5] = [
+        "shared",
+        "alpha",
+        "alpha OR beta OR rare",
+        "\"shared shared\"",
+        "zeta OR argus",
+    ];
+
+    /// Run the sealed-segment collection stage on one explicit path and
+    /// return the finished page.
+    fn collect_sealed_page(
+        index: &QuillIndex,
+        cx: &Cx,
+        query_text: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        fan_out: bool,
+    ) -> CollectedTopDocs {
+        let mut parsed = index.parser.parse_lenient(query_text);
+        let _ = canonicalize_query(&mut parsed.query);
+        let snapshot = index.search_snapshot();
+        let rank_pruning =
+            !exact_count && limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
+        let mut collector = if exact_count {
+            TopDocsCollector::with_exact_count(limit, offset)
+        } else {
+            TopDocsCollector::new(limit, offset)
+        }
+        .expect("ranked collector");
+        index
+            .collect_sealed_segments(
+                cx,
+                &mut collector,
+                &parsed.query,
+                &snapshot,
+                rank_pruning,
+                fan_out,
+            )
+            .expect("sealed collection");
+        collector.finish().expect("finish sealed collection")
+    }
+
+    /// Bit-exact comparison key: global docid plus raw f32 score bits.
+    fn ranked_page_key(collected: &CollectedTopDocs) -> (Vec<(u32, u32)>, Option<u64>) {
+        (
+            collected
+                .hits
+                .iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect(),
+            collected.total_count,
+        )
+    }
+
+    /// Seeded multi-segment fixture with heavy cross-segment term overlap and
+    /// score ties so fan-out ordering mistakes would surface.
+    async fn segment_fanout_fixture_index(
+        cx: &Cx,
+        segments: usize,
+        docs_per_segment: usize,
+        seed: u64,
+    ) -> QuillIndex {
+        const VOCABULARY: [&str; 10] = [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "shared", "rare", "quill",
+            "argus",
+        ];
+        let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for segment in 0..segments {
+            let mut batch = Vec::with_capacity(docs_per_segment);
+            for ordinal in 0..docs_per_segment {
+                let word_count = 3 + usize::try_from(next() % 10).expect("small word count");
+                let mut text = String::new();
+                for position in 0..word_count {
+                    if position != 0 {
+                        text.push(' ');
+                    }
+                    let pick = usize::try_from(next() % 10).expect("vocabulary pick");
+                    text.push_str(VOCABULARY[pick]);
+                }
+                batch.push(IndexableDocument::new(
+                    format!("fanout-s{segment:02}-d{ordinal:04}"),
+                    text,
+                ));
+            }
+            index
+                .index_documents(cx, &batch)
+                .await
+                .expect("accumulate fan-out fixture batch");
+            index
+                .commit(cx)
+                .await
+                .expect("seal fan-out fixture segment");
+        }
+        assert_eq!(index.snapshot().segments().len(), segments);
+        index
+    }
+
+    #[test]
+    fn sealed_segment_fanout_gate_thresholds() {
+        assert!(!sealed_segment_fanout(0, 0));
+        assert!(
+            !sealed_segment_fanout(1, SEGMENT_FANOUT_THRESHOLD),
+            "single-segment snapshots must never fan out",
+        );
+        assert!(
+            !sealed_segment_fanout(4, SEGMENT_FANOUT_THRESHOLD - 1),
+            "small corpora stay on the serial path",
+        );
+        assert!(sealed_segment_fanout(2, SEGMENT_FANOUT_THRESHOLD));
+        assert!(sealed_segment_fanout(16, u64::MAX));
+    }
+
+    #[test]
+    fn fanned_sealed_collection_matches_serial_exactly() {
+        run_with_cx(|cx| async move {
+            let concat = concat_merge_fixture_index(&cx).await;
+            let seeded = segment_fanout_fixture_index(&cx, 5, 64, 0x9e37_79b9_7f4a_7c15).await;
+            let pages = [(10_usize, 0_usize), (3, 4), (1, 0), (0, 0)];
+            let fixtures = [
+                (&concat, CONCAT_MERGE_QUERIES.as_slice()),
+                (&seeded, SEGMENT_FANOUT_QUERIES.as_slice()),
+            ];
+            for (index, queries) in fixtures {
+                for query in queries {
+                    for (limit, offset) in pages {
+                        for exact_count in [false, true] {
+                            let serial = ranked_page_key(&collect_sealed_page(
+                                index,
+                                &cx,
+                                query,
+                                limit,
+                                offset,
+                                exact_count,
+                                false,
+                            ));
+                            // Repeat the fanned arm: rayon schedules differ
+                            // run to run, and every schedule must reproduce
+                            // the serial page bit-exactly.
+                            for round in 0..3 {
+                                let fanned = ranked_page_key(&collect_sealed_page(
+                                    index,
+                                    &cx,
+                                    query,
+                                    limit,
+                                    offset,
+                                    exact_count,
+                                    true,
+                                ));
+                                assert_eq!(
+                                    fanned, serial,
+                                    "fan-out diverged from serial: query={query} \
+                                     limit={limit} offset={offset} \
+                                     exact_count={exact_count} round={round}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     #[cfg(feature = "durability")]

@@ -4265,6 +4265,56 @@ impl TopDocsCollector {
         })
     }
 
+    /// Build an empty collector sharing this collector's limit, offset, and
+    /// count-mode shape.
+    ///
+    /// Segment-parallel fan-out uses this to give each rayon task a private
+    /// accumulator whose retained window matches the fold target exactly.
+    ///
+    /// # Errors
+    ///
+    /// Rejects bounded heap allocation failure.
+    pub fn empty_like(&self) -> Result<Self, ArgusError> {
+        Self::build(self.limit, self.offset, self.exact_count)
+    }
+
+    /// Fold another collector's retained state into this one.
+    ///
+    /// [`HeapEntry`]'s total order (score via `total_cmp`, then ascending
+    /// docid) makes the retained top-`retained` set unique regardless of
+    /// insertion order, so folding per-segment partials in any order yields
+    /// exactly the set a single serial collector retains.
+    ///
+    /// # Errors
+    ///
+    /// Rejects collectors with mismatched limit/offset/count shape and exact
+    /// match-count overflow.
+    pub fn merge(&mut self, other: Self) -> Result<(), ArgusError> {
+        if self.limit != other.limit
+            || self.offset != other.offset
+            || self.exact_count != other.exact_count
+        {
+            return Err(ArgusError::CursorInvariant(
+                "merged top-k collectors must share limit, offset, and count mode",
+            ));
+        }
+        if self.exact_count {
+            self.total_count = self
+                .total_count
+                .checked_add(other.total_count)
+                .ok_or(ArgusError::MatchCountOverflow)?;
+        }
+        for entry in other.heap {
+            if self.heap.len() < self.retained {
+                self.heap.push(entry);
+            } else if self.heap.peek().is_some_and(|cutoff| entry < *cutoff) {
+                let _ = self.heap.pop();
+                self.heap.push(entry);
+            }
+        }
+        Ok(())
+    }
+
     /// Consume one segment scorer into this global accumulator.
     ///
     /// # Errors
@@ -6980,6 +7030,98 @@ mod tests {
         })?;
         assert_eq!(materialized, vec![4, 5, 6]);
         assert_eq!(hits.len(), page.hits.len());
+        Ok(())
+    }
+
+    #[test]
+    fn topdocs_merge_reproduces_single_collector_under_any_partition_and_order()
+    -> Result<(), ArgusError> {
+        // Deterministic scored stream with heavy ties: seven score buckets
+        // over 257 docids so cutoff-boundary ties cross every partition.
+        let mut state = 0x5eed_cafe_0000_0001_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let entries: Vec<(u32, f32)> = (0..257_u32)
+            .map(|docid| {
+                #[allow(clippy::cast_precision_loss)]
+                let bucket = (next() % 7) as f32;
+                (docid, 0.25_f32.mul_add(bucket, 1.0))
+            })
+            .collect();
+
+        let build = |limit: usize, offset: usize, exact: bool| {
+            if exact {
+                TopDocsCollector::with_exact_count(limit, offset)
+            } else {
+                TopDocsCollector::new(limit, offset)
+            }
+        };
+        let page_key = |collected: CollectedTopDocs| {
+            (
+                collected
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                collected.total_count,
+            )
+        };
+
+        for (limit, offset, exact) in [
+            (10_usize, 0_usize, false),
+            (10, 0, true),
+            (5, 7, true),
+            (3, 1, false),
+            (0, 0, true),
+        ] {
+            let mut baseline = build(limit, offset, exact)?;
+            for &(docid, score) in &entries {
+                baseline.record_live(docid, Some(score))?;
+            }
+            let expected = page_key(baseline.finish()?);
+
+            for partitions in [1_usize, 4, 7] {
+                for rotation in 0..partitions {
+                    let mut partials = Vec::with_capacity(partitions);
+                    for _ in 0..partitions {
+                        partials.push(build(limit, offset, exact)?);
+                    }
+                    for (position, &(docid, score)) in entries.iter().enumerate() {
+                        partials[position % partitions].record_live(docid, Some(score))?;
+                    }
+                    let mut fold = build(limit, offset, exact)?;
+                    // Merge in a rotated order: the retained set must be
+                    // identical no matter which partial folds first.
+                    for step in 0..partitions {
+                        let partial = partials[(step + rotation) % partitions].empty_like()?;
+                        let taken = std::mem::replace(
+                            &mut partials[(step + rotation) % partitions],
+                            partial,
+                        );
+                        fold.merge(taken)?;
+                    }
+                    assert_eq!(
+                        page_key(fold.finish()?),
+                        expected,
+                        "merge diverged: limit={limit} offset={offset} exact={exact} \
+                         partitions={partitions} rotation={rotation}",
+                    );
+                }
+            }
+        }
+
+        // Shape mismatches fail closed instead of silently mixing windows.
+        let mut ten = TopDocsCollector::new(10, 0)?;
+        assert!(ten.merge(TopDocsCollector::new(5, 0)?).is_err());
+        assert!(ten.merge(TopDocsCollector::new(10, 1)?).is_err());
+        assert!(
+            ten.merge(TopDocsCollector::with_exact_count(10, 0)?)
+                .is_err()
+        );
         Ok(())
     }
 
