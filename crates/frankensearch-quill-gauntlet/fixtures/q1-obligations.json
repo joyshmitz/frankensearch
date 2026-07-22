@@ -5,31 +5,31 @@
     {
       "id": "Q1-OB1",
       "status": "deferred",
-      "enforcement": "G1a runs the manifest-overlap sub-fixture; bound-consecutive merge enforcement and the crash matrix remain owned by e3.5 and e3.9",
+      "enforcement": "G1a runs the manifest-overlap sub-fixture and E3.5 runs the live merge-bound-consecutive sub-fixture; the full crash matrix remains owned by e3.9",
       "assertion": "covering intervals do not overlap, merge inputs are bound-consecutive, and every seal stays within one lease"
     },
     {
       "id": "Q1-OB2a",
-      "status": "deferred",
-      "enforcement": "owned by e3.5 merge fixture with e5.4 seal determinism",
+      "status": "executable",
+      "enforcement": "E3.5 runs bounded live concat-merge/reopen equivalence; Quiver q1_df_100_plus_300_preserves_blocks_and_decoded_behavior covers the required df=100 plus df=300 codec shape",
       "assertion": "decoded postings, aggregate statistics, and query results equal monolithic indexing, including df=100 plus df=300"
     },
     {
       "id": "Q1-OB2b",
-      "status": "deferred",
-      "enforcement": "owned by e3.5 raw-block witness and arbitrary merge-schedule property test",
+      "status": "executable",
+      "enforcement": "E3.5 runs a bounded live concat path; Quiver q1_df_100_plus_300_preserves_blocks_and_decoded_behavior, posting_concat_is_associative_and_copies_exact_source_bytes, every_partial_size_is_legal_at_an_interior_seam, positions_q1_concat_preserves_payloads_and_is_associative, and blockmax_concat_rebasing_is_associative_and_checks_q1_order enforce raw source blocks and every interior partial size 1 through 127",
       "assertion": "every input posting block remains byte-identical and source-ordered, with no new posting fragments"
     },
     {
       "id": "Q1-OB2c",
-      "status": "deferred",
-      "enforcement": "owned by the e2.6 external-representative codec regression plus the e3.5 two-stage merge/reopen fixture",
+      "status": "executable",
+      "enforcement": "E3.5 runs live identity rebuild/reopen checks; e2.6 gap-preserving IDMAP and external-representative regressions cover holes, duplicate representatives, and merge-of-merges identity selection",
       "assertion": "merged IDMAP is gap-preserving positional concatenation and IDHASH selects exactly the unique live representative, or the lowest global docid when every duplicate row is dead, before sorting; stale high-seal-sequence containers cannot mask live rows"
     },
     {
       "id": "Q1-OB3",
-      "status": "deferred",
-      "enforcement": "owned by e3.5 random merge order and e6.3 metamorphic suite",
+      "status": "executable",
+      "enforcement": "E3.5 runs bounded before/after query invariance while the Quiver posting, positions, BLOCKMAX, DOCLEN, IDMAP, and stored-metadata associativity fixtures cover valid staged concat schedules",
       "assertion": "query results are invariant under every merge schedule"
     },
     {

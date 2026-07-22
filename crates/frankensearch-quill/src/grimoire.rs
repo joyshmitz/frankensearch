@@ -1502,7 +1502,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     })
 }
 
-fn star_glob_matches(pattern: &[u8], term: &[u8]) -> bool {
+pub(crate) fn star_glob_matches(pattern: &[u8], term: &[u8]) -> bool {
     let mut pattern_pos = 0;
     let mut term_pos = 0;
     let mut resume_after_star = None;

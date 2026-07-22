@@ -652,6 +652,11 @@ pub struct CampaignReport {
     pub query_classes: Vec<QueryClassSummary>,
     pub mismatches: Vec<MismatchGroup>,
     pub passed: bool,
+    /// Immutable source/toolchain provenance for production campaigns
+    /// (bd-quill-e6-gauntlet-scale-rm3q.9). Deterministic regression fixtures
+    /// that are not independently observed live provenance leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<CampaignProvenance>,
 }
 
 #[derive(Serialize)]
@@ -666,6 +671,173 @@ struct CampaignRunReservation<'a> {
     query_source_identity_sha256: &'a str,
     divergence_registry_hash: &'a str,
     selected_case_ids: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<&'a CampaignProvenance>,
+}
+
+/// Immutable source and semantic provenance stamped into every production
+/// campaign (bd-quill-e6-gauntlet-scale-rm3q.9).
+///
+/// A campaign is admissible evidence only with the full environment pinned:
+/// engine commits and dirty state, lockfile, exact toolchain, Unicode tables,
+/// and the query profile identity. Missing or mismatched provenance fails
+/// closed; the reservation equality check inside
+/// [`ArtifactStore::load_verified_campaign`] replays these bytes verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignProvenance {
+    /// Subject engine source commit.
+    pub subject_git_revision: String,
+    /// Whether the subject source tree had uncommitted changes.
+    pub subject_source_dirty: bool,
+    /// Oracle engine source commit.
+    pub oracle_git_revision: String,
+    /// Whether the oracle source tree had uncommitted changes.
+    pub oracle_source_dirty: bool,
+    /// SHA-256 of the workspace `Cargo.lock`.
+    pub cargo_lock_sha256: String,
+    /// Full `rustc -Vv` output (release, commit, date, host).
+    pub rustc_version_verbose: String,
+    /// `std::char::UNICODE_VERSION` of the executing toolchain.
+    pub unicode_version: String,
+    /// Locked `unicode-normalization` crate version from `Cargo.lock`.
+    pub unicode_normalization_version: String,
+    /// Canonical hash of the campaign query profile (selection + profile).
+    pub query_profile_sha256: String,
+    /// Synthetic corpus seed when the corpus is generator-produced.
+    pub corpus_seed: Option<u64>,
+}
+
+impl CampaignProvenance {
+    /// Collect the full immutable provenance for one campaign execution.
+    ///
+    /// Git state is read from the invoking checkout unless overridden by the
+    /// `GAUNTLET_SUBJECT_REVISION` / `GAUNTLET_SUBJECT_DIRTY` and matching
+    /// oracle environment variables (the CI path supplies them explicitly so
+    /// runners never guess). Toolchain facts come from the executing `rustc`
+    /// and the workspace `Cargo.lock`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError::InvalidCampaign`] when any required fact
+    /// cannot be collected; a campaign must fail closed, never guess.
+    pub fn collect(
+        corpus_seed: Option<u64>,
+        selection: &CampaignSelection,
+    ) -> Result<Self, GauntletError> {
+        let (subject_git_revision, subject_source_dirty) =
+            collect_git_state("GAUNTLET_SUBJECT_REVISION", "GAUNTLET_SUBJECT_DIRTY")?;
+        let (oracle_git_revision, oracle_source_dirty) =
+            collect_git_state("GAUNTLET_ORACLE_REVISION", "GAUNTLET_ORACLE_DIRTY")?;
+        let cargo_lock_sha256 = hash_workspace_lockfile()?;
+        let rustc_version_verbose = collect_rustc_verbose()?;
+        let unicode_normalization_version = locked_crate_version("unicode-normalization")?;
+        let profile_bytes = serde_json::to_vec(selection).map_err(|error| {
+            GauntletError::InvalidCampaign {
+                reason: format!("query profile serialization failed: {error}"),
+            }
+        })?;
+        let query_profile_sha256 = sha256_hex(&profile_bytes);
+        Ok(Self {
+            subject_git_revision,
+            subject_source_dirty,
+            oracle_git_revision,
+            oracle_source_dirty,
+            cargo_lock_sha256,
+            rustc_version_verbose,
+            unicode_version: format!(
+                "{}.{}.{}",
+                char::UNICODE_VERSION.0, char::UNICODE_VERSION.1, char::UNICODE_VERSION.2
+            ),
+            unicode_normalization_version,
+            query_profile_sha256,
+            corpus_seed,
+        })
+    }
+}
+
+fn collect_git_state(
+    revision_env: &str,
+    dirty_env: &str,
+) -> Result<(String, bool), GauntletError> {
+    if let (Ok(revision), Ok(dirty)) = (std::env::var(revision_env), std::env::var(dirty_env)) {
+        return Ok((revision, dirty == "1" || dirty.eq_ignore_ascii_case("true")));
+    }
+    let revision = run_capture(
+        "git",
+        &["rev-parse", "HEAD"],
+        revision_env,
+    )?;
+    let porcelain = run_capture("git", &["status", "--porcelain"], dirty_env)?;
+    Ok((revision.trim().to_owned(), !porcelain.trim().is_empty()))
+}
+
+fn run_capture(program: &str, args: &[&str], label: &str) -> Result<String, GauntletError> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| GauntletError::InvalidCampaign {
+            reason: format!("provenance collection failed to spawn {label}: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(GauntletError::InvalidCampaign {
+            reason: format!("provenance collection command {label} failed: {output:?}"),
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|error| GauntletError::InvalidCampaign {
+        reason: format!("provenance collection output for {label} is not UTF-8: {error}"),
+    })
+}
+
+fn collect_rustc_verbose() -> Result<String, GauntletError> {
+    run_capture("rustc", &["-Vv"], "rustc -Vv")
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+}
+
+fn hash_workspace_lockfile() -> Result<String, GauntletError> {
+    let path = workspace_root().join("Cargo.lock");
+    let bytes = std::fs::read(&path).map_err(|error| GauntletError::InvalidCampaign {
+        reason: format!("cannot read {}: {error}", path.display()),
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn locked_crate_version(crate_name: &str) -> Result<String, GauntletError> {
+    let path = workspace_root().join("Cargo.lock");
+    let contents = std::fs::read_to_string(&path).map_err(|error| GauntletError::InvalidCampaign {
+        reason: format!("cannot read {}: {error}", path.display()),
+    })?;
+    let needle = format!("name = \"{crate_name}\"");
+    let mut lines = contents.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == needle {
+            for entry in lines.by_ref().take(4) {
+                let trimmed = entry.trim();
+                if let Some(version) = trimmed.strip_prefix("version = \"") {
+                    return Ok(version.trim_end_matches('"').to_owned());
+                }
+            }
+            break;
+        }
+    }
+    Err(GauntletError::InvalidCampaign {
+        reason: format!("crate {crate_name} not found in {}", path.display()),
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 impl CampaignReport {
@@ -774,6 +946,7 @@ impl CampaignReport {
             query_source_identity_sha256: &self.query_suite.manifest.source_identity_sha256,
             divergence_registry_hash: &divergence_registry_hash,
             selected_case_ids: selected.iter().map(|query| query.id.as_str()).collect(),
+            provenance: self.provenance.as_ref(),
         };
         Ok(serde_json::to_vec(&reservation)?)
     }
@@ -1087,6 +1260,7 @@ pub struct DifferentialCampaignRunner {
     semantic_contract: SemanticContract,
     config: CampaignConfig,
     registry: DivergenceRegistry,
+    provenance: Option<CampaignProvenance>,
 }
 
 impl DifferentialCampaignRunner {
@@ -1109,7 +1283,17 @@ impl DifferentialCampaignRunner {
             semantic_contract,
             config,
             registry,
+            provenance: None,
         })
+    }
+
+    /// Attach immutable production provenance (bd-quill-e6-gauntlet-scale-rm3q.9).
+    /// Every production campaign run stamps it into the reservation and the
+    /// report; regression fixtures deliberately leave it absent.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: CampaignProvenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 
     /// Verify, index, execute, compare, and persist one differential campaign.
@@ -1224,6 +1408,7 @@ impl DifferentialCampaignRunner {
                 .iter()
                 .map(|(query, _, _)| query.id.as_str())
                 .collect(),
+            provenance: self.provenance.as_ref(),
         };
         let reservation_bytes = serde_json::to_vec(&reservation)?;
         self.store
@@ -1383,6 +1568,7 @@ impl DifferentialCampaignRunner {
             query_classes,
             mismatches,
             passed,
+            provenance: self.provenance.clone(),
         };
         self.store.complete_campaign(&report)?;
         Ok(report)
@@ -5856,5 +6042,224 @@ mod tests {
         let roundtrip: ShrunkReproduction = serde_json::from_slice(&std::fs::read(&path)?)?;
         assert_eq!(roundtrip, reproduction);
         Ok(())
+    }
+
+    // ==== Live oracle campaign activation (bd-quill-e6-gauntlet-scale-rm3q.9) ====
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn live_campaign_engines() -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+        let subject =
+            crate::engine::QuillSubject::in_memory(config, "e6.9-live-activation-subject", false)
+                .expect("fresh scalar Quill subject");
+        let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
+            .expect("fresh scalar G1a Tantivy oracle");
+        (subject, oracle)
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn run_live_default_profile_campaign(
+        cx: &Cx,
+        root: &std::path::Path,
+        run_id: &str,
+    ) -> Result<CampaignReport, GauntletError> {
+        let fixture = make_scalar_g1a_regression_fixture();
+        let (mut subject, mut oracle) = live_campaign_engines();
+        let selection = CampaignSelection::DefaultSyntax;
+        let provenance =
+            CampaignProvenance::collect(Some(0x6201), &selection).expect("collect provenance");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(root),
+            SemanticContract::scalar_g1a(),
+            CampaignConfig {
+                selection,
+                index_batch_size: 5,
+                snippet_max_chars: None,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("live campaign runner")
+        .with_provenance(provenance);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            campaign
+                .run(
+                    cx,
+                    run_id,
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+        })
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn live_default_profile_campaign_stamps_provenance_and_reloads_verified() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let report = run_live_default_profile_campaign(
+            &asupersync::Cx::for_testing(),
+            temp.path(),
+            "e6.9-default-pr-lane",
+        )
+        .expect("live default-profile campaign must complete and pass");
+        assert!(report.passed, "default profile is green: {:?}", report.mismatches);
+        let provenance = report
+            .provenance
+            .as_ref()
+            .expect("production campaign stamps provenance");
+        assert!(!provenance.subject_git_revision.is_empty());
+        assert!(!provenance.cargo_lock_sha256.is_empty());
+        assert!(provenance.rustc_version_verbose.contains("release:"));
+        assert_eq!(
+            provenance.unicode_version,
+            format!(
+                "{}.{}.{}",
+                char::UNICODE_VERSION.0, char::UNICODE_VERSION.1, char::UNICODE_VERSION.2
+            )
+        );
+        assert!(!provenance.unicode_normalization_version.is_empty());
+        assert!(!provenance.query_profile_sha256.is_empty());
+
+        // CI-grade acceptance: ONLY a verified reload counts as evidence.
+        let reloaded = ArtifactStore::new(temp.path())
+            .load_verified_campaign("e6.9-default-pr-lane")
+            .expect("verified reload accepts the completed campaign");
+        assert_eq!(reloaded, report);
+        assert_eq!(reloaded.provenance, report.provenance);
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn live_campaign_provenance_mismatch_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        run_live_default_profile_campaign(
+            &asupersync::Cx::for_testing(),
+            temp.path(),
+            "e6.9-provenance-tamper",
+        )
+        .expect("campaign completes");
+        // Tamper with the reservation's provenance block: the verified reload
+        // must reject the campaign instead of trusting it.
+        let reservation_path = temp
+            .path()
+            .join("campaigns")
+            .join("e6.9-provenance-tamper")
+            .join("reservation.json");
+        let bytes = std::fs::read(&reservation_path).expect("read reservation");
+        let mut reservation: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse reservation");
+        reservation["provenance"]["cargo_lock_sha256"] =
+            serde_json::Value::String("00".repeat(32));
+        std::fs::write(
+            &reservation_path,
+            serde_json::to_vec(&reservation).expect("serialize tampered"),
+        )
+        .expect("write tampered");
+        let rejected =
+            ArtifactStore::new(temp.path()).load_verified_campaign("e6.9-provenance-tamper");
+        assert!(rejected.is_err(), "tampered provenance fails closed");
+    }
+
+    fn documents_content_hash(documents: &[GeneratedDocument]) -> String {
+        let mut hasher = Sha256::new();
+        for document in documents {
+            let bytes = serde_json::to_vec(document).expect("document json");
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(&bytes);
+        }
+        let digest = hasher.finalize();
+        let mut output = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(output, "{byte:02x}");
+        }
+        output
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    #[ignore = "nightly full lane: pinned generated + repository-scale corpora"]
+    fn live_default_profile_campaign_nightly_full_lane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Generated lane: pinned synthetic corpus, deterministic replay.
+        let spec = SyntheticCorpusSpec {
+            seed: 0xE609,
+            document_count: 2_000,
+            vocabulary_size: 2_048,
+            zipf_exponent: ZipfExponent::S11,
+            max_document_bytes: 2_048,
+        };
+        let documents: Vec<_> = SyntheticCorpus::new(spec)
+            .expect("synthetic spec")
+            .iter()
+            .collect();
+        let corpus_manifest = CorpusManifest {
+            schema_version: 1,
+            generator_id: GENERATOR_ID.to_owned(),
+            source: crate::generator::CorpusSourceManifest::Synthetic { spec },
+            document_count: u64::try_from(documents.len()).expect("doc count"),
+            total_content_bytes: documents
+                .iter()
+                .map(|document| u64::try_from(document.content.len()).unwrap_or(u64::MAX))
+                .sum(),
+            content_sha256: documents_content_hash(&documents),
+            skipped_repository_entries: Vec::new(),
+        };
+        let corpus_hash = corpus_manifest.manifest_hash().expect("corpus hash");
+        let query_suite = GeneratedQuerySuite::generate(
+            QueryGeneratorSpec {
+                seed: 0x9602,
+                default_limit: 20,
+                include_shared_relevance_queries: true,
+            },
+            &corpus_hash,
+            &SharedFixtureSuite::load().expect("shared fixtures"),
+        )
+        .expect("query suite");
+        let (mut subject, mut oracle) = live_campaign_engines();
+        let selection = CampaignSelection::DefaultSyntax;
+        let provenance =
+            CampaignProvenance::collect(Some(spec.seed), &selection).expect("collect provenance");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(temp.path()),
+            SemanticContract::scalar_g1a(),
+            CampaignConfig {
+                selection,
+                index_batch_size: 64,
+                snippet_max_chars: None,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("nightly campaign runner")
+        .with_provenance(provenance);
+        let report = asupersync::test_utils::run_test_with_cx(|cx| async move {
+            campaign
+                .run(
+                    cx,
+                    "e6.9-default-nightly-full",
+                    &mut subject,
+                    &mut oracle,
+                    &documents,
+                    &corpus_manifest,
+                    &query_suite,
+                )
+                .await
+        })
+        .expect("nightly full lane completes");
+        assert!(report.passed, "nightly lane green: {:?}", report.mismatches);
+        ArtifactStore::new(temp.path())
+            .load_verified_campaign("e6.9-default-nightly-full")
+            .expect("verified reload accepts the nightly campaign");
     }
 }

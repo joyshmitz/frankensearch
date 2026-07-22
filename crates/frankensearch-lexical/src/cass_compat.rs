@@ -3353,18 +3353,18 @@ mod cass_query_tests {
         // Byte-identity proof for the one-pass fusion: fast == slow on every
         // reject path and every decompose path.
         let cases = [
-            "",              // empty -> None
-            "a",             // single ASCII -> None
-            "hello world",   // ASCII with space -> None (space non-CJK)
-            "搜",            // single CJK -> None (unigram, no bigrams)
-            "搜索",          // 2 CJK -> Some
+            "",               // empty -> None
+            "a",              // single ASCII -> None
+            "hello world",    // ASCII with space -> None (space non-CJK)
+            "搜",             // single CJK -> None (unigram, no bigrams)
+            "搜索",           // 2 CJK -> Some
             "搜索引擎",       // 4 CJK -> Some
             "検索とうきょう", // mixed CJK scripts -> Some
             "한국어",         // hangul -> Some
-            "搜a",           // CJK then ASCII -> None (not all-CJK)
-            "a搜",           // ASCII lead -> None
-            "搜 索",         // CJK, space, CJK -> None (space breaks all-CJK)
-            "𠀀𠀁",          // Extension B (4-byte) CJK -> Some
+            "搜a",            // CJK then ASCII -> None (not all-CJK)
+            "a搜",            // ASCII lead -> None
+            "搜 索",          // CJK, space, CJK -> None (space breaks all-CJK)
+            "𠀀𠀁",           // Extension B (4-byte) CJK -> Some
         ];
         for c in cases {
             assert_eq!(

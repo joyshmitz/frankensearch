@@ -110,6 +110,26 @@ jobs:
         timeout-minutes: 30
         run: cargo test --profile release -p frankensearch-quill-gauntlet generator::tests::nightly_xlarge_stream_hash_integrity -- --ignored --exact --nocapture
 
+      - name: Quill oracle campaign PR fast lane (bd-quill-e6.9)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 20
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_ORACLE_REVISION: ${{ github.sha }}
+          GAUNTLET_ORACLE_DIRTY: "false"
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_default_profile_campaign_stamps_provenance_and_reloads_verified runner::tests::live_campaign_provenance_mismatch_fails_closed -- --exact --nocapture
+
+      - name: Quill oracle campaign nightly full lane (bd-quill-e6.9)
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 45
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_ORACLE_REVISION: ${{ github.sha }}
+          GAUNTLET_ORACLE_DIRTY: "false"
+        run: cargo test --profile release -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_default_profile_campaign_nightly_full_lane -- --ignored --exact --nocapture
+
       - name: Nightly full validation (all features)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
         run: cargo test --workspace --all-features -- --nocapture

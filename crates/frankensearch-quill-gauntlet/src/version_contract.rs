@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use asupersync::Cx;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -13,8 +14,8 @@ const TANTIVY_CHECKSUM_SHA256: &str =
     "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
 const QUIVER_DIFFERENTIAL_FIXTURE_ID: &str = "quiver-postings-bitpack-scalar-wide-v1";
 const Q1_FIXTURE_CATALOG_SHA256: [u8; 32] = [
-    0x32, 0x04, 0xe3, 0x59, 0xee, 0x73, 0x23, 0xc7, 0x46, 0x51, 0xd7, 0xd8, 0x95, 0xbf, 0x5f, 0xdf,
-    0x8a, 0xf6, 0xe9, 0x4d, 0x9b, 0x5c, 0xb1, 0x28, 0x93, 0x37, 0x3e, 0xcc, 0x59, 0x53, 0x94, 0xa4,
+    0x2c, 0x31, 0x3c, 0x1c, 0xf8, 0x96, 0x78, 0x8f, 0x49, 0x2c, 0x6b, 0x79, 0x79, 0x52, 0x65, 0xab,
+    0xd2, 0x5b, 0x1d, 0x00, 0x10, 0x5f, 0xd7, 0x15, 0x9a, 0x98, 0xe1, 0x15, 0x48, 0x2f, 0x95, 0x26,
 ];
 
 /// Committed provenance contract for the shipping Tantivy oracle adapter.
@@ -121,18 +122,33 @@ pub fn oracle_version_contract() -> Result<OracleVersionContract, GauntletError>
 /// # Errors
 ///
 /// Returns an error when IDs are missing, duplicated, reordered, assigned an
-/// unknown status, or when a full normative Q1 obligation is falsely marked
-/// executable before its downstream owner closes it.
+/// unknown status, or when the executable normative set differs from the
+/// bounded E3.5 acceptance surface.
 pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
     let catalog: Q1FixtureCatalog = serde_json::from_str(Q1_FIXTURE_CATALOG_JSON)?;
     let catalog_hash = Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes());
     const EXPECTED: [&str; 8] = [
         "Q1-OB1", "Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3", "Q1-OB4", "Q1-OB5", "Q1-OB6",
     ];
+    const EXPECTED_STATUSES: [&str; 8] = [
+        "deferred",
+        "executable",
+        "executable",
+        "executable",
+        "executable",
+        "deferred",
+        "deferred",
+        "deferred",
+    ];
     let ids = catalog
         .fixtures
         .iter()
         .map(|fixture| fixture.id.as_str())
+        .collect::<Vec<_>>();
+    let statuses = catalog
+        .fixtures
+        .iter()
+        .map(|fixture| fixture.status.as_str())
         .collect::<Vec<_>>();
     let unique = ids.iter().copied().collect::<BTreeSet<_>>();
     let internal = catalog.internal_differentials.as_slice();
@@ -142,16 +158,13 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
         || catalog.source_contract
             != "docs/contracts/quill-q1-docid-discipline.md#6-obligations-each-becomes-a-gauntlet-fixture"
         || ids != EXPECTED
+        || statuses != EXPECTED_STATUSES
         || unique.len() != EXPECTED.len()
         || catalog.fixtures.iter().any(|fixture| {
             !matches!(fixture.status.as_str(), "executable" | "deferred")
                 || fixture.enforcement.is_empty()
                 || fixture.assertion.is_empty()
         })
-        || catalog
-            .fixtures
-            .iter()
-            .any(|fixture| fixture.status == "executable")
         || internal.len() != 1
         || internal[0].id != QUIVER_DIFFERENTIAL_FIXTURE_ID
         || internal[0].status != "executable"
@@ -160,23 +173,27 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
         || internal[0].assertion.is_empty()
     {
         return Err(GauntletError::InvalidContract {
-            reason: "fixture catalog must contain eight ordered deferred normative Q1 rows and the executable Quiver differential"
+            reason: "fixture catalog must contain eight ordered Q1 rows with exactly OB2a, OB2b, OB2c, and OB3 executable, plus the executable Quiver differential"
                 .to_owned(),
         });
     }
     Ok(catalog)
 }
 
-/// Execute the bounded Q1 sub-fixtures owned by the scalar G1a checkpoint.
+/// Execute the bounded Q1 sub-fixtures owned by G1a and E3.5.
 ///
-/// Downstream merge, compaction, and multi-shard obligations remain explicit
-/// `deferred` rows rather than receiving false-green placeholder assertions.
+/// This exercises a real three-segment concat path, rejects a manifest-order
+/// violation, binds and verifies the merged successor, and compares live
+/// identity and query behavior before and after publication. The exhaustive
+/// raw-codec shapes named by the catalog remain inline Quiver fixtures so this
+/// runner does not duplicate the 1-through-127 partial-block sweep.
 ///
 /// # Errors
 ///
-/// Returns a contract error if interval validation, lease disjointness,
-/// boundary cutting, burn accounting, or watermark monotonicity regresses.
-pub fn run_q1_live_fixtures() -> Result<Vec<String>, GauntletError> {
+/// Returns a contract error if interval validation, merge/reopen equivalence,
+/// identity rebuilding, query invariance, lease disjointness, boundary
+/// cutting, burn accounting, or watermark monotonicity regresses.
+pub async fn run_q1_live_fixtures(cx: &Cx) -> Result<Vec<String>, GauntletError> {
     use frankensearch_quill::scribe::{DOCID_LEASE_BLOCK, DocIdAllocator};
     use frankensearch_quill::{
         CURRENT_ENGINE_VERSION, DEFAULT_SCHEMA, Manifest, ManifestSegment, TombstoneSet,
@@ -255,15 +272,299 @@ pub fn run_q1_live_fixtures() -> Result<Vec<String>, GauntletError> {
             reason: "Q1-OB5 reused a burned document-id tail".to_owned(),
         });
     }
+
+    let mut completed = vec!["Q1-OB1/manifest-overlap".to_owned()];
+    completed.extend(run_q1_concat_merge_fixture(cx).await?);
+    completed.push("Q1-OB5/allocator-boundary".to_owned());
+    Ok(completed)
+}
+
+async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletError> {
+    use frankensearch_core::IndexableDocument;
+    use frankensearch_quill::{
+        ConcatMergeError, KeeperError, QuillConfig, QuillIndex, QuillIndexError, SectionKind,
+    };
+
+    let mut index = QuillIndex::in_memory(QuillConfig {
+        deterministic_ingest: true,
+        ..QuillConfig::default()
+    })
+    .map_err(|error| q1_merge_error("create deterministic index", error))?;
+    let batches = [
+        vec![
+            IndexableDocument::new("merge-a1", "shared alpha exact phrase")
+                .with_title("Alpha segment")
+                .with_metadata("batch", "a"),
+            IndexableDocument::new("merge-a2", "shared common anchor")
+                .with_title("Common alpha")
+                .with_metadata("batch", "a"),
+        ],
+        vec![
+            IndexableDocument::new("merge-b1", "shared beta exact phrase")
+                .with_title("Beta segment")
+                .with_metadata("batch", "b"),
+            IndexableDocument::new("merge-b2", "common beta anchor")
+                .with_title("Common beta")
+                .with_metadata("batch", "b"),
+        ],
+        vec![
+            IndexableDocument::new("merge-c1", "shared gamma exact phrase")
+                .with_title("Gamma segment")
+                .with_metadata("batch", "c"),
+            IndexableDocument::new("merge-c2", "common gamma anchor")
+                .with_title("Common gamma")
+                .with_metadata("batch", "c"),
+        ],
+    ];
+    for documents in &batches {
+        index
+            .index_documents(cx, documents)
+            .await
+            .map_err(|error| q1_merge_error("index source batch", error))?;
+        index
+            .commit(cx)
+            .await
+            .map_err(|error| q1_merge_error("commit source batch", error))?;
+    }
+
+    let source_ids = index
+        .snapshot()
+        .segments()
+        .iter()
+        .map(|segment| segment.manifest().segment_id)
+        .collect::<Vec<_>>();
+    if source_ids.len() != 3 {
+        return Err(GauntletError::InvalidContract {
+            reason: format!(
+                "Q1 E3.5 expected three committed source segments, got {}",
+                source_ids.len()
+            ),
+        });
+    }
+    for segment in index.snapshot().segments() {
+        segment
+            .verify()
+            .map_err(|error| q1_merge_error("verify source segment", error))?;
+    }
+
+    let before_manifest = &index.snapshot().loaded_manifest().manifest;
+    let before_generation = before_manifest.generation;
+    let before_watermark = before_manifest.docid_high_watermark;
+    let before_field_stats = before_manifest.field_stats.clone();
+    let before_at_seal_doc_count = index.snapshot().at_seal_doc_count();
+    let before_live_doc_count = index.snapshot().doc_count();
+    let first_docid_hi = index.snapshot().segments()[0].manifest().docid_hi;
+    let merged_docid_lo = index.snapshot().segments()[0].manifest().docid_lo;
+    let merged_docid_hi = index.snapshot().segments()[2].manifest().docid_hi;
+
+    const DOCUMENT_IDS: [&str; 6] = [
+        "merge-a1", "merge-a2", "merge-b1", "merge-b2", "merge-c1", "merge-c2",
+    ];
+    let mut identity_rows = Vec::with_capacity(DOCUMENT_IDS.len());
+    for document_id in DOCUMENT_IDS {
+        let resolved = index
+            .snapshot()
+            .resolve_document_id(document_id)
+            .map_err(|error| q1_merge_error("resolve source identity", error))?
+            .ok_or_else(|| GauntletError::InvalidContract {
+                reason: format!("Q1 E3.5 source identity {document_id:?} is missing"),
+            })?;
+        identity_rows.push((document_id, resolved.global_docid));
+    }
+
+    const QUERIES: [&str; 4] = [
+        "shared",
+        "\"shared alpha\"",
+        "shared AND beta",
+        "alpha OR gamma",
+    ];
+    let mut before_queries = Vec::with_capacity(QUERIES.len());
+    for query in QUERIES {
+        let ranked = index
+            .search_paginated(cx, query, 32, 0, true)
+            .map_err(|error| q1_merge_error("run source query", error))?;
+        let docids = index
+            .collect_docids(cx, query)
+            .map_err(|error| q1_merge_error("collect source docids", error))?;
+        before_queries.push((query, ranked, docids));
+    }
+
+    let output_segment_id = [
+        0xe350_0000_0000_0001,
+        0xe350_0000_0000_0002,
+        0xe350_0000_0000_0003,
+        0xe350_0000_0000_0004,
+    ]
+    .into_iter()
+    .find(|candidate| !source_ids.contains(candidate))
+    .ok_or_else(|| GauntletError::InvalidContract {
+        reason: "Q1 E3.5 could not choose a collision-free fixture segment id".to_owned(),
+    })?;
+    let rejected_order = [source_ids[0], source_ids[2]];
+    let rejection = match index
+        .concat_merge(cx, &rejected_order, output_segment_id, 1_700_000_035)
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => {
+            return Err(GauntletError::InvalidContract {
+                reason: "Q1-OB1 admitted a nonconsecutive manifest source list".to_owned(),
+            });
+        }
+    };
+    match &rejection {
+        QuillIndexError::Keeper(KeeperError::ConcatMerge {
+            source:
+                ConcatMergeError::NonConsecutiveSources {
+                    position,
+                    expected,
+                    actual,
+                },
+        }) if *position == 1 && *expected == source_ids[1] && *actual == source_ids[2] => {}
+        _ => {
+            return Err(GauntletError::InvalidContract {
+                reason: format!(
+                    "Q1-OB1 manifest-order violation returned the wrong diagnosis: {rejection}"
+                ),
+            });
+        }
+    }
+    if index.snapshot().loaded_manifest().manifest.generation != before_generation
+        || index
+            .snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().segment_id)
+            .ne(source_ids.iter().copied())
+    {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1-OB1 rejected merge mutated the committed snapshot".to_owned(),
+        });
+    }
+
+    let merged = index
+        .concat_merge(cx, &source_ids, output_segment_id, 1_700_000_035)
+        .await
+        .map_err(|error| q1_merge_error("publish valid concat merge", error))?;
+    let expected_generation =
+        before_generation
+            .checked_add(1)
+            .ok_or_else(|| GauntletError::InvalidContract {
+                reason: "Q1 E3.5 source generation cannot advance".to_owned(),
+            })?;
+    let merged_manifest = &merged.loaded_manifest().manifest;
+    let Some(merged_segment) = merged.segments().first() else {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1 E3.5 merged snapshot contains no segment".to_owned(),
+        });
+    };
+    if merged.segments().len() != 1
+        || merged_segment.manifest().segment_id != output_segment_id
+        || merged_segment.manifest().docid_lo != merged_docid_lo
+        || merged_segment.manifest().docid_hi != merged_docid_hi
+        || merged_manifest.generation != expected_generation
+        || merged_manifest.docid_high_watermark != before_watermark
+        || merged_manifest.field_stats != before_field_stats
+        || merged.at_seal_doc_count() != before_at_seal_doc_count
+        || merged.doc_count() != before_live_doc_count
+    {
+        return Err(GauntletError::InvalidContract {
+            reason:
+                "Q1-OB2a merged successor changed range, generation, statistics, or document counts"
+                    .to_owned(),
+        });
+    }
+    merged_segment
+        .verify()
+        .map_err(|error| q1_merge_error("verify rebound merged segment", error))?;
+    for section in [
+        SectionKind::POSTINGS,
+        SectionKind::POSITIONS,
+        SectionKind::BLOCKMAX,
+        SectionKind::IDMAP,
+        SectionKind::IDHASH,
+        SectionKind::STOREDMETA,
+        SectionKind::STATS,
+    ] {
+        if merged_segment
+            .section(section)
+            .map_err(|error| q1_merge_error("open merged section", error))?
+            .is_none()
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: format!("Q1 E3.5 merged segment omitted {section:?}"),
+            });
+        }
+    }
+
+    for (document_id, global_docid) in identity_rows {
+        let resolved = index
+            .snapshot()
+            .resolve_document_id(document_id)
+            .map_err(|error| q1_merge_error("resolve merged identity", error))?
+            .ok_or_else(|| GauntletError::InvalidContract {
+                reason: format!("Q1-OB2c merged identity {document_id:?} is missing"),
+            })?;
+        let materialized = index
+            .snapshot()
+            .materialize_document_id(global_docid)
+            .map(|value| value.to_string());
+        if resolved.global_docid != global_docid
+            || resolved.segment_id != output_segment_id
+            || materialized.as_deref() != Some(document_id)
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: format!(
+                    "Q1-OB2c identity {document_id:?} changed representative across merge"
+                ),
+            });
+        }
+    }
+    let first_hole = u32::try_from(first_docid_hi).map_err(|_| GauntletError::InvalidContract {
+        reason: "Q1 E3.5 source hole does not fit the public docid domain".to_owned(),
+    })?;
+    if index
+        .snapshot()
+        .materialize_document_id(first_hole)
+        .is_some()
+    {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1-OB2c merged IDMAP filled a burned lease tail".to_owned(),
+        });
+    }
+
+    for (query, before_ranked, before_docids) in before_queries {
+        let after_ranked = index
+            .search_paginated(cx, query, 32, 0, true)
+            .map_err(|error| q1_merge_error("run merged query", error))?;
+        let after_docids = index
+            .collect_docids(cx, query)
+            .map_err(|error| q1_merge_error("collect merged docids", error))?;
+        if after_ranked != before_ranked || after_docids != before_docids {
+            return Err(GauntletError::InvalidContract {
+                reason: format!("Q1-OB3 query {query:?} changed across concat merge"),
+            });
+        }
+    }
+
     Ok(vec![
-        "Q1-OB1/manifest-overlap".to_owned(),
-        "Q1-OB5/allocator-boundary".to_owned(),
+        "Q1-OB1/merge-bound-consecutive".to_owned(),
+        "Q1-OB2a/merge-reopen-equivalence".to_owned(),
+        "Q1-OB2b/bounded-live-concat".to_owned(),
+        "Q1-OB2c/identity-rebuild-reopen".to_owned(),
+        "Q1-OB3/query-invariance".to_owned(),
     ])
 }
 
 fn q1_allocator_error(error: impl std::fmt::Display) -> GauntletError {
     GauntletError::InvalidContract {
         reason: format!("Q1 live allocator fixture failed: {error}"),
+    }
+}
+
+fn q1_merge_error(context: &str, error: impl std::fmt::Display) -> GauntletError {
+    GauntletError::InvalidContract {
+        reason: format!("Q1 E3.5 {context} failed: {error}"),
     }
 }
 
@@ -342,29 +643,39 @@ mod tests {
     }
 
     #[test]
-    fn q1_catalog_keeps_full_obligations_deferred_and_runs_owned_subfixtures() {
-        let catalog = q1_fixture_catalog().expect("valid Q1 catalog");
-        assert_eq!(
-            Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes()).as_slice(),
-            Q1_FIXTURE_CATALOG_SHA256
-        );
-        assert_eq!(catalog.fixtures.len(), 8);
-        assert_eq!(
-            catalog
-                .fixtures
-                .iter()
-                .filter(|fixture| fixture.status == "executable")
-                .map(|fixture| fixture.id.as_str())
-                .collect::<Vec<_>>(),
-            Vec::<&str>::new()
-        );
-        assert_eq!(
-            run_q1_live_fixtures().expect("live Q1 fixtures"),
-            ["Q1-OB1/manifest-overlap", "Q1-OB5/allocator-boundary"]
-        );
-        assert_eq!(catalog.internal_differentials.len(), 1);
-        assert_eq!(catalog.internal_differentials[0].id, FIXTURE_ID);
-        assert_eq!(catalog.internal_differentials[0].status, "executable");
+    fn q1_catalog_promotes_e35_obligations_and_runs_live_merge_subfixtures() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let catalog = q1_fixture_catalog().expect("valid Q1 catalog");
+            assert_eq!(
+                Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes()).as_slice(),
+                Q1_FIXTURE_CATALOG_SHA256
+            );
+            assert_eq!(catalog.fixtures.len(), 8);
+            assert_eq!(
+                catalog
+                    .fixtures
+                    .iter()
+                    .filter(|fixture| fixture.status == "executable")
+                    .map(|fixture| fixture.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3"]
+            );
+            assert_eq!(
+                run_q1_live_fixtures(&cx).await.expect("live Q1 fixtures"),
+                [
+                    "Q1-OB1/manifest-overlap",
+                    "Q1-OB1/merge-bound-consecutive",
+                    "Q1-OB2a/merge-reopen-equivalence",
+                    "Q1-OB2b/bounded-live-concat",
+                    "Q1-OB2c/identity-rebuild-reopen",
+                    "Q1-OB3/query-invariance",
+                    "Q1-OB5/allocator-boundary",
+                ]
+            );
+            assert_eq!(catalog.internal_differentials.len(), 1);
+            assert_eq!(catalog.internal_differentials[0].id, FIXTURE_ID);
+            assert_eq!(catalog.internal_differentials[0].status, "executable");
+        });
     }
 
     #[test]

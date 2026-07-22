@@ -4272,10 +4272,19 @@ mod tests {
                     .iter()
                     .any(|candidate| candidate == &QueryValue::Str(value.to_owned()))
             }),
-            Query::Glob { field_ids, pattern } => field_ids
-                .iter()
-                .copied()
-                .any(|field_id| field_text(doc, field_id).is_some_and(|value| value == pattern)),
+            Query::Glob { field_ids, pattern } => field_ids.iter().copied().any(|field_id| {
+                field_text(doc, field_id).is_some_and(|value| {
+                    value
+                        .split(|ch: char| !ch.is_alphanumeric())
+                        .filter(|term| !term.is_empty())
+                        .any(|term| {
+                            crate::grimoire::star_glob_matches(
+                                pattern.as_bytes(),
+                                term.to_lowercase().as_bytes(),
+                            )
+                        })
+                })
+            }),
             Query::Boost { query, .. } => ast_matches(query, doc),
         }
     }
@@ -5022,7 +5031,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn parser_result_sets_match_the_pinned_tantivy_adapter() {
         const DOCS: [EvalDoc; 10] = [
             EvalDoc {

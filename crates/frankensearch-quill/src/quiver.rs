@@ -332,6 +332,8 @@ mod bitpack {
     }
 }
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ops::{Bound, Range};
 
 use frankensearch_core::DocId;
@@ -431,6 +433,35 @@ impl PostingBlockKind {
 /// Typed failures from encoding or validating an FSLX posting stream.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum PostingCodecError {
+    /// Concatenation requires at least one validated source list.
+    #[error("cannot concatenate an empty POSTINGS list")]
+    EmptyConcat,
+    /// Concat inputs must be ordered by their decoded absolute docids.
+    #[error(
+        "POSTINGS concat part {part_index} starts at docid {first_doc}, not after prior docid {previous_last_doc}"
+    )]
+    ConcatRangeOrder {
+        /// Rejected source index.
+        part_index: usize,
+        /// Prior non-empty source's final absolute docid.
+        previous_last_doc: u32,
+        /// Current non-empty source's first absolute docid.
+        first_doc: u32,
+    },
+    /// Checked concat preflight arithmetic overflowed.
+    #[error("POSTINGS concat arithmetic overflow in part {part_index} while computing {field}")]
+    ConcatArithmeticOverflow {
+        /// Source index whose contribution overflowed.
+        part_index: usize,
+        /// Accumulator that overflowed.
+        field: &'static str,
+    },
+    /// Reserving the exact concatenated byte stream failed without panicking.
+    #[error("unable to reserve {bytes} concatenated POSTINGS bytes")]
+    ConcatAllocation {
+        /// Exact output byte count requested.
+        bytes: usize,
+    },
     /// A slice cannot be represented by the u32 TERMDICT `doc_freq` field.
     #[error("posting count {count} exceeds the u32 doc_freq range")]
     TooManyPostings {
@@ -689,6 +720,108 @@ impl EncodedPostingList {
             max_blocks: block_count,
             max_postings: posting_count,
         }
+    }
+
+    /// Concatenate validated posting streams without rewriting any block.
+    ///
+    /// Every block carries an absolute first docid, so an ordered Q1 merge is
+    /// exactly the bytewise concatenation of its source streams. Empty source
+    /// streams are allowed, but the source list itself must be non-empty.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty input, non-ascending source docids, checked count/length
+    /// overflow, aggregate reader-budget exhaustion, or fallible allocation
+    /// failure.
+    pub fn concatenate(parts: &[&PostingList<'_>]) -> Result<Self, PostingCodecError> {
+        Self::concatenate_with_limits(parts, PostingListLimits::default())
+    }
+
+    /// Concatenate with explicit aggregate reader budgets.
+    ///
+    /// This is primarily useful to pin resource-boundary behavior. Shipping
+    /// concat merge uses [`PostingListLimits::default`] so an output accepted
+    /// for publication is guaranteed to reopen through ordinary query reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::concatenate`].
+    pub fn concatenate_with_limits(
+        parts: &[&PostingList<'_>],
+        limits: PostingListLimits,
+    ) -> Result<Self, PostingCodecError> {
+        if parts.is_empty() {
+            return Err(PostingCodecError::EmptyConcat);
+        }
+
+        let mut byte_len = 0_usize;
+        let mut doc_freq = 0_u32;
+        let mut block_count = 0_usize;
+        let mut previous_last_doc = None;
+        for (part_index, part) in parts.iter().copied().enumerate() {
+            if let Some(first) = part.blocks.first()
+                && let Some(previous) = previous_last_doc
+                && first.first_doc <= previous
+            {
+                return Err(PostingCodecError::ConcatRangeOrder {
+                    part_index,
+                    previous_last_doc: previous,
+                    first_doc: first.first_doc,
+                });
+            }
+            if let Some(last) = part.blocks.last() {
+                previous_last_doc = Some(last.last_doc);
+            }
+            byte_len = byte_len.checked_add(part.bytes.len()).ok_or(
+                PostingCodecError::ConcatArithmeticOverflow {
+                    part_index,
+                    field: "byte length",
+                },
+            )?;
+            doc_freq = doc_freq.checked_add(part.doc_freq).ok_or(
+                PostingCodecError::ConcatArithmeticOverflow {
+                    part_index,
+                    field: "doc_freq",
+                },
+            )?;
+            block_count = block_count.checked_add(part.blocks.len()).ok_or(
+                PostingCodecError::ConcatArithmeticOverflow {
+                    part_index,
+                    field: "block count",
+                },
+            )?;
+        }
+        let posting_count =
+            usize::try_from(doc_freq).map_err(|_| PostingCodecError::PostingLimitExceeded {
+                limit: limits.max_postings,
+                actual: usize::MAX,
+            })?;
+        if posting_count > limits.max_postings {
+            return Err(PostingCodecError::PostingLimitExceeded {
+                limit: limits.max_postings,
+                actual: posting_count,
+            });
+        }
+        if block_count > limits.max_blocks {
+            return Err(PostingCodecError::BlockBudgetExhausted {
+                limit: limits.max_blocks,
+                validated: block_count,
+            });
+        }
+
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(byte_len)
+            .map_err(|_| PostingCodecError::ConcatAllocation { bytes: byte_len })?;
+        for part in parts {
+            bytes.extend_from_slice(part.as_bytes());
+        }
+        debug_assert_eq!(bytes.len(), byte_len);
+        Ok(Self {
+            bytes,
+            doc_freq,
+            block_count,
+        })
     }
 
     /// Encode a strictly docid-ascending posting slice.
@@ -4560,6 +4693,19 @@ pub enum DocLenCodecError {
         /// Actual size.
         actual: usize,
     },
+    /// Concatenation requires at least one validated source section.
+    #[error("cannot concatenate an empty DOCLEN section list")]
+    EmptyConcat,
+    /// Concat inputs must be ordered and non-overlapping.
+    #[error("DOCLEN concat section {index} begins at {current_lo}, before prior end {previous_hi}")]
+    ConcatRangeOrder {
+        /// Rejected source index.
+        index: usize,
+        /// Prior source's exclusive high bound.
+        previous_hi: u64,
+        /// Current source's inclusive low bound.
+        current_lo: u64,
+    },
     /// Fallible allocation failed without panicking.
     #[error("unable to reserve {bytes} bytes for DOCLEN {resource}")]
     Allocation {
@@ -4662,6 +4808,127 @@ impl EncodedDocLenSection {
             docid_lo,
             docid_hi,
             field_count: fields.len(),
+        })
+    }
+
+    /// Concatenate ordered non-overlapping DOCLEN sections.
+    ///
+    /// Inter-segment docid gaps receive the canonical hole byte. Source
+    /// fieldnorm IDs are copied exactly; concat never decodes or re-quantizes
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty input, field drift, range overlap/reversal, resource
+    /// abuse, arithmetic overflow, or allocation failure.
+    pub fn concatenate(
+        sections: &[DocLenSection<'_>],
+        expected_field_ords: &[u16],
+    ) -> Result<Self, DocLenCodecError> {
+        Self::concatenate_with_limits(sections, expected_field_ords, DocLenLimits::default())
+    }
+
+    /// Concatenate with caller-selected validation and allocation ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::concatenate`].
+    pub fn concatenate_with_limits(
+        sections: &[DocLenSection<'_>],
+        expected_field_ords: &[u16],
+        limits: DocLenLimits,
+    ) -> Result<Self, DocLenCodecError> {
+        let Some(first) = sections.first() else {
+            return Err(DocLenCodecError::EmptyConcat);
+        };
+        validate_doclen_expected_fields(expected_field_ords, limits.max_fields)?;
+        for (section_index, section) in sections.iter().enumerate() {
+            let compared = expected_field_ords.len().max(section.fields.len());
+            for field_index in 0..compared {
+                let expected = expected_field_ords.get(field_index).copied();
+                let actual = section.fields.get(field_index).map(|field| field.field_ord);
+                if expected != actual {
+                    return Err(DocLenCodecError::UnexpectedField {
+                        index: field_index,
+                        expected,
+                        actual,
+                    });
+                }
+            }
+            if section_index != 0 {
+                let previous_hi = sections[section_index - 1].docid_hi;
+                if section.docid_lo < previous_hi {
+                    return Err(DocLenCodecError::ConcatRangeOrder {
+                        index: section_index,
+                        previous_hi,
+                        current_lo: section.docid_lo,
+                    });
+                }
+            }
+        }
+
+        let docid_lo = first.docid_lo;
+        let docid_hi = sections
+            .last()
+            .map(|section| section.docid_hi)
+            .ok_or(DocLenCodecError::EmptyConcat)?;
+        let span = checked_doclen_span(docid_lo, docid_hi, limits)?;
+        let (offsets, total_len) = doclen_layout(expected_field_ords, span, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| DocLenCodecError::Allocation {
+                resource: "concatenated section bytes",
+                bytes: total_len,
+            })?;
+        for (&field_ord, &offset) in expected_field_ords.iter().zip(&offsets) {
+            bytes.extend_from_slice(&field_ord.to_le_bytes());
+            let offset = u32::try_from(offset)
+                .map_err(|_| DocLenCodecError::OffsetUnrepresentable { field_ord, offset })?;
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        for (field_index, &offset) in offsets.iter().enumerate() {
+            bytes.resize(offset, 0);
+            let mut cursor = docid_lo;
+            for (section_index, section) in sections.iter().enumerate() {
+                let gap = section.docid_lo.checked_sub(cursor).ok_or(
+                    DocLenCodecError::ConcatRangeOrder {
+                        index: section_index,
+                        previous_hi: cursor,
+                        current_lo: section.docid_lo,
+                    },
+                )?;
+                let gap = usize::try_from(gap).map_err(|_| DocLenCodecError::ResourceLimit {
+                    resource: "concat gap",
+                    actual: gap,
+                    limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+                })?;
+                let gap_end =
+                    bytes
+                        .len()
+                        .checked_add(gap)
+                        .ok_or(DocLenCodecError::ArithmeticOverflow {
+                            field: "concat gap end",
+                        })?;
+                bytes.resize(gap_end, DOCLEN_HOLE_FIELDNORM_ID);
+                let field = section.fields.get(field_index).ok_or_else(|| {
+                    DocLenCodecError::UnexpectedField {
+                        index: field_index,
+                        expected: expected_field_ords.get(field_index).copied(),
+                        actual: None,
+                    }
+                })?;
+                bytes.extend_from_slice(&section.bytes[field.range.clone()]);
+                cursor = section.docid_hi;
+            }
+        }
+        debug_assert_eq!(bytes.len(), total_len);
+        Ok(Self {
+            bytes,
+            docid_lo,
+            docid_hi,
+            field_count: expected_field_ords.len(),
         })
     }
 
@@ -5298,6 +5565,17 @@ pub struct EncodedIdMapSection {
     present_count: usize,
 }
 
+/// Validated exact layout for directly concatenating IDMAP source views.
+pub(crate) struct IdMapConcatPlan {
+    docid_lo: u64,
+    docid_hi: u64,
+    span: usize,
+    blob_offset: usize,
+    blob_len: usize,
+    total_len: usize,
+    present_count: usize,
+}
+
 impl EncodedIdMapSection {
     /// Encode span-aligned document identifiers and canonical-content hashes.
     ///
@@ -5853,6 +6131,13 @@ impl EncodedIdMapSection {
         Self::concatenate_with_limits(sections, IdMapLimits::default())
     }
 
+    /// Preflight an ordinary concat for direct emission into a larger buffer.
+    pub(crate) fn plan_concatenate(
+        sections: &[IdMapSection<'_>],
+    ) -> Result<IdMapConcatPlan, IdMapCodecError> {
+        IdMapConcatPlan::new(sections, IdMapLimits::default())
+    }
+
     /// Concatenate with caller-selected validation and allocation ceilings.
     ///
     /// # Errors
@@ -5862,6 +6147,26 @@ impl EncodedIdMapSection {
         sections: &[IdMapSection<'_>],
         limits: IdMapLimits,
     ) -> Result<Self, IdMapCodecError> {
+        let plan = IdMapConcatPlan::new(sections, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(plan.total_len)
+            .map_err(|_| IdMapCodecError::Allocation {
+                resource: "concatenated section bytes",
+                bytes: plan.total_len,
+            })?;
+        plan.append_to(sections, &mut bytes);
+        Ok(Self {
+            bytes,
+            docid_lo: plan.docid_lo,
+            docid_hi: plan.docid_hi,
+            present_count: plan.present_count,
+        })
+    }
+}
+
+impl IdMapConcatPlan {
+    fn new(sections: &[IdMapSection<'_>], limits: IdMapLimits) -> Result<Self, IdMapCodecError> {
         let Some(first) = sections.first().copied() else {
             return Err(IdMapCodecError::EmptyConcat);
         };
@@ -5906,112 +6211,106 @@ impl EncodedIdMapSection {
         }
         validate_id_map_blob_len(blob_len, limits)?;
         let (blob_offset, total_len) = id_map_layout(span, blob_len, limits)?;
-        let offsets_capacity = span
-            .checked_add(1)
-            .ok_or(IdMapCodecError::ArithmeticOverflow {
-                field: "concat offset count",
-            })?;
-        let mut offsets = Vec::new();
-        offsets
-            .try_reserve_exact(offsets_capacity)
-            .map_err(|_| IdMapCodecError::Allocation {
-                resource: "concat offsets",
-                bytes: offsets_capacity.saturating_mul(std::mem::size_of::<u32>()),
-            })?;
-        let mut hashes = Vec::new();
-        hashes
-            .try_reserve_exact(span)
-            .map_err(|_| IdMapCodecError::Allocation {
-                resource: "concat hashes",
-                bytes: span.saturating_mul(std::mem::size_of::<u64>()),
-            })?;
+        Ok(Self {
+            docid_lo,
+            docid_hi,
+            span,
+            blob_offset,
+            blob_len,
+            total_len,
+            present_count,
+        })
+    }
+
+    /// Exact canonical byte length of the merged IDMAP payload.
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.total_len
+    }
+
+    /// Inclusive lower global docid bound of the conceptual merged IDMAP.
+    pub(crate) const fn docid_lo(&self) -> u64 {
+        self.docid_lo
+    }
+
+    /// Append the canonical payload after [`Self::new`] validated the sources.
+    pub(crate) fn append_to(&self, sections: &[IdMapSection<'_>], bytes: &mut Vec<u8>) {
+        let section_start = bytes.len();
+        let entry_count = u32::try_from(self.span).expect("validated IDMAP span fits u32");
+        let blob_offset =
+            u32::try_from(self.blob_offset).expect("validated IDMAP blob offset fits u32");
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(&blob_offset.to_le_bytes());
+
         let mut current_offset = 0_u32;
-        offsets.push(current_offset);
-        let mut cursor = docid_lo;
-        for (section_index, section) in sections.iter().copied().enumerate() {
+        bytes.extend_from_slice(&current_offset.to_le_bytes());
+        let mut cursor = self.docid_lo;
+        for section in sections.iter().copied() {
             let gap =
-                section
-                    .docid_lo
-                    .checked_sub(cursor)
-                    .ok_or(IdMapCodecError::ConcatRangeOrder {
-                        index: section_index,
-                        previous_hi: cursor,
-                        current_lo: section.docid_lo,
-                    })?;
-            let gap = usize::try_from(gap).map_err(|_| IdMapCodecError::ResourceLimit {
-                resource: "concat gap",
-                actual: gap,
-                limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
-            })?;
-            for _ in 0..gap {
-                offsets.push(current_offset);
-                hashes.push(0);
-            }
+                usize::try_from(section.docid_lo - cursor).expect("validated IDMAP gap fits usize");
+            append_repeated_u32(bytes, current_offset, gap);
             for ordinal in 0..section.offset_count() {
                 let start =
-                    id_map_offset(section.offsets, ordinal).ok_or(IdMapCodecError::Truncated {
-                        expected: (ordinal + 1) * ID_MAP_OFFSET_LEN,
-                        actual: section.offsets.len(),
-                    })?;
-                let end = id_map_offset(section.offsets, ordinal + 1).ok_or(
-                    IdMapCodecError::Truncated {
-                        expected: (ordinal + 2) * ID_MAP_OFFSET_LEN,
-                        actual: section.offsets.len(),
-                    },
-                )?;
-                current_offset = current_offset.checked_add(end - start).ok_or(
-                    IdMapCodecError::ArithmeticOverflow {
-                        field: "concatenated identifier offset",
-                    },
-                )?;
-                offsets.push(current_offset);
-                hashes.push(id_map_hash(section.hashes, ordinal).ok_or(
-                    IdMapCodecError::Truncated {
-                        expected: (ordinal + 1) * ID_MAP_HASH_LEN,
-                        actual: section.hashes.len(),
-                    },
-                )?);
+                    id_map_offset(section.offsets, ordinal).expect("validated IDMAP source offset");
+                let end = id_map_offset(section.offsets, ordinal + 1)
+                    .expect("validated IDMAP source offset end");
+                current_offset = current_offset
+                    .checked_add(end - start)
+                    .expect("validated IDMAP blob length fits u32");
+                bytes.extend_from_slice(&current_offset.to_le_bytes());
             }
             cursor = section.docid_hi;
         }
-        debug_assert_eq!(offsets.len(), offsets_capacity);
-        debug_assert_eq!(hashes.len(), span);
-        debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(total_len)
-            .map_err(|_| IdMapCodecError::Allocation {
-                resource: "concatenated section bytes",
-                bytes: total_len,
-            })?;
-        let entry_count = u32::try_from(span).map_err(|_| IdMapCodecError::ResourceLimit {
-            resource: "durable entry count",
-            actual: u64::try_from(span).unwrap_or(u64::MAX),
-            limit: u64::from(u32::MAX),
-        })?;
-        let blob_offset_u32 =
-            u32::try_from(blob_offset).map_err(|_| IdMapCodecError::OffsetUnrepresentable {
-                offset: blob_offset,
-            })?;
-        bytes.extend_from_slice(&entry_count.to_le_bytes());
-        bytes.extend_from_slice(&blob_offset_u32.to_le_bytes());
-        for offset in offsets {
-            bytes.extend_from_slice(&offset.to_le_bytes());
+        debug_assert_eq!(usize::try_from(current_offset).ok(), Some(self.blob_len));
+
+        let mut cursor = self.docid_lo;
+        for section in sections.iter().copied() {
+            let gap =
+                usize::try_from(section.docid_lo - cursor).expect("validated IDMAP gap fits usize");
+            let gap_bytes = gap
+                .checked_mul(std::mem::size_of::<u64>())
+                .expect("validated IDMAP gap hash bytes");
+            bytes.resize(
+                bytes
+                    .len()
+                    .checked_add(gap_bytes)
+                    .expect("validated IDMAP gap hash end"),
+                0,
+            );
+            for ordinal in 0..section.offset_count() {
+                let content_hash =
+                    id_map_hash(section.hashes, ordinal).expect("validated IDMAP source hash");
+                bytes.extend_from_slice(&content_hash.to_le_bytes());
+            }
+            cursor = section.docid_hi;
         }
-        for content_hash in hashes {
-            bytes.extend_from_slice(&content_hash.to_le_bytes());
-        }
-        debug_assert_eq!(bytes.len(), blob_offset);
+        debug_assert_eq!(bytes.len() - section_start, self.blob_offset);
         for section in sections {
             bytes.extend_from_slice(section.blob.as_bytes());
         }
-        debug_assert_eq!(bytes.len(), total_len);
-        Ok(Self {
-            bytes,
-            docid_lo,
-            docid_hi,
-            present_count,
-        })
+        debug_assert_eq!(bytes.len() - section_start, self.total_len);
+    }
+}
+
+fn append_repeated_u32(bytes: &mut Vec<u8>, value: u32, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let byte_count = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .expect("validated repeated-u32 byte count");
+    let start = bytes.len();
+    let end = start
+        .checked_add(byte_count)
+        .expect("validated repeated-u32 end");
+    if value == 0 {
+        bytes.resize(end, 0);
+        return;
+    }
+    bytes.extend_from_slice(&value.to_le_bytes());
+    while bytes.len() < end {
+        let initialized = bytes.len() - start;
+        let copied = initialized.min(end - bytes.len());
+        bytes.extend_from_within(start..start + copied);
     }
 }
 
@@ -6407,6 +6706,29 @@ impl EncodedIdHashSection {
         )
     }
 
+    /// Rebuild IDHASH directly from the validated sources of a conceptual
+    /// merged IDMAP, without first materializing that IDMAP's durable bytes.
+    pub(crate) fn encode_resolved_concat(
+        id_maps: &[IdMapSection<'_>],
+        id_map_plan: &IdMapConcatPlan,
+        representative_ordinals: &[u32],
+    ) -> Result<Self, IdHashCodecError> {
+        let docid_lo = id_map_plan.docid_lo;
+        encode_resolved_id_hash_with_domain(
+            docid_lo,
+            id_map_plan.span,
+            id_map_plan.present_count,
+            |ordinal| concat_id_map_document_id_at_ordinal(id_maps, docid_lo, ordinal),
+            id_maps
+                .iter()
+                .copied()
+                .flat_map(|id_map| id_map.document_ids()),
+            representative_ordinals,
+            IdHashLimits::default(),
+            seeded_id_hash,
+        )
+    }
+
     /// Rebuild from externally resolved representatives with caller-selected ceilings.
     ///
     /// # Errors
@@ -6768,13 +7090,60 @@ fn encode_resolved_id_hash_with_hasher<F>(
 where
     F: Fn(&[u8]) -> u64 + Copy,
 {
+    encode_resolved_id_hash_with_domain(
+        id_map.docid_lo,
+        id_map.offset_count(),
+        id_map.present_count,
+        |ordinal| id_map.document_id_at_ordinal(ordinal),
+        id_map.document_ids(),
+        representative_ordinals,
+        limits,
+        hash,
+    )
+}
+
+fn concat_id_map_document_id_at_ordinal<'a>(
+    id_maps: &[IdMapSection<'a>],
+    docid_lo: u64,
+    ordinal: usize,
+) -> Option<&'a str> {
+    let global_docid = docid_lo.checked_add(u64::try_from(ordinal).ok()?)?;
+    let section_index = id_maps.partition_point(|id_map| id_map.docid_hi() <= global_docid);
+    id_maps
+        .get(section_index)
+        .copied()?
+        .get(global_docid)
+        .map(|entry| entry.document_id())
+}
+
+fn encode_resolved_id_hash_with_domain<'a, F, I, G>(
+    docid_lo: u64,
+    span: usize,
+    present_count: usize,
+    document_id_at_ordinal: G,
+    document_ids: I,
+    representative_ordinals: &[u32],
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<EncodedIdHashSection, IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+    G: Fn(usize) -> Option<&'a str> + Copy,
+    I: IntoIterator<Item = (u64, &'a str)>,
+{
     // Validation examines the complete physical IDMAP even though the durable
     // table contains only one externally selected row per exact identifier.
-    validate_id_hash_entry_limit(id_map.present_count, limits)?;
+    validate_id_hash_entry_limit(present_count, limits)?;
     validate_id_hash_entry_limit(representative_ordinals.len(), limits)?;
     let capacity = canonical_id_hash_capacity(representative_ordinals.len(), limits)?;
-    let entries =
-        build_resolved_id_hash_entries(id_map, representative_ordinals, capacity, limits, hash)?;
+    let entries = build_resolved_id_hash_entries(
+        span,
+        document_id_at_ordinal,
+        representative_ordinals,
+        capacity,
+        limits,
+        hash,
+    )?;
     let total_len = id_hash_section_len(capacity, limits)?;
     let mut bytes = Vec::new();
     bytes
@@ -6798,12 +7167,22 @@ where
     };
     // This proves that the externally supplied set covers every exact IDMAP
     // identifier and that its durable bytes satisfy the same reader contract.
-    parse_id_hash_with_hasher(encoded.as_bytes(), id_map, limits, hash)?;
+    validate_id_hash_with_domain(
+        encoded.as_bytes(),
+        docid_lo,
+        span,
+        present_count,
+        document_id_at_ordinal,
+        document_ids,
+        limits,
+        hash,
+    )?;
     Ok(encoded)
 }
 
-fn build_resolved_id_hash_entries<F>(
-    id_map: IdMapSection<'_>,
+fn build_resolved_id_hash_entries<'a, F, G>(
+    span: usize,
+    document_id_at_ordinal: G,
     representative_ordinals: &[u32],
     capacity: usize,
     limits: IdHashLimits,
@@ -6811,6 +7190,7 @@ fn build_resolved_id_hash_entries<F>(
 ) -> Result<Vec<u8>, IdHashCodecError>
 where
     F: Fn(&[u8]) -> u64 + Copy,
+    G: Fn(usize) -> Option<&'a str> + Copy,
 {
     let entries_len =
         capacity
@@ -6848,18 +7228,17 @@ where
                 ordinal: ordinal_u32,
             }
         })?;
-        if ordinal >= id_map.offset_count() {
+        if ordinal >= span {
             return Err(IdHashCodecError::RepresentativeOrdinalOutOfRange {
                 index,
                 ordinal: ordinal_u32,
             });
         }
-        let document_id = id_map.document_id_at_ordinal(ordinal).ok_or(
-            IdHashCodecError::RepresentativeOrdinalHole {
+        let document_id =
+            document_id_at_ordinal(ordinal).ok_or(IdHashCodecError::RepresentativeOrdinalHole {
                 index,
                 ordinal: ordinal_u32,
-            },
-        )?;
+            })?;
         let doc_ord_plus1 = ordinal_u32.checked_add(1).ok_or(
             IdHashCodecError::RepresentativeOrdinalOutOfRange {
                 index,
@@ -6889,7 +7268,7 @@ where
                         field: "stored resolved-representative ordinal",
                     }
                 })?;
-                let stored_document_id = id_map.document_id_at_ordinal(stored_ordinal).ok_or(
+                let stored_document_id = document_id_at_ordinal(stored_ordinal).ok_or(
                     IdHashCodecError::OrdinalHole {
                         slot,
                         ordinal: stored_plus1 - 1,
@@ -7006,6 +7385,12 @@ where
     Ok((entries, occupied))
 }
 
+struct ValidatedIdHash<'a> {
+    entries: &'a [u8],
+    capacity: usize,
+    occupied: usize,
+}
+
 fn parse_id_hash_with_hasher<'a, F>(
     bytes: &'a [u8],
     id_map: IdMapSection<'a>,
@@ -7015,7 +7400,41 @@ fn parse_id_hash_with_hasher<'a, F>(
 where
     F: Fn(&[u8]) -> u64 + Copy,
 {
-    validate_id_hash_entry_limit(id_map.present_count, limits)?;
+    let validated = validate_id_hash_with_domain(
+        bytes,
+        id_map.docid_lo,
+        id_map.offset_count(),
+        id_map.present_count,
+        |ordinal| id_map.document_id_at_ordinal(ordinal),
+        id_map.document_ids(),
+        limits,
+        hash,
+    )?;
+    Ok(IdHashSection {
+        bytes,
+        entries: validated.entries,
+        capacity: validated.capacity,
+        occupied: validated.occupied,
+        id_map,
+    })
+}
+
+fn validate_id_hash_with_domain<'bytes, 'ids, F, I, G>(
+    bytes: &'bytes [u8],
+    docid_lo: u64,
+    span: usize,
+    present_count: usize,
+    document_id_at_ordinal: G,
+    document_ids: I,
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<ValidatedIdHash<'bytes>, IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+    G: Fn(usize) -> Option<&'ids str> + Copy,
+    I: IntoIterator<Item = (u64, &'ids str)>,
+{
+    validate_id_hash_entry_limit(present_count, limits)?;
     if bytes.len() < ID_HASH_HEADER_LEN {
         return Err(IdHashCodecError::Truncated {
             expected: ID_HASH_HEADER_LEN,
@@ -7086,19 +7505,16 @@ where
                 slot,
                 ordinal: ordinal_u32,
             })?;
-        if ordinal >= id_map.offset_count() {
+        if ordinal >= span {
             return Err(IdHashCodecError::OrdinalOutOfRange {
                 slot,
                 ordinal: ordinal_u32,
             });
         }
-        let document_id =
-            id_map
-                .document_id_at_ordinal(ordinal)
-                .ok_or(IdHashCodecError::OrdinalHole {
-                    slot,
-                    ordinal: ordinal_u32,
-                })?;
+        let document_id = document_id_at_ordinal(ordinal).ok_or(IdHashCodecError::OrdinalHole {
+            slot,
+            ordinal: ordinal_u32,
+        })?;
         let expected_hash = hash(document_id.as_bytes());
         if key_hash != expected_hash {
             return Err(IdHashCodecError::KeyHashMismatch {
@@ -7124,13 +7540,6 @@ where
             expected: u32::try_from(canonical_capacity).unwrap_or(u32::MAX),
         });
     }
-    let section = IdHashSection {
-        bytes,
-        entries,
-        capacity,
-        occupied,
-        id_map,
-    };
     // Validate exact ascending-selected-ordinal insertion without allocating a
     // mirror table. One bounded probe per physical IDMAP row both finds its
     // exact representative and proves that every preceding cluster ordinal was
@@ -7139,13 +7548,13 @@ where
     let mask = capacity - 1;
     let mut selected = 0_usize;
     let mut probe_steps = 0_u64;
-    for (global_docid, document_id) in id_map.document_ids() {
+    for (global_docid, document_id) in document_ids {
         let ordinal = global_docid
-            .checked_sub(id_map.docid_lo)
+            .checked_sub(docid_lo)
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(IdHashCodecError::DocIdOverflow {
                 ordinal: 0,
-                docid_lo: id_map.docid_lo,
+                docid_lo,
             })?;
         let key_hash = hash(document_id.as_bytes());
         let mut slot = usize::try_from(key_hash & u64::try_from(mask).unwrap_or(u64::MAX))
@@ -7171,7 +7580,7 @@ where
                 }
             })?;
             if durable_hash == key_hash {
-                let durable_document_id = id_map.document_id_at_ordinal(durable_ordinal).ok_or(
+                let durable_document_id = document_id_at_ordinal(durable_ordinal).ok_or(
                     IdHashCodecError::OrdinalHole {
                         slot,
                         ordinal: doc_ord_plus1 - 1,
@@ -7205,7 +7614,11 @@ where
     if occupied != selected {
         return Err(IdHashCodecError::SelectedCountMismatch { occupied, selected });
     }
-    Ok(section)
+    Ok(ValidatedIdHash {
+        entries,
+        capacity,
+        occupied,
+    })
 }
 
 fn validate_id_hash_entry_limit(
@@ -7436,6 +7849,19 @@ pub enum NumericCodecError {
         docid_lo: u64,
         /// Exclusive upper bound.
         docid_hi: u64,
+    },
+    /// Merge requires at least one validated source section.
+    #[error("cannot merge an empty NUMERIC section list")]
+    EmptyMerge,
+    /// Merge inputs must be ordered and non-overlapping by segment range.
+    #[error("NUMERIC merge section {index} begins at {current_lo}, before prior end {previous_hi}")]
+    MergeRangeOrder {
+        /// Rejected source index.
+        index: usize,
+        /// Prior source's exclusive high bound.
+        previous_hi: u64,
+        /// Current source's inclusive low bound.
+        current_lo: u64,
     },
     /// A caller or durable declaration exceeded an explicit resource ceiling.
     #[error("NUMERIC {resource} {actual} exceeds limit {limit}")]
@@ -7741,6 +8167,241 @@ impl EncodedNumericSection {
                 bytes.extend_from_slice(&entry.value.value_bits().to_le_bytes());
                 bytes.extend_from_slice(&entry.docid.to_le_bytes());
             }
+        }
+        debug_assert_eq!(bytes.len(), total_len);
+        Ok(Self {
+            bytes,
+            schema,
+            docid_lo,
+            docid_hi,
+            entry_count: usize::try_from(total_entries).unwrap_or(usize::MAX),
+        })
+    }
+
+    /// K-way merge ordered, non-overlapping canonical NUMERIC sections.
+    ///
+    /// Each indexed numeric field is merged independently by its schema-typed
+    /// `(value, docid)` order. The implementation never concatenates pair
+    /// streams and never materializes all entries for a global re-sort.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty input, schema/type drift, range overlap/reversal,
+    /// resource abuse, arithmetic overflow, or allocation failure.
+    pub fn merge_sorted(
+        schema: SchemaDescriptor,
+        sections: &[NumericSection<'_>],
+    ) -> Result<Self, NumericCodecError> {
+        Self::merge_sorted_with_limits(schema, sections, NumericLimits::default())
+    }
+
+    /// K-way merge with caller-selected validation and allocation ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::merge_sorted`].
+    pub fn merge_sorted_with_limits(
+        schema: SchemaDescriptor,
+        sections: &[NumericSection<'_>],
+        limits: NumericLimits,
+    ) -> Result<Self, NumericCodecError> {
+        let Some(first) = sections.first() else {
+            return Err(NumericCodecError::EmptyMerge);
+        };
+        let expected = numeric_schema_fields(schema, limits.max_fields)?;
+        for (section_index, section) in sections.iter().enumerate() {
+            let compared = expected.len().max(section.fields.len());
+            for field_index in 0..compared {
+                let expected_field = expected.get(field_index).copied();
+                let actual_field = section.fields.get(field_index);
+                if expected_field.map(|(field_ord, _)| field_ord)
+                    != actual_field.map(|field| field.field_ord)
+                {
+                    return Err(NumericCodecError::UnexpectedField {
+                        index: field_index,
+                        expected: expected_field.map(|(field_ord, _)| field_ord),
+                        actual: actual_field.map(|field| field.field_ord),
+                    });
+                }
+                if let (Some((field_ord, expected_kind)), Some(actual)) =
+                    (expected_field, actual_field)
+                    && expected_kind != actual.kind
+                {
+                    return Err(NumericCodecError::ValueTypeMismatch {
+                        field_ord,
+                        expected: expected_kind.name(),
+                        actual: actual.kind.name(),
+                    });
+                }
+            }
+            if section_index != 0 {
+                let previous_hi = sections[section_index - 1].docid_hi;
+                if section.docid_lo < previous_hi {
+                    return Err(NumericCodecError::MergeRangeOrder {
+                        index: section_index,
+                        previous_hi,
+                        current_lo: section.docid_lo,
+                    });
+                }
+            }
+        }
+
+        let docid_lo = first.docid_lo;
+        let docid_hi = sections
+            .last()
+            .map(|section| section.docid_hi)
+            .ok_or(NumericCodecError::EmptyMerge)?;
+        checked_numeric_span(docid_lo, docid_hi, limits)?;
+
+        let mut field_counts = Vec::new();
+        field_counts
+            .try_reserve_exact(expected.len())
+            .map_err(|_| NumericCodecError::Allocation {
+                resource: "merged field counts",
+                bytes: expected.len().saturating_mul(std::mem::size_of::<usize>()),
+            })?;
+        let mut total_entries = 0_u64;
+        let mut total_len = 0_usize;
+        for field_index in 0..expected.len() {
+            let mut field_count = 0_u64;
+            for section in sections {
+                let count = u64::try_from(section.fields[field_index].count).unwrap_or(u64::MAX);
+                field_count = field_count.checked_add(count).ok_or(
+                    NumericCodecError::ArithmeticOverflow {
+                        field: "merged field entry count",
+                    },
+                )?;
+            }
+            if field_count > limits.max_entries_per_field {
+                return Err(NumericCodecError::ResourceLimit {
+                    resource: "entries per field",
+                    actual: field_count,
+                    limit: limits.max_entries_per_field,
+                });
+            }
+            if field_count > u64::from(u32::MAX) {
+                return Err(NumericCodecError::ResourceLimit {
+                    resource: "durable field entry count",
+                    actual: field_count,
+                    limit: u64::from(u32::MAX),
+                });
+            }
+            total_entries = total_entries.checked_add(field_count).ok_or(
+                NumericCodecError::ArithmeticOverflow {
+                    field: "merged total entry count",
+                },
+            )?;
+            if total_entries > limits.max_total_entries {
+                return Err(NumericCodecError::ResourceLimit {
+                    resource: "total entries",
+                    actual: total_entries,
+                    limit: limits.max_total_entries,
+                });
+            }
+            let field_count =
+                usize::try_from(field_count).map_err(|_| NumericCodecError::ResourceLimit {
+                    resource: "host field entry count",
+                    actual: field_count,
+                    limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+                })?;
+            let field_len = field_count
+                .checked_mul(NUMERIC_PAIR_LEN)
+                .and_then(|pairs| pairs.checked_add(NUMERIC_FIELD_HEADER_LEN))
+                .ok_or(NumericCodecError::ArithmeticOverflow {
+                    field: "merged field byte length",
+                })?;
+            total_len =
+                total_len
+                    .checked_add(field_len)
+                    .ok_or(NumericCodecError::ArithmeticOverflow {
+                        field: "merged section byte length",
+                    })?;
+            field_counts.push(field_count);
+        }
+        let total_len_u64 = u64::try_from(total_len).unwrap_or(u64::MAX);
+        if total_len_u64 > limits.max_section_bytes {
+            return Err(NumericCodecError::ResourceLimit {
+                resource: "section bytes",
+                actual: total_len_u64,
+                limit: limits.max_section_bytes,
+            });
+        }
+
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| NumericCodecError::Allocation {
+                resource: "merged section bytes",
+                bytes: total_len,
+            })?;
+        for (field_index, &(field_ord, kind)) in expected.iter().enumerate() {
+            bytes.extend_from_slice(&field_ord.to_le_bytes());
+            let count = u32::try_from(field_counts[field_index]).map_err(|_| {
+                NumericCodecError::ResourceLimit {
+                    resource: "durable field entry count",
+                    actual: u64::try_from(field_counts[field_index]).unwrap_or(u64::MAX),
+                    limit: u64::from(u32::MAX),
+                }
+            })?;
+            bytes.extend_from_slice(&count.to_le_bytes());
+
+            let mut positions = Vec::new();
+            positions.try_reserve_exact(sections.len()).map_err(|_| {
+                NumericCodecError::Allocation {
+                    resource: "field merge cursors",
+                    bytes: sections.len().saturating_mul(std::mem::size_of::<usize>()),
+                }
+            })?;
+            positions.resize(sections.len(), 0_usize);
+            let mut heap = BinaryHeap::new();
+            heap.try_reserve_exact(sections.len())
+                .map_err(|_| NumericCodecError::Allocation {
+                    resource: "field merge heap",
+                    bytes: sections
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(u64, u32, usize, u64)>()),
+                })?;
+            for (source_index, section) in sections.iter().enumerate() {
+                if let Some(entry) = section.field_at(field_index).entry(0) {
+                    heap.push(Reverse(numeric_merge_heap_entry(kind, entry, source_index)));
+                }
+            }
+
+            let mut emitted = 0_usize;
+            let mut previous = None;
+            while let Some(Reverse((_, docid, source_index, value_bits))) = heap.pop() {
+                let entry = NumericEntry {
+                    value: kind.value_from_bits(value_bits),
+                    docid,
+                };
+                if let Some(previous) = previous
+                    && !numeric_entry_cmp(kind, previous, entry).is_lt()
+                {
+                    return Err(NumericCodecError::NonCanonicalPairOrder {
+                        field_ord,
+                        index: emitted,
+                    });
+                }
+                bytes.extend_from_slice(&value_bits.to_le_bytes());
+                bytes.extend_from_slice(&docid.to_le_bytes());
+                previous = Some(entry);
+                emitted = emitted
+                    .checked_add(1)
+                    .ok_or(NumericCodecError::ArithmeticOverflow {
+                        field: "merged emitted entry count",
+                    })?;
+
+                let next = positions[source_index].checked_add(1).ok_or(
+                    NumericCodecError::ArithmeticOverflow {
+                        field: "field merge cursor",
+                    },
+                )?;
+                positions[source_index] = next;
+                if let Some(entry) = sections[source_index].field_at(field_index).entry(next) {
+                    heap.push(Reverse(numeric_merge_heap_entry(kind, entry, source_index)));
+                }
+            }
+            debug_assert_eq!(emitted, field_counts[field_index]);
         }
         debug_assert_eq!(bytes.len(), total_len);
         Ok(Self {
@@ -8500,6 +9161,19 @@ fn numeric_entry_cmp(
     numeric_value_cmp(kind, left.value, right.value).then_with(|| left.docid.cmp(&right.docid))
 }
 
+fn numeric_merge_heap_entry(
+    kind: NumericKind,
+    entry: NumericEntry,
+    source_index: usize,
+) -> (u64, u32, usize, u64) {
+    let value_bits = entry.value.value_bits();
+    let ordered_value = match kind {
+        NumericKind::I64 => value_bits ^ (1_u64 << 63),
+        NumericKind::U64 => value_bits,
+    };
+    (ordered_value, entry.docid, source_index, value_bits)
+}
+
 /// Packed size of one `{ field_ord: u16, field_offset: u32 }` STOREDMETA
 /// directory entry.
 pub const STORED_META_DIRECTORY_ENTRY_LEN: usize = 6;
@@ -8788,6 +9462,18 @@ pub struct EncodedStoredMetaSection {
     docid_hi: u64,
     field_count: usize,
     blob_bytes: u64,
+}
+
+/// Validated exact layout for directly concatenating STOREDMETA source views.
+pub(crate) struct StoredMetaConcatPlan {
+    docid_lo: u64,
+    docid_hi: u64,
+    span: usize,
+    presence_len: usize,
+    blob_lengths: Vec<usize>,
+    field_offsets: Vec<usize>,
+    total_len: usize,
+    total_blob_bytes: u64,
 }
 
 impl EncodedStoredMetaSection {
@@ -9272,12 +9958,86 @@ impl EncodedStoredMetaSection {
         Self::concatenate_with_limits(sections, expected_field_ords, StoredMetaLimits::default())
     }
 
+    /// Preflight an ordinary concat for direct emission into a larger buffer.
+    pub(crate) fn plan_concatenate(
+        sections: &[StoredMetaSection<'_>],
+        expected_field_ords: &[u16],
+    ) -> Result<StoredMetaConcatPlan, StoredMetaCodecError> {
+        StoredMetaConcatPlan::new(sections, expected_field_ords, StoredMetaLimits::default())
+    }
+
     /// Concatenate with caller-selected validation and allocation ceilings.
     ///
     /// # Errors
     ///
     /// Returns the same typed failures as [`Self::concatenate`].
     pub fn concatenate_with_limits(
+        sections: &[StoredMetaSection<'_>],
+        expected_field_ords: &[u16],
+        limits: StoredMetaLimits,
+    ) -> Result<Self, StoredMetaCodecError> {
+        let plan = StoredMetaConcatPlan::new(sections, expected_field_ords, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(plan.total_len)
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "section bytes",
+                bytes: plan.total_len,
+            })?;
+        plan.append_to(sections, expected_field_ords, &mut bytes);
+        Ok(Self {
+            bytes,
+            docid_lo: plan.docid_lo,
+            docid_hi: plan.docid_hi,
+            field_count: expected_field_ords.len(),
+            blob_bytes: plan.total_blob_bytes,
+        })
+    }
+
+    /// Borrow the exact canonical durable bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the wrapper and return its durable bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Number of schema-stored fields.
+    #[must_use]
+    pub const fn field_count(&self) -> usize {
+        self.field_count
+    }
+
+    /// Sum of opaque field blob bytes, excluding directories and offsets.
+    #[must_use]
+    pub const fn blob_bytes(&self) -> u64 {
+        self.blob_bytes
+    }
+
+    /// Re-open the owned bytes through the validating zero-copy reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an internal invariant was violated.
+    pub fn section(
+        &self,
+        expected_field_ords: &[u16],
+    ) -> Result<StoredMetaSection<'_>, StoredMetaCodecError> {
+        StoredMetaSection::parse(
+            &self.bytes,
+            self.docid_lo,
+            self.docid_hi,
+            expected_field_ords,
+        )
+    }
+}
+
+impl StoredMetaConcatPlan {
+    fn new(
         sections: &[StoredMetaSection<'_>],
         expected_field_ords: &[u16],
         limits: StoredMetaLimits,
@@ -9317,9 +10077,6 @@ impl EncodedStoredMetaSection {
             .ok_or(StoredMetaCodecError::EmptyConcat)?;
         let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
 
-        // Preflight the exact packed output before allocating it. Concat does
-        // not materialize values: it validates offset deltas under the target
-        // limits, then copies each opaque source blob exactly once.
         let mut blob_lengths = Vec::new();
         blob_lengths
             .try_reserve_exact(expected_field_ords.len())
@@ -9401,114 +10158,83 @@ impl EncodedStoredMetaSection {
 
         let (field_offsets, total_len) =
             stored_meta_layout(expected_field_ords, span, &blob_lengths, limits)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(total_len)
-            .map_err(|_| StoredMetaCodecError::Allocation {
-                resource: "section bytes",
-                bytes: total_len,
-            })?;
-        for (&field_ord, &offset) in expected_field_ords.iter().zip(&field_offsets) {
+        Ok(Self {
+            docid_lo,
+            docid_hi,
+            span,
+            presence_len: stored_meta_presence_len(span)?,
+            blob_lengths,
+            field_offsets,
+            total_len,
+            total_blob_bytes,
+        })
+    }
+
+    /// Exact canonical byte length of the merged STOREDMETA payload.
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.total_len
+    }
+
+    /// Append the canonical payload after [`Self::new`] validated the sources.
+    pub(crate) fn append_to(
+        &self,
+        sections: &[StoredMetaSection<'_>],
+        expected_field_ords: &[u16],
+        bytes: &mut Vec<u8>,
+    ) {
+        let section_start = bytes.len();
+        for (&field_ord, &offset) in expected_field_ords.iter().zip(&self.field_offsets) {
             bytes.extend_from_slice(&field_ord.to_le_bytes());
-            let offset = u32::try_from(offset)
-                .map_err(|_| StoredMetaCodecError::OffsetUnrepresentable { field_ord, offset })?;
+            let offset = u32::try_from(offset).expect("validated STOREDMETA field offset fits u32");
             bytes.extend_from_slice(&offset.to_le_bytes());
         }
 
-        let presence_len = stored_meta_presence_len(span)?;
         for (field_index, ((&field_ord, &field_offset), &blob_len)) in expected_field_ords
             .iter()
-            .zip(&field_offsets)
-            .zip(&blob_lengths)
+            .zip(&self.field_offsets)
+            .zip(&self.blob_lengths)
             .enumerate()
         {
-            debug_assert_eq!(bytes.len(), field_offset);
+            debug_assert_eq!(bytes.len() - section_start, field_offset);
             let presence_start = bytes.len();
-            let presence_end = presence_start.checked_add(presence_len).ok_or(
-                StoredMetaCodecError::ArithmeticOverflow {
-                    field: "presence end",
-                },
-            )?;
-            bytes.resize(presence_end, 0);
+            bytes.resize(presence_start + self.presence_len, 0);
             let mut current_offset = 0_u32;
             bytes.extend_from_slice(&current_offset.to_le_bytes());
             let mut output_ordinal = 0_usize;
-            let mut cursor = docid_lo;
+            let mut cursor = self.docid_lo;
             for section in sections {
-                let gap = section.docid_lo.checked_sub(cursor).ok_or(
-                    StoredMetaCodecError::ConcatRangeOrder {
-                        index: 0,
-                        previous_hi: cursor,
-                        current_lo: section.docid_lo,
-                    },
-                )?;
-                let gap =
-                    usize::try_from(gap).map_err(|_| StoredMetaCodecError::ResourceLimit {
-                        resource: "concat gap",
-                        actual: gap,
-                        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
-                    })?;
-                output_ordinal = output_ordinal.checked_add(gap).ok_or(
-                    StoredMetaCodecError::ArithmeticOverflow {
-                        field: "concat gap end",
-                    },
-                )?;
-                for _ in 0..gap {
-                    bytes.extend_from_slice(&current_offset.to_le_bytes());
-                }
+                let gap = usize::try_from(section.docid_lo - cursor)
+                    .expect("validated STOREDMETA gap fits usize");
+                output_ordinal += gap;
+                append_repeated_u32(bytes, current_offset, gap);
 
-                let field =
-                    section
-                        .field_at(field_index)
-                        .ok_or(StoredMetaCodecError::UnexpectedField {
-                            index: field_index,
-                            expected: Some(field_ord),
-                            actual: None,
-                        })?;
-                let source_span = usize::try_from(section.span()).map_err(|_| {
-                    StoredMetaCodecError::ResourceLimit {
-                        resource: "source docid span",
-                        actual: section.span(),
-                        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
-                    }
-                })?;
+                let field = section
+                    .field_at(field_index)
+                    .expect("validated STOREDMETA source field");
+                let source_span =
+                    usize::try_from(section.span()).expect("validated STOREDMETA span fits usize");
                 for ordinal in 0..source_span {
                     if stored_meta_presence_bit(field.presence, ordinal).unwrap_or(false) {
                         bytes[presence_start + output_ordinal / 8] |= 1 << (output_ordinal % 8);
                     }
-                    let start = stored_meta_offset(field.offsets, ordinal).ok_or_else(|| {
-                        StoredMetaCodecError::Truncated {
-                            expected: (ordinal + 1).saturating_mul(std::mem::size_of::<u32>()),
-                            actual: field.offsets.len(),
-                        }
-                    })?;
-                    let end = stored_meta_offset(field.offsets, ordinal + 1).ok_or_else(|| {
-                        StoredMetaCodecError::Truncated {
-                            expected: (ordinal + 2).saturating_mul(std::mem::size_of::<u32>()),
-                            actual: field.offsets.len(),
-                        }
-                    })?;
-                    current_offset = current_offset.checked_add(end - start).ok_or(
-                        StoredMetaCodecError::ArithmeticOverflow {
-                            field: "concatenated value offset",
-                        },
-                    )?;
+                    let start = stored_meta_offset(field.offsets, ordinal)
+                        .expect("validated STOREDMETA source offset");
+                    let end = stored_meta_offset(field.offsets, ordinal + 1)
+                        .expect("validated STOREDMETA source offset end");
+                    current_offset = current_offset
+                        .checked_add(end - start)
+                        .expect("validated STOREDMETA blob length fits u32");
                     bytes.extend_from_slice(&current_offset.to_le_bytes());
                     output_ordinal += 1;
                 }
                 cursor = section.docid_hi;
             }
-            debug_assert_eq!(output_ordinal, span);
+            debug_assert_eq!(output_ordinal, self.span);
             debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
             for section in sections {
-                let field =
-                    section
-                        .field_at(field_index)
-                        .ok_or(StoredMetaCodecError::UnexpectedField {
-                            index: field_index,
-                            expected: Some(field_ord),
-                            actual: None,
-                        })?;
+                let field = section
+                    .field_at(field_index)
+                    .expect("validated STOREDMETA source field");
                 bytes.extend_from_slice(field.blob);
             }
             tracing::debug!(
@@ -9518,62 +10244,14 @@ impl EncodedStoredMetaSection {
                 "concatenated Quill STOREDMETA field blob"
             );
         }
-        debug_assert_eq!(bytes.len(), total_len);
+        debug_assert_eq!(bytes.len() - section_start, self.total_len);
         tracing::debug!(
             field_count = expected_field_ords.len(),
-            blob_bytes = total_blob_bytes,
-            section_bytes = total_len,
+            blob_bytes = self.total_blob_bytes,
+            section_bytes = self.total_len,
             source_segments = sections.len(),
             "concatenated Quill STOREDMETA section"
         );
-        Ok(Self {
-            bytes,
-            docid_lo,
-            docid_hi,
-            field_count: expected_field_ords.len(),
-            blob_bytes: total_blob_bytes,
-        })
-    }
-
-    /// Borrow the exact canonical durable bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Consume the wrapper and return its durable bytes.
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    /// Number of schema-stored fields.
-    #[must_use]
-    pub const fn field_count(&self) -> usize {
-        self.field_count
-    }
-
-    /// Sum of opaque field blob bytes, excluding directories and offsets.
-    #[must_use]
-    pub const fn blob_bytes(&self) -> u64 {
-        self.blob_bytes
-    }
-
-    /// Re-open the owned bytes through the validating zero-copy reader.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if an internal invariant was violated.
-    pub fn section(
-        &self,
-        expected_field_ords: &[u16],
-    ) -> Result<StoredMetaSection<'_>, StoredMetaCodecError> {
-        StoredMetaSection::parse(
-            &self.bytes,
-            self.docid_lo,
-            self.docid_hi,
-            expected_field_ords,
-        )
     }
 }
 
@@ -11553,9 +12231,13 @@ mod tests {
         let left_list = left.posting_list()?;
         let right_list = right.posting_list()?;
 
-        let mut concatenated = left.as_bytes().to_vec();
-        concatenated.extend_from_slice(right.as_bytes());
-        let merged = PostingList::parse(&concatenated, 400)?;
+        let concatenated = EncodedPostingList::concatenate(&[&left_list, &right_list])?;
+        assert_eq!(concatenated.doc_freq(), 400);
+        assert_eq!(
+            concatenated.block_count(),
+            left_list.block_count() + right_list.block_count()
+        );
+        let merged = concatenated.posting_list()?;
         assert_eq!(
             merged
                 .blocks()
@@ -11599,7 +12281,7 @@ mod tests {
         assert_eq!(merged.decode_all()?, expected);
         let monolithic = EncodedPostingList::encode(&expected)?;
         assert_eq!(monolithic.posting_list()?.decode_all()?, expected);
-        assert_ne!(concatenated, monolithic.as_bytes());
+        assert_ne!(concatenated.as_bytes(), monolithic.as_bytes());
 
         let seam_doc = right_postings[0].doc_id;
         let mut cursor = merged.cursor()?;
@@ -11607,12 +12289,68 @@ mod tests {
         assert_eq!(cursor.advance(seam_doc)?, Some(right_postings[0]));
         assert_eq!(cursor.next()?, Some(right_postings[1]));
 
-        let mut reversed = right.as_bytes().to_vec();
-        reversed.extend_from_slice(left.as_bytes());
         assert!(matches!(
-            PostingList::parse(&reversed, 400),
-            Err(PostingCodecError::NonAscendingDecoded { .. })
+            EncodedPostingList::concatenate(&[&right_list, &left_list]),
+            Err(PostingCodecError::ConcatRangeOrder { .. })
         ));
+        assert!(matches!(
+            EncodedPostingList::concatenate(&[]),
+            Err(PostingCodecError::EmptyConcat)
+        ));
+        assert!(matches!(
+            EncodedPostingList::concatenate_with_limits(
+                &[&left_list, &right_list],
+                PostingListLimits {
+                    max_blocks: DEFAULT_MAX_POSTING_BLOCKS,
+                    max_postings: 399,
+                },
+            ),
+            Err(PostingCodecError::PostingLimitExceeded {
+                limit: 399,
+                actual: 400,
+            })
+        ));
+        assert!(matches!(
+            EncodedPostingList::concatenate_with_limits(
+                &[&left_list, &right_list],
+                PostingListLimits {
+                    max_blocks: 3,
+                    max_postings: DEFAULT_MAX_POSTINGS_PER_TERM,
+                },
+            ),
+            Err(PostingCodecError::BlockBudgetExhausted {
+                limit: 3,
+                validated: 4,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn posting_concat_is_associative_and_copies_exact_source_bytes() -> TestResult {
+        let a = EncodedPostingList::encode(&sparse_postings(100, 100))?;
+        let b = EncodedPostingList::encode(&sparse_postings(120, 10_000))?;
+        let c = EncodedPostingList::encode(&sparse_postings(80, 100_000))?;
+        let first_list = a.posting_list()?;
+        let second_list = b.posting_list()?;
+        let third_list = c.posting_list()?;
+
+        let direct = EncodedPostingList::concatenate(&[&first_list, &second_list, &third_list])?;
+        let first_pair = EncodedPostingList::concatenate(&[&first_list, &second_list])?;
+        let combined_list = first_pair.posting_list()?;
+        let staged = EncodedPostingList::concatenate(&[&combined_list, &third_list])?;
+        assert_eq!(staged, direct);
+
+        let mut exact = Vec::new();
+        exact.extend_from_slice(a.as_bytes());
+        exact.extend_from_slice(b.as_bytes());
+        exact.extend_from_slice(c.as_bytes());
+        assert_eq!(direct.as_bytes(), exact);
+        assert_eq!(direct.doc_freq(), 300);
+        assert_eq!(
+            direct.block_count(),
+            a.block_count() + b.block_count() + c.block_count()
+        );
         Ok(())
     }
 
@@ -12996,6 +13734,179 @@ mod tests {
     }
 
     #[test]
+    fn doclen_concat_inserts_gaps_preserves_raw_ids_and_is_associative() -> TestResult {
+        let expected_fields = [1_u16, 4];
+        let a_one = [Some(1), Some(41)];
+        let a_four = [Some(65), Some(100)];
+        let b_one = [Some(u32::MAX)];
+        let b_four = [Some(0)];
+        let c_one = [Some(42), Some(2_013_265_944)];
+        let c_four = [None, Some(1)];
+        let a = EncodedDocLenSection::encode(
+            10,
+            12,
+            &expected_fields,
+            &[
+                DocLenFieldInput::new(1, &a_one),
+                DocLenFieldInput::new(4, &a_four),
+            ],
+        )?;
+        let b = EncodedDocLenSection::encode(
+            14,
+            15,
+            &expected_fields,
+            &[
+                DocLenFieldInput::new(1, &b_one),
+                DocLenFieldInput::new(4, &b_four),
+            ],
+        )?;
+        let c = EncodedDocLenSection::encode(
+            16,
+            18,
+            &expected_fields,
+            &[
+                DocLenFieldInput::new(1, &c_one),
+                DocLenFieldInput::new(4, &c_four),
+            ],
+        )?;
+        let first_section = a.section(&expected_fields)?;
+        let second_section = b.section(&expected_fields)?;
+        let third_section = c.section(&expected_fields)?;
+        let sections = [
+            first_section.clone(),
+            second_section.clone(),
+            third_section.clone(),
+        ];
+        let direct = EncodedDocLenSection::concatenate(&sections, &expected_fields)?;
+
+        let monolithic_one = [
+            Some(1),
+            Some(41),
+            None,
+            None,
+            Some(u32::MAX),
+            None,
+            Some(42),
+            Some(2_013_265_944),
+        ];
+        let monolithic_four = [
+            Some(65),
+            Some(100),
+            None,
+            None,
+            Some(0),
+            None,
+            None,
+            Some(1),
+        ];
+        let monolithic = EncodedDocLenSection::encode(
+            10,
+            18,
+            &expected_fields,
+            &[
+                DocLenFieldInput::new(1, &monolithic_one),
+                DocLenFieldInput::new(4, &monolithic_four),
+            ],
+        )?;
+        assert_eq!(direct.as_bytes(), monolithic.as_bytes());
+        let direct_section = direct.section(&expected_fields)?;
+        let direct_one = direct_section.field(1).ok_or("merged DOCLEN field 1")?;
+        assert_eq!(
+            &direct_one.fieldnorm_ids()[..2],
+            first_section
+                .field(1)
+                .ok_or("source DOCLEN field 1")?
+                .fieldnorm_ids()
+        );
+        assert_eq!(
+            &direct_one.fieldnorm_ids()[2..4],
+            &[DOCLEN_HOLE_FIELDNORM_ID; 2]
+        );
+        assert_eq!(direct_one.fieldnorm_ids()[5], DOCLEN_HOLE_FIELDNORM_ID);
+
+        let left_pair = EncodedDocLenSection::concatenate(&sections[..2], &expected_fields)?;
+        let combined_section = left_pair.section(&expected_fields)?;
+        let left_associated = EncodedDocLenSection::concatenate(
+            &[combined_section, third_section.clone()],
+            &expected_fields,
+        )?;
+        assert_eq!(left_associated, direct);
+        let right_pair = EncodedDocLenSection::concatenate(&sections[1..], &expected_fields)?;
+        let trailing_section = right_pair.section(&expected_fields)?;
+        let right_associated = EncodedDocLenSection::concatenate(
+            &[first_section.clone(), trailing_section],
+            &expected_fields,
+        )?;
+        assert_eq!(right_associated, direct);
+        Ok(())
+    }
+
+    #[test]
+    fn doclen_concat_rejects_empty_reversed_overlap_field_drift_and_limits() -> TestResult {
+        let expected_fields = [1_u16];
+        let left_lengths = [Some(1), Some(2)];
+        let right_lengths = [Some(3)];
+        let left = EncodedDocLenSection::encode(
+            10,
+            12,
+            &expected_fields,
+            &[DocLenFieldInput::new(1, &left_lengths)],
+        )?;
+        let right = EncodedDocLenSection::encode(
+            14,
+            15,
+            &expected_fields,
+            &[DocLenFieldInput::new(1, &right_lengths)],
+        )?;
+        let overlap = EncodedDocLenSection::encode(
+            11,
+            12,
+            &expected_fields,
+            &[DocLenFieldInput::new(1, &right_lengths)],
+        )?;
+        let left_section = left.section(&expected_fields)?;
+        let right_section = right.section(&expected_fields)?;
+        let overlap_section = overlap.section(&expected_fields)?;
+        assert!(matches!(
+            EncodedDocLenSection::concatenate(&[], &expected_fields),
+            Err(DocLenCodecError::EmptyConcat)
+        ));
+        assert!(matches!(
+            EncodedDocLenSection::concatenate(
+                &[right_section.clone(), left_section.clone()],
+                &expected_fields
+            ),
+            Err(DocLenCodecError::ConcatRangeOrder { index: 1, .. })
+        ));
+        assert!(matches!(
+            EncodedDocLenSection::concatenate(
+                &[left_section.clone(), overlap_section],
+                &expected_fields
+            ),
+            Err(DocLenCodecError::ConcatRangeOrder { index: 1, .. })
+        ));
+        assert!(matches!(
+            EncodedDocLenSection::concatenate(&[left_section.clone(), right_section.clone()], &[2]),
+            Err(DocLenCodecError::UnexpectedField { index: 0, .. })
+        ));
+        assert!(matches!(
+            EncodedDocLenSection::concatenate_with_limits(
+                &[left_section, right_section],
+                &expected_fields,
+                DocLenLimits {
+                    max_docid_span: 4,
+                    ..DocLenLimits::default()
+                }
+            ),
+            Err(DocLenCodecError::ResourceLimit {
+                resource: "docid span",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn randomized_doclen_roundtrip_matches_quantization_oracle() -> TestResult {
         const BASE_SEED: u64 = 0x8b8b_1e17_d0c1_ea55;
         const FIELDS: [u16; 3] = [1, 4, 9];
@@ -13539,6 +14450,49 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_id_hash_concat_domain_matches_monolithic_id_map_bytes() -> TestResult {
+        let left_inputs = [Some(IdMapEntryInput::new("same", 1)), None];
+        let middle_inputs = [Some(IdMapEntryInput::new("β", 2))];
+        let right_inputs = [
+            Some(IdMapEntryInput::new("same", 3)),
+            Some(IdMapEntryInput::new("z", 4)),
+        ];
+        let left = EncodedIdMapSection::encode(10, 12, &left_inputs)?;
+        let middle = EncodedIdMapSection::encode(14, 15, &middle_inputs)?;
+        let right = EncodedIdMapSection::encode(16, 18, &right_inputs)?;
+        let id_maps = [left.section()?, middle.section()?, right.section()?];
+        let concat_plan = EncodedIdMapSection::plan_concatenate(&id_maps)?;
+
+        let monolithic_inputs = [
+            Some(IdMapEntryInput::new("same", 1)),
+            None,
+            None,
+            None,
+            Some(IdMapEntryInput::new("β", 2)),
+            None,
+            Some(IdMapEntryInput::new("same", 3)),
+            Some(IdMapEntryInput::new("z", 4)),
+        ];
+        let monolithic = EncodedIdMapSection::encode(10, 18, &monolithic_inputs)?;
+        let representative_ordinals = [4, 6, 7];
+        let expected = EncodedIdHashSection::encode_resolved_representatives(
+            monolithic.section()?,
+            &representative_ordinals,
+        )?;
+        let actual = EncodedIdHashSection::encode_resolved_concat(
+            &id_maps,
+            &concat_plan,
+            &representative_ordinals,
+        )?;
+
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+        assert_eq!(actual.capacity(), expected.capacity());
+        assert_eq!(actual.occupied(), expected.occupied());
+        actual.section(monolithic.section()?)?;
         Ok(())
     }
 
@@ -15145,6 +16099,215 @@ mod tests {
             Bound::Unbounded,
         )?;
         assert_eq!(high_unsigned.iter().collect::<Vec<_>>(), vec![105, 108]);
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_k_way_merge_handles_overlapping_values_and_is_associative() -> TestResult {
+        let a_signed = [
+            NumericEntry::i64(7, 101),
+            NumericEntry::i64(i64::MIN, 102),
+            NumericEntry::i64(-5, 100),
+        ];
+        let a_unsigned = [NumericEntry::u64(9, 103), NumericEntry::u64(0, 100)];
+        let b_signed = [
+            NumericEntry::i64(i64::MAX, 111),
+            NumericEntry::i64(-5, 110),
+            NumericEntry::i64(0, 112),
+        ];
+        let b_unsigned = [NumericEntry::u64(u64::MAX, 110), NumericEntry::u64(0, 112)];
+        let c_signed = [NumericEntry::i64(7, 121), NumericEntry::i64(-5, 120)];
+        let c_unsigned = [
+            NumericEntry::u64(1_u64 << 63, 121),
+            NumericEntry::u64(9, 120),
+        ];
+        let a = EncodedNumericSection::encode(
+            NUMERIC_TEST_SCHEMA,
+            100,
+            104,
+            &[
+                NumericFieldInput::new(0, &a_signed),
+                NumericFieldInput::new(1, &a_unsigned),
+            ],
+        )?;
+        let b = EncodedNumericSection::encode(
+            NUMERIC_TEST_SCHEMA,
+            110,
+            113,
+            &[
+                NumericFieldInput::new(0, &b_signed),
+                NumericFieldInput::new(1, &b_unsigned),
+            ],
+        )?;
+        let c = EncodedNumericSection::encode(
+            NUMERIC_TEST_SCHEMA,
+            120,
+            122,
+            &[
+                NumericFieldInput::new(0, &c_signed),
+                NumericFieldInput::new(1, &c_unsigned),
+            ],
+        )?;
+        let first_section = a.section()?;
+        let second_section = b.section()?;
+        let third_section = c.section()?;
+        let sections = [
+            first_section.clone(),
+            second_section.clone(),
+            third_section.clone(),
+        ];
+        let direct = EncodedNumericSection::merge_sorted(NUMERIC_TEST_SCHEMA, &sections)?;
+        assert_eq!(direct.entry_count(), 14);
+        let direct_section = direct.section()?;
+        assert_eq!(
+            direct_section
+                .field(0)
+                .ok_or("merged signed NUMERIC field")?
+                .entries()
+                .collect::<Vec<_>>(),
+            vec![
+                NumericEntry::i64(i64::MIN, 102),
+                NumericEntry::i64(-5, 100),
+                NumericEntry::i64(-5, 110),
+                NumericEntry::i64(-5, 120),
+                NumericEntry::i64(0, 112),
+                NumericEntry::i64(7, 101),
+                NumericEntry::i64(7, 121),
+                NumericEntry::i64(i64::MAX, 111),
+            ]
+        );
+        assert_eq!(
+            direct_section
+                .field(1)
+                .ok_or("merged unsigned NUMERIC field")?
+                .entries()
+                .collect::<Vec<_>>(),
+            vec![
+                NumericEntry::u64(0, 100),
+                NumericEntry::u64(0, 112),
+                NumericEntry::u64(9, 103),
+                NumericEntry::u64(9, 120),
+                NumericEntry::u64(1_u64 << 63, 121),
+                NumericEntry::u64(u64::MAX, 110),
+            ]
+        );
+
+        let all_signed = [
+            NumericEntry::i64(7, 101),
+            NumericEntry::i64(i64::MIN, 102),
+            NumericEntry::i64(-5, 100),
+            NumericEntry::i64(i64::MAX, 111),
+            NumericEntry::i64(-5, 110),
+            NumericEntry::i64(0, 112),
+            NumericEntry::i64(7, 121),
+            NumericEntry::i64(-5, 120),
+        ];
+        let all_unsigned = [
+            NumericEntry::u64(9, 103),
+            NumericEntry::u64(0, 100),
+            NumericEntry::u64(u64::MAX, 110),
+            NumericEntry::u64(0, 112),
+            NumericEntry::u64(1_u64 << 63, 121),
+            NumericEntry::u64(9, 120),
+        ];
+        let monolithic = EncodedNumericSection::encode(
+            NUMERIC_TEST_SCHEMA,
+            100,
+            122,
+            &[
+                NumericFieldInput::new(0, &all_signed),
+                NumericFieldInput::new(1, &all_unsigned),
+            ],
+        )?;
+        assert_eq!(direct.as_bytes(), monolithic.as_bytes());
+
+        let left_pair = EncodedNumericSection::merge_sorted(
+            NUMERIC_TEST_SCHEMA,
+            &[first_section.clone(), second_section.clone()],
+        )?;
+        let combined_section = left_pair.section()?;
+        let left_associated = EncodedNumericSection::merge_sorted(
+            NUMERIC_TEST_SCHEMA,
+            &[combined_section, third_section.clone()],
+        )?;
+        assert_eq!(left_associated, direct);
+        let right_pair = EncodedNumericSection::merge_sorted(
+            NUMERIC_TEST_SCHEMA,
+            &[second_section, third_section],
+        )?;
+        let trailing_section = right_pair.section()?;
+        let right_associated = EncodedNumericSection::merge_sorted(
+            NUMERIC_TEST_SCHEMA,
+            &[first_section, trailing_section],
+        )?;
+        assert_eq!(right_associated, direct);
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_merge_rejects_empty_reversed_overlap_and_resource_exhaustion() -> TestResult {
+        let left = EncodedNumericSection::encode(
+            NUMERIC_TEST_SCHEMA,
+            10,
+            12,
+            &[
+                NumericFieldInput::new(0, &[NumericEntry::i64(1, 10)]),
+                NumericFieldInput::new(1, &[NumericEntry::u64(1, 11)]),
+            ],
+        )?;
+        let right = EncodedNumericSection::encode(
+            NUMERIC_TEST_SCHEMA,
+            14,
+            16,
+            &[
+                NumericFieldInput::new(0, &[NumericEntry::i64(1, 14)]),
+                NumericFieldInput::new(1, &[NumericEntry::u64(1, 15)]),
+            ],
+        )?;
+        let overlap = EncodedNumericSection::encode(
+            NUMERIC_TEST_SCHEMA,
+            11,
+            13,
+            &[
+                NumericFieldInput::new(0, &[NumericEntry::i64(2, 11)]),
+                NumericFieldInput::new(1, &[]),
+            ],
+        )?;
+        let left_section = left.section()?;
+        let right_section = right.section()?;
+        let overlap_section = overlap.section()?;
+        assert!(matches!(
+            EncodedNumericSection::merge_sorted(NUMERIC_TEST_SCHEMA, &[]),
+            Err(NumericCodecError::EmptyMerge)
+        ));
+        assert!(matches!(
+            EncodedNumericSection::merge_sorted(
+                NUMERIC_TEST_SCHEMA,
+                &[right_section.clone(), left_section.clone()]
+            ),
+            Err(NumericCodecError::MergeRangeOrder { index: 1, .. })
+        ));
+        assert!(matches!(
+            EncodedNumericSection::merge_sorted(
+                NUMERIC_TEST_SCHEMA,
+                &[left_section.clone(), overlap_section]
+            ),
+            Err(NumericCodecError::MergeRangeOrder { index: 1, .. })
+        ));
+        assert!(matches!(
+            EncodedNumericSection::merge_sorted_with_limits(
+                NUMERIC_TEST_SCHEMA,
+                &[left_section, right_section],
+                NumericLimits {
+                    max_total_entries: 3,
+                    ..NumericLimits::default()
+                }
+            ),
+            Err(NumericCodecError::ResourceLimit {
+                resource: "total entries",
+                ..
+            })
+        ));
         Ok(())
     }
 

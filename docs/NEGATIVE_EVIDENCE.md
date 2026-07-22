@@ -15463,3 +15463,191 @@ calibration done; index quantize = cod-active; durability = #2 landed + #3 below
 worthwhile, un-swarmed perf lever this pass.** Next: the fsvi #3 stays a deprioritized lead (do it only if the
 verify() split is wanted for its own sake); otherwise wait for quill code or a fresh win to spawn a new twin.
 No code changed.
+
+### 2026-07-19 — SapphireHill — HOLD: Quill concat merge remains above the 2/4/8/16-source CPU/physical-I/O-byte spread gate (`bd-quill-e3-keeper-ndtk.5`)
+
+The predeclared gate in `concat_merge_ab` is
+`max(median ns / exact physical I/O byte) / min(...) <= 1.35x`, where the exact
+physical byte count is source FSLX bytes plus merged-output FSLX bytes. All
+measurements used strict remote execution on the same `ovh-a` worker:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+The fixture held logical work fixed at 1,024 documents (1,008 live, 16
+tombstones) and reported exact physical byte counts of 2,745,208 / 7,277,512 /
+16,354,280 / 34,543,016 for 2 / 4 / 8 / 16 source segments.
+
+| Variant | 2-source median (ns/B) | 4-source median (ns/B) | 8-source median (ns/B) | 16-source median (ns/B) | max/min spread |
+|---|---:|---:|---:|---:|---:|
+| Restored control (`quiver.rs` SHA-256 `7216c6dbd2d5aa36dda5529f708cba834d8e2ef756747c9074fbaf9bef0404ac`) | 3.4676 ms (1.263147) | 8.1796 ms (1.123956) | 18.485 ms (1.130285) | 69.385 ms (2.008655) | **1.787130x — FAIL** |
+| Direct STOREDMETA assembly (eliminate span-sized value materialization and copy each source field blob once) | 2.3012 ms (0.838261) | 4.7021 ms (0.646114) | 10.403 ms (0.636103) | 52.949 ms (1.532842) | **2.409741x — FAIL** |
+| Direct IDMAP final-buffer emission (eliminate temporary `Vec<u32>` offsets and `Vec<u64>` hashes) | 2.9945 ms (1.090810) | 6.8508 ms (0.941366) | 15.150 ms (0.926363) | 46.527 ms (1.346929) | **1.453997x — FAIL** |
+| Combined direct IDMAP + STOREDMETA final-buffer emission | 1.7533 ms (0.638677) | 3.1664 ms (0.435094) | 6.7024 ms (0.409825) | 30.372 ms (0.879252) | **2.145429x — FAIL** |
+
+The IDMAP candidate passed the exact monolithic-byte oracle remotely before its
+timed run. It improved the absolute 16-source median by about 32.9% versus the
+fresh control, but improved the smaller fan-ins enough that normalized spread
+still missed the contract by 7.7%. The STOREDMETA candidate widened spread even
+further.
+
+A strict-remote `perf` profile of the committed 16-source path then attributed
+about 51% of sampled child cost to the small `Vec<u8>` append-heavy assembly
+paths, with page faults/copying dominant and XXH3 hashing retaining an expected
+roughly 14.6% linear floor. The combined candidate therefore pre-sized and wrote
+both canonical output buffers directly. It passed all 14 concat unit/oracle
+tests plus crate-scoped `clippy -D warnings`, and improved every absolute median
+by roughly 49-64%. It nevertheless improved 2/4/8 sources much more than 16,
+yielding a 2.145429x normalized spread. The gate therefore rejects it despite
+the absolute speedup. All three speculative source cuts were reverted; the
+final `quiver.rs` matches the landed correctness checkpoint byte-for-byte
+(SHA-256 `31ce9e287f6c78f3684bfe93760c08c507e3404b37d55e64d14eb49276014554`).
+
+The remote benchmark commands exited 0 and emitted all measurements. Local
+Criterion artifact retrieval subsequently warned `No space left on device`; that
+post-measurement rsync failure does not invalidate the complete remote stdout.
+
+**Decision: HOLD.** Keep `bd-quill-e3-keeper-ndtk.5` `in_progress`; do not claim
+flat CPU/byte or close the Bead. The correctness checkpoint may land separately,
+but no measured perf candidate from this dig is retained.
+
+### 2026-07-19 — SapphireHill — HOLD follow-up: one-pass final FSLX assembly still misses the concat spread gate (`bd-quill-e3-keeper-ndtk.5`)
+
+The next single-lever candidate removed the remaining large intermediate-to-final
+copy: an exact-reserved `SegmentAssembler` emitted IDMAP and STOREDMETA directly
+into their final FSLX offsets, while retaining the existing canonical writer as a
+byte oracle. IDHASH was built from the validated conceptual concat domain before
+NUMERIC/STOREDMETA/STATS, preserving the incumbent collision, probe-budget,
+allocation, and error-order behavior without materializing a merged IDMAP.
+
+The final candidate passed the complete strict-remote Quill library suite on
+`ovh-a` (380 passed, 1 ignored, 0 failed). New checks covered complete FSLX byte
+identity, short/long/out-of-order assembler writes, and exact IDHASH equality
+between concat-domain and monolithic IDMAP construction across holes and duplicate
+physical identifiers. The all-targets clippy gate reached the crate with no
+finding in the three candidate-owned files, then stopped on pre-existing peer-owned
+warnings in `index.rs` and `query.rs`; those unrelated dirty files were not edited.
+
+Exactly one canonical timed run used the same worker, release profile, fixture,
+and exact physical-byte denominators as the table above:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| Variant | 2-source median (ns/B) | 4-source median (ns/B) | 8-source median (ns/B) | 16-source median (ns/B) | max/min spread |
+|---|---:|---:|---:|---:|---:|
+| Exact-reserve one-pass FSLX assembly | 1.6128 ms (0.587496) | 2.7231 ms (0.374180) | 4.9666 ms (0.303688) | 23.707 ms (0.686304) | **2.259897x — FAIL** |
+
+The candidate improved every absolute median by about 53-73% versus the restored
+control, including a 65.8% reduction at 16 sources. It nevertheless accelerated
+8 sources most and left the 16-source cache/page-fault cliff visible, so normalized
+spread exceeded the predeclared `1.35x` ceiling by 67.4%. The remote command exited
+0 and emitted all four complete measurements. The subsequent local Criterion
+artifact retrieval warning (`No space left on device`) occurred after timing and
+does not invalidate remote stdout. No second run, worker reroute, or local Cargo
+fallback was used.
+
+**Decision: HOLD.** Revert all speculative changes in `keeper.rs`, `quiver.rs`,
+and `segment.rs`; retain only this negative-evidence row. Leave
+`bd-quill-e3-keeper-ndtk.5` `in_progress`, add no PERF_LEDGER win, and do not claim
+the flat CPU/physical-byte acceptance criterion.
+
+### 2026-07-19 — SapphireHill — HOLD follow-up: removing the redundant post-encode checksum replay does not flatten concat scaling (`bd-quill-e3-keeper-ndtk.5`)
+
+This single-lever candidate retained the structural `SegmentReader::from_bytes`
+reopen of the freshly encoded merged FSLX image, but removed the immediately
+following `SegmentReader::verify()` replay. The canonical encoder had just
+computed every section XXH3 witness and the complete file-prefix witness from
+those same immutable bytes; the replay therefore reread every section and then
+the full file a second time before owned or durable publication. The hypothesis
+was that avoiding those two full-output reads would remove the 16-source
+working-set cliff while preserving framing, section-layout, and trailer-CRC
+validation.
+
+The complete strict-remote Quill library suite passed on `ovh-a` (377 passed,
+1 ignored, 0 failed). Crate-scoped `clippy -D warnings` reached Quill and stopped
+only on four pre-existing peer-owned warnings in `index.rs`; the candidate-owned
+`keeper.rs` produced no lint. The remote workspace-wide format check likewise
+reported only unrelated pre-existing files. UBS found no candidate-specific
+issue among its whole-file heuristic inventory.
+
+Exactly one canonical timed run used the same worker, release profile, fixture,
+and exact physical-byte denominators as the preceding rows:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| Variant | 2-source median (ns/B) | 4-source median (ns/B) | 8-source median (ns/B) | 16-source median (ns/B) | max/min spread |
+|---|---:|---:|---:|---:|---:|
+| Structural reopen without eager checksum replay | 3.3043 ms (1.203661) | 7.8243 ms (1.075134) | 17.382 ms (1.062841) | 66.842 ms (1.935037) | **1.820627x — FAIL** |
+
+The cut improved absolute medians by only about 3.7-6.0% versus the restored
+control and slightly worsened normalized spread from 1.787130x to 1.820627x.
+The 16-source result remains 34.9% above the predeclared `1.35x` ceiling, so the
+redundant checksum replay is not the dominant scaling defect. The remote command
+exited 0 and emitted all four complete measurements. The subsequent local
+Criterion artifact retrieval warning (`No space left on device`) occurred after
+timing and does not invalidate remote stdout. No second run, worker reroute, or
+local Cargo fallback was used.
+
+**Decision: HOLD.** Restore `keeper.rs` exactly and retain only this evidence.
+Leave `bd-quill-e3-keeper-ndtk.5` `in_progress`, add no PERF_LEDGER win, and do
+not claim the flat CPU/physical-byte acceptance criterion.
+
+### 2026-07-19 — SapphireHill — HOLD follow-up: bulk STOREDMETA gap-offset emission accelerates every size but worsens concat scaling (`bd-quill-e3-keeper-ndtk.5`)
+
+This one-lever candidate replaced STOREDMETA's scalar four-byte append for every
+burned-tail hole and stored field with a byte-identical bulk emitter. The helper
+seeded one little-endian `u32` and geometrically duplicated the initialized range
+with `Vec::extend_from_within`; the enclosing concat path had already validated
+the exact output layout and reserved the complete section. At 16 sources and
+five stored fields this removed roughly 4.9 million tiny `Vec` extension calls
+without changing offset values, presence bits, blobs, or validation order.
+
+A focused scalar-oracle test covered counts 0/1/2/3, doubling boundaries around
+64 and 1024, and the production-sized 65,472/65,473 gaps for values `0`,
+`0x01020304`, and `u32::MAX`. It passed strict-remotely alongside both existing
+STOREDMETA concat equivalence tests. The complete strict-remote Quill library
+suite then passed on `ovh-a` (378 passed, 1 ignored, 0 failed). Crate-scoped
+`clippy -D warnings` reached Quill and stopped only on the four pre-existing
+peer-owned `index.rs` findings; the candidate-owned `quiver.rs` produced no
+lint. The exact file also passed `rustfmt --check`.
+
+Exactly one canonical timed run used the same worker, release profile, fixture,
+and exact physical-byte denominators as the preceding rows:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| Variant | 2-source median (ns/B) | 4-source median (ns/B) | 8-source median (ns/B) | 16-source median (ns/B) | max/min spread |
+|---|---:|---:|---:|---:|---:|
+| Bulk repeated STOREDMETA gap offsets | 2.2721 ms (0.827660) | 4.6591 ms (0.640205) | 10.327 ms (0.631455) | 52.131 ms (1.509162) | **2.389973x — FAIL** |
+
+The bulk emitter improved every absolute median, and Criterion reported roughly
+22-40% reductions versus its same-worker cached baseline. It accelerated the
+4/8-source cases much more than the 16-source case, however, so the normalized
+spread worsened to 2.389973x: 77.0% above the predeclared `1.35x` ceiling and
+worse than the restored control's 1.787130x. Tiny gap-offset appends are real
+overhead but are not the dominant 16-source scaling defect. The remote command
+exited 0 and emitted all four complete measurements. The subsequent local
+Criterion artifact retrieval warning (`No space left on device`) occurred after
+timing and does not invalidate remote stdout. No second run, worker reroute, or
+local Cargo fallback was used.
+
+**Decision: HOLD.** Restore `quiver.rs` exactly (SHA-256
+`31ce9e287f6c78f3684bfe93760c08c507e3404b37d55e64d14eb49276014554`) and
+retain only this evidence. Leave `bd-quill-e3-keeper-ndtk.5` `in_progress`, add
+no PERF_LEDGER win, and do not claim the flat CPU/physical-byte acceptance
+criterion.

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
+use asupersync::runtime::spawn_blocking;
 use frankensearch_core::IndexableDocument;
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
@@ -29,7 +30,8 @@ use crate::keeper::{
     ManifestFieldStats, ManifestSegment, RecoveredSegment, TombstoneSet,
 };
 use crate::query::{
-    DefaultQueryParser, Query, QueryDiagnostic, QueryParserConfigError, canonicalize_query,
+    DefaultQueryParser, Query, QueryDiagnostic, QueryDiagnosticKind, QueryParserConfigError,
+    QueryValue, canonicalize_query,
 };
 use crate::quiver::{
     DocLenCodecError, DocLenSection, PositionCodecError, PositionList, Posting, PostingCodecError,
@@ -38,7 +40,8 @@ use crate::quiver::{
 use crate::schema::{DEFAULT_SCHEMA, SchemaDescriptor};
 use crate::scribe::{
     AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, FlushDocumentInput, FlushError,
-    FlushMode, FlushSegmentInput, IndexedFieldValue, StoredFieldValue, flush_accumulator_with_mode,
+    FlushMode, FlushSegmentInput, IndexedFieldValue, IndexedNumericValue, StoredFieldValue,
+    flush_accumulator_with_mode,
 };
 use crate::segment::{EncodedSegment, SectionKind};
 
@@ -603,6 +606,65 @@ impl QuillIndex {
         Ok(self.backend.snapshot())
     }
 
+    /// Replace one exact committed manifest run with a Q1 concat merge.
+    ///
+    /// The caller supplies source ids in current manifest order plus a
+    /// collision-free output identity. Policy-driven candidate selection and
+    /// identity generation remain Keeper E3.7 concerns; this method enforces
+    /// that no accumulator or staged publication can race the structural
+    /// replacement.
+    ///
+    /// # Errors
+    ///
+    /// Rejects uncommitted state, cancellation, a nonconsecutive source run,
+    /// codec/invariant failures, or durable publication failure.
+    pub async fn concat_merge(
+        &mut self,
+        cx: &Cx,
+        source_segment_ids: &[u64],
+        output_segment_id: u64,
+        created_unix_s: i64,
+    ) -> Result<&KeeperSnapshot, QuillIndexError> {
+        check_cancel(cx, "concat merge")?;
+        if self.has_uncommitted_changes() {
+            return Err(invalid_state(
+                "concat merge requires a fully committed scalar index",
+            ));
+        }
+        let next_seal_seq = self
+            .next_seal_seq
+            .checked_add(1)
+            .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+        match &mut self.backend {
+            IndexBackend::Durable(writer) => {
+                writer
+                    .concat_merge(cx, source_segment_ids, output_segment_id, created_unix_s)
+                    .await?;
+            }
+            IndexBackend::Memory(snapshot) => {
+                check_cancel(cx, "concat merge")?;
+                let source_snapshot = snapshot.clone();
+                let mut source_ids = Vec::new();
+                source_ids
+                    .try_reserve_exact(source_segment_ids.len())
+                    .map_err(|_| invalid_state("could not allocate concat-merge source ids"))?;
+                source_ids.extend_from_slice(source_segment_ids);
+                let successor = spawn_blocking(move || {
+                    source_snapshot.concat_merge_owned(
+                        &source_ids,
+                        output_segment_id,
+                        created_unix_s,
+                    )
+                })
+                .await?;
+                check_cancel(cx, "concat merge")?;
+                *snapshot = successor;
+            }
+        }
+        self.next_seal_seq = next_seal_seq;
+        Ok(self.backend.snapshot())
+    }
+
     fn prepare_pending_manifest(&mut self) -> Result<(), QuillIndexError> {
         if self.pending_manifest.is_some() {
             return Ok(());
@@ -896,6 +958,46 @@ impl QuillIndex {
             );
             parsed
         };
+        let mut result = self.search_paginated_ast(cx, &parsed.query, limit, offset, exact_count)?;
+        result.diagnostics = parsed.diagnostics;
+        Ok(result)
+    }
+
+    /// Execute one already-parsed engine-neutral query AST with pagination.
+    ///
+    /// This is the execution entry for programmatic ASTs — the CASS profile
+    /// (CassQueryParser output, structured filters, typed leaves) and any
+    /// caller that builds queries directly. Text query strings belong to
+    /// [`Self::search_paginated`].
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, section validation, unsupported-query, or
+    /// scorer/collector failures.
+    pub fn search_paginated_ast(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        check_cancel(cx, "search")?;
+        let query_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::ARGUS_QUERY,
+            phase = "query_ast",
+            segment_count = self.backend.snapshot().segments().len(),
+            doc_count = self.backend.snapshot().doc_count(),
+            limit,
+            offset,
+            exact_count,
+            result_count = tracing::field::Empty,
+            total_count = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _query_timer = crate::tracing_conventions::StageTimer::new(&query_span);
+        let _query_entered = query_span.enter();
         let snapshot = self.backend.snapshot();
         let mut collector = if exact_count {
             TopDocsCollector::with_exact_count(limit, offset)?
@@ -914,7 +1016,7 @@ impl QuillIndex {
             );
             let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
             let _score_entered = score_span.enter();
-            let mut scorer = lower_query(&parsed.query, 1.0, segment, snapshot, self.schema)?;
+            let mut scorer = lower_query(query, 1.0, segment, snapshot, self.schema)?;
             collector.collect(&mut scorer, segment)?;
         }
         let collect_span = tracing::info_span!(
@@ -957,7 +1059,7 @@ impl QuillIndex {
             hits,
             total_count,
             doc_count: snapshot.doc_count(),
-            diagnostics: parsed.diagnostics,
+            diagnostics: Vec::new(),
         })
     }
 
@@ -1456,12 +1558,229 @@ fn lower_query_with_mode(
             }
             lower_query_with_mode(query, boost, segment, snapshot, schema, mode)
         }
-        Query::Range { .. } | Query::Set { .. } | Query::Glob { .. } => {
-            Err(QuillIndexError::UnsupportedQuery {
-                detail: "range, set, and glob lowering belongs to a later checkpoint".to_owned(),
-            })
+        Query::Range {
+            field_id,
+            lower,
+            upper,
+        } => lower_numeric_range(segment, snapshot, schema, *field_id, lower, upper),
+        Query::Set { field_id, values } => lower_set(
+            segment,
+            snapshot,
+            schema,
+            *field_id,
+            values,
+            inherited_boost,
+            mode,
+        ),
+        Query::Glob { field_ids, pattern } => lower_glob(
+            segment,
+            snapshot,
+            schema,
+            field_ids,
+            pattern,
+            inherited_boost,
+            mode,
+        ),
+    }
+}
+
+/// Open one schema-typed NUMERIC section view for a segment, when the
+/// segment carries the section at all.
+fn open_numeric_section<'a>(
+    segment: &'a RecoveredSegment,
+    schema: SchemaDescriptor,
+) -> Result<Option<crate::quiver::NumericSection<'a>>, QuillIndexError> {
+    let Some(bytes) = segment.section(SectionKind::NUMERIC)? else {
+        return Ok(None);
+    };
+    let manifest = segment.manifest();
+    let section =
+        crate::quiver::NumericSection::parse(bytes, schema, manifest.docid_lo, manifest.docid_hi)
+            .map_err(crate::argus::ArgusError::from)?;
+    Ok(Some(section))
+}
+
+/// The field's numeric kind, or a typed rejection for non-numeric fields.
+fn numeric_kind_for(schema: SchemaDescriptor, field_ord: u16) -> Result<bool, QuillIndexError> {
+    let Some(field) = schema.fields.get(usize::from(field_ord)) else {
+        return Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("range query names unknown field {field_ord}"),
+        });
+    };
+    match field.kind {
+        crate::schema::FieldKind::I64 { .. } => Ok(true),
+        crate::schema::FieldKind::U64 { .. } => Ok(false),
+        _ => Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("field {field_ord} is not a numeric field"),
+        }),
+    }
+}
+
+fn convert_numeric_bound(
+    bound: &std::ops::Bound<QueryValue>,
+    signed: bool,
+) -> Result<std::ops::Bound<crate::quiver::NumericValue>, QuillIndexError> {
+    let convert = |value: &QueryValue| -> Result<crate::quiver::NumericValue, QuillIndexError> {
+        match (value, signed) {
+            (QueryValue::I64(v), true) => Ok(crate::quiver::NumericValue::I64(*v)),
+            (QueryValue::U64(v), false) => Ok(crate::quiver::NumericValue::U64(*v)),
+            (QueryValue::I64(v), false) => u64::try_from(*v)
+                .map(crate::quiver::NumericValue::U64)
+                .map_err(|_| QuillIndexError::UnsupportedQuery {
+                    detail: format!("signed bound {v} does not fit the unsigned field"),
+                }),
+            (QueryValue::U64(v), true) => i64::try_from(*v)
+                .map(crate::quiver::NumericValue::I64)
+                .map_err(|_| QuillIndexError::UnsupportedQuery {
+                    detail: format!("unsigned bound {v} does not fit the signed field"),
+                }),
+            (QueryValue::Str(text), _) => Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("string value {text:?} cannot bound a numeric range"),
+            }),
+        }
+    };
+    Ok(match bound {
+        std::ops::Bound::Included(value) => std::ops::Bound::Included(convert(value)?),
+        std::ops::Bound::Excluded(value) => std::ops::Bound::Excluded(convert(value)?),
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+    })
+}
+
+fn lower_numeric_range(
+    segment: &RecoveredSegment,
+    _snapshot: &KeeperSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    lower: &std::ops::Bound<QueryValue>,
+    upper: &std::ops::Bound<QueryValue>,
+) -> Result<ReferenceScorer<'static>, QuillIndexError> {
+    let signed = numeric_kind_for(schema, field_ord)?;
+    let Some(section) = open_numeric_section(segment, schema)? else {
+        return Ok(ReferenceScorer::empty());
+    };
+    let Some(field) = section.field(field_ord) else {
+        return Ok(ReferenceScorer::empty());
+    };
+    let lower = convert_numeric_bound(lower, signed)?;
+    let upper = convert_numeric_bound(upper, signed)?;
+    let scorer = ReferenceScorer::numeric_range(field, lower, upper, segment.manifest().doc_count)?;
+    Ok(scorer)
+}
+
+fn lower_set(
+    segment: &RecoveredSegment,
+    snapshot: &KeeperSnapshot,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    values: &[QueryValue],
+    inherited_boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'static>, QuillIndexError> {
+    if values.is_empty() {
+        return Ok(ReferenceScorer::empty());
+    }
+    let Some(field) = schema.fields.get(usize::from(field_ord)) else {
+        return Err(QuillIndexError::UnsupportedQuery {
+            detail: format!("set query names unknown field {field_ord}"),
+        });
+    };
+    let mut clauses = Vec::new();
+    clauses
+        .try_reserve_exact(values.len())
+        .map_err(|_| invalid_state("could not allocate set clauses"))?;
+    match field.kind {
+        crate::schema::FieldKind::I64 { .. } | crate::schema::FieldKind::U64 { .. } => {
+            let signed = matches!(field.kind, crate::schema::FieldKind::I64 { .. });
+            let Some(section) = open_numeric_section(segment, schema)? else {
+                return Ok(ReferenceScorer::empty());
+            };
+            let Some(numeric_field) = section.field(field_ord) else {
+                return Ok(ReferenceScorer::empty());
+            };
+            for value in values {
+                let (QueryValue::I64(_) | QueryValue::U64(_)) = value else {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!("string set member {value:?} targets a numeric field"),
+                    });
+                };
+                let point =
+                    convert_numeric_bound(&std::ops::Bound::Included(value.clone()), signed)?;
+                let std::ops::Bound::Included(point) = point else {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: "set member bound did not stay included".to_owned(),
+                    });
+                };
+                clauses.push(ScorerClause::should(ReferenceScorer::numeric_range(
+                    numeric_field,
+                    std::ops::Bound::Included(point),
+                    std::ops::Bound::Included(point),
+                    segment.manifest().doc_count,
+                )?));
+            }
+        }
+        crate::schema::FieldKind::Keyword | crate::schema::FieldKind::Text { .. } => {
+            for value in values {
+                let QueryValue::Str(text) = value else {
+                    return Err(QuillIndexError::UnsupportedQuery {
+                        detail: format!("numeric set member {value:?} targets a text field"),
+                    });
+                };
+                clauses.push(ScorerClause::should(lower_term(
+                    segment,
+                    snapshot,
+                    schema,
+                    field_ord,
+                    text.as_bytes(),
+                    inherited_boost,
+                )?));
+            }
+        }
+        crate::schema::FieldKind::StoredOnly => {
+            return Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("set query names stored-only field {field_ord}"),
+            });
         }
     }
+    lower_boolean(clauses, mode)
+}
+
+/// Bound on glob-expanded terms per field, mirroring the engine default.
+const GLOB_EXPANSION_LIMIT: usize = 16_384;
+
+fn lower_glob(
+    segment: &RecoveredSegment,
+    snapshot: &KeeperSnapshot,
+    schema: SchemaDescriptor,
+    field_ids: &[u16],
+    pattern: &str,
+    inherited_boost: f32,
+    mode: QueryLoweringMode,
+) -> Result<ReferenceScorer<'static>, QuillIndexError> {
+    let dictionary = open_dictionary(segment, schema)?;
+    let mut clauses = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for field_ord in field_ids {
+        let terms = dictionary.expand_glob(*field_ord, pattern.as_bytes(), GLOB_EXPANSION_LIMIT)?;
+        for term in terms {
+            // One clause per unique (field, term): expansion cannot repeat
+            // inside one field, but fields may share surface forms.
+            if !seen.insert((*field_ord, term.term.clone())) {
+                continue;
+            }
+            clauses.push(ScorerClause::should(lower_term(
+                segment,
+                snapshot,
+                schema,
+                *field_ord,
+                &term.term,
+                inherited_boost,
+            )?));
+        }
+    }
+    if clauses.is_empty() {
+        return Ok(ReferenceScorer::empty());
+    }
+    lower_boolean(clauses, mode)
 }
 
 fn lower_term(
@@ -1659,6 +1978,7 @@ fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::future::Future;
     #[cfg(feature = "durability")]
     use std::sync::Arc;
@@ -1667,6 +1987,30 @@ mod tests {
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig};
 
     use super::*;
+    use crate::keeper::ConcatMergeError;
+    use crate::quiver::{StatsSection, aggregate_field_stats};
+
+    const CONCAT_MERGE_QUERIES: [&str; 4] =
+        ["rust", "python", "rust OR python", "\"rust ownership\""];
+    const Q1_OB2A_QUERIES: [&str; 5] = [
+        "shared",
+        "left",
+        "right",
+        "left OR right",
+        "\"shared left\"",
+    ];
+    const KNOWN_SECTION_KINDS: [SectionKind; 10] = [
+        SectionKind::TERMDICT,
+        SectionKind::POSTINGS,
+        SectionKind::POSITIONS,
+        SectionKind::BLOCKMAX,
+        SectionKind::DOCLEN,
+        SectionKind::IDMAP,
+        SectionKind::IDHASH,
+        SectionKind::NUMERIC,
+        SectionKind::STOREDMETA,
+        SectionKind::STATS,
+    ];
 
     fn run_with_cx<F, Fut>(test: F)
     where
@@ -1695,6 +2039,487 @@ mod tests {
                 .with_title("Python guide")
                 .with_metadata("cluster", "data"),
         ]
+    }
+
+    async fn concat_merge_fixture_index(cx: &Cx) -> QuillIndex {
+        let documents = fixture_documents();
+        let mut index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+        for (batch_index, document) in documents.iter().enumerate() {
+            index
+                .index_documents(cx, std::slice::from_ref(document))
+                .await
+                .expect("accumulate concat-merge leaf");
+            index.commit(cx).await.expect("commit concat-merge leaf");
+            assert_eq!(
+                index.snapshot().segments().len(),
+                batch_index + 1,
+                "each committed fixture batch must seal one leaf segment",
+            );
+        }
+        index
+    }
+
+    struct Q1Ob2aSeal {
+        encoded: EncodedSegment,
+        field_stats: BTreeMap<u16, (u64, u32)>,
+    }
+
+    fn q1_ob2a_documents() -> Vec<IndexableDocument> {
+        (0_u32..400)
+            .map(|ordinal| {
+                let cohort = if ordinal < 100 { "left" } else { "right" };
+                IndexableDocument::new(
+                    format!("q1-ob2a-{ordinal:03}"),
+                    format!("shared {cohort} concat parity"),
+                )
+                .with_title(format!("{cohort} cohort"))
+                .with_metadata("cohort", cohort)
+            })
+            .collect()
+    }
+
+    fn q1_ob2a_doc_ord(first_doc_ord: u32, offset: usize) -> u32 {
+        first_doc_ord
+            .checked_add(u32::try_from(offset).expect("Q1-OB2a offset fits u32"))
+            .expect("Q1-OB2a document ordinal stays in one lease")
+    }
+
+    fn seal_q1_ob2a_documents(
+        documents: &[IndexableDocument],
+        first_doc_ord: u32,
+        segment_id: u64,
+    ) -> Q1Ob2aSeal {
+        let mut accumulator =
+            ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("Q1-OB2a accumulator");
+        let mut canonical_contents = Vec::with_capacity(documents.len());
+        for (offset, document) in documents.iter().enumerate() {
+            let doc_ord = q1_ob2a_doc_ord(first_doc_ord, offset);
+            let metadata = canonical_metadata(&document.metadata).expect("canonical metadata");
+            let ordinal = u64::from(doc_ord).to_le_bytes();
+            let title = document.title.as_deref().unwrap_or("");
+            let indexed = [
+                IndexedFieldValue::new(ID_FIELD, &document.id),
+                IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+                IndexedFieldValue::new(TITLE_FIELD, title),
+            ];
+            let stored = [
+                StoredFieldValue::new(METADATA_FIELD, &metadata),
+                StoredFieldValue::new(ORD_FIELD, &ordinal),
+            ];
+            accumulator
+                .add_document_with_values(doc_ord, &indexed, &[], &stored)
+                .expect("accumulate Q1-OB2a document");
+            canonical_contents.push(
+                canonical_document_preimage(document, &metadata)
+                    .expect("canonical Q1-OB2a content"),
+            );
+        }
+
+        let doc_count = u32::try_from(documents.len()).expect("Q1-OB2a document count fits u32");
+        let field_stats = accumulator
+            .fields()
+            .iter()
+            .map(|field| (field.field_ord(), (field.total_tokens(), doc_count)))
+            .collect::<BTreeMap<_, _>>();
+        let identities = documents
+            .iter()
+            .zip(&canonical_contents)
+            .enumerate()
+            .map(|(offset, (document, canonical_content))| {
+                FlushDocumentInput::from_canonical_content(
+                    q1_ob2a_doc_ord(first_doc_ord, offset),
+                    &document.id,
+                    canonical_content,
+                )
+            })
+            .collect::<Vec<_>>();
+        let encoded = flush_accumulator_with_mode(
+            &accumulator,
+            FlushSegmentInput {
+                segment_id,
+                lease_docid_base: 0,
+                created_unix_s: 0,
+                engine_version: CURRENT_ENGINE_VERSION,
+                documents: &identities,
+            },
+            FlushMode::Scalar,
+        )
+        .expect("seal Q1-OB2a segment");
+        Q1Ob2aSeal {
+            encoded,
+            field_stats,
+        }
+    }
+
+    fn q1_ob2a_owned_index(
+        encoded_segments: Vec<EncodedSegment>,
+        field_stats: Vec<ManifestFieldStats>,
+    ) -> QuillIndex {
+        let genesis = KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("Q1-OB2a genesis");
+        let mut manifest = genesis.next_manifest().expect("Q1-OB2a manifest");
+        manifest.docid_high_watermark = u64::from(DOC_ORDS_PER_LEASE);
+        manifest.segments = encoded_segments
+            .iter()
+            .enumerate()
+            .map(|(index, encoded)| {
+                manifest_segment(
+                    encoded,
+                    u64::try_from(index + 1).expect("Q1-OB2a seal sequence fits u64"),
+                )
+            })
+            .collect();
+        manifest.field_stats = field_stats;
+        let snapshot = genesis
+            .publish_owned_segments(&manifest, encoded_segments)
+            .expect("publish Q1-OB2a fixture");
+        QuillIndex::from_backend(
+            IndexBackend::Memory(snapshot),
+            DEFAULT_SCHEMA,
+            deterministic_config(),
+        )
+        .expect("bind Q1-OB2a fixture index")
+    }
+
+    fn q1_ob2a_fixture_indexes() -> (QuillIndex, QuillIndex) {
+        let documents = q1_ob2a_documents();
+        let left = seal_q1_ob2a_documents(&documents[..100], 0, 0x0b2a_0001);
+        let right = seal_q1_ob2a_documents(&documents[100..], 100, 0x0b2a_0002);
+        let monolithic = seal_q1_ob2a_documents(&documents, 0, 0x0b2a_0003);
+
+        let first_segment_stats =
+            merge_field_stats(&[], &left.field_stats).expect("left Q1-OB2a stats");
+        let combined_segment_stats = merge_field_stats(&first_segment_stats, &right.field_stats)
+            .expect("aggregate leaf stats");
+        let monolithic_stats =
+            merge_field_stats(&[], &monolithic.field_stats).expect("monolithic Q1-OB2a stats");
+        assert_eq!(combined_segment_stats, monolithic_stats);
+
+        let leaves = q1_ob2a_owned_index(vec![left.encoded, right.encoded], combined_segment_stats);
+        let monolithic = q1_ob2a_owned_index(vec![monolithic.encoded], monolithic_stats);
+        (leaves, monolithic)
+    }
+
+    fn q1_ob2a_decoded_terms(index: &QuillIndex) -> Vec<(u16, Vec<u8>, u32, Vec<Posting>)> {
+        let mut decoded = BTreeMap::<(u16, Vec<u8>), (u32, Vec<Posting>)>::new();
+        for segment in index.snapshot().segments() {
+            let dictionary = open_dictionary(segment, DEFAULT_SCHEMA).expect("Q1-OB2a TERMDICT");
+            let limit = usize::try_from(dictionary.term_count()).expect("term count fits usize");
+            let terms = dictionary
+                .cursor()
+                .expect("Q1-OB2a term cursor")
+                .collect_bounded(limit)
+                .expect("materialize Q1-OB2a terms");
+            for term in terms {
+                let postings =
+                    open_owned_cursor(segment, DEFAULT_SCHEMA, term.field_ord, &term.term, false)
+                        .expect("decode Q1-OB2a postings")
+                        .postings;
+                let entry = decoded.entry((term.field_ord, term.term)).or_default();
+                entry.0 = entry
+                    .0
+                    .checked_add(term.metadata.doc_freq)
+                    .expect("Q1-OB2a aggregate df fits u32");
+                entry.1.extend(postings);
+            }
+        }
+        decoded
+            .into_iter()
+            .map(|((field_ord, term), (doc_freq, postings))| (field_ord, term, doc_freq, postings))
+            .collect()
+    }
+
+    fn q1_ob2a_decoded_stats(segment: &RecoveredSegment) -> StatsSection {
+        let expected_fields = term_field_ords(DEFAULT_SCHEMA);
+        StatsSection::parse(
+            required_section(segment, SectionKind::STATS).expect("Q1-OB2a STATS bytes"),
+            &expected_fields,
+            segment.manifest().doc_count,
+        )
+        .expect("decode Q1-OB2a STATS")
+    }
+
+    fn q1_ob2a_query_evidence(index: &QuillIndex, cx: &Cx) -> Vec<(QuillSearchResult, Vec<u32>)> {
+        Q1_OB2A_QUERIES
+            .iter()
+            .map(|query| {
+                let ranked = index
+                    .search_paginated(cx, query, 500, 0, true)
+                    .expect("Q1-OB2a ranked query");
+                let docids = index
+                    .collect_docids(cx, query)
+                    .expect("Q1-OB2a scoreless query");
+                (ranked, docids)
+            })
+            .collect()
+    }
+
+    // ==== Range / Set / Glob lowering (bd-quill-e6-gauntlet-scale-rm3q.9) ====
+
+    const NUMERIC_TEST_FIELDS: [crate::schema::FieldDescriptor; 5] = [
+        crate::schema::FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: crate::schema::FieldKind::Keyword,
+            stored: true,
+        },
+        crate::schema::FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: crate::schema::FieldKind::Text {
+                analyzer: crate::schema::Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        crate::schema::FieldDescriptor {
+            id: 2,
+            name: "created",
+            kind: crate::schema::FieldKind::I64 {
+                indexed: true,
+                fast: false,
+            },
+            stored: true,
+        },
+        crate::schema::FieldDescriptor {
+            id: 3,
+            name: "cluster",
+            kind: crate::schema::FieldKind::Keyword,
+            stored: true,
+        },
+        crate::schema::FieldDescriptor {
+            id: 4,
+            name: "title",
+            kind: crate::schema::FieldKind::Text {
+                analyzer: crate::schema::Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+    ];
+    const NUMERIC_TEST_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "quill-numeric-lowering-test-v1",
+        fields: &NUMERIC_TEST_FIELDS,
+    };
+
+    async fn numeric_fixture_index(cx: &Cx) -> QuillIndex {
+        let snapshot =
+            KeeperSnapshot::in_memory(NUMERIC_TEST_SCHEMA).expect("in-memory genesis snapshot");
+        let mut index = QuillIndex::from_backend(
+            IndexBackend::Memory(snapshot),
+            NUMERIC_TEST_SCHEMA,
+            deterministic_config(),
+        )
+        .expect("numeric fixture index");
+        let docs: [(&str, &str, &str, i64); 4] = [
+            ("doc-a", "rust systems programming", "systems", 10),
+            ("doc-b", "rust ownership models", "systems", 30),
+            ("doc-c", "python data notebooks", "data", 50),
+            ("doc-d", "rust notebook bridges", "data", 70),
+        ];
+        for (ordinal, (id, content, cluster, created)) in docs.iter().enumerate() {
+            index.ensure_lease().expect("fixture lease");
+            index
+                .accumulator
+                .add_document_with_numeric(
+                    u32::try_from(ordinal).expect("ordinal"),
+                    &[
+                        IndexedFieldValue::new(0, id),
+                        IndexedFieldValue::new(1, content),
+                        IndexedFieldValue::new(3, cluster),
+                    ],
+                    &[IndexedNumericValue::i64(2, *created)],
+                )
+                .expect("accumulate numeric fixture document");
+            index.identities.push(PendingIdentity {
+                doc_ord: u32::try_from(ordinal).expect("ordinal"),
+                document_id: (*id).to_owned(),
+                canonical_content: content.as_bytes().to_vec(),
+            });
+        }
+        index.commit(cx).await.expect("commit numeric fixture");
+        index
+    }
+
+    fn hit_ids(result: &QuillSearchResult) -> Vec<&str> {
+        let mut ids: Vec<&str> = result
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn numeric_range_lowers_included_excluded_and_unbounded_bounds() {
+        run_with_cx(|cx| async move {
+            let index = numeric_fixture_index(&cx).await;
+            let included = index
+                .search_paginated(&cx, "created:[10 TO 30]", 10, 0, true)
+                .expect("included range query");
+            assert_eq!(hit_ids(&included), ["doc-a", "doc-b"]);
+
+            let excluded = index
+                .search_paginated(&cx, "created:{10 TO 30}", 10, 0, true)
+                .expect("exclusive range query");
+            assert!(hit_ids(&excluded).is_empty(), "open bounds exclude both");
+
+            let mixed = index
+                .search_paginated(&cx, "created:{10 TO 30]", 10, 0, true)
+                .expect("half-open range query");
+            assert_eq!(hit_ids(&mixed), ["doc-b"]);
+
+            let unbounded = index
+                .search_paginated(&cx, "created:[30 TO *]", 10, 0, true)
+                .expect("unbounded upper range");
+            assert_eq!(hit_ids(&unbounded), ["doc-b", "doc-c", "doc-d"]);
+
+            let miss = index
+                .search_paginated(&cx, "created:[100 TO 200]", 10, 0, true)
+                .expect("out-of-domain range");
+            assert!(hit_ids(&miss).is_empty());
+        });
+    }
+
+    #[test]
+    fn set_lowering_matches_keyword_and_numeric_members() {
+        run_with_cx(|cx| async move {
+            let index = numeric_fixture_index(&cx).await;
+            let keyword = index
+                .search_paginated(&cx, "cluster: IN [systems]", 10, 0, true)
+                .expect("keyword set query");
+            assert_eq!(hit_ids(&keyword), ["doc-a", "doc-b"]);
+
+            let keyword_two = index
+                .search_paginated(&cx, "cluster: IN [systems data]", 10, 0, true)
+                .expect("two-member keyword set");
+            assert_eq!(hit_ids(&keyword_two), ["doc-a", "doc-b", "doc-c", "doc-d"]);
+
+            let numeric = index
+                .search_paginated(&cx, "created: IN [10 50]", 10, 0, true)
+                .expect("numeric set query");
+            assert_eq!(hit_ids(&numeric), ["doc-a", "doc-c"]);
+
+            let numeric_miss = index
+                .search_paginated(&cx, "created: IN [11 12]", 10, 0, true)
+                .expect("numeric set miss");
+            assert!(hit_ids(&numeric_miss).is_empty());
+        });
+    }
+
+    #[test]
+    fn glob_lowering_expands_and_bounds_terms() {
+        run_with_cx(|cx| async move {
+            let index = numeric_fixture_index(&cx).await;
+            // ORACLE PARITY: the default lenient parser tokenizes the star
+            // away, so "notebook*" is the plain term `notebook` — identical
+            // behavior to the incumbent adapter.
+            let default_lenient = index
+                .search_paginated(&cx, "content:notebook*", 10, 0, true)
+                .expect("default lenient star behavior");
+            assert_eq!(hit_ids(&default_lenient), ["doc-d"]);
+
+            // Programmatic Glob ASTs (CASS parser output, direct AST
+            // construction) expand through the glob lowering.
+            let glob_ast = Query::Glob {
+                field_ids: vec![1],
+                pattern: "notebook*".to_owned(),
+            };
+            let expanded = index
+                .search_paginated_ast(&cx, &glob_ast, 10, 0, true)
+                .expect("programmatic glob expansion");
+            assert_eq!(hit_ids(&expanded), ["doc-c", "doc-d"]);
+
+            let prefix_share = Query::Glob {
+                field_ids: vec![1],
+                pattern: "note*".to_owned(),
+            };
+            let expanded = index
+                .search_paginated_ast(&cx, &prefix_share, 10, 0, true)
+                .expect("shared-prefix glob expansion");
+            assert_eq!(hit_ids(&expanded), ["doc-c", "doc-d"]);
+
+            let no_match = Query::Glob {
+                field_ids: vec![1],
+                pattern: "zebra*".to_owned(),
+            };
+            let expanded = index
+                .search_paginated_ast(&cx, &no_match, 10, 0, true)
+                .expect("no-match glob");
+            assert!(hit_ids(&expanded).is_empty());
+
+            let exact_singular = index
+                .search_paginated(&cx, "notebook", 10, 0, true)
+                .expect("exact singular");
+            assert_eq!(hit_ids(&exact_singular), ["doc-d"]);
+            let exact_plural = index
+                .search_paginated(&cx, "notebooks", 10, 0, true)
+                .expect("exact plural");
+            assert_eq!(hit_ids(&exact_plural), ["doc-c"]);
+        });
+    }
+
+    #[test]
+    fn typed_leaf_type_errors_are_typed_and_closed() {
+        run_with_cx(|cx| async move {
+            let index = numeric_fixture_index(&cx).await;
+            let range_on_keyword = index.search_paginated(&cx, "cluster:[1 TO 5]", 10, 0, true);
+            assert!(
+                range_on_keyword.is_err(),
+                "range on keyword field fails closed"
+            );
+
+            // The lenient parser recovers an invalid typed member by dropping
+            // it with a diagnostic, so a string member in a numeric set
+            // matches nothing instead of erroring.
+            let string_in_numeric_set = index
+                .search_paginated(&cx, "created: IN [zebra]", 10, 0, true)
+                .expect("lenient recovery");
+            assert!(hit_ids(&string_in_numeric_set).is_empty());
+            assert!(
+                string_in_numeric_set
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::InvalidTypedValue)
+            );
+        });
+    }
+
+    fn committed_segment_ids(index: &QuillIndex) -> Vec<u64> {
+        index
+            .snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().segment_id)
+            .collect()
+    }
+
+    fn fresh_merge_segment_id(index: &QuillIndex, seed: u64) -> u64 {
+        let mut candidate = seed;
+        loop {
+            if index
+                .snapshot()
+                .segments()
+                .iter()
+                .all(|segment| segment.manifest().segment_id != candidate)
+            {
+                return candidate;
+            }
+            candidate = candidate
+                .checked_add(1)
+                .expect("concat-merge test segment-id space exhausted");
+        }
+    }
+
+    fn concat_merge_query_results(index: &QuillIndex, cx: &Cx) -> Vec<QuillSearchResult> {
+        CONCAT_MERGE_QUERIES
+            .iter()
+            .map(|query| {
+                index
+                    .search_paginated(cx, query, 10, 0, true)
+                    .expect("concat-merge fixture query")
+            })
+            .collect()
     }
 
     #[cfg(feature = "durability")]
@@ -1799,6 +2624,353 @@ mod tests {
             assert_eq!(docids, ranked_docids);
             assert_eq!(docids.len(), 3);
             assert_eq!(ranked.total_count, Some(3));
+        });
+    }
+
+    #[test]
+    fn in_memory_concat_merge_preserves_query_results_scores_and_docids() {
+        run_with_cx(|cx| async move {
+            let mut index = concat_merge_fixture_index(&cx).await;
+            let source_ids = committed_segment_ids(&index);
+            assert_eq!(source_ids.len(), 3);
+
+            let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            let results_before = concat_merge_query_results(&index, &cx);
+            let docids_before = index
+                .collect_docids(&cx, "rust OR python")
+                .expect("collect pre-merge docids");
+            let output_segment_id = fresh_merge_segment_id(&index, 0xc011_ca7e_0000_0001);
+
+            index
+                .concat_merge(&cx, &source_ids, output_segment_id, 17)
+                .await
+                .expect("merge the complete in-memory leaf run");
+
+            assert_eq!(index.snapshot().segments().len(), 1);
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation_before + 1,
+            );
+            assert_eq!(
+                concat_merge_query_results(&index, &cx),
+                results_before,
+                "ranked hits, exact scores, global docids, and counts must survive merge",
+            );
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "rust OR python")
+                    .expect("collect post-merge docids"),
+                docids_before,
+            );
+            let merge_seal_seq = index.snapshot().segments()[0].manifest().seal_seq;
+
+            index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new(
+                        "after-merge",
+                        "ordinary sealing remains available after concat merge",
+                    )],
+                )
+                .await
+                .expect("accumulate after concat merge");
+            index
+                .commit(&cx)
+                .await
+                .expect("ordinary commit after concat merge");
+            assert_eq!(
+                index
+                    .snapshot()
+                    .segments()
+                    .iter()
+                    .map(|segment| segment.manifest().seal_seq)
+                    .collect::<Vec<_>>(),
+                [merge_seal_seq, merge_seal_seq + 1],
+                "concat output and the next ordinary seal need distinct monotone sequences",
+            );
+        });
+    }
+
+    #[test]
+    fn concat_merge_matches_fresh_monolithic_df_100_plus_300_with_same_docids() {
+        run_with_cx(|cx| async move {
+            let (mut leaves, monolithic) = q1_ob2a_fixture_indexes();
+            assert_eq!(
+                leaves
+                    .snapshot()
+                    .segments()
+                    .iter()
+                    .map(|segment| (segment.manifest().docid_lo, segment.manifest().docid_hi))
+                    .collect::<Vec<_>>(),
+                [(0, 100), (100, 400)],
+                "Q1-OB2a leaves must be adjacent inside one lease",
+            );
+            assert_eq!(monolithic.snapshot().segments()[0].manifest().docid_lo, 0);
+            assert_eq!(monolithic.snapshot().segments()[0].manifest().docid_hi, 400);
+
+            let source_shared_dfs = leaves
+                .snapshot()
+                .segments()
+                .iter()
+                .map(|segment| {
+                    open_dictionary(segment, DEFAULT_SCHEMA)
+                        .expect("source Q1-OB2a TERMDICT")
+                        .lookup(CONTENT_FIELD, b"shared")
+                        .expect("source shared lookup")
+                        .expect("source shared term")
+                        .metadata
+                        .doc_freq
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(source_shared_dfs, [100, 300]);
+            assert_eq!(
+                snapshot_doc_freq(
+                    monolithic.snapshot(),
+                    DEFAULT_SCHEMA,
+                    CONTENT_FIELD,
+                    b"shared",
+                )
+                .expect("monolithic shared df"),
+                400,
+            );
+
+            let source_stats = leaves
+                .snapshot()
+                .segments()
+                .iter()
+                .map(q1_ob2a_decoded_stats)
+                .collect::<Vec<_>>();
+            let source_aggregate =
+                aggregate_field_stats(source_stats.iter()).expect("aggregate source STATS");
+            let monolithic_stats = q1_ob2a_decoded_stats(&monolithic.snapshot().segments()[0]);
+            let monolithic_aggregate = monolithic_stats
+                .rows()
+                .iter()
+                .map(|row| SnapshotFieldStats {
+                    field_ord: row.field_ord,
+                    total_tokens: row.total_tokens,
+                    doc_count: u64::from(row.doc_count),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(source_aggregate, monolithic_aggregate);
+            assert_eq!(
+                leaves.snapshot().loaded_manifest().manifest.field_stats,
+                monolithic.snapshot().loaded_manifest().manifest.field_stats,
+            );
+
+            let monolithic_terms = q1_ob2a_decoded_terms(&monolithic);
+            assert_eq!(
+                q1_ob2a_decoded_terms(&leaves),
+                monolithic_terms,
+                "source terms and decoded postings must match fresh monolithic indexing",
+            );
+            let monolithic_evidence = q1_ob2a_query_evidence(&monolithic, &cx);
+            assert_eq!(
+                q1_ob2a_query_evidence(&leaves, &cx),
+                monolithic_evidence,
+                "source leaves and fresh monolithic seal must have exact scores, ids, docids, and counts",
+            );
+            assert_eq!(
+                leaves
+                    .collect_docids(&cx, "shared")
+                    .expect("source shared docids"),
+                (0_u32..400).collect::<Vec<_>>(),
+            );
+
+            let source_ids = committed_segment_ids(&leaves);
+            leaves
+                .concat_merge(&cx, &source_ids, 0x0b2a_0004, 0)
+                .await
+                .expect("Q1-OB2a concat merge");
+            assert_eq!(leaves.snapshot().segments().len(), 1);
+            assert_eq!(
+                snapshot_doc_freq(leaves.snapshot(), DEFAULT_SCHEMA, CONTENT_FIELD, b"shared")
+                    .expect("merged shared df"),
+                400,
+            );
+            assert_eq!(
+                q1_ob2a_decoded_terms(&leaves),
+                monolithic_terms,
+                "every merged term and decoded posting must match fresh monolithic indexing",
+            );
+            assert_eq!(
+                q1_ob2a_decoded_stats(&leaves.snapshot().segments()[0]),
+                monolithic_stats,
+                "merged decoded STATS must match fresh monolithic indexing",
+            );
+            assert_eq!(
+                leaves.snapshot().loaded_manifest().manifest.field_stats,
+                monolithic.snapshot().loaded_manifest().manifest.field_stats,
+            );
+            assert_eq!(
+                q1_ob2a_query_evidence(&leaves, &cx),
+                monolithic_evidence,
+                "merged and monolithic query scores, ids, docids, counts, and docsets must match",
+            );
+        });
+    }
+
+    #[test]
+    fn concat_merge_rejects_reversed_and_skipped_runs_without_publication() {
+        run_with_cx(|cx| async move {
+            let mut index = concat_merge_fixture_index(&cx).await;
+            let source_ids = committed_segment_ids(&index);
+            assert_eq!(source_ids.len(), 3);
+            let manifest_before = index.snapshot().loaded_manifest().manifest.clone();
+            let output_segment_id = fresh_merge_segment_id(&index, 0xc011_ca7e_0000_0010);
+
+            let reversed = [source_ids[1], source_ids[0]];
+            let Err(error) = index
+                .concat_merge(&cx, &reversed, output_segment_id, 19)
+                .await
+            else {
+                panic!("reversed concat-merge run unexpectedly published");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                    source: ConcatMergeError::NonConsecutiveSources { .. }
+                })
+            ));
+            assert_eq!(
+                &index.snapshot().loaded_manifest().manifest,
+                &manifest_before,
+                "reversed rejection must not advance the snapshot generation",
+            );
+
+            let skipped = [source_ids[0], source_ids[2]];
+            let Err(error) = index
+                .concat_merge(&cx, &skipped, output_segment_id, 23)
+                .await
+            else {
+                panic!("skipped concat-merge run unexpectedly published");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                    source: ConcatMergeError::NonConsecutiveSources { .. }
+                })
+            ));
+            assert_eq!(
+                &index.snapshot().loaded_manifest().manifest,
+                &manifest_before,
+                "skipped-run rejection must leave the exact snapshot unchanged",
+            );
+
+            let wrapped = [source_ids[1], source_ids[2], source_ids[0]];
+            let Err(error) = index
+                .concat_merge(&cx, &wrapped, output_segment_id, 29)
+                .await
+            else {
+                panic!("manifest-wrapping concat-merge run unexpectedly published");
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                    source: ConcatMergeError::SourceRunPastManifest {
+                        position: 2,
+                        actual,
+                    }
+                }) if actual == source_ids[0]
+            ));
+            assert_eq!(
+                &index.snapshot().loaded_manifest().manifest,
+                &manifest_before,
+                "wrapped-run rejection must leave the exact snapshot unchanged",
+            );
+        });
+    }
+
+    #[test]
+    fn concat_merge_direct_and_associated_schedules_match() {
+        run_with_cx(|cx| async move {
+            let mut direct = concat_merge_fixture_index(&cx).await;
+            let mut left_associated = concat_merge_fixture_index(&cx).await;
+            let mut right_associated = concat_merge_fixture_index(&cx).await;
+            let leaf_ids = committed_segment_ids(&direct);
+            assert_eq!(leaf_ids, committed_segment_ids(&left_associated));
+            assert_eq!(leaf_ids, committed_segment_ids(&right_associated));
+            assert_eq!(leaf_ids.len(), 3);
+
+            let results_before = concat_merge_query_results(&direct, &cx);
+            assert_eq!(
+                concat_merge_query_results(&left_associated, &cx),
+                results_before,
+            );
+            assert_eq!(
+                concat_merge_query_results(&right_associated, &cx),
+                results_before,
+            );
+            let final_segment_id = fresh_merge_segment_id(&direct, 0xc011_ca7e_0000_0020);
+            let intermediate_segment_id =
+                fresh_merge_segment_id(&left_associated, 0xc011_ca7e_0000_0030);
+            let right_intermediate_segment_id =
+                fresh_merge_segment_id(&right_associated, 0xc011_ca7e_0000_0040);
+
+            direct
+                .concat_merge(&cx, &leaf_ids, final_segment_id, 31)
+                .await
+                .expect("direct three-leaf concat merge");
+            left_associated
+                .concat_merge(&cx, &leaf_ids[..2], intermediate_segment_id, 29)
+                .await
+                .expect("left-associated first concat merge");
+            let left_final_sources = [intermediate_segment_id, leaf_ids[2]];
+            left_associated
+                .concat_merge(&cx, &left_final_sources, final_segment_id, 31)
+                .await
+                .expect("left-associated final concat merge");
+            right_associated
+                .concat_merge(&cx, &leaf_ids[1..], right_intermediate_segment_id, 29)
+                .await
+                .expect("right-associated first concat merge");
+            let right_final_sources = [leaf_ids[0], right_intermediate_segment_id];
+            right_associated
+                .concat_merge(&cx, &right_final_sources, final_segment_id, 31)
+                .await
+                .expect("right-associated final concat merge");
+
+            assert_eq!(direct.snapshot().segments().len(), 1);
+            assert_eq!(left_associated.snapshot().segments().len(), 1);
+            assert_eq!(right_associated.snapshot().segments().len(), 1);
+            let direct_segment = &direct.snapshot().segments()[0];
+            let left_segment = &left_associated.snapshot().segments()[0];
+            let right_segment = &right_associated.snapshot().segments()[0];
+            assert_eq!(
+                direct_segment.source_bytes(),
+                left_segment.source_bytes(),
+                "the complete merged FSLX image must be schedule-independent",
+            );
+            assert_eq!(
+                direct_segment.source_bytes(),
+                right_segment.source_bytes(),
+                "right-associated merge must emit the same complete FSLX image",
+            );
+            for kind in KNOWN_SECTION_KINDS {
+                assert_eq!(
+                    direct_segment.section(kind).expect("direct merged section"),
+                    left_segment
+                        .section(kind)
+                        .expect("left-associated merged section"),
+                    "section {} differs by merge schedule",
+                    kind.raw(),
+                );
+                assert_eq!(
+                    direct_segment.section(kind).expect("direct merged section"),
+                    right_segment
+                        .section(kind)
+                        .expect("right-associated merged section"),
+                    "section {} differs under right association",
+                    kind.raw(),
+                );
+            }
+
+            let direct_results = concat_merge_query_results(&direct, &cx);
+            let left_results = concat_merge_query_results(&left_associated, &cx);
+            let right_results = concat_merge_query_results(&right_associated, &cx);
+            assert_eq!(direct_results, results_before);
+            assert_eq!(left_results, results_before);
+            assert_eq!(right_results, results_before);
         });
     }
 

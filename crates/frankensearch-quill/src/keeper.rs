@@ -3,11 +3,13 @@
 //! This module owns the hand-rolled MANIFEST v1 wire format, Q1 range
 //! validation, two-slot recovery, cross-process writer ownership, staged
 //! durability repair, serialized publication, and writer-admitted garbage
-//! collection. Segment I/O and the remaining merge/compaction policy live in
-//! adjacent Keeper modules and milestones.
+//! collection. It also owns the structural Q1 concat-merge primitive; tier
+//! selection and tombstone-folding compaction remain later policy milestones.
 
+use std::cmp::Ordering;
 #[cfg(unix)]
 use std::collections::HashSet;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -25,12 +27,21 @@ use frankensearch_index::mapped_file::ReadOnlyMappedFile;
 use thiserror::Error;
 
 use crate::error::QuillError;
-use crate::quiver::{
-    IdHashCodecError, IdHashLookupPlan, IdHashSection, IdMapCodecError, IdMapSection,
+use crate::grimoire::{
+    ByteSpan, EncodedTermDictionary, OwnedTerm, TermDictionary, TermInput, TermMetadata,
+    TermSectionLengths,
 };
-use crate::schema::SchemaDescriptor;
+use crate::quiver::{
+    BlockMaxConcatList, DocLenSection, EncodedBlockMax, EncodedDocLenSection, EncodedIdHashSection,
+    EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
+    EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdHashLookupPlan,
+    IdHashSection, IdMapCodecError, IdMapEntry, IdMapSection, NumericSection, PositionList,
+    PostingList, StatsSection, StoredMetaSection, aggregate_field_stats,
+};
+use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{
-    EncodedSegment, PendingSegmentFile, SectionKind, SegmentHeader, SegmentReader,
+    EncodedSegment, PendingSegmentFile, PlannedSection, SectionEntry, SectionKind,
+    SegmentAssembler, SegmentHeader, SegmentHeaderInput, SegmentReader,
 };
 
 pub use crate::stats::{SegmentStats, SegmentStatsProvider};
@@ -172,6 +183,113 @@ pub enum ManifestCodecError {
     },
 }
 
+/// Typed failures from Q1-preserving whole-segment concat merge.
+#[derive(Debug, Error)]
+pub enum ConcatMergeError {
+    /// A merge must replace at least two immutable segments.
+    #[error("concat merge requires at least two source segments, got {count}")]
+    TooFewSources {
+        /// Supplied source count.
+        count: usize,
+    },
+    /// One caller-supplied source id is absent from the current snapshot.
+    #[error("concat merge source {segment_id:#018x} at position {position} is not live")]
+    SourceNotFound {
+        /// Position in caller order.
+        position: usize,
+        /// Missing immutable segment id.
+        segment_id: u64,
+    },
+    /// Caller order did not name one uninterrupted manifest slice.
+    #[error(
+        "concat merge source {actual:#018x} at position {position} is not manifest-consecutive; expected {expected:#018x}"
+    )]
+    NonConsecutiveSources {
+        /// Position in caller order.
+        position: usize,
+        /// Required segment at this manifest position.
+        expected: u64,
+        /// Caller-supplied segment id.
+        actual: u64,
+    },
+    /// A live id appears after the chosen manifest suffix has ended.
+    #[error(
+        "concat merge source {actual:#018x} at position {position} wraps past the manifest suffix"
+    )]
+    SourceRunPastManifest {
+        /// Position in caller order.
+        position: usize,
+        /// Live source id that wrapped to an earlier manifest position.
+        actual: u64,
+    },
+    /// The proposed immutable output id already belongs to a live segment.
+    #[error("concat merge output segment id {segment_id:#018x} collides with a live segment")]
+    OutputSegmentCollision {
+        /// Colliding segment id.
+        segment_id: u64,
+    },
+    /// A source carries an extension whose merge semantics are unknown.
+    #[error(
+        "concat merge source {segment_id:#018x} carries unsupported section kind {section_kind}"
+    )]
+    UnknownSection {
+        /// Source segment id.
+        segment_id: u64,
+        /// Raw durable section kind.
+        section_kind: u16,
+    },
+    /// Checked merge arithmetic overflowed.
+    #[error("concat merge arithmetic overflow while computing {field}")]
+    ArithmeticOverflow {
+        /// Failed counter or offset.
+        field: &'static str,
+    },
+    /// A fallible allocation failed without panicking.
+    #[error("unable to reserve {count} entries for concat merge {resource}")]
+    Allocation {
+        /// Allocation purpose.
+        resource: &'static str,
+        /// Requested element count.
+        count: usize,
+    },
+    /// One section codec rejected source or rebuilt bytes.
+    #[error("concat merge {section:?} codec failed: {detail}")]
+    SectionCodec {
+        /// Affected FSLX section.
+        section: SectionKind,
+        /// Typed codec's stable diagnosis.
+        detail: String,
+    },
+    /// External-id state admitted more than one live physical row.
+    #[error(
+        "concat merge document id {document_id:?} has multiple live rows {first_global_docid}/{duplicate_global_docid}"
+    )]
+    MultipleLiveDocumentIds {
+        /// Exact external identifier.
+        document_id: String,
+        /// First live global document id.
+        first_global_docid: u32,
+        /// Duplicate live global document id.
+        duplicate_global_docid: u32,
+    },
+    /// The successor MANIFEST failed canonical validation.
+    #[error("concat merge successor manifest is invalid: {detail}")]
+    InvalidManifest {
+        /// Manifest diagnosis.
+        detail: String,
+    },
+    /// The caller cancelled before the visibility boundary.
+    #[error("concat merge cancelled before MANIFEST publication")]
+    Cancelled,
+    /// Final FSLX framing or temp-file staging failed.
+    #[error("concat merge segment operation failed: {source}")]
+    Segment {
+        /// Segment-layer diagnosis.
+        #[source]
+        source: QuillError,
+    },
+}
+
 /// Keeper I/O, recovery, locking, and publication failures.
 #[derive(Debug, Error)]
 pub enum KeeperError {
@@ -196,6 +314,13 @@ pub enum KeeperError {
         /// Writer invariant diagnosis.
         #[source]
         source: ManifestCodecError,
+    },
+    /// A whole-segment concat merge failed before publication completed.
+    #[error("keeper concat merge failed: {source}")]
+    ConcatMerge {
+        /// Merge planning, codec, or cancellation diagnosis.
+        #[source]
+        source: ConcatMergeError,
     },
     /// Neither existing slot is valid.
     #[error("no valid manifest in {directory}: current={current}; previous={previous}")]
@@ -462,6 +587,12 @@ pub enum KeeperError {
     },
 }
 
+impl From<ConcatMergeError> for KeeperError {
+    fn from(source: ConcatMergeError) -> Self {
+        Self::ConcatMerge { source }
+    }
+}
+
 impl From<KeeperError> for SearchError {
     fn from(error: KeeperError) -> Self {
         match error {
@@ -583,6 +714,12 @@ impl From<KeeperError> for SearchError {
                 phase: "keeper.writer_admission".to_owned(),
                 reason: "writer admission cancelled".to_owned(),
             },
+            KeeperError::ConcatMerge {
+                source: ConcatMergeError::Cancelled,
+            } => Self::Cancelled {
+                phase: "keeper.concat_merge".to_owned(),
+                reason: "concat merge cancelled before MANIFEST publication".to_owned(),
+            },
             KeeperError::PublishLock { source } => match source {
                 LockError::Cancelled => Self::Cancelled {
                     phase: "keeper.publish".to_owned(),
@@ -625,6 +762,96 @@ impl TombstoneSet {
             encoded: EMPTY_TOMBSTONES.to_vec(),
             cardinality: 0,
         }
+    }
+
+    /// Build the one history-independent representation for sorted membership.
+    ///
+    /// Replacement segments use this path so equivalent merge schedules cannot
+    /// retain ARRAY/BITMAP hysteresis from their source MANIFEST generations.
+    fn from_sorted_docids(docids: &[u32]) -> Result<Self, ManifestCodecError> {
+        if docids.is_empty() {
+            return Ok(Self::new());
+        }
+        if let Some([previous, current]) = docids.windows(2).find(|pair| pair[0] >= pair[1]) {
+            return Err(invalid(format!(
+                "concat tombstones are not strictly ascending at {}/{}",
+                previous, current
+            )));
+        }
+
+        let mut chunk_count = 0_usize;
+        let mut encoded_len = std::mem::size_of::<u32>();
+        let mut start = 0_usize;
+        while start < docids.len() {
+            let chunk_id = split_tombstone_docid(docids[start]).0;
+            let end = start
+                + docids[start..]
+                    .partition_point(|docid| split_tombstone_docid(*docid).0 == chunk_id);
+            let cardinality = end - start;
+            let payload_len = if cardinality <= usize::from(TOMBSTONE_ARRAY_MAX_CARDINALITY) {
+                cardinality.checked_mul(std::mem::size_of::<u16>())
+            } else {
+                Some(TOMBSTONE_BITMAP_BYTES)
+            }
+            .ok_or_else(|| invalid("concat tombstone payload length overflow"))?;
+            encoded_len = encoded_len
+                .checked_add(5)
+                .and_then(|length| length.checked_add(payload_len))
+                .ok_or_else(|| invalid("concat tombstone wire length overflow"))?;
+            chunk_count = chunk_count
+                .checked_add(1)
+                .ok_or_else(|| invalid("concat tombstone chunk count overflow"))?;
+            start = end;
+        }
+        let chunk_count_u32 = u32::try_from(chunk_count)
+            .map_err(|_| invalid("concat tombstone chunk count does not fit u32"))?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(encoded_len)
+            .map_err(|error| invalid(format!("concat tombstone allocation failed: {error}")))?;
+        put_u32(&mut encoded, chunk_count_u32);
+        let mut start = 0_usize;
+        while start < docids.len() {
+            let chunk_id = split_tombstone_docid(docids[start]).0;
+            let end = start
+                + docids[start..]
+                    .partition_point(|docid| split_tombstone_docid(*docid).0 == chunk_id);
+            let cardinality = end - start;
+            if cardinality <= usize::from(TOMBSTONE_ARRAY_MAX_CARDINALITY) {
+                write_tombstone_container_header(
+                    &mut encoded,
+                    chunk_id,
+                    0,
+                    u64::try_from(cardinality).unwrap_or(u64::MAX),
+                )?;
+                for &docid in &docids[start..end] {
+                    put_u16(&mut encoded, split_tombstone_docid(docid).1);
+                }
+            } else {
+                write_tombstone_container_header(
+                    &mut encoded,
+                    chunk_id,
+                    1,
+                    u64::try_from(cardinality).unwrap_or(u64::MAX),
+                )?;
+                let payload_start = encoded.len();
+                encoded.resize(payload_start + TOMBSTONE_BITMAP_BYTES, 0);
+                for &docid in &docids[start..end] {
+                    set_bitmap_value(
+                        &mut encoded[payload_start..],
+                        split_tombstone_docid(docid).1,
+                    );
+                }
+            }
+            start = end;
+        }
+        let cardinality = u64::try_from(docids.len())
+            .map_err(|_| invalid("concat tombstone cardinality does not fit u64"))?;
+        debug_assert_eq!(
+            validate_tombstone_bytes(&encoded, None).ok(),
+            Some(cardinality)
+        );
+        Ok(Self::from_validated_bytes(encoded, cardinality))
     }
 
     /// Parse canonical roaring-lite bytes without normalizing container kinds.
@@ -1302,6 +1529,13 @@ impl RecoveredSegmentBacking {
         }
     }
 
+    fn section_entries(&self) -> &[SectionEntry] {
+        match self {
+            Self::Mapped(reader) => reader.section_entries(),
+            Self::Owned(reader) => reader.section_entries(),
+        }
+    }
+
     fn verify(&self) -> Result<(), QuillError> {
         match self {
             Self::Mapped(reader) => reader.verify(),
@@ -1594,6 +1828,12 @@ impl RecoveredSegment {
     /// not match its section-table witness.
     pub fn section(&self, kind: SectionKind) -> Result<Option<&[u8]>, QuillError> {
         self.reader.section(kind)
+    }
+
+    /// Validated section table, including unknown optional extensions.
+    #[must_use]
+    pub fn section_entries(&self) -> &[SectionEntry] {
+        self.reader.section_entries()
     }
 
     /// Borrow the complete immutable FSLX image for byte-level verification.
@@ -1923,6 +2163,30 @@ impl KeeperSnapshot {
             },
             segments,
         )
+    }
+
+    /// Replace one exact caller-ordered manifest run with a Q1 concat merge.
+    ///
+    /// This owned-buffer entry point is primarily useful for deterministic
+    /// testing and offline assembly. Durable indexes must use
+    /// [`KeeperWriter::concat_merge`], which runs construction on the runtime's
+    /// blocking lane and preserves writer admission through publication.
+    ///
+    /// # Errors
+    ///
+    /// Rejects fewer than two sources, any list that is not one uninterrupted
+    /// slice of the current manifest, output-id collision, unknown extension
+    /// sections, corrupt source codecs, duplicate-live external identifiers,
+    /// or an invalid successor publication.
+    pub fn concat_merge_owned(
+        &self,
+        source_segment_ids: &[u64],
+        output_segment_id: u64,
+        created_unix_s: i64,
+    ) -> Result<Self, KeeperError> {
+        let artifact =
+            build_concat_merge(self, source_segment_ids, output_segment_id, created_unix_s)?;
+        self.publish_owned_segments(&artifact.manifest, vec![artifact.encoded])
     }
 
     /// Durable index directory, or `None` for an in-memory snapshot.
@@ -2617,6 +2881,61 @@ impl KeeperWriter {
         .await
     }
 
+    /// Build, install, and atomically publish one Q1-preserving concat merge.
+    ///
+    /// Source ids are interpreted in caller order and must name exactly one
+    /// uninterrupted slice of the current manifest. Construction runs on the
+    /// asupersync blocking lane. The fully synced immutable output remains
+    /// unreachable until the exact successor MANIFEST is published; a
+    /// cancellation between those two steps can therefore leave only a safe
+    /// garbage-collectable orphan.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed merge validation/codec failures plus the ordinary segment
+    /// installation and reconciled MANIFEST-publication failures.
+    pub async fn concat_merge(
+        &mut self,
+        cx: &Cx,
+        source_segment_ids: &[u64],
+        output_segment_id: u64,
+        created_unix_s: i64,
+    ) -> Result<&KeeperSnapshot, KeeperError> {
+        if cx.is_cancel_requested() {
+            return Err(ConcatMergeError::Cancelled.into());
+        }
+        let mut source_ids = Vec::new();
+        source_ids
+            .try_reserve_exact(source_segment_ids.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "source ids",
+                count: source_segment_ids.len(),
+            })?;
+        source_ids.extend_from_slice(source_segment_ids);
+        let snapshot = self.snapshot.clone();
+        let artifact = spawn_blocking(move || {
+            build_concat_merge(&snapshot, &source_ids, output_segment_id, created_unix_s)
+        })
+        .await?;
+        if cx.is_cancel_requested() {
+            return Err(ConcatMergeError::Cancelled.into());
+        }
+
+        let ConcatMergeArtifact { encoded, manifest } = artifact;
+        let guard = writer_mutation_guard(cx).await?;
+        let admission = Arc::clone(&self.admission);
+        let pending = spawn_blocking(move || {
+            let _guard = guard;
+            admission.ensure_directory_identity()?;
+            encoded
+                .write_temp_retryable(&admission.directory)
+                .map_err(|source| KeeperError::from(ConcatMergeError::Segment { source }))
+        })
+        .await?;
+        self.publish_segment(cx, pending).await?;
+        self.publish(cx, &manifest).await
+    }
+
     /// Run one grace-window garbage sweep under the held writer admission.
     ///
     /// # Errors
@@ -2638,6 +2957,1197 @@ impl KeeperWriter {
         })
         .await
     }
+}
+
+struct ConcatMergeArtifact {
+    encoded: EncodedSegment,
+    manifest: Manifest,
+}
+
+struct ConcatSource<'a> {
+    segment: &'a RecoveredSegment,
+    terms: Vec<OwnedTerm>,
+    postings: &'a [u8],
+    positions: Option<&'a [u8]>,
+    blockmax: &'a [u8],
+    doclen: DocLenSection<'a>,
+    id_map: IdMapSection<'a>,
+    numeric: Option<NumericSection<'a>>,
+    stored_meta: Option<StoredMetaSection<'a>>,
+    stats: StatsSection,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ConcatTermHeapItem {
+    field_ord: u16,
+    term: Vec<u8>,
+    source_index: usize,
+    term_index: usize,
+}
+
+impl Ord for ConcatTermHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .field_ord
+            .cmp(&self.field_ord)
+            .then_with(|| other.term.cmp(&self.term))
+            .then_with(|| other.source_index.cmp(&self.source_index))
+            .then_with(|| other.term_index.cmp(&self.term_index))
+    }
+}
+
+impl PartialOrd for ConcatTermHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug)]
+struct MergedTermRow {
+    field_ord: u16,
+    term: Vec<u8>,
+    metadata: TermMetadata,
+}
+
+type MergedTermSections = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<MergedTermRow>);
+
+#[derive(Clone, Copy, Debug)]
+struct IdentityRepresentative {
+    lowest_global_docid: u32,
+    live_global_docid: Option<u32>,
+}
+
+fn build_concat_merge(
+    snapshot: &KeeperSnapshot,
+    source_segment_ids: &[u64],
+    output_segment_id: u64,
+    created_unix_s: i64,
+) -> Result<ConcatMergeArtifact, ConcatMergeError> {
+    if source_segment_ids.len() < 2 {
+        return Err(ConcatMergeError::TooFewSources {
+            count: source_segment_ids.len(),
+        });
+    }
+    let segments = snapshot.segments();
+    let first_id = source_segment_ids[0];
+    let start = segments
+        .iter()
+        .position(|segment| segment.manifest.segment_id == first_id)
+        .ok_or(ConcatMergeError::SourceNotFound {
+            position: 0,
+            segment_id: first_id,
+        })?;
+    for (position, &actual) in source_segment_ids.iter().enumerate() {
+        let expected_index = start
+            .checked_add(position)
+            .ok_or(ConcatMergeError::SourceRunPastManifest { position, actual })?;
+        let Some(expected) = segments.get(expected_index) else {
+            if segments
+                .iter()
+                .any(|segment| segment.manifest.segment_id == actual)
+            {
+                return Err(ConcatMergeError::SourceRunPastManifest { position, actual });
+            }
+            return Err(ConcatMergeError::SourceNotFound {
+                position,
+                segment_id: actual,
+            });
+        };
+        if expected.manifest.segment_id != actual {
+            if segments
+                .iter()
+                .any(|segment| segment.manifest.segment_id == actual)
+            {
+                return Err(ConcatMergeError::NonConsecutiveSources {
+                    position,
+                    expected: expected.manifest.segment_id,
+                    actual,
+                });
+            }
+            return Err(ConcatMergeError::SourceNotFound {
+                position,
+                segment_id: actual,
+            });
+        }
+    }
+    if segments
+        .iter()
+        .any(|segment| segment.manifest.segment_id == output_segment_id)
+    {
+        return Err(ConcatMergeError::OutputSegmentCollision {
+            segment_id: output_segment_id,
+        });
+    }
+    let end = start.checked_add(source_segment_ids.len()).ok_or(
+        ConcatMergeError::ArithmeticOverflow {
+            field: "source manifest slice end",
+        },
+    )?;
+    let selected =
+        segments
+            .get(start..end)
+            .ok_or_else(|| ConcatMergeError::SourceRunPastManifest {
+                position: source_segment_ids.len(),
+                actual: *source_segment_ids.last().unwrap_or(&first_id),
+            })?;
+    for segment in selected {
+        if let Some(entry) = segment.section_entries().iter().find(|entry| {
+            !(SectionKind::TERMDICT.raw()..=SectionKind::STATS.raw()).contains(&entry.kind.raw())
+        }) {
+            return Err(ConcatMergeError::UnknownSection {
+                segment_id: segment.manifest.segment_id,
+                section_kind: entry.kind.raw(),
+            });
+        }
+        segment
+            .verify()
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+    }
+
+    let schema = snapshot.schema();
+    let term_fields = concat_term_field_ords(schema)?;
+    let stored_fields = concat_stored_field_ords(schema)?;
+    let has_positions = concat_schema_has_positions(schema);
+    let has_numeric = concat_schema_has_numeric(schema);
+    let mut sources = Vec::new();
+    sources
+        .try_reserve_exact(selected.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "source views",
+            count: selected.len(),
+        })?;
+    for segment in selected {
+        sources.push(open_concat_source(
+            segment,
+            schema,
+            &term_fields,
+            &stored_fields,
+            has_positions,
+            has_numeric,
+        )?);
+    }
+
+    let docid_lo = selected
+        .first()
+        .map(|segment| segment.manifest.docid_lo)
+        .ok_or(ConcatMergeError::TooFewSources { count: 0 })?;
+    let docid_hi = selected
+        .last()
+        .map(|segment| segment.manifest.docid_hi)
+        .ok_or(ConcatMergeError::TooFewSources { count: 0 })?;
+    let doc_count_u64 = selected.iter().try_fold(0_u64, |count, segment| {
+        count
+            .checked_add(u64::from(segment.manifest.doc_count))
+            .ok_or(ConcatMergeError::ArithmeticOverflow {
+                field: "physical document count",
+            })
+    })?;
+    let doc_count =
+        u32::try_from(doc_count_u64).map_err(|_| ConcatMergeError::ArithmeticOverflow {
+            field: "durable physical document count",
+        })?;
+
+    let (postings, positions, blockmax, merged_terms) =
+        merge_concat_terms(&sources, has_positions)?;
+    let mut term_inputs = Vec::new();
+    term_inputs
+        .try_reserve_exact(merged_terms.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "TERMDICT inputs",
+            count: merged_terms.len(),
+        })?;
+    for term in &merged_terms {
+        term_inputs.push(TermInput::new(term.field_ord, &term.term, term.metadata));
+    }
+    let termdict = EncodedTermDictionary::encode_sorted(
+        schema,
+        TermSectionLengths {
+            postings: durable_concat_len(&postings, "POSTINGS")?,
+            positions: has_positions
+                .then(|| durable_concat_len(&positions, "POSITIONS"))
+                .transpose()?,
+            blockmax: durable_concat_len(&blockmax, "BLOCKMAX")?,
+        },
+        &term_inputs,
+    )
+    .map_err(|error| concat_codec(SectionKind::TERMDICT, error))?;
+
+    let mut doclen_sections = Vec::new();
+    doclen_sections
+        .try_reserve_exact(sources.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "DOCLEN source views",
+            count: sources.len(),
+        })?;
+    doclen_sections.extend(sources.iter().map(|source| source.doclen.clone()));
+    let doclen = EncodedDocLenSection::concatenate(&doclen_sections, &term_fields)
+        .map_err(|error| concat_codec(SectionKind::DOCLEN, error))?;
+    let mut id_map_sections = Vec::new();
+    id_map_sections
+        .try_reserve_exact(sources.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "IDMAP source views",
+            count: sources.len(),
+        })?;
+    id_map_sections.extend(sources.iter().map(|source| source.id_map));
+    let id_map_plan = EncodedIdMapSection::plan_concatenate(&id_map_sections)
+        .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
+
+    let tombstone_docids = collect_concat_tombstones(&sources)?;
+    let tombstones = TombstoneSet::from_sorted_docids(&tombstone_docids).map_err(|error| {
+        ConcatMergeError::InvalidManifest {
+            detail: error.to_string(),
+        }
+    })?;
+    let representative_ordinals = resolve_concat_representatives_from_sources(
+        &id_map_sections,
+        id_map_plan.docid_lo(),
+        &tombstone_docids,
+    )?;
+    let id_hash = EncodedIdHashSection::encode_resolved_concat(
+        &id_map_sections,
+        &id_map_plan,
+        &representative_ordinals,
+    )
+    .map_err(|error| concat_codec(SectionKind::IDHASH, error))?;
+
+    let numeric = if has_numeric {
+        let mut numeric_sections = Vec::new();
+        numeric_sections
+            .try_reserve_exact(sources.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "NUMERIC source views",
+                count: sources.len(),
+            })?;
+        for source in &sources {
+            numeric_sections.push(
+                source
+                    .numeric
+                    .clone()
+                    .ok_or_else(|| concat_missing_section(source.segment, SectionKind::NUMERIC))?,
+            );
+        }
+        Some(
+            EncodedNumericSection::merge_sorted(schema, &numeric_sections)
+                .map_err(|error| concat_codec(SectionKind::NUMERIC, error))?,
+        )
+    } else {
+        None
+    };
+    let mut stored_sections = Vec::new();
+    let stored_meta_plan =
+        if stored_fields.is_empty() {
+            None
+        } else {
+            stored_sections
+                .try_reserve_exact(sources.len())
+                .map_err(|_| ConcatMergeError::Allocation {
+                    resource: "STOREDMETA source views",
+                    count: sources.len(),
+                })?;
+            for source in &sources {
+                stored_sections.push(source.stored_meta.clone().ok_or_else(|| {
+                    concat_missing_section(source.segment, SectionKind::STOREDMETA)
+                })?);
+            }
+            Some(
+                EncodedStoredMetaSection::plan_concatenate(&stored_sections, &stored_fields)
+                    .map_err(|error| concat_codec(SectionKind::STOREDMETA, error))?,
+            )
+        };
+
+    let aggregate = aggregate_field_stats(sources.iter().map(|source| &source.stats))
+        .map_err(|error| concat_codec(SectionKind::STATS, error))?;
+    let mut stats_rows = Vec::new();
+    stats_rows
+        .try_reserve_exact(aggregate.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "STATS rows",
+            count: aggregate.len(),
+        })?;
+    for row in aggregate {
+        if row.doc_count != doc_count_u64 {
+            return Err(ConcatMergeError::SectionCodec {
+                section: SectionKind::STATS,
+                detail: format!(
+                    "field {} denominator {} differs from merged physical count {doc_count_u64}",
+                    row.field_ord, row.doc_count
+                ),
+            });
+        }
+        stats_rows.push(FieldStats::new(row.field_ord, row.total_tokens, doc_count));
+    }
+    let stats = EncodedStatsSection::encode(&term_fields, &stats_rows, doc_count)
+        .map_err(|error| concat_codec(SectionKind::STATS, error))?;
+
+    let mut section_plan = Vec::new();
+    section_plan
+        .try_reserve_exact(10)
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "FSLX section plan",
+            count: 10,
+        })?;
+    section_plan.push(PlannedSection::new(
+        SectionKind::TERMDICT,
+        termdict.as_bytes().len(),
+    ));
+    section_plan.push(PlannedSection::new(SectionKind::POSTINGS, postings.len()));
+    if has_positions {
+        section_plan.push(PlannedSection::new(SectionKind::POSITIONS, positions.len()));
+    }
+    section_plan.push(PlannedSection::new(SectionKind::BLOCKMAX, blockmax.len()));
+    section_plan.push(PlannedSection::new(
+        SectionKind::DOCLEN,
+        doclen.as_bytes().len(),
+    ));
+    section_plan.push(PlannedSection::new(
+        SectionKind::IDMAP,
+        id_map_plan.encoded_len(),
+    ));
+    section_plan.push(PlannedSection::new(
+        SectionKind::IDHASH,
+        id_hash.as_bytes().len(),
+    ));
+    if let Some(numeric) = &numeric {
+        section_plan.push(PlannedSection::new(
+            SectionKind::NUMERIC,
+            numeric.as_bytes().len(),
+        ));
+    }
+    if let Some(stored_meta_plan) = &stored_meta_plan {
+        section_plan.push(PlannedSection::new(
+            SectionKind::STOREDMETA,
+            stored_meta_plan.encoded_len(),
+        ));
+    }
+    section_plan.push(PlannedSection::new(
+        SectionKind::STATS,
+        stats.as_bytes().len(),
+    ));
+
+    let mut assembler = SegmentAssembler::new(
+        SegmentHeaderInput {
+            segment_id: output_segment_id,
+            schema,
+            docid_lo,
+            docid_hi,
+            doc_count,
+            created_unix_s,
+            engine_version: CURRENT_ENGINE_VERSION,
+        },
+        &section_plan,
+    )
+    .map_err(|source| ConcatMergeError::Segment { source })?;
+    assembler
+        .copy_section(SectionKind::TERMDICT, termdict.as_bytes())
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    assembler
+        .copy_section(SectionKind::POSTINGS, &postings)
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    if has_positions {
+        assembler
+            .copy_section(SectionKind::POSITIONS, &positions)
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+    }
+    assembler
+        .copy_section(SectionKind::BLOCKMAX, &blockmax)
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    assembler
+        .copy_section(SectionKind::DOCLEN, doclen.as_bytes())
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    assembler
+        .write_section(SectionKind::IDMAP, |bytes| {
+            id_map_plan.append_to(&id_map_sections, bytes);
+        })
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+
+    {
+        let id_map_bytes = assembler
+            .written_section(SectionKind::IDMAP)
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+        let merged_id_map = IdMapSection::parse(id_map_bytes, docid_lo, docid_hi)
+            .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
+        id_hash
+            .section(merged_id_map)
+            .map_err(|error| concat_codec(SectionKind::IDHASH, error))?;
+    }
+    assembler
+        .copy_section(SectionKind::IDHASH, id_hash.as_bytes())
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    if let Some(numeric) = &numeric {
+        assembler
+            .copy_section(SectionKind::NUMERIC, numeric.as_bytes())
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+    }
+    if let Some(stored_meta_plan) = &stored_meta_plan {
+        assembler
+            .write_section(SectionKind::STOREDMETA, |bytes| {
+                stored_meta_plan.append_to(&stored_sections, &stored_fields, bytes);
+            })
+            .map_err(|source| ConcatMergeError::Segment { source })?;
+    }
+    assembler
+        .copy_section(SectionKind::STATS, stats.as_bytes())
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    let encoded = assembler
+        .finish()
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    let reader = SegmentReader::from_bytes(encoded.as_bytes(), schema)
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+    reader
+        .verify()
+        .map_err(|source| ConcatMergeError::Segment { source })?;
+
+    let next_seal_seq = snapshot
+        .loaded
+        .manifest
+        .segments
+        .iter()
+        .map(|segment| segment.seal_seq)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(ConcatMergeError::ArithmeticOverflow {
+            field: "seal sequence",
+        })?;
+    let replacement = ManifestSegment {
+        segment_id: output_segment_id,
+        seal_seq: next_seal_seq,
+        file_len: encoded.file_len(),
+        file_xxh3: encoded.file_xxh3(),
+        docid_lo,
+        docid_hi,
+        doc_count,
+        tombstones,
+    };
+    let mut manifest = snapshot.loaded.manifest.clone();
+    manifest.generation =
+        manifest
+            .generation
+            .checked_add(1)
+            .ok_or(ConcatMergeError::ArithmeticOverflow {
+                field: "manifest generation",
+            })?;
+    manifest.last_publish_unix_s = 0;
+    manifest.segments.splice(start..end, [replacement]);
+    manifest
+        .validate()
+        .map_err(|error| ConcatMergeError::InvalidManifest {
+            detail: error.to_string(),
+        })?;
+    Ok(ConcatMergeArtifact { encoded, manifest })
+}
+
+fn open_concat_source<'a>(
+    segment: &'a RecoveredSegment,
+    schema: SchemaDescriptor,
+    term_fields: &[u16],
+    stored_fields: &[u16],
+    has_positions: bool,
+    has_numeric: bool,
+) -> Result<ConcatSource<'a>, ConcatMergeError> {
+    let postings = required_concat_section(segment, SectionKind::POSTINGS)?;
+    let positions = if has_positions {
+        Some(required_concat_section(segment, SectionKind::POSITIONS)?)
+    } else {
+        None
+    };
+    let blockmax = required_concat_section(segment, SectionKind::BLOCKMAX)?;
+    let termdict_bytes = required_concat_section(segment, SectionKind::TERMDICT)?;
+    let termdict = TermDictionary::parse(
+        termdict_bytes,
+        schema,
+        TermSectionLengths {
+            postings: durable_concat_len(postings, "source POSTINGS")?,
+            positions: positions
+                .map(|bytes| durable_concat_len(bytes, "source POSITIONS"))
+                .transpose()?,
+            blockmax: durable_concat_len(blockmax, "source BLOCKMAX")?,
+        },
+    )
+    .map_err(|error| concat_codec(SectionKind::TERMDICT, error))?;
+    let term_count = usize::try_from(termdict.term_count()).map_err(|_| {
+        ConcatMergeError::ArithmeticOverflow {
+            field: "source term count",
+        }
+    })?;
+    let terms = termdict
+        .cursor()
+        .and_then(|cursor| cursor.collect_bounded(term_count))
+        .map_err(|error| concat_codec(SectionKind::TERMDICT, error))?;
+
+    let manifest = segment.manifest();
+    let doclen = DocLenSection::parse(
+        required_concat_section(segment, SectionKind::DOCLEN)?,
+        manifest.docid_lo,
+        manifest.docid_hi,
+        term_fields,
+    )
+    .map_err(|error| concat_codec(SectionKind::DOCLEN, error))?;
+    let id_map = IdMapSection::parse(
+        required_concat_section(segment, SectionKind::IDMAP)?,
+        manifest.docid_lo,
+        manifest.docid_hi,
+    )
+    .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
+    let numeric = if has_numeric {
+        Some(
+            NumericSection::parse(
+                required_concat_section(segment, SectionKind::NUMERIC)?,
+                schema,
+                manifest.docid_lo,
+                manifest.docid_hi,
+            )
+            .map_err(|error| concat_codec(SectionKind::NUMERIC, error))?,
+        )
+    } else {
+        None
+    };
+    let stored_meta = if stored_fields.is_empty() {
+        None
+    } else {
+        Some(
+            StoredMetaSection::parse(
+                required_concat_section(segment, SectionKind::STOREDMETA)?,
+                manifest.docid_lo,
+                manifest.docid_hi,
+                stored_fields,
+            )
+            .map_err(|error| concat_codec(SectionKind::STOREDMETA, error))?,
+        )
+    };
+    let stats = StatsSection::parse(
+        required_concat_section(segment, SectionKind::STATS)?,
+        term_fields,
+        manifest.doc_count,
+    )
+    .map_err(|error| concat_codec(SectionKind::STATS, error))?;
+    Ok(ConcatSource {
+        segment,
+        terms,
+        postings,
+        positions,
+        blockmax,
+        doclen,
+        id_map,
+        numeric,
+        stored_meta,
+        stats,
+    })
+}
+
+fn merge_concat_terms(
+    sources: &[ConcatSource<'_>],
+    has_positions: bool,
+) -> Result<MergedTermSections, ConcatMergeError> {
+    let mut heap = BinaryHeap::new();
+    heap.try_reserve(sources.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "term merge heap",
+            count: sources.len(),
+        })?;
+    for (source_index, source) in sources.iter().enumerate() {
+        push_concat_term(&mut heap, source, source_index, 0)?;
+    }
+    let mut postings_output = Vec::new();
+    let mut positions_output = Vec::new();
+    let mut blockmax_output = Vec::new();
+    let total_terms = sources.iter().try_fold(0_usize, |count, source| {
+        count
+            .checked_add(source.terms.len())
+            .ok_or(ConcatMergeError::ArithmeticOverflow {
+                field: "source term count sum",
+            })
+    })?;
+    let mut merged_terms = Vec::new();
+    merged_terms
+        .try_reserve(total_terms)
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "merged term rows",
+            count: total_terms,
+        })?;
+
+    while let Some(first) = heap.pop() {
+        let field_ord = first.field_ord;
+        let term = first.term;
+        let mut parts = Vec::new();
+        parts
+            .try_reserve_exact(sources.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "equal-term source rows",
+                count: sources.len(),
+            })?;
+        parts.push((first.source_index, first.term_index));
+        push_concat_term(
+            &mut heap,
+            &sources[first.source_index],
+            first.source_index,
+            first.term_index + 1,
+        )?;
+        while heap
+            .peek()
+            .is_some_and(|next| next.field_ord == field_ord && next.term == term)
+        {
+            let next = heap.pop().expect("peeked concat term remains present");
+            parts.push((next.source_index, next.term_index));
+            push_concat_term(
+                &mut heap,
+                &sources[next.source_index],
+                next.source_index,
+                next.term_index + 1,
+            )?;
+        }
+        parts.sort_unstable_by_key(|(source_index, _)| *source_index);
+
+        let mut posting_slices = Vec::new();
+        posting_slices.try_reserve_exact(parts.len()).map_err(|_| {
+            ConcatMergeError::Allocation {
+                resource: "term POSTINGS slices",
+                count: parts.len(),
+            }
+        })?;
+        for &(source_index, term_index) in &parts {
+            let source = &sources[source_index];
+            let metadata = source.terms[term_index].metadata;
+            posting_slices.push(concat_span(
+                source.postings,
+                metadata.postings,
+                SectionKind::POSTINGS,
+            )?);
+        }
+        let mut posting_lists = Vec::new();
+        posting_lists
+            .try_reserve_exact(parts.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "source POSTINGS views",
+                count: parts.len(),
+            })?;
+        for (&bytes, &(source_index, term_index)) in posting_slices.iter().zip(&parts) {
+            posting_lists.push(
+                PostingList::parse(
+                    bytes,
+                    sources[source_index].terms[term_index].metadata.doc_freq,
+                )
+                .map_err(|error| concat_codec(SectionKind::POSTINGS, error))?,
+            );
+        }
+        let mut posting_refs = Vec::new();
+        posting_refs
+            .try_reserve_exact(posting_lists.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "POSTINGS references",
+                count: posting_lists.len(),
+            })?;
+        posting_refs.extend(posting_lists.iter());
+        let merged_postings = EncodedPostingList::concatenate(&posting_refs)
+            .map_err(|error| concat_codec(SectionKind::POSTINGS, error))?;
+        let doc_freq = merged_postings.doc_freq();
+
+        let mut blockmax_lists = Vec::new();
+        blockmax_lists.try_reserve_exact(parts.len()).map_err(|_| {
+            ConcatMergeError::Allocation {
+                resource: "source BLOCKMAX views",
+                count: parts.len(),
+            }
+        })?;
+        for ((source_index, term_index), postings) in parts.iter().copied().zip(&posting_lists) {
+            let source = &sources[source_index];
+            let bytes = concat_span(
+                source.blockmax,
+                source.terms[term_index].metadata.blockmax,
+                SectionKind::BLOCKMAX,
+            )?;
+            blockmax_lists.push(
+                BlockMaxConcatList::parse(bytes, postings)
+                    .map_err(|error| concat_codec(SectionKind::BLOCKMAX, error))?,
+            );
+        }
+        let mut blockmax_refs = Vec::new();
+        blockmax_refs
+            .try_reserve_exact(blockmax_lists.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "BLOCKMAX references",
+                count: blockmax_lists.len(),
+            })?;
+        blockmax_refs.extend(blockmax_lists.iter());
+        let merged_blockmax = EncodedBlockMax::concatenate(&blockmax_refs)
+            .map_err(|error| concat_codec(SectionKind::BLOCKMAX, error))?;
+
+        let has_term_positions = sources[parts[0].0].terms[parts[0].1]
+            .metadata
+            .positions
+            .is_some();
+        let merged_positions = if has_term_positions {
+            let mut position_lists = Vec::new();
+            position_lists.try_reserve_exact(parts.len()).map_err(|_| {
+                ConcatMergeError::Allocation {
+                    resource: "source POSITIONS views",
+                    count: parts.len(),
+                }
+            })?;
+            for ((source_index, term_index), postings) in parts.iter().copied().zip(&posting_lists)
+            {
+                let source = &sources[source_index];
+                let span = source.terms[term_index].metadata.positions.ok_or_else(|| {
+                    ConcatMergeError::SectionCodec {
+                        section: SectionKind::POSITIONS,
+                        detail: format!(
+                            "field {field_ord} term {:?} has inconsistent positional metadata",
+                            String::from_utf8_lossy(&term)
+                        ),
+                    }
+                })?;
+                let bytes = concat_span(
+                    source.positions.ok_or_else(|| {
+                        concat_missing_section(source.segment, SectionKind::POSITIONS)
+                    })?,
+                    span,
+                    SectionKind::POSITIONS,
+                )?;
+                position_lists.push(
+                    PositionList::parse(bytes, postings)
+                        .map_err(|error| concat_codec(SectionKind::POSITIONS, error))?,
+                );
+            }
+            let mut refs = Vec::new();
+            refs.try_reserve_exact(position_lists.len()).map_err(|_| {
+                ConcatMergeError::Allocation {
+                    resource: "POSITIONS references",
+                    count: position_lists.len(),
+                }
+            })?;
+            refs.extend(position_lists.iter());
+            Some(
+                EncodedPositionList::concatenate(&refs)
+                    .map_err(|error| concat_codec(SectionKind::POSITIONS, error))?,
+            )
+        } else {
+            for &(source_index, term_index) in &parts {
+                if sources[source_index].terms[term_index]
+                    .metadata
+                    .positions
+                    .is_some()
+                {
+                    return Err(ConcatMergeError::SectionCodec {
+                        section: SectionKind::POSITIONS,
+                        detail: "equal term has inconsistent positional metadata".to_owned(),
+                    });
+                }
+            }
+            None
+        };
+        if has_term_positions && !has_positions {
+            return Err(ConcatMergeError::SectionCodec {
+                section: SectionKind::POSITIONS,
+                detail: "term carries positions but schema has no POSITIONS section".to_owned(),
+            });
+        }
+
+        let postings_offset = durable_concat_len(&postings_output, "POSTINGS offset")?;
+        append_concat_bytes(
+            &mut postings_output,
+            merged_postings.as_bytes(),
+            "POSTINGS output",
+        )?;
+        let blockmax_offset = durable_concat_len(&blockmax_output, "BLOCKMAX offset")?;
+        append_concat_bytes(
+            &mut blockmax_output,
+            merged_blockmax.as_bytes(),
+            "BLOCKMAX output",
+        )?;
+        let positions_span = if let Some(merged_positions) = merged_positions {
+            let offset = durable_concat_len(&positions_output, "POSITIONS offset")?;
+            let len = durable_concat_len(merged_positions.as_bytes(), "term POSITIONS length")?;
+            append_concat_bytes(
+                &mut positions_output,
+                merged_positions.as_bytes(),
+                "POSITIONS output",
+            )?;
+            Some(ByteSpan::new(offset, len))
+        } else {
+            None
+        };
+        let postings_len = durable_concat_len(merged_postings.as_bytes(), "term POSTINGS length")?;
+        let blockmax_len = durable_concat_len(merged_blockmax.as_bytes(), "term BLOCKMAX length")?;
+        let metadata = positions_span.map_or_else(
+            || {
+                TermMetadata::without_positions(
+                    doc_freq,
+                    ByteSpan::new(postings_offset, postings_len),
+                    ByteSpan::new(blockmax_offset, blockmax_len),
+                )
+            },
+            |positions_span| {
+                TermMetadata::with_positions(
+                    doc_freq,
+                    ByteSpan::new(postings_offset, postings_len),
+                    positions_span,
+                    ByteSpan::new(blockmax_offset, blockmax_len),
+                )
+            },
+        );
+        merged_terms.push(MergedTermRow {
+            field_ord,
+            term,
+            metadata,
+        });
+    }
+    Ok((
+        postings_output,
+        positions_output,
+        blockmax_output,
+        merged_terms,
+    ))
+}
+
+fn push_concat_term(
+    heap: &mut BinaryHeap<ConcatTermHeapItem>,
+    source: &ConcatSource<'_>,
+    source_index: usize,
+    term_index: usize,
+) -> Result<(), ConcatMergeError> {
+    let Some(term) = source.terms.get(term_index) else {
+        return Ok(());
+    };
+    let mut key = Vec::new();
+    key.try_reserve_exact(term.term.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "term heap key",
+            count: term.term.len(),
+        })?;
+    key.extend_from_slice(&term.term);
+    heap.push(ConcatTermHeapItem {
+        field_ord: term.field_ord,
+        term: key,
+        source_index,
+        term_index,
+    });
+    Ok(())
+}
+
+fn collect_concat_tombstones(sources: &[ConcatSource<'_>]) -> Result<Vec<u32>, ConcatMergeError> {
+    let count = sources.iter().try_fold(0_usize, |count, source| {
+        let source_count = usize::try_from(source.segment.manifest.tombstones.cardinality())
+            .map_err(|_| ConcatMergeError::ArithmeticOverflow {
+                field: "host tombstone cardinality",
+            })?;
+        count
+            .checked_add(source_count)
+            .ok_or(ConcatMergeError::ArithmeticOverflow {
+                field: "merged tombstone cardinality",
+            })
+    })?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(count)
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "merged tombstone docids",
+            count,
+        })?;
+    for source in sources {
+        let mut containers = TombstoneContainers::new(
+            source.segment.manifest.tombstones.as_bytes(),
+        )
+        .map_err(|error| ConcatMergeError::InvalidManifest {
+            detail: error.to_string(),
+        })?;
+        while let Some(container) =
+            containers
+                .next_container()
+                .map_err(|error| ConcatMergeError::InvalidManifest {
+                    detail: error.to_string(),
+                })?
+        {
+            match container.kind {
+                0 => {
+                    for index in 0..container.payload.len() / 2 {
+                        output.push(
+                            (u32::from(container.chunk_id) << 16)
+                                | u32::from(array_value(container.payload, index)),
+                        );
+                    }
+                }
+                1 => {
+                    for (byte_index, byte) in container.payload.iter().copied().enumerate() {
+                        let mut bits = byte;
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as usize;
+                            let low = u16::try_from(byte_index * 8 + bit).map_err(|_| {
+                                ConcatMergeError::ArithmeticOverflow {
+                                    field: "bitmap tombstone low bits",
+                                }
+                            })?;
+                            output.push((u32::from(container.chunk_id) << 16) | u32::from(low));
+                            bits &= bits - 1;
+                        }
+                    }
+                }
+                _ => {
+                    return Err(ConcatMergeError::InvalidManifest {
+                        detail: "unknown validated tombstone container kind".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    if output.len() != count {
+        return Err(ConcatMergeError::InvalidManifest {
+            detail: format!(
+                "decoded tombstone count {} differs from declared {count}",
+                output.len()
+            ),
+        });
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+fn resolve_concat_representatives(
+    id_map: IdMapSection<'_>,
+    tombstone_docids: &[u32],
+) -> Result<Vec<u32>, ConcatMergeError> {
+    resolve_concat_representatives_from_entries(
+        id_map.docid_lo(),
+        id_map.entries(),
+        tombstone_docids,
+    )
+}
+
+fn resolve_concat_representatives_from_sources(
+    id_maps: &[IdMapSection<'_>],
+    docid_lo: u64,
+    tombstone_docids: &[u32],
+) -> Result<Vec<u32>, ConcatMergeError> {
+    resolve_concat_representatives_from_entries(
+        docid_lo,
+        id_maps.iter().copied().flat_map(|id_map| id_map.entries()),
+        tombstone_docids,
+    )
+}
+
+fn resolve_concat_representatives_from_entries<'a>(
+    docid_lo: u64,
+    entries: impl IntoIterator<Item = (u64, IdMapEntry<'a>)>,
+    tombstone_docids: &[u32],
+) -> Result<Vec<u32>, ConcatMergeError> {
+    let mut representatives = BTreeMap::<&str, IdentityRepresentative>::new();
+    let mut tombstones = tombstone_docids.iter().copied().peekable();
+    for (global_docid, entry) in entries {
+        let global_docid =
+            u32::try_from(global_docid).map_err(|_| ConcatMergeError::ArithmeticOverflow {
+                field: "IDHASH representative global docid",
+            })?;
+        if let Some(&tombstone) = tombstones.peek()
+            && tombstone < global_docid
+        {
+            return Err(ConcatMergeError::InvalidManifest {
+                detail: format!(
+                    "merged tombstone {tombstone} references an IDMAP hole before row {global_docid}"
+                ),
+            });
+        }
+        let is_live = if tombstones.peek().copied() == Some(global_docid) {
+            tombstones.next();
+            false
+        } else {
+            true
+        };
+        match representatives.get_mut(entry.document_id()) {
+            Some(representative) => {
+                representative.lowest_global_docid =
+                    representative.lowest_global_docid.min(global_docid);
+                if is_live {
+                    if let Some(first_global_docid) = representative.live_global_docid {
+                        let mut document_id = String::new();
+                        document_id
+                            .try_reserve_exact(entry.document_id().len())
+                            .map_err(|_| ConcatMergeError::Allocation {
+                                resource: "duplicate document id diagnosis",
+                                count: entry.document_id().len(),
+                            })?;
+                        document_id.push_str(entry.document_id());
+                        return Err(ConcatMergeError::MultipleLiveDocumentIds {
+                            document_id,
+                            first_global_docid,
+                            duplicate_global_docid: global_docid,
+                        });
+                    }
+                    representative.live_global_docid = Some(global_docid);
+                }
+            }
+            None => {
+                representatives.insert(
+                    entry.document_id(),
+                    IdentityRepresentative {
+                        lowest_global_docid: global_docid,
+                        live_global_docid: is_live.then_some(global_docid),
+                    },
+                );
+            }
+        }
+    }
+    if let Some(tombstone) = tombstones.next() {
+        return Err(ConcatMergeError::InvalidManifest {
+            detail: format!(
+                "merged tombstone {tombstone} is not represented by a trailing IDMAP row"
+            ),
+        });
+    }
+    let mut ordinals = Vec::new();
+    ordinals
+        .try_reserve_exact(representatives.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "IDHASH representative ordinals",
+            count: representatives.len(),
+        })?;
+    for representative in representatives.values() {
+        let global_docid = representative
+            .live_global_docid
+            .unwrap_or(representative.lowest_global_docid);
+        let ordinal = u64::from(global_docid).checked_sub(docid_lo).ok_or(
+            ConcatMergeError::ArithmeticOverflow {
+                field: "IDHASH representative ordinal",
+            },
+        )?;
+        ordinals.push(u32::try_from(ordinal).map_err(|_| {
+            ConcatMergeError::ArithmeticOverflow {
+                field: "durable IDHASH representative ordinal",
+            }
+        })?);
+    }
+    ordinals.sort_unstable();
+    Ok(ordinals)
+}
+
+fn required_concat_section(
+    segment: &RecoveredSegment,
+    kind: SectionKind,
+) -> Result<&[u8], ConcatMergeError> {
+    segment
+        .section(kind)
+        .map_err(|source| ConcatMergeError::Segment { source })?
+        .ok_or_else(|| concat_missing_section(segment, kind))
+}
+
+fn concat_missing_section(segment: &RecoveredSegment, kind: SectionKind) -> ConcatMergeError {
+    ConcatMergeError::SectionCodec {
+        section: kind,
+        detail: format!(
+            "source segment {:#018x} is missing the required section",
+            segment.manifest.segment_id
+        ),
+    }
+}
+
+fn concat_span(
+    bytes: &[u8],
+    span: ByteSpan,
+    section: SectionKind,
+) -> Result<&[u8], ConcatMergeError> {
+    let start = usize::try_from(span.offset).map_err(|_| ConcatMergeError::ArithmeticOverflow {
+        field: "section span offset",
+    })?;
+    let len = usize::try_from(span.len).map_err(|_| ConcatMergeError::ArithmeticOverflow {
+        field: "section span length",
+    })?;
+    let end = start
+        .checked_add(len)
+        .ok_or(ConcatMergeError::ArithmeticOverflow {
+            field: "section span end",
+        })?;
+    bytes
+        .get(start..end)
+        .ok_or_else(|| ConcatMergeError::SectionCodec {
+            section,
+            detail: format!(
+                "referenced byte span [{start}, {end}) exceeds section length {}",
+                bytes.len()
+            ),
+        })
+}
+
+fn durable_concat_len(bytes: &[u8], field: &'static str) -> Result<u64, ConcatMergeError> {
+    u64::try_from(bytes.len()).map_err(|_| ConcatMergeError::ArithmeticOverflow { field })
+}
+
+fn append_concat_bytes(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    resource: &'static str,
+) -> Result<(), ConcatMergeError> {
+    output
+        .try_reserve(bytes.len())
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource,
+            count: output.len().saturating_add(bytes.len()),
+        })?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn concat_codec(section: SectionKind, error: impl std::fmt::Display) -> ConcatMergeError {
+    ConcatMergeError::SectionCodec {
+        section,
+        detail: error.to_string(),
+    }
+}
+
+fn concat_term_field_ords(schema: SchemaDescriptor) -> Result<Vec<u16>, ConcatMergeError> {
+    let count = schema
+        .fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+        .count();
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(count)
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "schema term fields",
+            count,
+        })?;
+    output.extend(schema.fields.iter().filter_map(|field| {
+        matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }).then_some(field.id)
+    }));
+    Ok(output)
+}
+
+fn concat_stored_field_ords(schema: SchemaDescriptor) -> Result<Vec<u16>, ConcatMergeError> {
+    let count = schema.fields.iter().filter(|field| field.stored).count();
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(count)
+        .map_err(|_| ConcatMergeError::Allocation {
+            resource: "schema stored fields",
+            count,
+        })?;
+    output.extend(
+        schema
+            .fields
+            .iter()
+            .filter_map(|field| field.stored.then_some(field.id)),
+    );
+    Ok(output)
+}
+
+fn concat_schema_has_positions(schema: SchemaDescriptor) -> bool {
+    schema.fields.iter().any(|field| {
+        matches!(
+            field.kind,
+            FieldKind::Text {
+                positions: true,
+                ..
+            }
+        )
+    })
+}
+
+fn concat_schema_has_numeric(schema: SchemaDescriptor) -> bool {
+    schema.fields.iter().any(|field| {
+        matches!(
+            field.kind,
+            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
+        )
+    })
 }
 
 fn reconcile_published_segment(
@@ -2665,10 +4175,11 @@ fn reconcile_published_segment(
             path: pending.path().to_path_buf(),
             source,
         })?;
+    let expected_file_len = pending.file_len();
     if !published_metadata.file_type().is_file()
         || !pending_metadata.file_type().is_file()
-        || published_metadata.len() != pending.file_len()
-        || pending_metadata.len() != pending.file_len()
+        || published_metadata.len() != expected_file_len
+        || pending_metadata.len() != expected_file_len
     {
         return Err(KeeperError::Io {
             operation: "reconcile published segment",
@@ -11171,6 +12682,45 @@ mod tests {
             Err(KeeperError::MultipleLiveDocumentIds {
                 first_global_docid: 0,
                 duplicate_global_docid: 20,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn concat_representatives_prefer_the_only_live_duplicate_independent_of_row_age() -> TestResult
+    {
+        let encoded = EncodedIdMapSection::encode(
+            0,
+            3,
+            &[
+                Some(IdMapEntryInput::new("same", 11)),
+                Some(IdMapEntryInput::new("other", 22)),
+                Some(IdMapEntryInput::new("same", 33)),
+            ],
+        )?;
+
+        assert_eq!(
+            resolve_concat_representatives(encoded.section()?, &[0])?,
+            [1, 2],
+            "a live later row must replace a tombstoned earlier representative",
+        );
+        assert_eq!(
+            resolve_concat_representatives(encoded.section()?, &[2])?,
+            [0, 1],
+            "a live earlier row must survive a tombstoned later representative",
+        );
+        assert_eq!(
+            resolve_concat_representatives(encoded.section()?, &[0, 2])?,
+            [0, 1],
+            "an all-dead identity uses its lowest global docid as canonical hash input",
+        );
+        assert!(matches!(
+            resolve_concat_representatives(encoded.section()?, &[]),
+            Err(ConcatMergeError::MultipleLiveDocumentIds {
+                first_global_docid: 0,
+                duplicate_global_docid: 2,
                 ..
             })
         ));
