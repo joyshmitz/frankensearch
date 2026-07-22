@@ -6090,3 +6090,43 @@ rrf_config tier_weighted/hash_tiebreak realistic. Two regressions are newly deci
 normalize_signal's single-pass rewrite is ~14% SLOWER at n192/n1536, and neighbor_smooth_recip's
 v2 mutual is ~1.2× slower — both warrant follow-up before any KEEP claim. Any future KEEP/REJECT
 row for these benches must quote the lever median AND its null p5/p95 from the same run.
+
+## 2026-07-22 — LANDED: Quill SWAR default tokenizer — length-dependent, decidable win on long tokens (`bd-quill-e1-scribe-bejd.1`, FuchsiaMaple)
+
+`FrankensearchTokenizer::analyze` (Quill's default analyzer, on the ingest and query hot paths)
+now finds token boundaries with a SWAR-on-u64 byte classifier that visits eight ASCII bytes per
+64-bit word (`skip_separators` / `scan_token_end` in `crates/frankensearch-quill/src/scribe.rs`),
+falling back to the scalar char-walk for the span around each non-ASCII byte. It is safe code only —
+no `core::arch` intrinsics; the quill crate root is `#![forbid(unsafe_code)]`. The classifier is a
+borrow-safe per-lane range test (guard the top bit of each lane, then subtract the broadcast
+threshold so every lane stays in `[1,255]` and no borrow crosses a lane boundary — the bare
+Bit-Twiddling-Hacks `hasless` is NOT per-lane-correct, a bug the byte-parity property tests caught
+before this landed).
+
+BYTE PARITY (correctness, not perf): the emitted `AnalyzedToken` stream (text/position/offsets) is
+byte-identical to the retained scalar char-walk oracle `analyze_default_scalar_reference` and to the
+shipping Tantivy `SimpleTokenizer + LowerCaser` incumbent, pinned by the pre-existing language-contract
+fixture test plus new tests: an exhaustive per-lane classifier check over every ASCII byte, a random
+ASCII-word cross-lane-contamination guard, lane-edge cases (tokens of length 6..=17 straddling the
+8/16-byte window; multi-byte scalar values at lane 7 / lane-0-of-next-window / mid-window), and a
+4000-input xorshift property corpus mixing ASCII with 2/3/4-byte scalar values. 61/61 scribe tests
+and 385/385 quill-lib tests green.
+
+Bench `tokenizer_simd_ab` (same-binary `paired_median_ratio`, 41 rounds × inner=16 ~4ms batches,
+A/A null-control), authoritative run on fleet worker `ovh-a` via `rch exec`, `--profile release`.
+Ratio = `simd/scalar`, `<1.0` = SWAR faster. The payoff is length-dependent:
+
+| bench (48KiB corpus) | lever median [p5, p95] | A/A null [p5, p95] | verdict |
+|---|---|---|---|
+| tokenizer_simd_long (24–48B tokens) | 0.6818 [0.6690, 0.6884] | 1.0002 [0.9952, 1.0079] | **DECIDABLE WIN** ~1.47× (criterion corroborates 77.0µs vs 94.4µs, ~1.23×) |
+| tokenizer_simd (short ~6B tokens) | 0.83 / 1.02 (run-to-run) | ±2%…±10% (run-varying) | **WASH** — sign flips across runs inside fleet noise; criterion ≈parity (171µs vs 174µs) |
+
+Reading: on the long-token corpus (hashes/base64/UUIDs/long identifiers with long separator runs)
+the SWAR classifier amortizes its per-window mask and wins decidably and reproducibly (~1.2–1.5×,
+tight null). On the realistic short-token corpus (~6-byte space-separated words) it is ≈parity — the
+scalar `tokenizer_next_char` already has an ASCII byte fast-path, so a ~6-byte token barely fills one
+8-lane window, and the lever sign flips run-to-run (0.83 win one run, 1.02 regression another) inside
+the fleet's null spread; this is NOT cited as a short-token win. KEEP as the default because it is a
+large decidable win on the long tokens common in code/log/data corpora, byte-parity-correct, and
+carries no reproducible short-token regression. (bd-5hz0 lesson holds: this is a full-scan classify —
+every byte visited — not a `memchr`/`contains` early-exit scan, so SIMD helps rather than regresses.)

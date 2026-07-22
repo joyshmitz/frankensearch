@@ -193,13 +193,23 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
     Ok(report)
 }
 
-/// Scalar reference implementation of the shipping frankensearch analyzer.
+/// Default implementation of the shipping frankensearch analyzer.
 ///
 /// This fuses Tantivy's `SimpleTokenizer` and `LowerCaser`: split on
 /// non-alphanumeric Unicode scalar values, ASCII-lowercase in place, and use
 /// the full Unicode lowercase expansion otherwise. It deliberately does not
 /// enforce [`MAX_TERM_BYTES`]; admission belongs to document/query consumers
 /// so a dropped document token retains its position gap.
+///
+/// Token boundaries are found by a SWAR (SIMD-within-a-register) byte
+/// classifier that visits eight ASCII bytes per 64-bit word
+/// ([`skip_separators`]/[`scan_token_end`]), falling back to the scalar
+/// char-walk for the span around each non-ASCII byte. The emitted stream is
+/// byte-parity-identical to [`analyze_default_scalar_reference`] — the retained
+/// scalar oracle — which the `swar_default_matches_scalar_reference_*` tests and
+/// the `tokenizer_simd_ab` bench pin (bd-quill-e1-scribe-bejd.1). No
+/// `core::arch` intrinsics are used; the quill crate root is
+/// `#![forbid(unsafe_code)]`.
 #[derive(Debug, Clone, Default)]
 pub struct FrankensearchTokenizer {
     token: AnalyzedToken,
@@ -235,6 +245,134 @@ fn next_token_position(position: u32) -> u32 {
         .expect("analyzed token position exceeds the u32 contract")
 }
 
+/// Bytes classified per 64-bit SWAR word.
+const SWAR_LANES: usize = 8;
+/// SWAR broadcast of the byte `0x01` into every lane.
+const SWAR_ONES: u64 = 0x0101_0101_0101_0101;
+/// SWAR broadcast of the byte `0x80` (per-lane high bit) into every lane.
+const SWAR_HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// Per-lane marker (`0x80` in the lane) where `lo <= byte <= hi`.
+///
+/// Correct for lanes whose byte is `< 0x80`, with `lo <= 128` and `hi < 128`.
+/// The compare is borrow-safe *per lane*: each lane's guard (top) bit is forced
+/// before the broadcast threshold is subtracted, so every lane stays in
+/// `[1, 255]` (`0x80 + byte - threshold`, `byte < 0x80`, `threshold <= 128`) and
+/// no borrow ever crosses a lane boundary — unlike the bare Bit-Twiddling-Hacks
+/// `hasless`, whose subtraction lets a low lane's underflow corrupt the next
+/// lane's marker. Lanes holding a byte `>= 0x80` produce an unspecified marker;
+/// every caller pairs this with an explicit high-bit test so a non-ASCII lane
+/// terminates the span before its marker is consulted.
+#[inline]
+const fn swar_range_mark(word: u64, lo: u64, hi: u64) -> u64 {
+    let guarded = word | SWAR_HIGH;
+    // 0x80 in each lane whose byte is >= lo.
+    let ge_lo = guarded.wrapping_sub(SWAR_ONES.wrapping_mul(lo)) & SWAR_HIGH;
+    // 0x80 in each lane whose byte is > hi (i.e. >= hi + 1).
+    let gt_hi = guarded.wrapping_sub(SWAR_ONES.wrapping_mul(hi + 1)) & SWAR_HIGH;
+    // In range iff at-or-above lo and not above hi.
+    ge_lo & !gt_hi
+}
+
+/// Per-lane marker (`0x80` in the lane) where the ASCII byte is `[0-9A-Za-z]`.
+///
+/// This is the SWAR equivalent of [`u8::is_ascii_alphanumeric`] and therefore of
+/// [`tokenizer_is_alphanumeric`] for ASCII scalar values. See
+/// [`swar_range_mark`] for the non-ASCII lane caveat.
+#[inline]
+const fn swar_ascii_alnum_mark(word: u64) -> u64 {
+    swar_range_mark(word, b'0' as u64, b'9' as u64)
+        | swar_range_mark(word, b'A' as u64, b'Z' as u64)
+        | swar_range_mark(word, b'a' as u64, b'z' as u64)
+}
+
+/// Load the eight bytes at `at` as a little-endian word so lane 0 is the byte at
+/// the lowest offset. The caller guarantees `at + SWAR_LANES <= bytes.len()`.
+#[inline]
+fn swar_load(bytes: &[u8], at: usize) -> u64 {
+    let mut lanes = [0_u8; SWAR_LANES];
+    lanes.copy_from_slice(&bytes[at..at + SWAR_LANES]);
+    u64::from_le_bytes(lanes)
+}
+
+/// Advance past separators and return the byte offset of the first byte that
+/// begins an alphanumeric token, or `text.len()` when the remainder holds none.
+///
+/// The SWAR fast path classifies eight ASCII bytes per word; the first
+/// non-ASCII byte (always a UTF-8 leading byte because every earlier byte was
+/// ASCII) hands off to [`tokenizer_next_char`] so Unicode alphanumeric
+/// classification stays byte-parity-exact with the scalar reference.
+#[inline]
+fn skip_separators(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut cursor = from;
+    loop {
+        while cursor + SWAR_LANES <= len {
+            let word = swar_load(bytes, cursor);
+            // Stop at the first ASCII-alnum lane or the first non-ASCII byte.
+            let stop = swar_ascii_alnum_mark(word) | (word & SWAR_HIGH);
+            if stop == 0 {
+                cursor += SWAR_LANES;
+                continue;
+            }
+            let at = cursor + (stop.trailing_zeros() as usize) / SWAR_LANES;
+            if bytes[at] < 0x80 {
+                return at;
+            }
+            cursor = at;
+            break;
+        }
+        match tokenizer_next_char(text, cursor) {
+            None => return len,
+            Some((ch, next)) => {
+                if tokenizer_is_alphanumeric(ch) {
+                    return cursor;
+                }
+                cursor = next;
+            }
+        }
+    }
+}
+
+/// Given a token starting at `from` (an alphanumeric char boundary), return the
+/// exclusive end offset of the maximal alphanumeric run and whether every byte
+/// in it is ASCII (which selects the [`str::make_ascii_lowercase`] fast path).
+#[inline]
+fn scan_token_end(text: &str, from: usize) -> (usize, bool) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut cursor = from;
+    let mut all_ascii = true;
+    loop {
+        while cursor + SWAR_LANES <= len {
+            let word = swar_load(bytes, cursor);
+            // Stop at the first ASCII separator lane or the first non-ASCII byte.
+            let stop = (swar_ascii_alnum_mark(word) ^ SWAR_HIGH) | (word & SWAR_HIGH);
+            if stop == 0 {
+                cursor += SWAR_LANES;
+                continue;
+            }
+            let at = cursor + (stop.trailing_zeros() as usize) / SWAR_LANES;
+            if bytes[at] < 0x80 {
+                return (at, all_ascii);
+            }
+            cursor = at;
+            break;
+        }
+        match tokenizer_next_char(text, cursor) {
+            None => return (len, all_ascii),
+            Some((ch, next)) => {
+                if !tokenizer_is_alphanumeric(ch) {
+                    return (cursor, all_ascii);
+                }
+                all_ascii &= ch.is_ascii();
+                cursor = next;
+            }
+        }
+    }
+}
+
 impl TokenAnalyzer for FrankensearchTokenizer {
     fn supports(&self, analyzer: AnalyzerKind) -> bool {
         analyzer == AnalyzerKind::FrankensearchDefault
@@ -247,28 +385,16 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         sink: &mut dyn FnMut(&AnalyzedToken),
     ) {
         debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
+        let len = text.len();
         let mut cursor = 0;
         let mut position = 0_u32;
 
-        while let Some((ch, next_cursor)) = tokenizer_next_char(text, cursor) {
-            if !tokenizer_is_alphanumeric(ch) {
-                cursor = next_cursor;
-                continue;
+        while cursor < len {
+            let offset_from = skip_separators(text, cursor);
+            if offset_from >= len {
+                break;
             }
-
-            let offset_from = cursor;
-            let mut offset_to = next_cursor;
-            let mut resume_at = next_cursor;
-            let mut all_ascii = ch.is_ascii();
-            while let Some((next_ch, after_next)) = tokenizer_next_char(text, resume_at) {
-                if !tokenizer_is_alphanumeric(next_ch) {
-                    resume_at = after_next;
-                    break;
-                }
-                all_ascii &= next_ch.is_ascii();
-                offset_to = after_next;
-                resume_at = after_next;
-            }
+            let (offset_to, all_ascii) = scan_token_end(text, offset_from);
 
             self.token.text.clear();
             let source = &text[offset_from..offset_to];
@@ -287,7 +413,7 @@ impl TokenAnalyzer for FrankensearchTokenizer {
             sink(&self.token);
 
             position = next_token_position(position);
-            cursor = resume_at;
+            cursor = offset_to;
         }
     }
 
@@ -301,6 +427,62 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         self.token.offset_from = 0;
         self.token.offset_to = 0;
         self.token.position_length = 0;
+    }
+}
+
+/// Pure scalar char-walk reference for the default frankensearch analyzer.
+///
+/// This is the byte-parity oracle for the SWAR fast path in
+/// [`FrankensearchTokenizer::analyze`] (bd-quill-e1-scribe-bejd.1): it walks one
+/// Unicode scalar value at a time with no register-width classification, so the
+/// two implementations share no boundary-finding code and a divergence in
+/// either is caught by diffing their streams. It is also the A/B baseline arm in
+/// the `tokenizer_simd_ab` bench. Emission (slice, lowercase-path selection,
+/// position/offset assignment) is identical to the production analyzer.
+#[cfg(any(test, feature = "bench-internals"))]
+pub fn analyze_default_scalar_reference(text: &str, sink: &mut dyn FnMut(&AnalyzedToken)) {
+    let mut token = AnalyzedToken::default();
+    let mut cursor = 0;
+    let mut position = 0_u32;
+
+    while let Some((ch, next_cursor)) = tokenizer_next_char(text, cursor) {
+        if !tokenizer_is_alphanumeric(ch) {
+            cursor = next_cursor;
+            continue;
+        }
+
+        let offset_from = cursor;
+        let mut offset_to = next_cursor;
+        let mut resume_at = next_cursor;
+        let mut all_ascii = ch.is_ascii();
+        while let Some((next_ch, after_next)) = tokenizer_next_char(text, resume_at) {
+            if !tokenizer_is_alphanumeric(next_ch) {
+                resume_at = after_next;
+                break;
+            }
+            all_ascii &= next_ch.is_ascii();
+            offset_to = after_next;
+            resume_at = after_next;
+        }
+
+        token.text.clear();
+        let source = &text[offset_from..offset_to];
+        if all_ascii {
+            token.text.push_str(source);
+            token.text.make_ascii_lowercase();
+        } else {
+            for source_char in source.chars() {
+                token.text.extend(source_char.to_lowercase());
+            }
+        }
+        token.position = position;
+        token.offset_from = offset_from;
+        token.offset_to = offset_to;
+        token.position_length = 1;
+        sink(&token);
+
+        position = next_token_position(position);
+        cursor = resume_at;
     }
 }
 
@@ -4334,6 +4516,140 @@ mod tests {
             }
         }
         assert_eq!(executed, 6, "all default-analyzer fixtures must execute");
+    }
+
+    fn scalar_reference_tokens(text: &str) -> Vec<AnalyzedToken> {
+        let mut tokens = Vec::new();
+        analyze_default_scalar_reference(text, &mut |token| tokens.push(token.clone()));
+        tokens
+    }
+
+    #[test]
+    fn swar_ascii_alnum_mark_matches_scalar_for_every_ascii_byte_in_every_lane() {
+        // The garbage-marker caveat only covers bytes >= 0x80; every ASCII lane
+        // must classify exactly like `u8::is_ascii_alphanumeric`, with a
+        // non-alnum filler in the other lanes to catch cross-lane borrow bleed.
+        for lane in 0..SWAR_LANES {
+            for byte in 0_u8..=0x7F {
+                let mut lanes = [b'.'; SWAR_LANES];
+                lanes[lane] = byte;
+                let word = u64::from_le_bytes(lanes);
+                let marked = (swar_ascii_alnum_mark(word) >> (lane * 8)) & 0x80 != 0;
+                assert_eq!(
+                    marked,
+                    byte.is_ascii_alphanumeric(),
+                    "lane {lane} byte {byte:#04x} misclassified"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swar_ascii_alnum_mark_matches_scalar_on_random_ascii_words() {
+        // Every lane of a fully random ASCII word must agree with the scalar
+        // classifier — this is the cross-lane contamination guard.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for _ in 0..8192 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let word = state & 0x7F7F_7F7F_7F7F_7F7F; // force ASCII lanes
+            let mark = swar_ascii_alnum_mark(word);
+            for lane in 0..SWAR_LANES {
+                let byte = u8::try_from((word >> (lane * 8)) & 0xFF).expect("masked to a byte");
+                let marked = (mark >> (lane * 8)) & 0x80 != 0;
+                assert_eq!(
+                    marked,
+                    byte.is_ascii_alphanumeric(),
+                    "byte {byte:#04x} in lane {lane} misclassified"
+                );
+            }
+        }
+    }
+
+    /// Inputs engineered so tokens and non-ASCII bytes land at every offset
+    /// relative to the 8-byte SWAR window: token runs of length 6..=17 straddle
+    /// the first/second word boundary, and multi-byte scalar values appear at
+    /// lane 7 (window edge), lane 0 of the next window, and mid-window.
+    const LANE_EDGE_CASES: &[&str] = &[
+        "",
+        "a",
+        "aa",
+        "aaaaaaa",           // 7-byte token: entirely inside the tail path
+        "aaaaaaaa",          // exactly one full window
+        "aaaaaaaaa",         // one full window + tail
+        "aaaaaaaaaaaaaaa",   // 15
+        "aaaaaaaaaaaaaaaa",  // 16 (two full windows)
+        "aaaaaaaaaaaaaaaaa", // 17
+        "       a",          // 7 separators then alnum at lane 7
+        "        a",         // 8 separators then alnum at lane 0 of the next window
+        "aaaaaaa a",         // token ends exactly at the window edge
+        "POL-358",
+        "camelCase snake_case_name",
+        "café",
+        "aaaaaaaé",  // 7 ASCII alnum + a 2-byte scalar starting at lane 7
+        "aaaaaaaaé", // 8 ASCII alnum + a 2-byte scalar at lane 0 of the next window
+        "aaaaaaa😀", // 4-byte scalar (separator) straddling the window edge
+        "aaaaaa中b", // 3-byte alnum scalar mid-window continues the token
+        "Ω123",
+        "搜索引擎",
+        "a搜b索c",
+        "———",
+        "\u{0}\u{1}mix\u{7f}end",
+    ];
+
+    #[test]
+    fn swar_default_matches_scalar_reference_on_lane_edge_cases() {
+        for &case in LANE_EDGE_CASES {
+            assert_eq!(
+                analyzed_tokens(case),
+                scalar_reference_tokens(case),
+                "SWAR analyzer diverged from the scalar char-walk reference for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn swar_default_matches_shipping_incumbent_on_lane_edge_cases() {
+        for &case in LANE_EDGE_CASES {
+            assert_eq!(
+                analyzed_tokens(case),
+                incumbent_tokens(case),
+                "SWAR analyzer diverged from the shipping tokenizer for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn swar_default_matches_scalar_reference_on_random_corpus() {
+        // Deterministic xorshift corpus mixing ASCII alnum/separators with
+        // 2/3/4-byte scalar values (both alphanumeric and separator classes) at
+        // random lengths so tokens straddle SWAR lane edges at every offset.
+        const ALPHABET: &[char] = &[
+            'a', 'z', 'A', 'Z', '0', '9', '_', ' ', '-', '.', '/', '\n', '\t', 'é', 'Ω', 'ß', 'İ',
+            '中', '搜', '索', 'テ', '검', '—', '，', '😀', '𠀀',
+        ];
+        let alphabet_len = u64::try_from(ALPHABET.len()).expect("alphabet length fits u64");
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let raw_len = usize::try_from(next() % 48).expect("length fits usize");
+            let mut input = String::new();
+            for _ in 0..raw_len {
+                let idx = usize::try_from(next() % alphabet_len).expect("index fits usize");
+                input.push(ALPHABET[idx]);
+            }
+            assert_eq!(
+                analyzed_tokens(&input),
+                scalar_reference_tokens(&input),
+                "SWAR analyzer diverged from the scalar char-walk reference for {input:?}"
+            );
+        }
     }
 
     #[test]
