@@ -4481,6 +4481,8 @@ mod tests {
         DeltaFieldNorm, DeltaNumericValue, DeltaSegment, DeltaStoredValue, DeltaTermPosting,
     };
     use crate::keeper::ConcatMergeError;
+    #[cfg(feature = "bench-internals")]
+    use crate::query::{BooleanClause, QueryField};
     use crate::quiver::{
         EncodedPositionList, EncodedPostingList, StatsSection, aggregate_field_stats,
     };
@@ -7515,6 +7517,338 @@ mod tests {
                 segment.cached_rank_pruning_term_count(),
                 2,
                 "nested fallback must not validate title BLOCKMAX metadata"
+            );
+        });
+    }
+
+    const E410_ALGEBRA_DOCS: usize = 48;
+    const E410_ALGEBRA_VOCAB: [&str; 8] = [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+    ];
+
+    fn e410_lcg_next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// Deterministic 48-document corpus over an eight-word vocabulary with
+    /// varying term frequencies and document lengths, shared by the E4.10
+    /// public-surface property suites (bd-quill-e4-argus-3ycz.10).
+    fn e410_algebra_documents() -> Vec<IndexableDocument> {
+        let mut state = 0xe410_5eed_u64;
+        let mut documents = Vec::with_capacity(E410_ALGEBRA_DOCS);
+        for ordinal in 0..E410_ALGEBRA_DOCS {
+            let word_count =
+                3 + usize::try_from(e410_lcg_next(&mut state) % 8).expect("word count fits usize");
+            let mut words = Vec::with_capacity(word_count);
+            for _ in 0..word_count {
+                words.push(
+                    E410_ALGEBRA_VOCAB
+                        [usize::try_from(e410_lcg_next(&mut state) % 8).expect("pick fits usize")],
+                );
+            }
+            let title = E410_ALGEBRA_VOCAB
+                [usize::try_from(e410_lcg_next(&mut state) % 8).expect("title fits usize")];
+            documents.push(
+                IndexableDocument::new(format!("algebra-{ordinal:02}"), words.join(" "))
+                    .with_title(title),
+            );
+        }
+        documents
+    }
+
+    /// E4.10 query-algebra property suite at the preparsed public surface
+    /// (bd-quill-e4-argus-3ycz.10): Should-clause commutativity of the result
+    /// set and Must-clause associativity hold end-to-end through plan and
+    /// collect. Laws compare result sets with epsilon-bounded scores because
+    /// clause order feeds non-associative f32 accumulation. Runs behind
+    /// `bench-internals` because associativity needs programmatic nesting the
+    /// shipping string parser cannot construct.
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn e410_public_api_algebra_laws_hold() {
+        const DOCS: usize = E410_ALGEBRA_DOCS;
+        const VOCAB: [&str; 8] = E410_ALGEBRA_VOCAB;
+        const SCORE_EPSILON: f32 = 1e-4;
+        fn scored_set(result: &QuillSearchResult) -> Vec<(String, f32)> {
+            let mut rows = result
+                .hits
+                .iter()
+                .map(|hit| (hit.document_id.clone(), hit.score))
+                .collect::<Vec<_>>();
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows
+        }
+        fn assert_epsilon_equal_sets(label: &str, left: &[(String, f32)], right: &[(String, f32)]) {
+            assert_eq!(
+                left.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                right.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                "{label}: result document sets diverged",
+            );
+            for ((document_id, left_score), (_, right_score)) in left.iter().zip(right) {
+                let drift = (left_score - right_score).abs()
+                    / left_score.abs().max(right_score.abs()).max(1e-12);
+                assert!(
+                    drift <= SCORE_EPSILON,
+                    "{label}: {document_id} score drift {left_score} vs {right_score} \
+                     breaches ScoreEpsilon",
+                );
+            }
+        }
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("algebra index");
+            index
+                .index_documents(&cx, &e410_algebra_documents())
+                .await
+                .expect("accumulate algebra corpus");
+            index.commit(&cx).await.expect("seal algebra corpus");
+
+            let content_term = |text: &str| Query::Term {
+                fields: vec![QueryField::new(CONTENT_FIELD, 1.0)],
+                text: text.to_owned(),
+            };
+
+            let mut nonempty_should = 0_usize;
+            let mut nonempty_must = 0_usize;
+            let mut seed_state = 0x5eed_e410_u64;
+            for seed in 0_u64..16 {
+                let mut chosen = Vec::with_capacity(3);
+                while chosen.len() < 3 {
+                    let pick = usize::try_from(e410_lcg_next(&mut seed_state) % 8)
+                        .expect("pick fits usize");
+                    if !chosen.contains(&pick) {
+                        chosen.push(pick);
+                    }
+                }
+                let terms = [VOCAB[chosen[0]], VOCAB[chosen[1]], VOCAB[chosen[2]]];
+
+                let should = |order: [usize; 3]| Query::Boolean {
+                    clauses: order
+                        .into_iter()
+                        .map(|slot| BooleanClause::new(Occur::Should, content_term(terms[slot])))
+                        .collect(),
+                    operator: None,
+                };
+                let baseline = index
+                    .search_preparsed_paginated(&cx, &should([0, 1, 2]), DOCS, 0, true)
+                    .expect("baseline Should union");
+                let baseline_rows = scored_set(&baseline);
+                if !baseline_rows.is_empty() {
+                    nonempty_should += 1;
+                }
+                for order in [[2, 0, 1], [1, 2, 0], [2, 1, 0]] {
+                    let permuted = index
+                        .search_preparsed_paginated(&cx, &should(order), DOCS, 0, true)
+                        .expect("permuted Should union");
+                    assert_eq!(
+                        permuted.total_count, baseline.total_count,
+                        "seed {seed}: Should permutation changed the exact count",
+                    );
+                    assert_epsilon_equal_sets(
+                        &format!("seed {seed} Should order {order:?}"),
+                        &baseline_rows,
+                        &scored_set(&permuted),
+                    );
+                }
+
+                let must = |query: Query| BooleanClause::new(Occur::Must, query);
+                let flat = Query::Boolean {
+                    clauses: vec![
+                        must(content_term(terms[0])),
+                        must(content_term(terms[1])),
+                        must(content_term(terms[2])),
+                    ],
+                    operator: None,
+                };
+                let right_nested = Query::Boolean {
+                    clauses: vec![
+                        must(content_term(terms[0])),
+                        must(Query::Boolean {
+                            clauses: vec![
+                                must(content_term(terms[1])),
+                                must(content_term(terms[2])),
+                            ],
+                            operator: None,
+                        }),
+                    ],
+                    operator: None,
+                };
+                let left_nested = Query::Boolean {
+                    clauses: vec![
+                        must(Query::Boolean {
+                            clauses: vec![
+                                must(content_term(terms[0])),
+                                must(content_term(terms[1])),
+                            ],
+                            operator: None,
+                        }),
+                        must(content_term(terms[2])),
+                    ],
+                    operator: None,
+                };
+                let flat_result = index
+                    .search_preparsed_paginated(&cx, &flat, DOCS, 0, true)
+                    .expect("flat Must intersection");
+                let flat_rows = scored_set(&flat_result);
+                if !flat_rows.is_empty() {
+                    nonempty_must += 1;
+                }
+                for (shape, query) in [("right-nested", right_nested), ("left-nested", left_nested)]
+                {
+                    let nested = index
+                        .search_preparsed_paginated(&cx, &query, DOCS, 0, true)
+                        .expect("nested Must intersection");
+                    assert_eq!(
+                        nested.total_count, flat_result.total_count,
+                        "seed {seed}: {shape} Must association changed the exact count",
+                    );
+                    assert_epsilon_equal_sets(
+                        &format!("seed {seed} Must {shape}"),
+                        &flat_rows,
+                        &scored_set(&nested),
+                    );
+                }
+            }
+            assert!(
+                nonempty_should >= 8,
+                "Should-commutativity draws were mostly vacuous: {nonempty_should}/16",
+            );
+            assert!(
+                nonempty_must >= 1,
+                "every Must-associativity draw was vacuous",
+            );
+        });
+    }
+
+    /// E4.10 pagination metamorphic at the shipping string surface
+    /// (bd-quill-e4-argus-3ycz.10): page concatenation reproduces the full
+    /// ranking bit-for-bit on both the nested default lowering and the
+    /// prunable direct-syntax union, with and without exact counting, and an
+    /// offset past the last match yields an empty page.
+    #[test]
+    fn e410_public_api_pagination_metamorphic_holds() {
+        const DOCS: usize = E410_ALGEBRA_DOCS;
+        run_with_cx(|cx| async move {
+            let mut index =
+                QuillIndex::in_memory(deterministic_config()).expect("pagination index");
+            index
+                .index_documents(&cx, &e410_algebra_documents())
+                .await
+                .expect("accumulate pagination corpus");
+            index.commit(&cx).await.expect("seal pagination corpus");
+
+            for query in ["alpha epsilon", "content:alpha OR content:epsilon"] {
+                for exact_count in [true, false] {
+                    let full = index
+                        .search_paginated(&cx, query, DOCS, 0, exact_count)
+                        .expect("full ranking");
+                    let full_rows = full
+                        .hits
+                        .iter()
+                        .map(|hit| {
+                            (
+                                hit.document_id.clone(),
+                                hit.global_docid,
+                                hit.score.to_bits(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(
+                        !full_rows.is_empty(),
+                        "pagination fixture query {query:?} must match documents",
+                    );
+                    for page_size in [1_usize, 7] {
+                        let mut paged_rows = Vec::with_capacity(full_rows.len());
+                        let mut offset = 0_usize;
+                        loop {
+                            let page = index
+                                .search_paginated(&cx, query, page_size, offset, exact_count)
+                                .expect("ranking page");
+                            if exact_count {
+                                assert_eq!(
+                                    page.total_count, full.total_count,
+                                    "{query:?}: page at offset {offset} changed the exact count",
+                                );
+                            } else {
+                                assert_eq!(page.total_count, None);
+                            }
+                            if page.hits.is_empty() {
+                                break;
+                            }
+                            paged_rows.extend(page.hits.iter().map(|hit| {
+                                (
+                                    hit.document_id.clone(),
+                                    hit.global_docid,
+                                    hit.score.to_bits(),
+                                )
+                            }));
+                            offset += page_size;
+                        }
+                        assert_eq!(
+                            paged_rows, full_rows,
+                            "{query:?} page-size {page_size} exact_count {exact_count}: \
+                             page concatenation must reproduce the full ranking bit-for-bit",
+                        );
+                        let overshoot = index
+                            .search_paginated(&cx, query, page_size, full_rows.len(), exact_count)
+                            .expect("overshoot page");
+                        assert!(
+                            overshoot.hits.is_empty(),
+                            "{query:?}: offset past the last match must yield an empty page",
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Scalar ingestion refuses duplicate live document ids, both in-batch
+    /// and against the committed snapshot: the Delta lane owns logical
+    /// upserts, so the scalar lane pins the reject posture that the lexical
+    /// engine's upsert-replaces semantics intentionally diverge from
+    /// (bd-quill-e4-argus-3ycz.10).
+    #[test]
+    fn e410_scalar_duplicate_document_id_is_rejected() {
+        run_with_cx(|cx| async move {
+            let mut index = QuillIndex::in_memory(deterministic_config()).expect("dup index");
+            index
+                .index_documents(&cx, &[IndexableDocument::new("dup-doc", "alpha original")])
+                .await
+                .expect("first ingest");
+            let in_batch = index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new("dup-doc", "beta replacement")],
+                )
+                .await
+                .expect_err("uncommitted duplicate id must be rejected");
+            assert!(
+                in_batch.to_string().contains("duplicate live document id"),
+                "unexpected in-batch duplicate error: {in_batch}",
+            );
+            index.commit(&cx).await.expect("seal original document");
+            let committed = index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new("dup-doc", "gamma replacement")],
+                )
+                .await
+                .expect_err("committed duplicate id must be rejected");
+            assert!(
+                committed.to_string().contains("duplicate live document id"),
+                "unexpected committed duplicate error: {committed}",
+            );
+            let original = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("search the surviving document");
+            assert_eq!(original.hits.len(), 1);
+            assert_eq!(original.hits[0].document_id, "dup-doc");
+            assert_eq!(
+                index.doc_count(),
+                1,
+                "rejected ingests must not change doc_count",
             );
         });
     }

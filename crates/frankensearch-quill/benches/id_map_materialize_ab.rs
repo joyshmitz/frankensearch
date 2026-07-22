@@ -87,12 +87,11 @@ fn winner_indices(count: usize) -> Vec<usize> {
 fn mapped_winners(section: IdMapSection<'_>, docids: &[u64]) -> Vec<DocId> {
     docids
         .iter()
-        .map(|&docid| match section.materialize(docid) {
-            Some(id) => id,
-            None => {
+        .map(|&docid| {
+            section.materialize(docid).unwrap_or_else(|| {
                 eprintln!("id-map-materialize-ab missing winner docid {docid}");
                 std::process::exit(2);
-            }
+            })
         })
         .collect()
 }
@@ -105,6 +104,7 @@ fn checksum_id(checksum: u64, id: &DocId) -> u64 {
         .wrapping_add(first)
 }
 
+#[allow(clippy::significant_drop_tightening)]
 fn bench_materialization(c: &mut Criterion) {
     let fixture = build_fixture();
     let section = require("open", fixture.encoded.section());
@@ -144,15 +144,10 @@ fn bench_materialization(c: &mut Criterion) {
                 b.iter(|| {
                     let mut checksum = 0_u64;
                     for &docid in docids {
-                        let id = match section.materialize(black_box(docid)) {
-                            Some(id) => id,
-                            None => {
-                                eprintln!(
-                                    "id-map-materialize-ab missing timed winner docid {docid}"
-                                );
-                                std::process::exit(2);
-                            }
-                        };
+                        let id = section.materialize(black_box(docid)).unwrap_or_else(|| {
+                            eprintln!("id-map-materialize-ab missing timed winner docid {docid}");
+                            std::process::exit(2);
+                        });
                         checksum = checksum_id(checksum, &id);
                         black_box(id);
                     }

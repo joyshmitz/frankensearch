@@ -3637,6 +3637,127 @@ mod tests {
         });
     }
 
+    /// E4.10 limit/count/order semantics ported from the lexical engine's
+    /// public-surface tests (`search_respects_limit`,
+    /// `zero_limit_returns_empty_without_collector_panic`,
+    /// `no_results_for_unmatched_query`, `search_scores_are_descending`,
+    /// `doc_count_accurate_after_operations`): every case must stay
+    /// rank-exact against the oracle (bd-quill-e4-argus-3ycz.10).
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn e410_limit_count_and_order_semantics_match_oracle() {
+        let revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let mut subject = QuillSubject::in_memory(e55_config(), "e410-limits-subject", false)
+            .expect("E4.10 limits Quill subject");
+        let mut oracle = TantivyOracle::in_memory_scalar_g1a(&revision, false)
+            .expect("E4.10 limits Tantivy oracle");
+        // Every document carries "shared" exactly once at a distinct document
+        // length, so the counted match-all case has five distinct scores;
+        // "rust" matches exactly two documents at distinct (tf, |d|) pairs.
+        let documents = vec![
+            frankensearch_core::IndexableDocument::new(
+                "doc-1",
+                "rust is a systems programming language shared",
+            )
+            .with_title("borrow checker"),
+            frankensearch_core::IndexableDocument::new(
+                "doc-2",
+                "machine learning with neural networks shared",
+            )
+            .with_title("gradient guide"),
+            frankensearch_core::IndexableDocument::new("doc-3", "rust rust rust ownership shared")
+                .with_title("moved values"),
+            frankensearch_core::IndexableDocument::new("doc-4", "databases and storage shared")
+                .with_title("storage primer"),
+            frankensearch_core::IndexableDocument::new(
+                "doc-5",
+                "distributed consensus algorithms paxos raft quorum vault shared",
+            )
+            .with_title("consensus notes"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            subject
+                .claim_fresh_campaign()
+                .expect("claim E4.10 limits subject campaign");
+            subject
+                .index_mut()
+                .expect("E4.10 limits subject index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index E4.10 limits subject corpus");
+            subject
+                .index_mut()
+                .expect("E4.10 limits subject index")
+                .commit(&cx)
+                .await
+                .expect("commit E4.10 limits subject corpus");
+            subject
+                .mark_committed()
+                .expect("publish E4.10 limits subject campaign");
+
+            oracle
+                .claim_fresh_campaign()
+                .expect("claim E4.10 limits oracle campaign");
+            oracle
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index E4.10 limits oracle corpus");
+            oracle
+                .mark_committed()
+                .expect("publish E4.10 limits oracle campaign");
+
+            let harness = DifferentialHarness::default();
+            for (id, query, limit, expected_hits) in [
+                ("limit-zero", "rust", 0_u64, 0_usize),
+                ("limit-one", "rust", 1, 1),
+                ("limit-exact", "rust", 2, 2),
+                ("limit-headroom", "rust", 10, 2),
+                ("no-match", "zzzabsent", 10, 0),
+                ("match-all-counted", "shared", 10, 5),
+            ] {
+                let mut case = DifferentialCase::new(format!("e410-{id}"), query, limit);
+                case.snippet_max_chars = None;
+                let run = harness
+                    .run(&cx, &subject, &oracle, &case)
+                    .await
+                    .unwrap_or_else(|error| panic!("E4.10 limits case {id} failed: {error}"));
+                assert_eq!(
+                    run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "E4.10 limits case {id}: {:?}",
+                    run.comparison.divergences,
+                );
+                assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+                assert_eq!(
+                    run.comparison.subject.hits.len(),
+                    expected_hits,
+                    "E4.10 limits case {id} returned the wrong page size",
+                );
+                if id == "match-all-counted" {
+                    assert_eq!(
+                        run.comparison.subject.match_count,
+                        crate::comparator::CountState::Value(5),
+                        "an exact count over the shared term must see every live document",
+                    );
+                    let scores = run
+                        .comparison
+                        .subject
+                        .hits
+                        .iter()
+                        .map(|hit| f32::from_bits(hit.score_bits))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        scores.windows(2).all(|pair| pair[0] >= pair[1]),
+                        "public ranking must be non-increasing in score: {scores:?}",
+                    );
+                }
+            }
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn doclen_and_raw_stats_match_tantivy_before_and_after_delete() {
