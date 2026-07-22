@@ -43,6 +43,10 @@ rustix = { version = "1.1.4", features = ["fs", "process"] }
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 frankensearch-lexical = { workspace = true, features = ["bench-internals"] }
+# Dev-only: the legacy `SimpleTokenizer + LowerCaser` arm of the tokenizer A/B
+# bench. Already built for this crate transitively via frankensearch-lexical, so
+# this adds no compile cost and keeps Tantivy out of Quill's shipped graph.
+tantivy = { workspace = true }
 tempfile = "3.27"
 tracing-subscriber = { workspace = true }
 
@@ -64,6 +68,11 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "concat_merge_ab"
 harness = false
+
+[[bench]]
+name = "tokenizer_simd_ab"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true
