@@ -6506,3 +6506,34 @@ isolated CPU pinning), hard-code at least 30 samples and four inner iterations,
 and require both dimensional A/A bands within 0.97–1.03 plus every dispatch
 and generic CV below 5%. Exact bit parity remains mandatory; only then may the
 dispatch/generic speedup be cited from this legacy target.
+
+## 2026-07-22 — BLOCKED / UNTIMED: retained top-k A/A CV audit never links remotely (`bd-3srq`, IndigoOtter)
+
+Negative-evidence mining closed the proposed duplicate retrofit before any
+source edit: `int8_vs_f16_fast_ab` already measures the real shipped exact-f16
+and int8-two-pass methods in one binary, includes an interleaved f16/f16 A/A
+null, and proves set recall plus exact ordering over 32 queries. Its shipped
+2026-07-11 result remains 1.43x paired with recall@10 1.0000 and 32/32 exact
+order matches. The open question here was only whether that retained harness
+can reproduce under the newer per-arm Criterion CV-below-5% admission rule.
+
+After `scripts/rch-ensure-deps.sh --check` passed, strict-remote release job
+`j-29942429901652363` began on `vmi1264463` at 20:25:38Z. RCH ignored the
+requested warmed-worker hint, synchronized a cold workspace, downloaded and
+compiled dependencies, and reached `frankensearch-core` plus
+`frankensearch-index`. It then spent more than ten minutes in the final release
+link without emitting the parity banner, A/A row, Criterion sample, or timed
+path. The hook remained alive, but after 21 minutes 22 seconds total the job was
+cleanly cancelled at 20:47:00Z. No benchmark or production source was changed.
+
+**Decision: BLOCKED / UNTIMED, not REJECT.** There is no new top-k performance
+claim and the existing shipped win is not overturned. The same cold
+release/LTO route also blocks starting the queued legacy `rrf_merge_fuse` A/A
+retrofit responsibly in this cycle; ledger/history mining found that target's
+missing null control and weak first/last-only parity check, but it was not
+edited or timed. Retry both only when RCH honors a worker with a warmed
+frankensearch release-bench graph or the exact benchmark binary links within
+ten minutes. Top-k then requires the existing 32-query recall/order proof,
+A/A wholly within 0.97–1.03, and both Criterion arm CVs below 5%; RRF requires
+full `FusedHit` equality, an interleaved map/map A/A, and all compared arm CVs
+below 5% before retaining any harness change.
