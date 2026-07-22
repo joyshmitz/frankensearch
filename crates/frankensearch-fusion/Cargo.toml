@@ -67,6 +67,7 @@ harness = false
 [[bench]]
 name = "prf_expand_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "pool_minmax_fuse"
@@ -87,6 +88,7 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "neighbor_smooth_recip_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "hubness_penalty"
@@ -95,6 +97,7 @@ harness = false
 [[bench]]
 name = "hubness_dot_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "federated_fuse"
@@ -136,30 +139,37 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "sync_hash_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "expand_fuse_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "merge_dedup_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "filter_match_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "tokenize_ascii_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "code_signal_probe_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "normalize_signal_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "fused_materialize"
@@ -215,27 +225,33 @@ harness = false
 [[bench]]
 name = "docid_materialize_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "metadata_clone_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "explanation_clone_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "rrf_recip_ab"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "scoredresult_box_ab"
 harness = false
+required-features = ["bench-internals"]
 
 # Latency cost of the shipped RrfConfig knobs (per-tier weights + hash tiebreak).
 [[bench]]
 name = "rrf_config_cost_ab"
 harness = false
+required-features = ["bench-internals"]
 
 # REAL-data hybrid (lexical+vector RRF) vs Tantivy-lexical-alone known-item retrieval.
 [[bench]]
