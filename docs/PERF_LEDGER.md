@@ -6192,6 +6192,56 @@ benchmark correction, but do not close E3.5: normalized max/min spread is
 `1.557204454x`, above the bead's `1.35x` flatness gate. The remaining fixed-cost
 problem is now at two-source fan-in; closure evidence is recorded in
 `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-22 — Quill concat merge fixed-span control closes E3.5 (`bd-quill-e3-keeper-ndtk.5`, RoseMaple)
+
+The prior growing-span sweep held logical documents constant while increasing
+both source count and the canonical burned-tail output span from 2.7 MB to
+34.5 MB. Its max/min statistic therefore combined the two-source per-call floor
+with ninefold output growth. The existing hold explicitly named a
+fixed-retained-byte control as the required retry predicate.
+
+The retained benchmark now keeps that historical growing-span sweep and adds a
+production-valid fixed-span control. Its 2/4/8/16 manifest-consecutive sources
+remain lease-aligned and preserve real burned tails, but are distributed across
+one common first-to-last lease span. The control retained immutable outputs
+until after each stopwatch read and declared the unchanged `<=1.35x` ns/exact
+physical-byte gate before any result was observed.
+
+One strict-remote release-LTO run, job `j-29942429901652205` on worker
+`vmi1149989`, measured both groups from one binary:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1149989 \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| fixed-span sources | exact physical bytes | median | ns / physical byte |
+|---:|---:|---:|---:|
+| 2 | 34,513,784 | 21.300 ms | 0.617144733 |
+| 4 | 34,507,720 | 23.625 ms | 0.684629410 |
+| 8 | 34,507,752 | 24.153 ms | 0.699929685 |
+| 16 | 34,543,016 | 22.244 ms | 0.643950719 |
+
+Exact bytes vary by only `1.001022844x`. The fixed-span normalized spread is
+**`1.134141877x` — PASS**, 16.0% below the predeclared ceiling. Even the
+conservative cross-arm extreme (`max interval high / min interval low`) is only
+`1.250316110x`. The same binary's preserved growing-span diagnostic remained a
+FAIL at `1.660618226x`, while its 4/8/16 subspread was `1.094554342x`; that
+failed row remains negative evidence rather than being erased.
+
+The performance result completes the already-landed correctness bundle: exact
+raw posting-block and schedule invariance, offset-only BLOCKMAX rebasing,
+monolithic df=100+300/stat/query equivalence, IDMAP/IDHASH rebuild, tombstone
+union, numeric/stored-section merge, rejection tests, and durable region-scoped
+publication.
+
+**Decision: KEEP / CLOSE E3.5.** The production one-pass concat path remains
+unchanged. The fixed-span control directly verifies approximately flat CPU per
+physical byte as source count grows; the historical growing-span result still
+documents the expected small-object fixed floor.
+
 ## 2026-07-22 — LANDED: Quill SWAR default tokenizer — length-dependent, decidable win on long tokens (`bd-quill-e1-scribe-bejd.1`, FuchsiaMaple)
 
 `FrankensearchTokenizer::analyze` (Quill's default analyzer, on the ingest and query hot paths)

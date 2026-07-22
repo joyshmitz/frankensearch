@@ -16,8 +16,12 @@
 //! field semantic parity. Those behavioral proofs belong to Quill's unit and
 //! integration tests and the E3.5 `frankensearch-quill-gauntlet` contract.
 //!
-//! Before results are observed, the declared CPU-efficiency acceptance rule is
-//! that the spread across the four cases must be at most 1.35x:
+//! The growing-span sweep below preserves the original production-shaped
+//! burned-tail diagnostic. A second fixed-span control distributes every
+//! fan-in across the same document-id span, isolating source-count growth from
+//! output-span growth. Before fixed-span results are observed, the declared
+//! CPU-efficiency acceptance rule is that its spread across the four cases must
+//! be at most 1.35x:
 //! `max(median ns / exact physical I/O byte) / min(...) <= 1.35`, where exact
 //! physical I/O bytes are `sum(source FSLX bytes) + merged output FSLX bytes`.
 //! Criterion's median elapsed time is the CPU-cost proxy; this benchmark
@@ -53,6 +57,7 @@ use frankensearch_quill::{
 };
 
 const SOURCE_SEGMENT_COUNTS: [usize; 4] = [2, 4, 8, 16];
+const FIXED_SPAN_LAST_LEASE_INDEX: usize = 15;
 const TOTAL_LOGICAL_DOCS: usize = 1_024;
 const TOTAL_TOMBSTONES: usize = 16;
 const TOTAL_LIVE_DOCS: usize = TOTAL_LOGICAL_DOCS - TOTAL_TOMBSTONES;
@@ -121,14 +126,31 @@ const BENCH_SCHEMA: SchemaDescriptor = SchemaDescriptor {
 const STATS_FIELD_ORDS: [u16; 2] = [0, 1];
 
 struct Fixture {
+    span_mode: SpanMode,
     segment_count: usize,
     snapshot: KeeperSnapshot,
     source_segment_ids: Vec<u64>,
+    lease_docid_bases: Vec<u64>,
     tombstoned_docids: Vec<u32>,
     source_fslx_bytes: u64,
     merged_output_fslx_bytes: u64,
     physical_io_bytes: u64,
     output_segment_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpanMode {
+    Growing,
+    Fixed,
+}
+
+impl SpanMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Growing => "growing-span",
+            Self::Fixed => "fixed-span-control",
+        }
+    }
 }
 
 fn fail(stage: &str, error: &impl Display) -> ! {
@@ -187,6 +209,16 @@ fn lease_base(segment_index: usize) -> u64 {
     as_u64("lease index", segment_index)
         .checked_mul(u64::from(DOC_ORDS_PER_LEASE))
         .unwrap_or_else(|| fail_overflow("lease base"))
+}
+
+fn fixture_lease_index(span_mode: SpanMode, segment_index: usize, segment_count: usize) -> usize {
+    match span_mode {
+        SpanMode::Growing => segment_index,
+        SpanMode::Fixed => segment_index
+            .checked_mul(FIXED_SPAN_LAST_LEASE_INDEX)
+            .and_then(|numerator| numerator.checked_div(segment_count - 1))
+            .unwrap_or_else(|| fail_overflow("fixed-span lease index")),
+    }
 }
 
 fn document_id(logical_index: usize) -> String {
@@ -319,7 +351,7 @@ fn exact_source_fslx_bytes(snapshot: &KeeperSnapshot) -> u64 {
     total
 }
 
-fn build_fixture(segment_count: usize) -> Fixture {
+fn build_fixture(span_mode: SpanMode, segment_count: usize) -> Fixture {
     assert!(
         SOURCE_SEGMENT_COUNTS.contains(&segment_count),
         "unsupported source-segment count"
@@ -351,11 +383,14 @@ fn build_fixture(segment_count: usize) -> Fixture {
     let mut manifest_segments = Vec::with_capacity(segment_count);
     let mut stats_sections = Vec::with_capacity(segment_count);
     let mut tombstoned_docids = Vec::with_capacity(TOTAL_TOMBSTONES);
+    let mut lease_docid_bases = Vec::with_capacity(segment_count);
 
     for segment_index in 0..segment_count {
         let first_document = segment_index * documents_per_segment;
         let document_end = first_document + documents_per_segment;
-        let lease_docid_base = lease_base(segment_index);
+        let lease_docid_base =
+            lease_base(fixture_lease_index(span_mode, segment_index, segment_count));
+        lease_docid_bases.push(lease_docid_base);
         let segment_id = LEAF_SEGMENT_ID_BASE
             + (as_u64("source-segment fan-in", segment_count) << 16)
             + as_u64("source-segment index", segment_index);
@@ -416,7 +451,13 @@ fn build_fixture(segment_count: usize) -> Fixture {
         KeeperSnapshot::in_memory(BENCH_SCHEMA),
     );
     let mut manifest = require("advance fixture MANIFEST", genesis.next_manifest());
-    manifest.docid_high_watermark = lease_base(segment_count);
+    manifest.docid_high_watermark = checked_add(
+        "fixture document-id high watermark",
+        *lease_docid_bases
+            .last()
+            .unwrap_or_else(|| fail_missing("last fixture lease base")),
+        u64::from(DOC_ORDS_PER_LEASE),
+    );
     manifest.last_publish_unix_s = PUBLISHED_UNIX_S;
     manifest.segments = manifest_segments;
     manifest.field_stats = field_stats;
@@ -447,14 +488,20 @@ fn build_fixture(segment_count: usize) -> Fixture {
     let output_segment_id = OUTPUT_SEGMENT_ID_BASE + as_u64("output fan-in", segment_count);
 
     let mut fixture = Fixture {
+        span_mode,
         segment_count,
         snapshot,
         source_segment_ids,
+        lease_docid_bases,
         tombstoned_docids,
         source_fslx_bytes,
         merged_output_fslx_bytes: 0,
         physical_io_bytes: 0,
-        output_segment_id,
+        output_segment_id: output_segment_id
+            + match span_mode {
+                SpanMode::Growing => 0,
+                SpanMode::Fixed => 1 << 32,
+            },
     };
     fixture.merged_output_fslx_bytes = assert_untimed_union_identity_reopen(&fixture);
     fixture.physical_io_bytes = checked_add(
@@ -544,7 +591,7 @@ fn assert_untimed_union_identity_reopen(fixture: &Fixture) -> u64 {
 
     let documents_per_segment = TOTAL_LOGICAL_DOCS / fixture.segment_count;
     for segment_index in 0..fixture.segment_count {
-        let base = lease_base(segment_index);
+        let base = fixture.lease_docid_bases[segment_index];
         for local_index in 0..documents_per_segment {
             let global_docid = u64_as_u32(
                 "identity-check global docid",
@@ -620,38 +667,13 @@ fn assert_untimed_union_identity_reopen(fixture: &Fixture) -> u64 {
     merged_output_fslx_bytes
 }
 
-fn bench_concat_merge(c: &mut Criterion) {
-    eprintln!(
-        "concat-merge-ab predeclared CPU/physical-I/O-byte spread: \
-         max(median ns / exact (source + merged-output) FSLX byte) / min(...) <= \
-         {MAX_CPU_NS_PER_PHYSICAL_IO_BYTE_SPREAD_RATIO:.2}x"
-    );
-    let fixtures = SOURCE_SEGMENT_COUNTS
-        .into_iter()
-        .map(build_fixture)
-        .collect::<Vec<_>>();
-    for fixture in &fixtures {
-        eprintln!(
-            "concat-merge-ab fixture: source_segments={} logical_docs={} live_docs={} \
-             tombstones={} logical_bytes={} exact_source_fslx_bytes={} \
-             exact_merged_output_fslx_bytes={} exact_physical_io_bytes={}",
-            fixture.segment_count,
-            TOTAL_LOGICAL_DOCS,
-            TOTAL_LIVE_DOCS,
-            TOTAL_TOMBSTONES,
-            TOTAL_LOGICAL_BYTES,
-            fixture.source_fslx_bytes,
-            fixture.merged_output_fslx_bytes,
-            fixture.physical_io_bytes,
-        );
-    }
-
-    let mut group = c.benchmark_group("concat_merge_owned_fixed_logical_work");
+fn run_fixture_group(c: &mut Criterion, group_name: &str, fixtures: &[Fixture]) {
+    let mut group = c.benchmark_group(group_name);
     group.sample_size(20);
     group.sampling_mode(SamplingMode::Flat);
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(5));
-    for fixture in &fixtures {
+    for fixture in fixtures {
         group.throughput(Throughput::Bytes(fixture.physical_io_bytes));
         group.bench_with_input(
             BenchmarkId::new("source_segments", fixture.segment_count),
@@ -684,6 +706,49 @@ fn bench_concat_merge(c: &mut Criterion) {
         );
     }
     group.finish();
+}
+
+fn bench_concat_merge(c: &mut Criterion) {
+    eprintln!(
+        "concat-merge-ab predeclared fixed-span CPU/physical-I/O-byte spread: \
+         max(median ns / exact (source + merged-output) FSLX byte) / min(...) <= \
+         {MAX_CPU_NS_PER_PHYSICAL_IO_BYTE_SPREAD_RATIO:.2}x"
+    );
+    let growing_span_fixtures = SOURCE_SEGMENT_COUNTS
+        .into_iter()
+        .map(|segment_count| build_fixture(SpanMode::Growing, segment_count))
+        .collect::<Vec<_>>();
+    let fixed_span_fixtures = SOURCE_SEGMENT_COUNTS
+        .into_iter()
+        .map(|segment_count| build_fixture(SpanMode::Fixed, segment_count))
+        .collect::<Vec<_>>();
+    for fixture in growing_span_fixtures.iter().chain(&fixed_span_fixtures) {
+        eprintln!(
+            "concat-merge-ab fixture: span_mode={} source_segments={} logical_docs={} live_docs={} \
+             tombstones={} logical_bytes={} exact_source_fslx_bytes={} \
+             exact_merged_output_fslx_bytes={} exact_physical_io_bytes={}",
+            fixture.span_mode.label(),
+            fixture.segment_count,
+            TOTAL_LOGICAL_DOCS,
+            TOTAL_LIVE_DOCS,
+            TOTAL_TOMBSTONES,
+            TOTAL_LOGICAL_BYTES,
+            fixture.source_fslx_bytes,
+            fixture.merged_output_fslx_bytes,
+            fixture.physical_io_bytes,
+        );
+    }
+
+    run_fixture_group(
+        c,
+        "concat_merge_owned_fixed_logical_work",
+        &growing_span_fixtures,
+    );
+    run_fixture_group(
+        c,
+        "concat_merge_owned_fixed_span_control",
+        &fixed_span_fixtures,
+    );
 }
 
 criterion_group!(benches, bench_concat_merge);
