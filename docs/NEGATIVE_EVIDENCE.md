@@ -15917,3 +15917,41 @@ bench/Cargo changes were manually removed.
 Retry only with an idle same-worker warmed cache or isolated CPU pinning,
 at least 30 samples and four inner iterations, dimensional A/A bands wholly
 inside 0.97–1.03, all dispatch/generic CVs below 5%, and exact bit parity.
+
+### 2026-07-22 — REJECT: shared cross-task pruning floor for segment fan-out is a wash at page-10 shapes (`bd-dknq`, cc)
+
+Candidate: fan-out sibling collectors share an `AtomicU32` monotone-max pruning
+floor (f32 bits of any sibling's full-heap k-th score — a rank-safe lower bound
+on the global k-th). Implementation was proven correct: 454/454 quill-lib tests
+green including the parallel==serial bit-exact property under the racing floor
+(both `shared_floor` on and off), a floor-mechanics unit test (publish only
+from full heaps, monotone max, negative scores never published), and bit-exact
+three-way page parity asserted in every bench cell before timing.
+
+Measured (`segment_fanout_ab` extended to three forced modes, ratio =
+fanned-shared-floor / fanned-local-cutoff, `paired_median_ratio` + A/A null,
+rounds=41 inner=4, `RAYON_NUM_THREADS=4`, worker vmi1227854, LTO release,
+limit=10): ALL 12 cells indistinguishable from the null — medians 0.9269 to
+1.0404 with every median inside its null p5..p95 band, `decidable=false`
+across gate8x2500 (20k docs), gate4x12500 (50k), and below_gate2x500, on
+high_df/mid_df/union3/phrase. Representative: gate8x2500 phrase floor 1.0051
+[0.887, 1.097] vs null 0.9903 [0.911, 1.125]; gate4x12500 union3 floor 0.9733
+[0.866, 1.137] vs null 0.9977 [0.841, 1.266].
+
+Why it cannot pay at these shapes: with limit+offset=10 each sibling's heap
+fills within its first posting block, so local cutoffs reach competitive
+strength in microseconds; all 4-8 siblings start simultaneously (no sequential
+head start to inherit), and rank-safe block skipping saturates with the local
+floor alone. The atomic adds a Relaxed load per block refill and a fetch_max
+per cutoff improvement — invisible in the same measurements.
+
+**Decision: REJECT; the mechanism was reverted, production keeps per-segment
+local cutoffs.** The full implementation is preserved in the session
+scratchpad and described here for re-derivation. Retry predicate: re-attempt
+only when (a) snapshots routinely hold >= 16 sealed segments so rayon queues
+late-starting tasks behind finished siblings (a real head start to inherit),
+or (b) deep pagination (`limit + offset` >= 200) keeps heaps unfilled long
+enough for local cutoffs to stay weak, or (c) a profiled workload shows
+`refill_with_cutoff` block-skip rates materially below the serial path's on
+fanned queries. Measure the same three-mode A/B; require decidable <= 0.97 on
+union3 or phrase.
