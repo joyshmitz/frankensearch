@@ -6382,3 +6382,43 @@ the stable radix partition remain the bulk-seal winner, especially at 8
 threads; Delta remains the small/incremental construction path. The shipping
 code already has this separation, so E1.7 needs no production routing edit.
 The paired harness is retained for the E8 matrix and future crossover work.
+
+## 2026-07-22 — REJECT: caching the token-start SWAR word regresses short and long corpora (`bd-short-token-mask-reuse-cpn9`, IndigoOtter)
+
+This timed retry supersedes the earlier UNTIMED blocker. The single candidate
+carried the eight-byte ASCII word and its alphanumeric lane mask from
+`skip_separators` into `scan_token_end`, so a short token ending in that word
+could avoid one reload and one `swar_ascii_alnum_mark` call. The retained
+pre-change shipping SWAR path and candidate ran in one release binary. Before
+timing, strict-remote job `j-29942429901652220` passed all three focused
+behavior-isomorphism tests on `vmi1149989`: randomized mixed Unicode, lane-edge
+versus the scalar oracle, and lane-edge versus the retained shipping path
+(**3 passed, 0 failed**). Token text, positions, byte offsets, ordering, and
+lowercasing were exact.
+
+Strict-remote release job `j-29942429901652232` then completed on the same
+worker. Ratios are candidate/shipping, so values above one are regressions:
+
+| corpus | shipping/shipping A/A median [p5, p95] | cached/shipping median [p5, p95] | shipping Criterion interval | cached Criterion interval |
+|---|---:|---:|---:|---:|
+| short-token, 48 KiB | 0.9986 [0.7967, 1.2115] | **1.2030 [1.0739, 1.3024]** | 211.31–225.74 us | **271.73–282.93 us** |
+| long-token control, 48 KiB | 0.9957 [0.9483, 1.1542] | **1.1313 [1.1135, 1.1601]** | 81.930–86.646 us | **98.392–100.84 us** |
+
+Raw Criterion per-iteration sample CVs were respectively **7.119% / 8.691%**
+for short shipping/cached and **8.293% / 4.066%** for long shipping/cached.
+Those three above-5% CVs and the wide short A/A band prohibit any KEEP claim.
+They do not rescue the candidate: both paired medians point slower, and both
+independent Criterion intervals are disjoint in the slower direction. A warm
+repeat was attempted, but RCH ignored the `vmi1149989` soft pin and routed job
+`j-29942429901652267` to `vmi1153651`; it was cancelled before timing because
+cross-worker samples would not repair the same-worker evidence.
+
+**Decision: REJECT and retain shipping SWAR.** The extra `Option`-carried
+window state and control flow cost more than reloading/reclassifying an
+L1-resident eight-byte word: about 20.3% by the short paired median and 13.1%
+on the long control. All candidate source and benchmark edits were manually
+removed. Retry only if profile plus generated-code evidence shows a new
+representation eliminates the added state spills/branches, and an idle
+same-worker run produces an A/A band inside 0.97–1.03 with all decisive-arm
+CVs below 5%; require cached/shipping <=0.97 on short tokens and no long-token
+regression before reconsidering production.
