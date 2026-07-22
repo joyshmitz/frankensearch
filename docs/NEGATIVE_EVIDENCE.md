@@ -15759,3 +15759,28 @@ E3.5 open with the retained absolute win, and move to the next actionable
 critical-path bead. A future E3.5 attempt must first add stage-attributed
 fixed-work evidence or a fixed-retained-byte control that isolates a single
 production cost of at least 13.306% in the two-source case.
+
+### 2026-07-22 — BLOCKED / UNTIMED: short-token cached start-window mask (`bd-short-token-mask-reuse-cpn9`, IndigoOtter)
+
+Ledger and recent-history mining left the short-token tokenizer gap open while
+closing the already-landed long-token SWAR, RRF, dot-product, and top-k siblings.
+The incumbent short-token same-binary probe was non-decisive: `simd/scalar =
+0.9750 [0.9253, 0.9900]` versus A/A `0.9988 [0.9547, 1.0367]`; raw Criterion
+CV was 4.2350% scalar and 17.1325% SWAR. A one-lever broadword experiment reused
+the token-start word's ASCII-alphanumeric mask in token-end discovery. Its
+focused strict-remote conformance gate passed **3/3** randomized, lane-edge
+scalar-oracle, and shipping-incumbent tests.
+
+There is deliberately no performance verdict. Strict-remote job
+`j-29942429901652077` on `vmi1153651` started at `2026-07-22T18:16:40Z` but,
+after roughly 34 minutes, never emitted a timed-path row; an earlier attempt
+refused local fallback because the fleet had no admissible worker. The admitted
+job was cancelled at closeout, and every speculative source/bench edit was
+manually removed.
+
+**Retry predicate:** only reopen on a four-slot admissible worker with a warm
+Quill release-benchmark graph, or when the exact benchmark binary can be built
+inside ten minutes. Require one same-binary interleaved `cached/shipping` A/B,
+a `shipping/shipping` A/A null, both decisive-arm CVs below 5%, and the existing
+exact token-stream proof. Without those timed rows this remains BLOCKED, not a
+REJECT and not evidence that the primitive is exhausted.

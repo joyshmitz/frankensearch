@@ -6231,3 +6231,42 @@ the fleet's null spread; this is NOT cited as a short-token win. KEEP as the def
 large decidable win on the long tokens common in code/log/data corpora, byte-parity-correct, and
 carries no reproducible short-token regression. (bd-5hz0 lesson holds: this is a full-scan classify —
 every byte visited — not a `memchr`/`contains` early-exit scan, so SIMD helps rather than regresses.)
+
+## 2026-07-22 — BLOCKED: Quill short-token cached start-window mask did not reach the timed path (`bd-short-token-mask-reuse-cpn9`, IndigoOtter)
+
+Profile-first routing selected the still-open short-token gap in
+`tokenizer_simd_ab`, not the already-landed long-token SWAR win. The incumbent
+same-binary short-token probe on RCH worker `hz1` reported `simd/scalar =
+0.9750 [0.9253, 0.9900]` against an A/A null of `0.9988 [0.9547, 1.0367]`:
+inside the null floor and therefore not a decision. Its raw Criterion sample CVs
+were 4.2350% for the scalar arm and 17.1325% for the SWAR arm, confirming that
+the short-token measurement needed a stronger paired comparator.
+
+The attempted single lever carried the already-computed ASCII word and
+alphanumeric lane mask from separator skipping into token-end scanning, avoiding
+a reload/reclassification when a short token starts and ends in one eight-byte
+word. This maps to the alien-graveyard broadword rank/select primitive plus a
+CEGIS-style retained incumbent comparator. Before timing, all three focused
+behavior-isomorphism tests passed remotely on `ovh-b`: randomized mixed-Unicode
+corpus, lane-edge corpus versus the scalar oracle, and lane-edge corpus versus
+the retained shipping SWAR path (**3 passed, 0 failed**). Token text, positions,
+offsets, ordering, and lowercase behavior were exact; tie-breaking, floating
+point, and RNG semantics are not involved.
+
+The decisive strict-remote release benchmark never executed. An initial
+`RCH_REQUIRE_REMOTE=1` attempt correctly refused local fallback because no
+worker was admissible. Job `j-29942429901652077` was then admitted on
+`vmi1153651` at `2026-07-22T18:16:40Z`; after roughly 34 minutes of project
+sync, dependency download, compilation, and final linking it still had emitted
+zero A/A, A/B, Criterion, or CV rows. It was cancelled at the closeout boundary.
+Consequently there is **no candidate timing result and no KEEP/REJECT claim**.
+All speculative source and benchmark edits were manually removed; only this
+evidence remains.
+
+**Decision: BLOCKED / UNTIMED.** Retry only when an admissible four-slot RCH
+worker has a warm `frankensearch-quill` release-benchmark dependency graph (or
+the exact benchmark binary can be built inside ten minutes). Rerun the retained
+same-binary `shipping SWAR` versus `cached start-window mask` comparator with
+41 interleaved rounds, its shipping-vs-shipping A/A null, and Criterion arms;
+KEEP only if the candidate interval clears the null floor and both decisive-arm
+CVs are below 5%. Otherwise record the numeric REJECT and its next predicate.
