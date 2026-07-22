@@ -15821,3 +15821,35 @@ profile identifies and removes its accumulation hotspot, then time
 accumulation-plus-seal symmetrically with its own A/A null. Until then retain
 the current design: Delta for small/incremental construction, radix for bulk
 sealing.
+
+### 2026-07-22 — REJECT: cached short-token SWAR start window is 1.20x slower on short tokens and 1.13x slower on the long control (`bd-short-token-mask-reuse-cpn9`, IndigoOtter)
+
+The earlier entry was UNTIMED, not negative evidence about the primitive. This
+retry reached the exact retained-incumbent comparator. The candidate returned
+the already-loaded eight-byte word and its ASCII-alphanumeric lane mask from
+separator skipping, then consumed the unused lanes in token-end scanning.
+Shipping and candidate shared one binary and token scratch. Strict-remote job
+`j-29942429901652220` on `vmi1149989` first passed randomized mixed-Unicode,
+scalar lane-edge, and shipping lane-edge equivalence (**3/3**), proving exact
+token text, positions, byte offsets, order, and lowercase behavior.
+
+Strict-remote job `j-29942429901652232` on the same worker produced:
+
+| 48 KiB shape | shipping/shipping A/A median [p5, p95] | cached/shipping median [p5, p95] | shipping time [Criterion interval] | cached time [Criterion interval] | raw CV shipping/cached |
+|---|---:|---:|---:|---:|---:|
+| realistic short tokens | 0.9986 [0.7967, 1.2115] | **1.2030 [1.0739, 1.3024]** | 218.669 us [211.31, 225.74] | **286.887 us [271.73, 282.93]** | 7.119% / 8.691% |
+| long-token control | 0.9957 [0.9483, 1.1542] | **1.1313 [1.1135, 1.1601]** | 86.408 us [81.930, 86.646] | **99.879 us [98.392, 100.84]** | 8.293% / 4.066% |
+
+The worker noise is too high for a KEEP: three decisive-arm CVs exceed 5% and
+the short A/A floor is wide. The direction is nevertheless consistently and
+materially negative: both paired medians are regressions and both Criterion
+interval pairs are disjoint with the cached arm slower. RCH routed the requested
+warm repeat to a different worker (`j-29942429901652267`, `vmi1153651`) despite
+the soft pin; that invalid cross-worker reroute was cancelled before timing.
+
+**Decision: REJECT.** The saved L1-resident reload/classification is cheaper
+than carrying an `Option<CachedAsciiWindow>` and branching over its state. The
+source and comparator edits were manually removed. Reopen only when a profile
+and disassembly demonstrate a representation with no added spills/branches,
+then require an idle same-worker A/A band within 0.97–1.03, every decisive-arm
+CV below 5%, short cached/shipping <=0.97, and no regression on long tokens.
