@@ -6244,6 +6244,56 @@ docs measured 2.96x WORSE on high_df_term — the production gate keeps that pat
 bead): shared cross-task pruning cutoff via atomic score max; re-measure `union3`/`phrase`
 cells where local-only cutoffs leave pruning on the table.
 
+## 2026-07-22 — Quill concat merge fixed-span control closes E3.5 (`bd-quill-e3-keeper-ndtk.5`, RoseMaple)
+
+The prior growing-span sweep held logical documents constant while increasing
+both source count and the canonical burned-tail output span from 2.7 MB to
+34.5 MB. Its max/min statistic therefore combined the two-source per-call floor
+with ninefold output growth. The existing hold explicitly named a
+fixed-retained-byte control as the required retry predicate.
+
+The retained benchmark now keeps that historical growing-span sweep and adds a
+production-valid fixed-span control. Its 2/4/8/16 manifest-consecutive sources
+remain lease-aligned and preserve real burned tails, but are distributed across
+one common first-to-last lease span. The control retained immutable outputs
+until after each stopwatch read and declared the unchanged `<=1.35x` ns/exact
+physical-byte gate before any result was observed.
+
+One strict-remote release-LTO run, job `j-29942429901652205` on worker
+`vmi1149989`, measured both groups from one binary:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1149989 \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| fixed-span sources | exact physical bytes | median | ns / physical byte |
+|---:|---:|---:|---:|
+| 2 | 34,513,784 | 21.300 ms | 0.617144733 |
+| 4 | 34,507,720 | 23.625 ms | 0.684629410 |
+| 8 | 34,507,752 | 24.153 ms | 0.699929685 |
+| 16 | 34,543,016 | 22.244 ms | 0.643950719 |
+
+Exact bytes vary by only `1.001022844x`. The fixed-span normalized spread is
+**`1.134141877x` — PASS**, 16.0% below the predeclared ceiling. Even the
+conservative cross-arm extreme (`max interval high / min interval low`) is only
+`1.250316110x`. The same binary's preserved growing-span diagnostic remained a
+FAIL at `1.660618226x`, while its 4/8/16 subspread was `1.094554342x`; that
+failed row remains negative evidence rather than being erased.
+
+The performance result completes the already-landed correctness bundle: exact
+raw posting-block and schedule invariance, offset-only BLOCKMAX rebasing,
+monolithic df=100+300/stat/query equivalence, IDMAP/IDHASH rebuild, tombstone
+union, numeric/stored-section merge, rejection tests, and durable region-scoped
+publication.
+
+**Decision: KEEP / CLOSE E3.5.** The production one-pass concat path remains
+unchanged. The fixed-span control directly verifies approximately flat CPU per
+physical byte as source count grows; the historical growing-span result still
+documents the expected small-object fixed floor.
+
+## 2026-07-22 — LANDED: Quill SWAR default tokenizer — length-dependent, decidable win on long tokens (`bd-quill-e1-scribe-bejd.1`, FuchsiaMaple)
 
 `FrankensearchTokenizer::analyze` (Quill's default analyzer, on the ingest and query hot paths)
 now finds token boundaries with a SWAR-on-u64 byte classifier that visits eight ASCII bytes per
@@ -6423,3 +6473,36 @@ representation eliminates the added state spills/branches, and an idle
 same-worker run produces an A/A band inside 0.97–1.03 with all decisive-arm
 CVs below 5%; require cached/shipping <=0.97 on short tokens and no long-token
 regression before reconsidering production.
+
+## 2026-07-22 — REJECT: legacy f16 dot-product A/A retrofit misses the <5% CV admission rule (`bd-dot-product-aa-null-wegn`, IndigoOtter)
+
+Negative-evidence mining showed that the f16/f32/i8 kernel families are
+already heavily explored, while the legacy `dot_product` Criterion target
+still lacked the same-binary A/A floor required to interpret its existing
+dispatch/generic comparison. A bench-only candidate added exact `to_bits()`
+parity checks plus interleaved shipping/shipping and AVX2-dispatch/generic
+measurements at dimensions 256 and 384; production code was untouched.
+
+Strict-remote release job `j-29942429901652321` completed on `vmi1149989`.
+Ratios below are first/second, so dispatch/generic values below one favor the
+shipping dispatch:
+
+| dimension | dispatch/dispatch A/A median [p5, p95] | dispatch/generic median [p5, p95] | dispatch Criterion interval | generic Criterion interval | raw CV dispatch/generic |
+|---:|---:|---:|---:|---:|---:|
+| 256 | 1.0055 [0.9154, 1.0743] | **0.2798 [0.2334, 0.4562]** | 286.06–308.79 us | 1.1273–1.2494 ms | **6.399% / 5.607%** |
+| 384 | 1.0292 [0.7778, 1.1771] | **0.4423 [0.2461, 0.6548]** | 418.15–509.40 us | 1.8671–1.9869 ms | **32.059% / 6.491%** |
+
+The direction is large and exact parity passed, but all four decisive-arm CVs
+exceed 5% and the 384-dimensional A/A band is especially wide. The benchmark
+therefore cannot support a KEEP under the admission rule. A warmed retry with
+30 samples and four inner iterations was requested, but RCH routed
+`j-29942429901652351` to the cold, disk-critical `hz1` worker instead of the
+warmed worker; it was cancelled before compilation or timing. All bench and
+Cargo edits were manually removed.
+
+**Decision: REJECT the measurement retrofit, not the shipping AVX2 kernel.**
+Reopen only on an idle, admissible worker with the same warmed build cache (or
+isolated CPU pinning), hard-code at least 30 samples and four inner iterations,
+and require both dimensional A/A bands within 0.97–1.03 plus every dispatch
+and generic CV below 5%. Exact bit parity remains mandatory; only then may the
+dispatch/generic speedup be cited from this legacy target.

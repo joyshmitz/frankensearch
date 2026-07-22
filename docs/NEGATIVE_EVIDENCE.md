@@ -15760,6 +15760,40 @@ critical-path bead. A future E3.5 attempt must first add stage-attributed
 fixed-work evidence or a fixed-retained-byte control that isolates a single
 production cost of at least 13.306% in the two-source case.
 
+### 2026-07-22 — RESOLVED: fixed-span control separates concat fan-in from the small-object floor (`bd-quill-e3-keeper-ndtk.5`)
+
+The retry predicate above is now fulfilled without another production-source
+change. The old benchmark increased source count and output span together, so
+its cross-size max/min statistic could not distinguish fan-in overhead from the
+two-source fixed floor. The benchmark retains that exact diagnostic and adds a
+second sweep whose 2/4/8/16 source runs share one first-to-last lease span.
+Sources remain manifest-consecutive, lease-aligned, gapped, and valid Q1 input;
+exact physical bytes still count all source FSLX plus the merged output.
+
+Before observing the new rows, the control preserved the original `<=1.35x`
+threshold. Strict-remote release-LTO job `j-29942429901652205` ran on
+`vmi1149989` and produced:
+
+| fixed-span sources | exact bytes | median | ns/B |
+|---:|---:|---:|---:|
+| 2 | 34,513,784 | 21.300 ms | 0.617144733 |
+| 4 | 34,507,720 | 23.625 ms | 0.684629410 |
+| 8 | 34,507,752 | 24.153 ms | 0.699929685 |
+| 16 | 34,543,016 | 22.244 ms | 0.643950719 |
+
+The physical-byte spread is `1.001022844x`; normalized timing spread is
+**`1.134141877x` — PASS**. The conservative interval extreme is
+`1.250316110x`, also below the gate. In the same binary, the intentionally
+preserved growing-span diagnostic still failed at `1.660618226x`, and a
+separate unmodified-current-main reproduction (job `j-29942429901652182`, same
+worker) failed at `1.551393895x`. Both failures remain valid evidence about the
+small-object intercept; neither is evidence of superlinear fan-in cost once
+physical bytes are held constant.
+
+**Resolution:** close the E3.5 performance hold on the predeclared fixed-span
+control. Retain the growing-span rows here so future work does not rediscover
+or mislabel the two-source fixed floor as a concat codec regression.
+
 ### 2026-07-22 — BLOCKED / UNTIMED: short-token cached start-window mask (`bd-short-token-mask-reuse-cpn9`, IndigoOtter)
 
 Ledger and recent-history mining left the short-token tokenizer gap open while
@@ -15853,3 +15887,33 @@ source and comparator edits were manually removed. Reopen only when a profile
 and disassembly demonstrate a representation with no added spills/branches,
 then require an idle same-worker A/A band within 0.97–1.03, every decisive-arm
 CV below 5%, short cached/shipping <=0.97, and no regression on long tokens.
+
+### 2026-07-22 — REJECT: legacy f16 dot-product A/A retrofit is too noisy to retain (`bd-dot-product-aa-null-wegn`, IndigoOtter)
+
+This was a measurement-infrastructure lever, not a new kernel. Ledger and
+recent-history mining found the f16/f32/i8 implementation families already
+well explored, but the legacy `dot_product` Criterion target lacked a null
+control. The candidate added exact bit-parity assertions and interleaved
+shipping/shipping A/A beside shipping-dispatch/generic A/B for dimensions 256
+and 384, without modifying production source.
+
+Strict-remote job `j-29942429901652321` on `vmi1149989` produced:
+
+| dimension | dispatch/dispatch A/A median [p5, p95] | dispatch/generic median [p5, p95] | raw dispatch/generic CV |
+|---:|---:|---:|---:|
+| 256 | 1.0055 [0.9154, 1.0743] | 0.2798 [0.2334, 0.4562] | **6.399% / 5.607%** |
+| 384 | 1.0292 [0.7778, 1.1771] | 0.4423 [0.2461, 0.6548] | **32.059% / 6.491%** |
+
+Exact `to_bits()` parity passed and the incumbent dispatch was directionally
+much faster, with Criterion intervals of 286.06–308.79 us versus
+1.1273–1.2494 ms at 256 dimensions and 418.15–509.40 us versus
+1.8671–1.9869 ms at 384. That does not override the mandatory noise gate: all
+four arm CVs exceed 5%, and the 384-dimensional null band is unusably wide.
+RCH then routed warmed retry `j-29942429901652351` to cold, disk-critical `hz1`;
+it was cancelled before compilation/timing rather than mixing workers. The
+bench/Cargo changes were manually removed.
+
+**Decision: REJECT the retrofit and retain the unchanged shipping kernel.**
+Retry only with an idle same-worker warmed cache or isolated CPU pinning,
+at least 30 samples and four inner iterations, dimensional A/A bands wholly
+inside 0.97–1.03, all dispatch/generic CVs below 5%, and exact bit parity.

@@ -401,16 +401,13 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
         reason: "Q1 E3.5 could not choose a collision-free fixture segment id".to_owned(),
     })?;
     let rejected_order = [source_ids[0], source_ids[2]];
-    let rejection = match index
+    let Err(rejection) = index
         .concat_merge(cx, &rejected_order, output_segment_id, 1_700_000_035)
         .await
-    {
-        Err(error) => error,
-        Ok(_) => {
-            return Err(GauntletError::InvalidContract {
-                reason: "Q1-OB1 admitted a nonconsecutive manifest source list".to_owned(),
-            });
-        }
+    else {
+        return Err(GauntletError::InvalidContract {
+            reason: "Q1-OB1 admitted a nonconsecutive manifest source list".to_owned(),
+        });
     };
     match &rejection {
         QuillIndexError::Keeper(KeeperError::ConcatMerge {
