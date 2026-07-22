@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "corpus_manifest_hash": "7bfb1132b162336911e48b7fc28c88b52d70f71ea4827957bfb7402185aac1cd",
+  "query_manifest_hash": "3224846b5beafa0e9406de02bcd8dc7ba3331cd1ae7fdfe3e2398ac6d708e523",
+  "query_seed": 25089,
+  "cases": [
+    {
+      "query_id": "harvested-00",
+      "ranked_document_ids": [
+        "test-rust-001",
+        "test-mixed-007",
+        "test-rust-002",
+        "test-rust-003",
+        "test-rust-004",
+        "test-rust-005",
+        "test-rust-006",
+        "test-rust-007",
+        "test-rust-008",
+        "test-rust-009",
+        "test-rust-010",
+        "test-rust-011",
+        "test-rust-012",
+        "test-rust-013",
+        "test-rust-014",
+        "test-rust-015",
+        "test-rust-016",
+        "test-rust-017",
+        "test-rust-018",
+        "test-rust-019"
+      ]
+    },
+    {
+      "query_id": "harvested-01",
+      "ranked_document_ids": [
+        "test-ml-003",
+        "test-rust-015",
+        "test-ml-001",
+        "test-ml-015",
+        "test-ml-019",
+        "test-ml-018",
+        "test-cooking-017",
+        "test-cooking-007",
+        "test-cooking-014",
+        "test-mixed-012",
+        "test-sysadmin-018",
+        "test-sysadmin-020",
+        "test-ml-020",
+        "test-sysadmin-001",
+        "test-rust-003",
+        "test-rust-012",
+        "test-rust-013",
+        "test-ml-017",
+        "test-ml-002",
+        "test-ml-004"
+      ]
+    },
+    {
+      "query_id": "harvested-02",
+      "ranked_document_ids": [
+        "test-sysadmin-017",
+        "test-mixed-004",
+        "test-sysadmin-002",
+        "test-mixed-001",
+        "test-rust-005",
+        "test-rust-007",
+        "test-cooking-001",
+        "test-cooking-006",
+        "test-cooking-013",
+        "test-cooking-016",
+        "test-cooking-015",
+        "test-cooking-004",
+        "test-cooking-005",
+        "test-cooking-007",
+        "test-cooking-009",
+        "test-cooking-010",
+        "test-cooking-011",
+        "test-cooking-014",
+        "test-cooking-017",
+        "test-cooking-018"
+      ]
+    },
+    {
+      "query_id": "harvested-03",
+      "ranked_document_ids": [
+        "test-cooking-001",
+        "test-mixed-017",
+        "test-mixed-006",
+        "test-cooking-011",
+        "test-mixed-005",
+        "test-mixed-012"
+      ]
+    },
+    {
+      "query_id": "harvested-04",
+      "ranked_document_ids": [
+        "test-mixed-012",
+        "test-ml-004",
+        "test-ml-013",
+        "test-rust-019",
+        "test-mixed-010",
+        "test-rust-004",
+        "test-ml-014",
+        "test-rust-020",
+        "test-ml-001",
+        "test-sysadmin-001",
+        "test-rust-005",
+        "test-rust-007",
+        "test-rust-010",
+        "test-rust-015",
+        "test-mixed-005",
+        "test-mixed-011",
+        "test-mixed-014",
+        "test-mixed-015",
+        "test-mixed-017",
+        "test-mixed-001"
+      ]
+    },
+    {
+      "query_id": "harvested-05",
+      "ranked_document_ids": [
+        "test-ml-005",
+        "test-ml-019",
+        "test-mixed-003",
+        "test-rust-017"
+      ]
+    },
+    {
+      "query_id": "harvested-06",
+      "ranked_document_ids": ["test-ml-006", "test-sysadmin-010"]
+    },
+    {
+      "query_id": "harvested-07",
+      "ranked_document_ids": ["test-cooking-006", "test-cooking-009"]
+    },
+    {
+      "query_id": "harvested-08",
+      "ranked_document_ids": [
+        "test-sysadmin-001",
+        "test-sysadmin-014",
+        "test-mixed-001",
+        "test-rust-010",
+        "test-rust-017"
+      ]
+    },
+    {
+      "query_id": "harvested-09",
+      "ranked_document_ids": ["test-rust-017", "test-ml-004"]
+    },
+    {
+      "query_id": "harvested-10",
+      "ranked_document_ids": [
+        "test-rust-005",
+        "test-rust-018",
+        "test-rust-001",
+        "test-rust-002",
+        "test-rust-003",
+        "test-rust-004",
+        "test-rust-006",
+        "test-rust-007",
+        "test-rust-008",
+        "test-rust-009",
+        "test-rust-010",
+        "test-rust-011",
+        "test-rust-012",
+        "test-rust-013",
+        "test-rust-014",
+        "test-rust-015",
+        "test-rust-016",
+        "test-rust-017",
+        "test-rust-019",
+        "test-rust-020"
+      ]
+    },
+    {
+      "query_id": "harvested-11",
+      "ranked_document_ids": ["test-sysadmin-007"]
+    },
+    {
+      "query_id": "harvested-12",
+      "ranked_document_ids": [
+        "test-rust-007",
+        "test-rust-017",
+        "test-rust-009"
+      ]
+    },
+    {
+      "query_id": "harvested-13",
+      "ranked_document_ids": ["test-ml-014"]
+    },
+    {
+      "query_id": "harvested-14",
+      "ranked_document_ids": [
+        "test-cooking-013",
+        "test-cooking-016",
+        "test-cooking-004",
+        "test-cooking-015",
+        "test-cooking-002",
+        "test-cooking-001",
+        "test-cooking-005",
+        "test-cooking-006",
+        "test-cooking-007",
+        "test-cooking-009",
+        "test-cooking-010",
+        "test-cooking-011",
+        "test-cooking-014",
+        "test-cooking-017",
+        "test-cooking-018",
+        "test-cooking-019",
+        "test-cooking-003",
+        "test-cooking-008",
+        "test-cooking-012",
+        "test-cooking-020"
+      ]
+    },
+    {
+      "query_id": "harvested-15",
+      "ranked_document_ids": ["test-ml-006", "test-sysadmin-010"]
+    },
+    {
+      "query_id": "harvested-16",
+      "ranked_document_ids": [
+        "test-cooking-003",
+        "test-sysadmin-012",
+        "test-sysadmin-001",
+        "test-sysadmin-002",
+        "test-sysadmin-003",
+        "test-sysadmin-004",
+        "test-sysadmin-005",
+        "test-sysadmin-006",
+        "test-sysadmin-007",
+        "test-sysadmin-008",
+        "test-sysadmin-009",
+        "test-sysadmin-010",
+        "test-sysadmin-011",
+        "test-sysadmin-013",
+        "test-sysadmin-014",
+        "test-sysadmin-015",
+        "test-sysadmin-016",
+        "test-sysadmin-017",
+        "test-sysadmin-018",
+        "test-sysadmin-019"
+      ]
+    },
+    {
+      "query_id": "harvested-17",
+      "ranked_document_ids": [
+        "test-ml-010",
+        "test-mixed-010",
+        "test-ml-008",
+        "test-rust-019",
+        "test-rust-004",
+        "test-ml-014",
+        "test-ml-001",
+        "test-sysadmin-001",
+        "test-mixed-012",
+        "test-rust-005",
+        "test-rust-007",
+        "test-rust-010",
+        "test-rust-015",
+        "test-rust-020",
+        "test-mixed-005",
+        "test-mixed-011",
+        "test-mixed-014",
+        "test-mixed-015",
+        "test-mixed-017",
+        "test-mixed-001"
+      ]
+    },
+    {
+      "query_id": "harvested-18",
+      "ranked_document_ids": ["test-ml-001"]
+    },
+    {
+      "query_id": "harvested-19",
+      "ranked_document_ids": ["test-cooking-001", "test-cooking-005"]
+    },
+    {
+      "query_id": "harvested-20",
+      "ranked_document_ids": []
+    },
+    {
+      "query_id": "harvested-21",
+      "ranked_document_ids": []
+    },
+    {
+      "query_id": "harvested-22",
+      "ranked_document_ids": [
+        "test-mixed-010",
+        "test-ml-016",
+        "test-ml-002",
+        "test-mixed-002",
+        "test-rust-007",
+        "test-rust-012",
+        "test-rust-018",
+        "test-rust-001",
+        "test-ml-012",
+        "test-mixed-017",
+        "test-sysadmin-005",
+        "test-sysadmin-015",
+        "test-cooking-011",
+        "test-mixed-009",
+        "test-mixed-005",
+        "test-mixed-015",
+        "test-mixed-013",
+        "test-mixed-011",
+        "test-mixed-014",
+        "test-mixed-006"
+      ]
+    },
+    {
+      "query_id": "harvested-23",
+      "ranked_document_ids": []
+    },
+    {
+      "query_id": "harvested-24",
+      "ranked_document_ids": []
+    }
+  ]
+}
