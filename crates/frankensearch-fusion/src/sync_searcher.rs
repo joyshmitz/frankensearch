@@ -39,6 +39,83 @@ pub trait SyncLexicalSearch: Send + Sync {
     fn search_sync(&self, query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>>;
 }
 
+/// Per-query synchronous lexical adapter for Quill.
+///
+/// [`SyncLexicalSearch`] receives only the semantic query vector, so the text
+/// query and its structured-concurrency context are carried explicitly by this
+/// adapter. Quill's reader path is synchronous and lock-free; `search_sync`
+/// therefore never creates a runtime or blocks on an async operation.
+#[cfg(feature = "quill")]
+#[derive(Clone)]
+pub struct QuillSyncLexicalSearch {
+    index: Arc<frankensearch_quill::QuillIndex>,
+    cx: asupersync::Cx,
+    query: Arc<str>,
+}
+
+#[cfg(feature = "quill")]
+impl QuillSyncLexicalSearch {
+    /// Bind a Quill index to one consumer-owned request context and text query.
+    #[must_use]
+    pub fn new(
+        index: Arc<frankensearch_quill::QuillIndex>,
+        cx: asupersync::Cx,
+        query: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            index,
+            cx,
+            query: query.into(),
+        }
+    }
+
+    /// Borrow the text query paired with this adapter.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+}
+
+#[cfg(feature = "quill")]
+impl SyncLexicalSearch for QuillSyncLexicalSearch {
+    fn search_sync(&self, _query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+        let result = self
+            .index
+            .search_paginated(&self.cx, &self.query, limit, 0, false)
+            .map_err(map_quill_search_error)?;
+        Ok(result
+            .hits
+            .into_iter()
+            .map(|hit| ScoredResult {
+                doc_id: hit.document_id.into(),
+                score: hit.score,
+                source: ScoreSource::Lexical,
+                index: None,
+                fast_score: None,
+                quality_score: None,
+                lexical_score: Some(hit.score),
+                rerank_score: None,
+                explanation: None,
+                metadata: None,
+            })
+            .collect())
+    }
+}
+
+#[cfg(feature = "quill")]
+fn map_quill_search_error(error: frankensearch_quill::QuillIndexError) -> SearchError {
+    match error {
+        frankensearch_quill::QuillIndexError::Cancelled { phase } => SearchError::Cancelled {
+            phase: phase.to_owned(),
+            reason: "Quill observed request cancellation".to_owned(),
+        },
+        source => SearchError::SubsystemError {
+            subsystem: "quill",
+            source: Box::new(source),
+        },
+    }
+}
+
 /// Former enabled-path NQC shape retained for the same-binary allocation A/B.
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
@@ -1212,5 +1289,62 @@ mod tests {
                 .iter()
                 .all(|result| result.source == ScoreSource::Hybrid)
         );
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_sync_adapter_carries_query_context_and_maps_cancellation() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_quill::{QuillConfig, QuillIndex};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            fn assert_send_sync<T: Send + Sync>() {}
+            assert_send_sync::<QuillSyncLexicalSearch>();
+
+            let mut quill = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            })
+            .expect("create in-memory Quill index");
+            quill
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new(
+                        "quill-only",
+                        "native quill lexical result",
+                    )],
+                )
+                .await
+                .expect("index Quill fixture");
+            quill.commit(&cx).await.expect("commit Quill fixture");
+
+            let quill = Arc::new(quill);
+            let lexical = Arc::new(QuillSyncLexicalSearch::new(
+                Arc::clone(&quill),
+                cx.clone(),
+                "native quill",
+            ));
+            assert_eq!(lexical.query(), "native quill");
+            let hits = lexical.search_sync(&[f32::NAN], 1).expect("sync search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "quill-only");
+            assert_eq!(hits[0].source, ScoreSource::Lexical);
+            assert_eq!(hits[0].lexical_score, Some(hits[0].score));
+
+            let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+                .with_lexical(lexical);
+            let (fused, _) = searcher
+                .search_collect(&[1.0, 0.0], 3)
+                .expect("hybrid sync search");
+            assert!(fused.iter().any(|hit| hit.doc_id == "quill-only"));
+
+            let cancelled = cx.clone();
+            cancelled.set_cancel_requested(true);
+            let adapter = QuillSyncLexicalSearch::new(quill, cancelled, "native");
+            assert!(matches!(
+                adapter.search_sync(&[], 1),
+                Err(SearchError::Cancelled { ref phase, .. }) if phase == "search"
+            ));
+        });
     }
 }

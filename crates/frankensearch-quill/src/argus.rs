@@ -16,14 +16,19 @@ use frankensearch_core::DocId;
 use thiserror::Error;
 
 use crate::contract::{BM25_K1, compute_tf_cache, idf};
+use crate::delta::{DeltaBlockMax, DeltaPosting, DeltaPostings, DeltaSnapshot, DeltaTerm};
 use crate::quiver::{
-    DocLenField, NumericCodecError, NumericDocIdSet, NumericField, NumericValue,
-    PositionCodecError, PostingCodecError, SnapshotFieldStats,
+    BlockMaxEntry, DocLenField, NumericCodecError, NumericDocIdSet, NumericField, NumericValue,
+    PositionCodecError, PostingCodecError, SnapshotFieldStats, ValidatedTermPruningMetadata,
 };
 
 pub use crate::query::Occur;
 
 const UNION_HORIZON: usize = 4_096;
+const UNION_HORIZON_U64: u64 = 4_096;
+pub(crate) const MAX_SCORE_MAX_CLAUSES: usize = 8;
+pub(crate) const BMW_MIN_CLAUSES: usize = MAX_SCORE_MAX_CLAUSES + 1;
+const BMW_MIN_TOTAL_COST: u64 = 16_384;
 const MAX_GLOBAL_DOCID_EXCLUSIVE: u64 = 1_u64 << 32;
 
 /// Owner-bound decoder for one cursor's compressed position runs.
@@ -116,12 +121,12 @@ pub enum ArgusError {
         /// Failed invariant.
         reason: &'static str,
     },
-    /// Snapshot term frequency exceeded the snapshot's physical document count.
+    /// Snapshot term frequency exceeded the snapshot's BM25 document count.
     #[error("term doc_freq {doc_freq} exceeds snapshot N {doc_count}")]
     InvalidDocFrequency {
         /// Snapshot-level term document frequency.
         doc_freq: u64,
-        /// Snapshot-level physical document count.
+        /// Snapshot-level BM25 document count.
         doc_count: u64,
     },
     /// A scorer bound statistics and field lengths from different fields.
@@ -204,8 +209,8 @@ pub enum ArgusError {
     /// An exact match count exceeded the durable collection domain.
     #[error("exact match count overflowed u64")]
     MatchCountOverflow,
-    /// A scoreless collector received a scorer that scores while advancing.
-    #[error("doc-set collection requires a recursively unscored Boolean scorer")]
+    /// A movement-only operation received a tree that scores while advancing.
+    #[error("movement-only scoring requires a recursively unscored scorer tree")]
     ScoredTreeForUnscoredCollector,
     /// A caller attempted to score a deliberately unscored query tree.
     #[error("an unscored Boolean query has no BM25 score")]
@@ -221,6 +226,12 @@ pub enum ArgusError {
         value_count: usize,
         /// Physical at-seal documents supplied by the segment plan.
         segment_num_docs: u32,
+    },
+    /// A programmatic constant-score predicate supplied a non-finite boost.
+    #[error("constant-score predicate has invalid boost bits 0x{boost_bits:08x}")]
+    InvalidConstantBoost {
+        /// Exact rejected f32 representation.
+        boost_bits: u32,
     },
     /// A match-all leaf cannot describe the supplied global document domain.
     #[error(
@@ -285,6 +296,40 @@ pub trait PostingCursor {
     /// Returns a typed error if the cursor cannot preserve its validated
     /// storage invariants.
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError>;
+
+    /// Fork the current position into an independent cursor suitable for
+    /// competitive candidate generation.
+    ///
+    /// The default opts out. A cursor must return `Some` only when the fork
+    /// retains sound live-snapshot impact metadata for every remaining row.
+    fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+        None
+    }
+
+    /// Conservative score ceiling over every remaining block in this term.
+    fn term_score_upper_bound(&self, _live_avgdl: f32, _weight: f32) -> Option<f32> {
+        None
+    }
+
+    /// Whether this cursor exposes real skip-capable posting blocks.
+    ///
+    /// A whole-term ceiling is sufficient for `MaxScore` but not for BMW. The
+    /// default is deliberately false so a custom cursor with only a term bound
+    /// falls back to exhaustive collection instead of surfacing an invariant
+    /// error when the clause-count threshold selects BMW.
+    fn supports_block_max(&self) -> bool {
+        false
+    }
+
+    /// Conservative score ceiling for the cursor's current posting block.
+    fn current_block_score_upper_bound(&self, _live_avgdl: f32, _weight: f32) -> Option<f32> {
+        None
+    }
+
+    /// Inclusive validated last docid of the current posting block.
+    fn current_block_last_doc(&self) -> Option<u32> {
+        None
+    }
 }
 
 impl<T> PostingCursor for Box<T>
@@ -322,6 +367,26 @@ where
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         (**self).advance(target)
     }
+
+    fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+        (**self).fork_for_pruning()
+    }
+
+    fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+        (**self).term_score_upper_bound(live_avgdl, weight)
+    }
+
+    fn supports_block_max(&self) -> bool {
+        (**self).supports_block_max()
+    }
+
+    fn current_block_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+        (**self).current_block_score_upper_bound(live_avgdl, weight)
+    }
+
+    fn current_block_last_doc(&self) -> Option<u32> {
+        (**self).current_block_last_doc()
+    }
 }
 
 enum SealedCursorInner<'a> {
@@ -329,9 +394,27 @@ enum SealedCursorInner<'a> {
     Positions(crate::quiver::PositionCursor<'a>),
 }
 
+#[derive(Clone)]
+enum SealedBlockMax {
+    ValidatedTerm(Arc<ValidatedTermPruningMetadata>),
+    #[cfg(test)]
+    Fixture(Arc<[BlockMaxEntry]>),
+}
+
+impl SealedBlockMax {
+    fn entries(&self) -> &[BlockMaxEntry] {
+        match self {
+            Self::ValidatedTerm(metadata) => metadata.block_max(),
+            #[cfg(test)]
+            Self::Fixture(entries) => entries,
+        }
+    }
+}
+
 /// Owner-safe adapter for one validated sealed posting or position cursor.
 pub struct SealedPostingCursor<'a> {
     inner: SealedCursorInner<'a>,
+    block_max: Option<SealedBlockMax>,
     size_hint: u32,
     segment_num_docs: u32,
 }
@@ -349,9 +432,75 @@ impl<'a> SealedPostingCursor<'a> {
     ) -> Result<Self, ArgusError> {
         Ok(Self {
             inner: SealedCursorInner::Docs(postings.cursor()?),
+            block_max: None,
             size_hint: postings.doc_freq(),
             segment_num_docs,
         })
+    }
+
+    /// Bind an owner-safe compressed posting cursor without pruning metadata.
+    ///
+    /// This is the exact-count and scoreless production path: POSTINGS remains
+    /// lazy and owner-safe, while BLOCKMAX is neither opened nor represented by
+    /// an empty sentinel.
+    #[must_use]
+    pub(crate) fn from_owned(
+        postings: crate::quiver::PostingCursor<'a>,
+        size_hint: u32,
+        segment_num_docs: u32,
+    ) -> Self {
+        Self {
+            inner: SealedCursorInner::Docs(postings),
+            block_max: None,
+            size_hint,
+            segment_num_docs,
+        }
+    }
+
+    /// Open an owner-safe cursor from one segment-cached, fully validated term.
+    ///
+    /// POSTINGS block layout and BLOCKMAX rows remain paired behind the same
+    /// shared metadata value, so no production caller can bind bounds from a
+    /// different term.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed posting invariant error if the selected immutable term
+    /// span no longer matches the cached validation witness.
+    pub(crate) fn from_validated_pruning(
+        postings_bytes: &'a [u8],
+        metadata: Arc<ValidatedTermPruningMetadata>,
+        segment_num_docs: u32,
+    ) -> Result<Self, ArgusError> {
+        let size_hint = metadata.doc_freq();
+        let postings = metadata.cursor(postings_bytes)?;
+        Ok(Self {
+            inner: SealedCursorInner::Docs(postings),
+            block_max: Some(SealedBlockMax::ValidatedTerm(metadata)),
+            size_hint,
+            segment_num_docs,
+        })
+    }
+
+    /// Bind an owner-safe posting cursor to fully validated BLOCKMAX entries.
+    ///
+    /// The entries must come from the same [`crate::quiver::PostingList`] that
+    /// produced `postings`; the storage opener is responsible for validating
+    /// that one-to-one relationship before construction.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn with_block_max(
+        postings: crate::quiver::PostingCursor<'a>,
+        block_max: Arc<[BlockMaxEntry]>,
+        size_hint: u32,
+        segment_num_docs: u32,
+    ) -> Self {
+        Self {
+            inner: SealedCursorInner::Docs(postings),
+            block_max: Some(SealedBlockMax::Fixture(block_max)),
+            size_hint,
+            segment_num_docs,
+        }
     }
 
     /// Open a sealed cursor already paired with its validated POSITIONS stream.
@@ -366,6 +515,7 @@ impl<'a> SealedPostingCursor<'a> {
     ) -> Result<Self, ArgusError> {
         Ok(Self {
             inner: SealedCursorInner::Positions(positions.cursor()?),
+            block_max: None,
             size_hint: positions.doc_freq(),
             segment_num_docs,
         })
@@ -423,6 +573,56 @@ impl PostingCursor for SealedPostingCursor<'_> {
             }
         }
     }
+
+    fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+        let SealedCursorInner::Docs(cursor) = &self.inner else {
+            return None;
+        };
+        self.block_max.as_ref()?;
+        Some(Box::new(Self {
+            inner: SealedCursorInner::Docs(cursor.clone()),
+            block_max: self.block_max.clone(),
+            size_hint: self.size_hint,
+            segment_num_docs: self.segment_num_docs,
+        }))
+    }
+
+    fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+        let entries = self.block_max.as_ref()?.entries();
+        let mut maximum = None::<f32>;
+        for entry in entries {
+            let bound = entry.score_upper_bound(live_avgdl, weight)?;
+            maximum = Some(maximum.map_or(bound, |current| current.max(bound)));
+        }
+        maximum
+    }
+
+    fn supports_block_max(&self) -> bool {
+        matches!(&self.inner, SealedCursorInner::Docs(_))
+            && self
+                .block_max
+                .as_ref()
+                .is_some_and(|entries| !entries.entries().is_empty())
+    }
+
+    fn current_block_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+        let SealedCursorInner::Docs(cursor) = &self.inner else {
+            return None;
+        };
+        let block_index = cursor.block_index()?;
+        self.block_max
+            .as_ref()?
+            .entries()
+            .get(block_index)?
+            .score_upper_bound(live_avgdl, weight)
+    }
+
+    fn current_block_last_doc(&self) -> Option<u32> {
+        let SealedCursorInner::Docs(cursor) = &self.inner else {
+            return None;
+        };
+        cursor.block_last_doc()
+    }
 }
 
 impl PositionsReader for SealedPostingCursor<'_> {
@@ -454,6 +654,235 @@ impl PositionsReader for SealedPostingCursor<'_> {
             output.push(position?);
         }
         Ok(())
+    }
+}
+
+/// Allocation-free cursor over one immutable Delta term chain.
+///
+/// Physical postings remain append-ordered in the frozen generation. The
+/// adapter validates that ordering while skipping rows superseded or deleted
+/// by the Delta-local identity overlay. A cursor starts on its first live row,
+/// exactly like the sealed adapter.
+#[derive(Clone)]
+pub struct DeltaPostingCursor<'a> {
+    term: Option<DeltaTerm<'a>>,
+    block_max: Option<DeltaBlockMax>,
+    remaining: Option<DeltaPostings<'a>>,
+    current: Option<DeltaPosting<'a>>,
+    current_ordinal: Option<u32>,
+    next_ordinal: u32,
+    last_physical_doc: Option<u32>,
+    size_hint: u32,
+    cost: u64,
+    segment_num_docs: u32,
+}
+
+impl<'a> DeltaPostingCursor<'a> {
+    /// Open one live-only `(field, term)` cursor in a frozen Delta generation.
+    ///
+    /// A missing term produces a fused empty cursor with the generation's live
+    /// segment cardinality. No posting or position row is materialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invariant failure if a generation exceeds the durable
+    /// `u32` cursor domain or its first posting violates ascending order.
+    pub fn new(
+        delta: &'a DeltaSnapshot,
+        field_ord: u16,
+        term_bytes: &[u8],
+    ) -> Result<Self, ArgusError> {
+        let term = delta.find_term(field_ord, term_bytes);
+        let (live_doc_freq, block_max) =
+            term.map_or((0, None), DeltaTerm::live_doc_freq_and_block_max);
+        let size_hint = u32::try_from(live_doc_freq).map_err(|_| {
+            ArgusError::CursorInvariant("Delta live document frequency exceeds u32")
+        })?;
+        // Intersection ordering also fixes the f32 score-accumulation order.
+        // Use the same live document frequency emitted by a sealed cursor so
+        // folding Delta tombstones cannot perturb score bits across a seal.
+        let cost = u64::try_from(live_doc_freq).map_err(|_| {
+            ArgusError::CursorInvariant("Delta live document frequency exceeds u64")
+        })?;
+        let segment_num_docs = u32::try_from(delta.live_document_count())
+            .map_err(|_| ArgusError::CursorInvariant("Delta live document count exceeds u32"))?;
+        let remaining = term.map(DeltaTerm::postings);
+        let mut cursor = Self {
+            term,
+            block_max,
+            remaining,
+            current: None,
+            current_ordinal: None,
+            next_ordinal: 0,
+            last_physical_doc: None,
+            size_hint,
+            cost,
+            segment_num_docs,
+        };
+        cursor.pull_next_live()?;
+        Ok(cursor)
+    }
+
+    fn pull_next_live(&mut self) -> Result<Option<u32>, ArgusError> {
+        let Some(term) = self.term else {
+            self.current = None;
+            self.current_ordinal = None;
+            return Ok(None);
+        };
+        let Some(remaining) = self.remaining.as_mut() else {
+            self.current = None;
+            self.current_ordinal = None;
+            return Ok(None);
+        };
+        loop {
+            let Some(posting) = remaining.next() else {
+                self.current = None;
+                self.current_ordinal = None;
+                return Ok(None);
+            };
+            if self
+                .last_physical_doc
+                .is_some_and(|previous| posting.global_docid <= previous)
+            {
+                return Err(ArgusError::CursorInvariant(
+                    "Delta term postings are not strictly docid-ascending",
+                ));
+            }
+            self.last_physical_doc = Some(posting.global_docid);
+            let ordinal = self.next_ordinal;
+            self.next_ordinal =
+                self.next_ordinal
+                    .checked_add(1)
+                    .ok_or(ArgusError::CursorInvariant(
+                        "Delta posting ordinal exceeds u32",
+                    ))?;
+            if !term.is_live(posting) {
+                continue;
+            }
+            self.current = Some(posting);
+            self.current_ordinal = Some(ordinal);
+            return Ok(Some(posting.global_docid));
+        }
+    }
+}
+
+impl PostingCursor for DeltaPostingCursor<'_> {
+    fn doc(&self) -> Option<u32> {
+        self.current.map(|posting| posting.global_docid)
+    }
+
+    fn freq(&self) -> Option<u32> {
+        self.current.map(|posting| posting.frequency)
+    }
+
+    fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+        self.current.filter(|posting| posting.has_positions())?;
+        self.current_ordinal
+            .map(|ordinal| PositionsHandle::new(self, ordinal))
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.size_hint
+    }
+
+    fn cost(&self) -> u64 {
+        self.cost
+    }
+
+    fn segment_num_docs(&self) -> u32 {
+        self.segment_num_docs
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        if self.current.is_none() {
+            return Ok(None);
+        }
+        self.pull_next_live()
+    }
+
+    fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        if self.doc().is_none_or(|doc| doc >= target) {
+            return Ok(self.doc());
+        }
+        loop {
+            let moved = self.pull_next_live()?;
+            if moved.is_none_or(|doc| doc >= target) {
+                return Ok(moved);
+            }
+        }
+    }
+
+    fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+        self.block_max?;
+        Some(Box::new(self.clone()))
+    }
+
+    fn term_score_upper_bound(&self, live_avgdl: f32, weight: f32) -> Option<f32> {
+        self.block_max?.score_upper_bound(live_avgdl, weight)
+    }
+}
+
+impl PositionsReader for DeltaPostingCursor<'_> {
+    fn decode_positions(
+        &self,
+        posting_ordinal: u32,
+        output: &mut Vec<u32>,
+    ) -> Result<(), ArgusError> {
+        if self.current_ordinal != Some(posting_ordinal) {
+            return Err(ArgusError::CursorInvariant(
+                "positions handle no longer identifies the current Delta posting",
+            ));
+        }
+        let term = self.term.ok_or(ArgusError::CursorInvariant(
+            "empty Delta cursor cannot resolve positions",
+        ))?;
+        let posting = self.current.ok_or(ArgusError::CursorInvariant(
+            "exhausted Delta cursor cannot resolve positions",
+        ))?;
+        let expected = usize::try_from(posting.frequency)
+            .map_err(|_| ArgusError::CursorInvariant("Delta position count does not fit usize"))?;
+        let positions = term.positions(posting).ok_or(ArgusError::CursorInvariant(
+            "positioned Delta cursor has no current position run",
+        ))?;
+        output
+            .try_reserve_exact(expected)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "decoded Delta positions",
+                count: expected,
+            })?;
+        let initial_len = output.len();
+        output.extend(positions);
+        if output.len().saturating_sub(initial_len) != expected {
+            return Err(ArgusError::CursorInvariant(
+                "Delta position run disagrees with posting frequency",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Borrowed fieldnorm view paired with one frozen Delta generation.
+#[derive(Clone, Copy)]
+pub struct DeltaFieldNorms<'a> {
+    delta: &'a DeltaSnapshot,
+    field_ord: u16,
+}
+
+impl<'a> DeltaFieldNorms<'a> {
+    /// Bind one indexed string field in an immutable Delta generation.
+    #[must_use]
+    pub const fn new(delta: &'a DeltaSnapshot, field_ord: u16) -> Self {
+        Self { delta, field_ord }
+    }
+}
+
+impl FieldNormReader for DeltaFieldNorms<'_> {
+    fn field_ord(&self) -> u16 {
+        self.field_ord
+    }
+
+    fn fieldnorm_id(&self, global_docid: u32) -> Option<u8> {
+        self.delta.live_fieldnorm_id(self.field_ord, global_docid)
     }
 }
 
@@ -509,13 +938,18 @@ impl Bm25FieldSnapshot {
         self.stats.field_ord
     }
 
-    /// Snapshot physical document count used as BM25 `N`.
+    /// Snapshot lifecycle population used as BM25 `N`.
+    ///
+    /// Composite views count Keeper's at-seal rows plus live Delta rows.
     #[must_use]
     pub const fn doc_count(&self) -> u64 {
         self.stats.doc_count
     }
 
-    /// Snapshot token numerator, including tombstoned documents until merge.
+    /// Snapshot token numerator under the same lifecycle as [`Self::doc_count`].
+    ///
+    /// Keeper tombstones remain until compaction; Delta tombstones are excluded
+    /// immediately because those rows are never sealed.
     #[must_use]
     pub const fn total_tokens(&self) -> u64 {
         self.stats.total_tokens
@@ -553,6 +987,7 @@ pub struct TermScorer<'a> {
     fieldnorms: Box<dyn FieldNormReader + 'a>,
     snapshot: Bm25FieldSnapshot,
     weight: f32,
+    term_score_upper_bound: Option<f32>,
     cost: u64,
     size_hint: u32,
     segment_num_docs: u32,
@@ -562,10 +997,11 @@ impl<'a> TermScorer<'a> {
     /// Build a term scorer from snapshot-level statistics and segment-local
     /// cursor state.
     ///
-    /// `snapshot_doc_freq` is the sum across every live segment and therefore
-    /// includes tombstoned postings until compaction. Runtime cost, size hint,
-    /// and segment `num_docs` come from the cursor so exact required-clause
-    /// ordering cannot drift from its storage implementation.
+    /// `snapshot_doc_freq` follows the same lifecycle population: Keeper
+    /// postings include tombstones until compaction, while Delta postings count
+    /// only live rows. Runtime cost, size hint, and segment `num_docs` come from
+    /// the cursor so exact required-clause ordering cannot drift from its
+    /// storage implementation.
     ///
     /// # Errors
     ///
@@ -601,7 +1037,7 @@ impl<'a> TermScorer<'a> {
         if u64::from(segment_num_docs) > snapshot.doc_count() {
             return Err(ArgusError::InvalidSnapshot {
                 field_ord: snapshot.field_ord(),
-                reason: "segment num_docs exceeds snapshot physical document count",
+                reason: "segment num_docs exceeds snapshot BM25 document count",
             });
         }
         if !field_boost.is_finite() {
@@ -654,11 +1090,21 @@ impl<'a> TermScorer<'a> {
                 boost_bits: field_boost.to_bits(),
             });
         }
+        // Query-time avgdl and idf/boost are immutable for this scorer. Scan a
+        // sealed term's validated block table once here instead of once per
+        // 4,096-doc competitive window.
+        let term_score_upper_bound = snapshot
+            .average_field_length()
+            .filter(|average| average.is_finite() && *average > 0.0)
+            .filter(|_| !weight.is_sign_negative())
+            .and_then(|average| cursor.term_score_upper_bound(average, weight))
+            .filter(|bound| bound.is_finite() && !bound.is_sign_negative());
         Ok(Self {
             cursor: Box::new(cursor),
             fieldnorms: Box::new(fieldnorms),
             snapshot,
             weight,
+            term_score_upper_bound,
             cost,
             size_hint,
             segment_num_docs,
@@ -732,6 +1178,53 @@ impl<'a> TermScorer<'a> {
         let norm = self.snapshot.tf_cache[usize::from(fieldnorm_id)];
         let tf_factor = frequency / (frequency + norm);
         finite_score(self.weight * tf_factor, doc)
+    }
+
+    fn competitive_cursor(&self) -> Option<CompetitiveTermCursor<'_>> {
+        let live_avgdl = self.snapshot.average_field_length()?;
+        let term_upper_bound = self.term_score_upper_bound?;
+        Some(CompetitiveTermCursor {
+            cursor: self.cursor.fork_for_pruning()?,
+            live_avgdl,
+            weight: self.weight,
+            term_upper_bound,
+        })
+    }
+}
+
+struct CompetitiveTermCursor<'a> {
+    cursor: Box<dyn PostingCursor + 'a>,
+    live_avgdl: f32,
+    weight: f32,
+    term_upper_bound: f32,
+}
+
+impl CompetitiveTermCursor<'_> {
+    fn doc(&self) -> Option<u32> {
+        self.cursor.doc()
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        self.cursor.next()
+    }
+
+    fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        self.cursor.advance(target)
+    }
+
+    const fn term_upper_bound(&self) -> f32 {
+        self.term_upper_bound
+    }
+
+    fn current_block_upper_bound(&self) -> Option<f32> {
+        let bound = self
+            .cursor
+            .current_block_score_upper_bound(self.live_avgdl, self.weight)?;
+        (bound.is_finite() && !bound.is_sign_negative()).then_some(bound)
+    }
+
+    fn current_block_last_doc(&self) -> Option<u32> {
+        self.cursor.current_block_last_doc()
     }
 }
 
@@ -971,7 +1464,7 @@ impl<'a> PhraseScorer<'a> {
             if u64::from(cursor_segment_num_docs) > snapshot.doc_count() {
                 return Err(ArgusError::InvalidSnapshot {
                     field_ord: snapshot.field_ord(),
-                    reason: "phrase segment num_docs exceeds snapshot physical document count",
+                    reason: "phrase segment num_docs exceeds snapshot BM25 document count",
                 });
             }
             if segment_num_docs
@@ -1393,6 +1886,7 @@ enum ScorerNode<'a> {
     Term(TermScorer<'a>),
     Phrase(PhraseScorer<'a>),
     NumericRange(NumericRangeScorer),
+    ConstantScore(ConstantScoreScorer),
     Intersection(IntersectionScorer<'a>),
     Union(BufferedUnionScorer<'a>),
     UnscoredUnion(UnscoredUnionScorer<'a>),
@@ -1529,6 +2023,31 @@ impl<'a> ReferenceScorer<'a> {
         upper: Bound<NumericValue>,
         segment_num_docs: u32,
     ) -> Result<Self, ArgusError> {
+        Self::numeric_range_with_boost(field, lower, upper, segment_num_docs, 1.0)
+    }
+
+    /// Compile one boosted NUMERIC field range into an owned constant-score doc set.
+    ///
+    /// Movement, cost, and size estimates are identical to [`Self::numeric_range`].
+    /// Each current match scores exactly `boost`, preserving `Boost(Range)` without
+    /// introducing a synthetic Boolean child or changing score accumulation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::numeric_range`] and rejects a
+    /// non-finite boost before exposing the scorer.
+    pub fn numeric_range_with_boost(
+        field: NumericField<'_>,
+        lower: Bound<NumericValue>,
+        upper: Bound<NumericValue>,
+        segment_num_docs: u32,
+        boost: f32,
+    ) -> Result<Self, ArgusError> {
+        if !boost.is_finite() {
+            return Err(ArgusError::InvalidConstantBoost {
+                boost_bits: boost.to_bits(),
+            });
+        }
         let value_count = field.len();
         if value_count > usize::try_from(segment_num_docs).unwrap_or(usize::MAX) {
             return Err(ArgusError::InvalidNumericCardinality {
@@ -1546,7 +2065,103 @@ impl<'a> ReferenceScorer<'a> {
                 docids,
                 value_count,
                 segment_num_docs,
+                boost,
             )),
+        })
+    }
+
+    /// Build one numeric-range scorer from an already materialized sorted doc set.
+    ///
+    /// Fast-only numeric columns are retained outside NUMERIC, so the index layer
+    /// scans their leaf-local column and supplies the exact matches here. Planning
+    /// metadata and constant-score behavior remain identical to NUMERIC-backed
+    /// ranges.
+    pub(crate) fn materialized_numeric_range(
+        field_ord: u16,
+        docids: Vec<u32>,
+        value_count: usize,
+        segment_num_docs: u32,
+        boost: f32,
+    ) -> Result<Self, ArgusError> {
+        if !boost.is_finite() {
+            return Err(ArgusError::InvalidConstantBoost {
+                boost_bits: boost.to_bits(),
+            });
+        }
+        if value_count > usize::try_from(segment_num_docs).unwrap_or(usize::MAX) {
+            return Err(ArgusError::InvalidNumericCardinality {
+                field_ord,
+                value_count,
+                segment_num_docs,
+            });
+        }
+        if docids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ArgusError::CursorInvariant(
+                "materialized numeric range docids are not strictly ascending",
+            ));
+        }
+        if docids.is_empty() {
+            return Ok(Self::empty());
+        }
+        Ok(Self {
+            node: ScorerNode::NumericRange(NumericRangeScorer::new_materialized(
+                docids,
+                value_count,
+                segment_num_docs,
+                boost,
+            )),
+        })
+    }
+
+    /// Replace one movement-only scorer tree's score with a finite constant.
+    ///
+    /// This is the canonical lowering for predicates such as a bounded glob:
+    /// the child is materialized into its exact unique document set, so each
+    /// document contributes the constant exactly once and the resulting cost
+    /// is the true unique-match cardinality. The child must be safe for
+    /// scoreless movement so no discarded BM25 arithmetic can affect traversal
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-finite score or a child tree that requires scoring while
+    /// advancing.
+    pub fn constant_score(mut inner: Self, score: f32) -> Result<Self, ArgusError> {
+        if !score.is_finite() {
+            return Err(ArgusError::InvalidConstantBoost {
+                boost_bits: score.to_bits(),
+            });
+        }
+        if inner.is_explicit_empty() {
+            return Ok(Self::empty());
+        }
+        if !inner.is_unscored_safe() {
+            return Err(ArgusError::ScoredTreeForUnscoredCollector);
+        }
+        let segment_num_docs = inner.segment_num_docs();
+        let mut docids = Vec::new();
+        while let Some(doc) = inner.doc() {
+            if docids.last().is_some_and(|previous| *previous >= doc) {
+                return Err(ArgusError::CursorInvariant(
+                    "constant-score child did not advance monotonically",
+                ));
+            }
+            if docids.len() == docids.capacity() {
+                docids.try_reserve(1).map_err(|_| ArgusError::Allocation {
+                    resource: "constant-score docids",
+                    count: docids.len().saturating_add(1),
+                })?;
+            }
+            docids.push(doc);
+            inner.next()?;
+        }
+        Ok(Self {
+            node: ScorerNode::ConstantScore(ConstantScoreScorer {
+                docids,
+                index: 0,
+                segment_num_docs,
+                score,
+            }),
         })
     }
 
@@ -1568,6 +2183,7 @@ impl<'a> ReferenceScorer<'a> {
             | ScorerNode::Term(_)
             | ScorerNode::Phrase(_)
             | ScorerNode::NumericRange(_) => true,
+            ScorerNode::ConstantScore(_) => true,
             ScorerNode::Intersection(scorer) => scorer.scorers.iter().all(Self::is_unscored_safe),
             ScorerNode::Union(_) => false,
             ScorerNode::UnscoredUnion(scorer) => scorer.active.iter().all(Self::is_unscored_safe),
@@ -1579,6 +2195,53 @@ impl<'a> ReferenceScorer<'a> {
                     && scorer.excluded.iter().all(Self::is_unscored_safe)
             }
         }
+    }
+
+    fn competitive_score_upper_bound(&self) -> Option<f32> {
+        match &self.node {
+            ScorerNode::Term(term) => term.term_score_upper_bound,
+            _ => None,
+        }
+    }
+
+    fn competitive_supports_block_max(&self) -> bool {
+        matches!(
+            &self.node,
+            ScorerNode::Term(term)
+                if term.term_score_upper_bound.is_some() && term.cursor.supports_block_max()
+        )
+    }
+
+    fn competitive_is_direct_term(&self) -> bool {
+        matches!(&self.node, ScorerNode::Term(_))
+    }
+
+    fn competitive_term_cursor(&self) -> Option<CompetitiveTermCursor<'_>> {
+        match &self.node {
+            ScorerNode::Term(term) => term.competitive_cursor(),
+            _ => None,
+        }
+    }
+
+    fn union_pruning_stats(&self) -> Option<UnionPruningStats> {
+        let ScorerNode::Union(union) = &self.node else {
+            return None;
+        };
+        Some(union.pruning_stats)
+    }
+
+    /// Return privacy-safe aggregate evidence for the pruning path that
+    /// actually executed while this scorer was collected.
+    #[must_use]
+    pub(crate) fn pruning_telemetry(&self) -> PruningTelemetry {
+        self.union_pruning_stats()
+            .map_or_else(PruningTelemetry::default, PruningTelemetry::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pruning_window_counts(&self) -> Option<(u64, u64)> {
+        self.union_pruning_stats()
+            .map(|stats| (stats.max_score_windows, stats.block_max_wand_windows))
     }
 
     /// Lower Boolean clauses into the pinned Tantivy scorer-tree shape.
@@ -1710,6 +2373,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.doc(),
             ScorerNode::Phrase(scorer) => scorer.doc(),
             ScorerNode::NumericRange(scorer) => scorer.doc(),
+            ScorerNode::ConstantScore(scorer) => scorer.doc(),
             ScorerNode::Intersection(scorer) => scorer.doc(),
             ScorerNode::Union(scorer) => scorer.doc(),
             ScorerNode::UnscoredUnion(scorer) => scorer.doc(),
@@ -1727,6 +2391,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.cost,
             ScorerNode::Phrase(scorer) => scorer.cost,
             ScorerNode::NumericRange(scorer) => scorer.cost(),
+            ScorerNode::ConstantScore(scorer) => scorer.cost(),
             ScorerNode::Intersection(scorer) => scorer.cost(),
             ScorerNode::Union(scorer) => scorer.cost(),
             ScorerNode::UnscoredUnion(scorer) => scorer.cost(),
@@ -1744,6 +2409,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.size_hint,
             ScorerNode::Phrase(scorer) => scorer.size_hint,
             ScorerNode::NumericRange(scorer) => scorer.size_hint(),
+            ScorerNode::ConstantScore(scorer) => scorer.size_hint(),
             ScorerNode::Intersection(scorer) => scorer.size_hint(),
             ScorerNode::Union(scorer) => scorer.size_hint(),
             ScorerNode::UnscoredUnion(scorer) => scorer.size_hint(),
@@ -1761,6 +2427,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.segment_num_docs,
             ScorerNode::Phrase(scorer) => scorer.segment_num_docs,
             ScorerNode::NumericRange(scorer) => scorer.segment_num_docs,
+            ScorerNode::ConstantScore(scorer) => scorer.segment_num_docs(),
             ScorerNode::Intersection(scorer) => scorer.segment_num_docs,
             ScorerNode::Union(scorer) => scorer.segment_num_docs,
             ScorerNode::UnscoredUnion(scorer) => scorer.segment_num_docs,
@@ -1785,6 +2452,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.next(),
             ScorerNode::Phrase(scorer) => scorer.next(),
             ScorerNode::NumericRange(scorer) => Ok(scorer.next()),
+            ScorerNode::ConstantScore(scorer) => Ok(scorer.next()),
             ScorerNode::Intersection(scorer) => scorer.next(),
             ScorerNode::Union(scorer) => scorer.next(),
             ScorerNode::UnscoredUnion(scorer) => scorer.next(),
@@ -1805,6 +2473,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.seek(target),
             ScorerNode::Phrase(scorer) => scorer.seek(target),
             ScorerNode::NumericRange(scorer) => Ok(scorer.seek(target)),
+            ScorerNode::ConstantScore(scorer) => Ok(scorer.seek(target)),
             ScorerNode::Intersection(scorer) => scorer.seek(target),
             ScorerNode::Union(scorer) => scorer.seek(target),
             ScorerNode::UnscoredUnion(scorer) => scorer.seek(target),
@@ -1834,6 +2503,7 @@ impl<'a> ReferenceScorer<'a> {
                 classify_seek_result(target, result)
             }
             ScorerNode::NumericRange(scorer) => classify_seek_result(target, scorer.seek(target)),
+            ScorerNode::ConstantScore(scorer) => scorer.seek_danger(target),
             ScorerNode::Intersection(scorer) => scorer.seek_danger(target),
             ScorerNode::Union(scorer) => scorer.seek_danger(target),
             ScorerNode::UnscoredUnion(scorer) => scorer.seek_danger(target),
@@ -1862,6 +2532,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Term(scorer) => scorer.score(),
             ScorerNode::Phrase(scorer) => scorer.score(),
             ScorerNode::NumericRange(scorer) => scorer.score(),
+            ScorerNode::ConstantScore(scorer) => scorer.score(),
             ScorerNode::Intersection(scorer) => scorer.score(),
             ScorerNode::Union(scorer) => scorer.score(),
             ScorerNode::UnscoredUnion(_) => Err(ArgusError::ScoreUnavailable),
@@ -1917,6 +2588,12 @@ impl<'a> ReferenceScorer<'a> {
     {
         if matches!(collector, CollectorState::DocSet(_)) && !self.is_unscored_safe() {
             return Err(ArgusError::ScoredTreeForUnscoredCollector);
+        }
+        if let CollectorState::TopDocs(top_docs) = collector
+            && !top_docs.exact_count
+            && let ScorerNode::Union(union) = &mut self.node
+        {
+            return union.collect_top_docs(top_docs, live_docs);
         }
         while let Some(doc) = self.doc() {
             match collector {
@@ -2178,15 +2855,44 @@ impl AllScorer {
 /// Tantivy's runtime fast-field range scorer. Keeping those concerns separate
 /// preserves both filter-first seeking and the oracle's stable f32 score order.
 struct NumericRangeScorer {
-    docids: NumericDocIdSet,
+    docids: NumericRangeDocIds,
     index: usize,
     cost: u64,
     size_hint: u32,
     segment_num_docs: u32,
+    score: f32,
 }
 
 impl NumericRangeScorer {
-    fn new(docids: NumericDocIdSet, value_count: usize, segment_num_docs: u32) -> Self {
+    fn new(docids: NumericDocIdSet, value_count: usize, segment_num_docs: u32, score: f32) -> Self {
+        Self::from_docids(
+            NumericRangeDocIds::Encoded(docids),
+            value_count,
+            segment_num_docs,
+            score,
+        )
+    }
+
+    fn new_materialized(
+        docids: Vec<u32>,
+        value_count: usize,
+        segment_num_docs: u32,
+        score: f32,
+    ) -> Self {
+        Self::from_docids(
+            NumericRangeDocIds::Materialized(docids),
+            value_count,
+            segment_num_docs,
+            score,
+        )
+    }
+
+    fn from_docids(
+        docids: NumericRangeDocIds,
+        value_count: usize,
+        segment_num_docs: u32,
+        score: f32,
+    ) -> Self {
         let match_count = u32::try_from(docids.len()).unwrap_or(u32::MAX);
         let full_cardinality =
             value_count == usize::try_from(segment_num_docs).unwrap_or(usize::MAX);
@@ -2202,6 +2908,7 @@ impl NumericRangeScorer {
             cost,
             size_hint,
             segment_num_docs,
+            score,
         }
     }
 
@@ -2234,7 +2941,25 @@ impl NumericRangeScorer {
         let doc = self.doc().ok_or(ArgusError::CursorInvariant(
             "cannot score an exhausted numeric range",
         ))?;
-        finite_score(1.0, doc)
+        finite_score(self.score, doc)
+    }
+}
+
+enum NumericRangeDocIds {
+    Encoded(NumericDocIdSet),
+    Materialized(Vec<u32>),
+}
+
+impl NumericRangeDocIds {
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Encoded(docids) => docids.as_slice(),
+            Self::Materialized(docids) => docids,
+        }
     }
 }
 
@@ -2245,6 +2970,57 @@ impl NumericRangeScorer {
 )]
 fn tantivy_range_cost(segment_num_docs: u32) -> u64 {
     (f64::from(segment_num_docs) * 0.8) as u64
+}
+
+/// Materialized constant-score cursor over one exact unique document set.
+struct ConstantScoreScorer {
+    docids: Vec<u32>,
+    index: usize,
+    segment_num_docs: u32,
+    score: f32,
+}
+
+impl ConstantScoreScorer {
+    fn doc(&self) -> Option<u32> {
+        self.docids.get(self.index).copied()
+    }
+
+    fn cost(&self) -> u64 {
+        u64::try_from(self.docids.len()).unwrap_or(u64::MAX)
+    }
+
+    fn size_hint(&self) -> u32 {
+        u32::try_from(self.docids.len()).unwrap_or(u32::MAX)
+    }
+
+    const fn segment_num_docs(&self) -> u32 {
+        self.segment_num_docs
+    }
+
+    fn next(&mut self) -> Option<u32> {
+        if self.index < self.docids.len() {
+            self.index += 1;
+        }
+        self.doc()
+    }
+
+    fn seek(&mut self, target: u32) -> Option<u32> {
+        let tail = self.docids.get(self.index..).unwrap_or_default();
+        self.index += tail.partition_point(|&docid| docid < target);
+        self.doc()
+    }
+
+    fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
+        let result = self.seek(target);
+        classify_seek_result(target, result)
+    }
+
+    fn score(&self) -> Result<f32, ArgusError> {
+        let doc = self.doc().ok_or(ArgusError::CursorInvariant(
+            "cannot score an exhausted constant-score predicate",
+        ))?;
+        finite_score(self.score, doc)
+    }
 }
 
 /// Lazy scoreless disjunction used only by doc-set collection.
@@ -2458,6 +3234,133 @@ impl<'a> IntersectionScorer<'a> {
     }
 }
 
+// Rank-safety argument for every pruning comparison:
+//
+// * each sealed/Delta leaf first recomputes its tf ceiling from conservative
+//   `(max_frequency, min_fieldnorm)` metadata using the live snapshot avgdl and
+//   the live idf/boost weight;
+// * all contributions are non-negative, so the exact f64 sum is inflated by
+//   the standard `n * EPSILON` forward-error envelope before rounding outward
+//   to f32. The result therefore covers any scorer-vector addition order;
+// * callers skip only when this ceiling is strictly below the running kth
+//   score. Equality remains competitive because a smaller docid can win a tie.
+//
+// MaxScore may consequently omit a document that matches only the
+// non-essential prefix, while BMW may skip an interval only after summing every
+// term whose current doc can occur in that interval. Neither proof depends on
+// the avgdl regime under which a sealed block was created.
+fn conservative_bound_sum(bounds: impl IntoIterator<Item = f32>) -> Option<f32> {
+    conservative_optional_bound_sum(bounds.into_iter().map(Some))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the checked finite f64 envelope is deliberately rounded outward to f32"
+)]
+fn conservative_optional_bound_sum(bounds: impl IntoIterator<Item = Option<f32>>) -> Option<f32> {
+    let mut exact = 0.0_f64;
+    let mut count = 0_u32;
+    for bound in bounds {
+        let bound = bound?;
+        if !bound.is_finite() || bound.is_sign_negative() {
+            return None;
+        }
+        exact += f64::from(bound);
+        count = count.checked_add(1)?;
+    }
+    if !exact.is_finite() || exact > f64::from(f32::MAX) {
+        return None;
+    }
+    let rounding_budget = f64::from(count) * f64::from(f32::EPSILON);
+    if rounding_budget >= 1.0 {
+        return None;
+    }
+    let inflated = exact / (1.0 - rounding_budget);
+    if !inflated.is_finite() || inflated > f64::from(f32::MAX) {
+        return None;
+    }
+    let rounded = inflated as f32;
+    if f64::from(rounded) >= inflated {
+        Some(rounded)
+    } else {
+        Some(f32::from_bits(rounded.to_bits().checked_add(1)?))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnionPruningStrategy {
+    MaxScore,
+    BlockMaxWand,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct UnionPruningStats {
+    max_score_windows: u64,
+    block_max_wand_windows: u64,
+    blocks_skipped: u64,
+    candidate_docs: u64,
+}
+
+/// Aggregate scorer evidence suitable for stable tracing fields.
+///
+/// This deliberately excludes terms, document identifiers, and cutoff scores.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PruningTelemetry {
+    max_score_windows: u64,
+    block_max_wand_windows: u64,
+    blocks_skipped: u64,
+    candidate_docs: u64,
+}
+
+impl From<UnionPruningStats> for PruningTelemetry {
+    fn from(stats: UnionPruningStats) -> Self {
+        Self {
+            max_score_windows: stats.max_score_windows,
+            block_max_wand_windows: stats.block_max_wand_windows,
+            blocks_skipped: stats.blocks_skipped,
+            candidate_docs: stats.candidate_docs,
+        }
+    }
+}
+
+impl PruningTelemetry {
+    /// Stable name for the pruning path observed during collection.
+    #[must_use]
+    pub(crate) const fn plan(self) -> &'static str {
+        match (
+            self.max_score_windows != 0,
+            self.block_max_wand_windows != 0,
+        ) {
+            (false, false) => "exhaustive",
+            (true, false) => "max_score",
+            (false, true) => "block_max_wand",
+            (true, true) => "mixed_pruning",
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn pruning_windows(self) -> u64 {
+        self.max_score_windows
+            .saturating_add(self.block_max_wand_windows)
+    }
+
+    #[must_use]
+    pub(crate) const fn blocks_skipped(self) -> u64 {
+        self.blocks_skipped
+    }
+
+    #[must_use]
+    pub(crate) const fn candidate_docs(self) -> u64 {
+        self.candidate_docs
+    }
+}
+
+struct CompetitiveCandidates {
+    strategy: UnionPruningStrategy,
+    docs: Vec<u32>,
+    blocks_skipped: u64,
+}
+
 struct BufferedUnionScorer<'a> {
     active: Vec<ReferenceScorer<'a>>,
     score_window: Vec<Option<f32>>,
@@ -2466,6 +3369,7 @@ struct BufferedUnionScorer<'a> {
     current: Option<u32>,
     current_score: f32,
     segment_num_docs: u32,
+    pruning_stats: UnionPruningStats,
 }
 
 impl<'a> BufferedUnionScorer<'a> {
@@ -2488,6 +3392,7 @@ impl<'a> BufferedUnionScorer<'a> {
             current: None,
             current_score: 0.0,
             segment_num_docs,
+            pruning_stats: UnionPruningStats::default(),
         };
         if scorer.refill()? {
             scorer.advance_buffered();
@@ -2521,13 +3426,52 @@ impl<'a> BufferedUnionScorer<'a> {
     }
 
     fn refill(&mut self) -> Result<bool, ArgusError> {
+        self.refill_with_cutoff(None)
+    }
+
+    fn refill_with_cutoff(&mut self, cutoff: Option<f32>) -> Result<bool, ArgusError> {
         self.clear_buffer();
         let Some(window_start) = self.active.iter().filter_map(ReferenceScorer::doc).min() else {
             self.window_start = None;
             return Ok(false);
         };
         self.window_start = Some(window_start);
-        let horizon_end = u64::from(window_start) + UNION_HORIZON as u64;
+        let horizon_end = u64::from(window_start) + UNION_HORIZON_U64;
+        if let Some(cutoff) = cutoff
+            && cutoff.is_finite()
+            && let Some(candidates) =
+                self.competitive_candidates(window_start, horizon_end, cutoff)?
+        {
+            match candidates.strategy {
+                UnionPruningStrategy::MaxScore => {
+                    self.pruning_stats.max_score_windows =
+                        self.pruning_stats.max_score_windows.saturating_add(1);
+                }
+                UnionPruningStrategy::BlockMaxWand => {
+                    self.pruning_stats.block_max_wand_windows =
+                        self.pruning_stats.block_max_wand_windows.saturating_add(1);
+                }
+            }
+            self.pruning_stats.blocks_skipped = self
+                .pruning_stats
+                .blocks_skipped
+                .saturating_add(candidates.blocks_skipped);
+            self.pruning_stats.candidate_docs = self
+                .pruning_stats
+                .candidate_docs
+                .saturating_add(u64::try_from(candidates.docs.len()).unwrap_or(u64::MAX));
+            self.fill_candidate_window(window_start, horizon_end, &candidates.docs)?;
+            return Ok(true);
+        }
+        self.fill_exhaustive_window(window_start, horizon_end)?;
+        Ok(true)
+    }
+
+    fn fill_exhaustive_window(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+    ) -> Result<(), ArgusError> {
         let mut index = 0;
         while index < self.active.len() {
             loop {
@@ -2551,7 +3495,356 @@ impl<'a> BufferedUnionScorer<'a> {
                 }
             }
         }
-        Ok(true)
+        Ok(())
+    }
+
+    fn competitive_candidates(
+        &self,
+        window_start: u32,
+        horizon_end: u64,
+        cutoff: f32,
+    ) -> Result<Option<CompetitiveCandidates>, ArgusError> {
+        let strategy = match self.active.len() {
+            2..=MAX_SCORE_MAX_CLAUSES
+                if self
+                    .active
+                    .iter()
+                    .all(ReferenceScorer::competitive_is_direct_term) =>
+            {
+                UnionPruningStrategy::MaxScore
+            }
+            2..=MAX_SCORE_MAX_CLAUSES => return Ok(None),
+            BMW_MIN_CLAUSES..
+                if self
+                    .active
+                    .iter()
+                    .map(ReferenceScorer::cost)
+                    .fold(0_u64, u64::saturating_add)
+                    >= BMW_MIN_TOTAL_COST =>
+            {
+                UnionPruningStrategy::BlockMaxWand
+            }
+            _ => return Ok(None),
+        };
+        match strategy {
+            UnionPruningStrategy::MaxScore => {
+                let mut smallest = f32::INFINITY;
+                for scorer in &self.active {
+                    let Some(bound) = scorer.competitive_score_upper_bound() else {
+                        return Ok(None);
+                    };
+                    smallest = smallest.min(bound);
+                }
+                if smallest >= cutoff {
+                    return Ok(None);
+                }
+            }
+            UnionPruningStrategy::BlockMaxWand => {
+                if self
+                    .active
+                    .iter()
+                    .any(|scorer| !scorer.competitive_supports_block_max())
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        let mut cursors = Vec::new();
+        cursors
+            .try_reserve_exact(self.active.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "competitive term cursors",
+                count: self.active.len(),
+            })?;
+        for scorer in &self.active {
+            let Some(cursor) = scorer.competitive_term_cursor() else {
+                return Ok(None);
+            };
+            cursors.push(cursor);
+        }
+        let candidates = match strategy {
+            UnionPruningStrategy::MaxScore => {
+                let Some(candidates) =
+                    Self::max_score_candidates(&mut cursors, horizon_end, cutoff)?
+                else {
+                    return Ok(None);
+                };
+                candidates
+            }
+            UnionPruningStrategy::BlockMaxWand => {
+                Self::block_max_wand_candidates(&mut cursors, horizon_end, cutoff)?
+            }
+        };
+        if candidates
+            .docs
+            .iter()
+            .any(|doc| *doc < window_start || u64::from(*doc) >= horizon_end)
+        {
+            return Err(ArgusError::CursorInvariant(
+                "competitive candidate escaped its union window",
+            ));
+        }
+        Ok(Some(candidates))
+    }
+
+    fn max_score_candidates(
+        cursors: &mut [CompetitiveTermCursor<'_>],
+        horizon_end: u64,
+        cutoff: f32,
+    ) -> Result<Option<CompetitiveCandidates>, ArgusError> {
+        let mut by_upper_bound = Vec::new();
+        by_upper_bound
+            .try_reserve_exact(cursors.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "MaxScore bound order",
+                count: cursors.len(),
+            })?;
+        by_upper_bound.extend(0..cursors.len());
+        by_upper_bound.sort_unstable_by(|left, right| {
+            cursors[*left]
+                .term_upper_bound()
+                .total_cmp(&cursors[*right].term_upper_bound())
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut nonessential = 0_usize;
+        while nonessential < by_upper_bound.len() {
+            let prefix = &by_upper_bound[..=nonessential];
+            let bound = conservative_bound_sum(
+                prefix
+                    .iter()
+                    .map(|index| cursors[*index].term_upper_bound()),
+            )
+            .ok_or(ArgusError::CursorInvariant(
+                "MaxScore bound sum was not finite and conservative",
+            ))?;
+            if bound < cutoff {
+                nonessential += 1;
+            } else {
+                break;
+            }
+        }
+        if nonessential == 0 {
+            return Ok(None);
+        }
+
+        let maximum_candidates = UNION_HORIZON
+            .checked_mul(cursors.len().saturating_sub(nonessential))
+            .ok_or(ArgusError::Allocation {
+                resource: "MaxScore candidates",
+                count: usize::MAX,
+            })?;
+        let mut docs = Vec::new();
+        docs.try_reserve_exact(maximum_candidates)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "MaxScore candidates",
+                count: maximum_candidates,
+            })?;
+        for &index in &by_upper_bound[nonessential..] {
+            while let Some(doc) = cursors[index].doc() {
+                if u64::from(doc) >= horizon_end {
+                    break;
+                }
+                docs.push(doc);
+                cursors[index].next()?;
+            }
+        }
+        docs.sort_unstable();
+        docs.dedup();
+        Ok(Some(CompetitiveCandidates {
+            strategy: UnionPruningStrategy::MaxScore,
+            docs,
+            blocks_skipped: 0,
+        }))
+    }
+
+    fn block_max_wand_candidates(
+        cursors: &mut [CompetitiveTermCursor<'_>],
+        horizon_end: u64,
+        cutoff: f32,
+    ) -> Result<CompetitiveCandidates, ArgusError> {
+        let mut docs = Vec::new();
+        docs.try_reserve_exact(UNION_HORIZON)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "block-max WAND candidates",
+                count: UNION_HORIZON,
+            })?;
+        let mut order = Vec::new();
+        order
+            .try_reserve_exact(cursors.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "block-max WAND pivot order",
+                count: cursors.len(),
+            })?;
+        let horizon_last = u32::try_from(horizon_end.saturating_sub(1).min(u64::from(u32::MAX)))
+            .map_err(|_| ArgusError::CursorInvariant("union horizon last doc exceeds u32"))?;
+        let mut blocks_skipped = 0_u64;
+
+        loop {
+            order.clear();
+            order.extend(cursors.iter().enumerate().filter_map(|(index, cursor)| {
+                cursor
+                    .doc()
+                    .filter(|doc| u64::from(*doc) < horizon_end)
+                    .map(|_| index)
+            }));
+            if order.is_empty() {
+                break;
+            }
+            order.sort_unstable_by(|left, right| {
+                cursors[*left]
+                    .doc()
+                    .cmp(&cursors[*right].doc())
+                    .then_with(|| left.cmp(right))
+            });
+
+            let interval_end = order
+                .iter()
+                .filter_map(|index| cursors[*index].current_block_last_doc())
+                .min()
+                .ok_or(ArgusError::CursorInvariant(
+                    "block-max cursor has no current block end",
+                ))?
+                .min(horizon_last);
+            let relevant_count = order
+                .iter()
+                .take_while(|index| {
+                    cursors[**index]
+                        .doc()
+                        .is_some_and(|doc| doc <= interval_end)
+                })
+                .count();
+            let relevant = &order[..relevant_count];
+            let block_bound = conservative_optional_bound_sum(
+                relevant
+                    .iter()
+                    .map(|index| cursors[*index].current_block_upper_bound()),
+            )
+            .ok_or(ArgusError::CursorInvariant(
+                "block-max bound sum was not finite and conservative",
+            ))?;
+            if block_bound < cutoff {
+                for &index in relevant {
+                    if interval_end == u32::MAX {
+                        while cursors[index].next()?.is_some() {}
+                    } else {
+                        cursors[index].advance(interval_end + 1)?;
+                    }
+                    blocks_skipped = blocks_skipped.saturating_add(1);
+                }
+                continue;
+            }
+
+            let mut pivot = None;
+            for pivot_index in 0..order.len() {
+                let bound = conservative_bound_sum(
+                    order[..=pivot_index]
+                        .iter()
+                        .map(|index| cursors[*index].term_upper_bound()),
+                )
+                .ok_or(ArgusError::CursorInvariant(
+                    "WAND pivot bound sum was not finite and conservative",
+                ))?;
+                if bound >= cutoff {
+                    pivot = Some(pivot_index);
+                    break;
+                }
+            }
+            let Some(pivot_index) = pivot else {
+                break;
+            };
+            let pivot_doc = cursors[order[pivot_index]]
+                .doc()
+                .ok_or(ArgusError::CursorInvariant("WAND pivot is exhausted"))?;
+            let minimum_doc = cursors[order[0]]
+                .doc()
+                .ok_or(ArgusError::CursorInvariant("WAND minimum is exhausted"))?;
+            if minimum_doc < pivot_doc {
+                for &index in &order[..pivot_index] {
+                    if cursors[index].doc().is_some_and(|doc| doc < pivot_doc) {
+                        cursors[index].advance(pivot_doc)?;
+                    }
+                }
+                continue;
+            }
+
+            docs.push(pivot_doc);
+            for &index in &order {
+                if cursors[index].doc() == Some(pivot_doc) {
+                    cursors[index].next()?;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(CompetitiveCandidates {
+            strategy: UnionPruningStrategy::BlockMaxWand,
+            docs,
+            blocks_skipped,
+        })
+    }
+
+    fn fill_candidate_window(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+        candidates: &[u32],
+    ) -> Result<(), ArgusError> {
+        // Candidate discovery advances only shadow cursors. Real cursors still
+        // visit the selected docs in the original scorer-vector order and use
+        // the exhaustive path's identical swap-remove exhaustion behavior, so
+        // pruning cannot regroup f32 contributions or change score bits.
+        let mut index = 0;
+        while index < self.active.len() {
+            loop {
+                let Some(doc) = self.active[index].doc() else {
+                    self.active.swap_remove(index);
+                    break;
+                };
+                if u64::from(doc) >= horizon_end {
+                    index += 1;
+                    break;
+                }
+                let candidate_index = candidates.partition_point(|candidate| *candidate < doc);
+                let Some(&candidate) = candidates.get(candidate_index) else {
+                    Self::advance_scorer_to_horizon(&mut self.active[index], horizon_end)?;
+                    if self.active[index].doc().is_none() {
+                        self.active.swap_remove(index);
+                    } else {
+                        index += 1;
+                    }
+                    break;
+                };
+                if doc < candidate {
+                    self.active[index].advance(candidate)?;
+                    continue;
+                }
+                let offset = usize::try_from(u64::from(doc) - u64::from(window_start))
+                    .map_err(|_| ArgusError::CursorInvariant("union offset does not fit usize"))?;
+                let contribution = self.active[index].score()?;
+                let total = self.score_window[offset].unwrap_or(0.0) + contribution;
+                self.score_window[offset] = Some(finite_score(total, doc)?);
+                self.active[index].next()?;
+                if self.active[index].doc().is_none() {
+                    self.active.swap_remove(index);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_scorer_to_horizon(
+        scorer: &mut ReferenceScorer<'_>,
+        horizon_end: u64,
+    ) -> Result<(), ArgusError> {
+        if let Ok(target) = u32::try_from(horizon_end) {
+            scorer.advance(target)?;
+            return Ok(());
+        }
+        while scorer.next()?.is_some() {}
+        Ok(())
     }
 
     fn advance_buffered(&mut self) -> Option<u32> {
@@ -2583,12 +3876,41 @@ impl<'a> BufferedUnionScorer<'a> {
         Ok(self.advance_buffered())
     }
 
+    fn collect_top_docs<L>(
+        &mut self,
+        collector: &mut TopDocsCollector,
+        live_docs: &L,
+    ) -> Result<(), ArgusError>
+    where
+        L: LiveDocs + ?Sized,
+    {
+        while let Some(doc) = self.current {
+            let score = self.score()?;
+            if live_docs.is_live(doc) {
+                collector.record_live(doc, Some(score))?;
+            }
+            if self.advance_buffered().is_some() {
+                continue;
+            }
+            loop {
+                let cutoff = collector.competitive_cutoff_score();
+                if !self.refill_with_cutoff(cutoff)? {
+                    return Ok(());
+                }
+                if self.advance_buffered().is_some() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn seek(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         if self.current.is_some_and(|doc| doc >= target) {
             return Ok(self.current);
         }
         if self.window_start.is_some_and(|start| {
-            u64::from(target).saturating_sub(u64::from(start)) < UNION_HORIZON as u64
+            u64::from(target).saturating_sub(u64::from(start)) < UNION_HORIZON_U64
         }) {
             while self.current.is_some_and(|doc| doc < target) {
                 self.next()?;
@@ -2619,7 +3941,7 @@ impl<'a> BufferedUnionScorer<'a> {
             return Ok(SeekDangerResult::SeekLowerBound(None));
         }
         if self.window_start.is_some_and(|start| {
-            u64::from(target).saturating_sub(u64::from(start)) < UNION_HORIZON as u64
+            u64::from(target).saturating_sub(u64::from(start)) < UNION_HORIZON_U64
                 && target >= start
         }) {
             return classify_seek_result(target, self.seek(target)?);
@@ -2989,6 +4311,14 @@ impl TopDocsCollector {
         Ok(())
     }
 
+    fn competitive_cutoff_score(&self) -> Option<f32> {
+        if self.retained != 0 && self.heap.len() == self.retained {
+            self.heap.peek().map(|entry| entry.score)
+        } else {
+            None
+        }
+    }
+
     /// Sort the global heap, apply offset once, and return page winners.
     ///
     /// # Errors
@@ -3164,8 +4494,8 @@ mod tests {
     use super::*;
     use crate::contract::{BM25_B, fieldnorm_to_id, id_to_fieldnorm};
     use crate::quiver::{
-        DocLenFieldInput, EncodedDocLenSection, EncodedNumericSection, EncodedPositionList,
-        EncodedPostingList, NumericEntry, NumericFieldInput, Posting,
+        DocLenFieldInput, EncodedBlockMax, EncodedDocLenSection, EncodedNumericSection,
+        EncodedPositionList, EncodedPostingList, NumericEntry, NumericFieldInput, Posting,
     };
     use crate::schema::{FieldDescriptor, FieldKind, SchemaDescriptor};
 
@@ -3242,6 +4572,51 @@ mod tests {
             let tail = self.postings.get(self.index..).unwrap_or_default();
             self.index += tail.partition_point(|posting| posting.doc_id < target);
             Ok(self.doc())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TermBoundOnlyCursor(VecCursor);
+
+    impl PostingCursor for TermBoundOnlyCursor {
+        fn doc(&self) -> Option<u32> {
+            self.0.doc()
+        }
+
+        fn freq(&self) -> Option<u32> {
+            self.0.freq()
+        }
+
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            None
+        }
+
+        fn size_hint(&self) -> u32 {
+            self.0.size_hint()
+        }
+
+        fn cost(&self) -> u64 {
+            self.0.cost()
+        }
+
+        fn segment_num_docs(&self) -> u32 {
+            self.0.segment_num_docs()
+        }
+
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            self.0.next()
+        }
+
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.0.advance(target)
+        }
+
+        fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
+            Some(Box::new(self.clone()))
+        }
+
+        fn term_score_upper_bound(&self, _live_avgdl: f32, weight: f32) -> Option<f32> {
+            (weight.is_finite() && !weight.is_sign_negative()).then_some(weight)
         }
     }
 
@@ -3471,6 +4846,224 @@ mod tests {
             snapshot_doc_freq,
             boost,
         )?))
+    }
+
+    fn sealed_union<'a>(
+        posting_lists: &'a [crate::quiver::PostingList<'_>],
+        block_max: Option<&'a [Arc<[BlockMaxEntry]>]>,
+        fieldnorms: DocLenField<'a>,
+        snapshot: &Bm25FieldSnapshot,
+        rows_by_term: &[Vec<Posting>],
+        boosts: &[f32],
+        segment_num_docs: u32,
+    ) -> Result<ReferenceScorer<'a>, ArgusError> {
+        if posting_lists.len() != rows_by_term.len() || posting_lists.len() != boosts.len() {
+            return Err(ArgusError::CursorInvariant(
+                "sealed union fixture cardinalities disagree",
+            ));
+        }
+        if block_max.is_some_and(|bounds| bounds.len() != posting_lists.len()) {
+            return Err(ArgusError::CursorInvariant(
+                "sealed union BLOCKMAX cardinality disagrees",
+            ));
+        }
+        let mut clauses = Vec::new();
+        clauses
+            .try_reserve_exact(posting_lists.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "sealed union fixture clauses",
+                count: posting_lists.len(),
+            })?;
+        for (index, postings) in posting_lists.iter().enumerate() {
+            let cursor = if let Some(bounds) = block_max {
+                SealedPostingCursor::with_block_max(
+                    postings.cursor()?,
+                    Arc::clone(&bounds[index]),
+                    postings.doc_freq(),
+                    segment_num_docs,
+                )
+            } else {
+                SealedPostingCursor::new(postings, segment_num_docs)?
+            };
+            let scorer = TermScorer::new(
+                cursor,
+                fieldnorms,
+                snapshot.clone(),
+                u64::try_from(rows_by_term[index].len()).map_err(|_| {
+                    ArgusError::CursorInvariant("fixture document frequency exceeds u64")
+                })?,
+                boosts[index],
+            )?;
+            clauses.push(ScorerClause::should(ReferenceScorer::term(scorer)));
+        }
+        ReferenceScorer::boolean(clauses)
+    }
+
+    fn assert_hits_bit_exact(actual: &[ScoredDoc], expected: &[ScoredDoc]) {
+        assert_eq!(actual.len(), expected.len(), "hit count differs");
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.global_docid, expected.global_docid,
+                "docid differs at rank {index}"
+            );
+            assert_eq!(
+                actual.score.to_bits(),
+                expected.score.to_bits(),
+                "score bits differ at rank {index} for doc {}",
+                actual.global_docid
+            );
+        }
+    }
+
+    fn timed_encoded_grouped_union(
+        encoded_doclens: &EncodedDocLenSection,
+        encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
+        cached_metadata: Option<&[Arc<ValidatedTermPruningMetadata>]>,
+        snapshot: &Bm25FieldSnapshot,
+        rows_by_term: &[Vec<Posting>],
+        boosts: &[f32],
+        segment_num_docs: u32,
+        limit: usize,
+        group_size: usize,
+        rank_pruning: bool,
+    ) -> Result<(u128, Vec<ScoredDoc>, UnionPruningStats), Box<dyn std::error::Error>> {
+        if group_size == 0
+            || encoded_terms.len() != rows_by_term.len()
+            || encoded_terms.len() != boosts.len()
+            || !encoded_terms.len().is_multiple_of(group_size)
+            || cached_metadata.is_some_and(|metadata| metadata.len() != encoded_terms.len())
+        {
+            return Err(Box::new(ArgusError::CursorInvariant(
+                "encoded grouped-union fixture cardinalities disagree",
+            )));
+        }
+        let started = std::time::Instant::now();
+        let doclens = encoded_doclens.section(&[1])?;
+        let fieldnorms = doclens.field(1).ok_or(ArgusError::CursorInvariant(
+            "encoded grouped-union fixture has no field 1",
+        ))?;
+        let mut outer = Vec::new();
+        outer
+            .try_reserve_exact(encoded_terms.len() / group_size)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "encoded grouped-union outer clauses",
+                count: encoded_terms.len() / group_size,
+            })?;
+        let mut group = Vec::new();
+        group
+            .try_reserve_exact(group_size)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "encoded grouped-union inner clauses",
+                count: group_size,
+            })?;
+        for (index, (encoded_postings, encoded_block_max)) in encoded_terms.iter().enumerate() {
+            let cached = cached_metadata.map(|metadata| Arc::clone(&metadata[index]));
+            let cursor = if let Some(metadata) = cached {
+                if rank_pruning {
+                    SealedPostingCursor::from_validated_pruning(
+                        encoded_postings.as_bytes(),
+                        metadata,
+                        segment_num_docs,
+                    )?
+                } else {
+                    let size_hint = metadata.doc_freq();
+                    SealedPostingCursor::from_owned(
+                        metadata.cursor(encoded_postings.as_bytes())?,
+                        size_hint,
+                        segment_num_docs,
+                    )
+                }
+            } else if rank_pruning {
+                let postings = encoded_postings.posting_list()?;
+                let metadata = Arc::new(
+                    postings.into_pruning_metadata(encoded_block_max.as_bytes(), fieldnorms)?,
+                );
+                SealedPostingCursor::from_validated_pruning(
+                    encoded_postings.as_bytes(),
+                    metadata,
+                    segment_num_docs,
+                )?
+            } else {
+                let postings = encoded_postings.posting_list()?;
+                let size_hint = postings.doc_freq();
+                SealedPostingCursor::from_owned(
+                    postings.into_cursor()?,
+                    size_hint,
+                    segment_num_docs,
+                )
+            };
+            let term = ReferenceScorer::term(TermScorer::new(
+                cursor,
+                fieldnorms,
+                snapshot.clone(),
+                u64::try_from(rows_by_term[index].len()).map_err(|_| {
+                    ArgusError::CursorInvariant("fixture document frequency exceeds u64")
+                })?,
+                boosts[index],
+            )?);
+            group.push(ScorerClause::should(term));
+            if group.len() == group_size {
+                let grouped = ReferenceScorer::boolean(std::mem::take(&mut group))?;
+                outer.push(ScorerClause::should(grouped));
+                group
+                    .try_reserve_exact(group_size)
+                    .map_err(|_| ArgusError::Allocation {
+                        resource: "encoded grouped-union inner clauses",
+                        count: group_size,
+                    })?;
+            }
+        }
+        let mut scorer = ReferenceScorer::boolean(outer)?;
+        let mut collector = TopDocsCollector::new(limit, 0)?;
+        collector.collect(&mut scorer, &AllLiveDocs)?;
+        let stats = scorer
+            .union_pruning_stats()
+            .ok_or(ArgusError::CursorInvariant(
+                "profile scorer is not a top-level union",
+            ))?;
+        let hits = collector.finish()?.hits;
+        let elapsed_us = started.elapsed().as_micros();
+        Ok((elapsed_us, hits, stats))
+    }
+
+    fn validate_encoded_pruning_metadata(
+        encoded_doclens: &EncodedDocLenSection,
+        encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
+    ) -> Result<Vec<Arc<ValidatedTermPruningMetadata>>, Box<dyn std::error::Error>> {
+        let doclens = encoded_doclens.section(&[1])?;
+        let fieldnorms = doclens.field(1).ok_or(ArgusError::CursorInvariant(
+            "encoded grouped-union fixture has no field 1",
+        ))?;
+        let mut metadata = Vec::new();
+        metadata
+            .try_reserve_exact(encoded_terms.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "encoded grouped-union cached metadata",
+                count: encoded_terms.len(),
+            })?;
+        for (encoded_postings, encoded_block_max) in encoded_terms {
+            let postings = encoded_postings.posting_list()?;
+            metadata.push(Arc::new(
+                postings.into_pruning_metadata(encoded_block_max.as_bytes(), fieldnorms)?,
+            ));
+        }
+        Ok(metadata)
+    }
+
+    fn validated_block_max_entries(
+        encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
+        posting_lists: &[crate::quiver::PostingList<'_>],
+        fieldnorms: DocLenField<'_>,
+    ) -> Result<Vec<Arc<[BlockMaxEntry]>>, crate::quiver::BlockMaxError> {
+        encoded_terms
+            .iter()
+            .zip(posting_lists)
+            .map(|((_, block_max), postings)| {
+                block_max
+                    .block_max_list(postings, fieldnorms)
+                    .map(|bounds| Arc::<[BlockMaxEntry]>::from(bounds.entries()))
+            })
+            .collect()
     }
 
     fn postings(docs: &[u32]) -> Vec<Posting> {
@@ -5182,6 +6775,139 @@ mod tests {
     }
 
     #[test]
+    fn e410_seeded_query_algebra_and_pagination_metamorphics_hold()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DOCS: usize = 48;
+        const PAGE: usize = 7;
+        let lengths = [Some(1); DOCS];
+        let encoded = EncodedDocLenSection::encode(
+            0,
+            DOCS as u64,
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, DOCS as u64, DOCS as u64)?;
+
+        for seed in 1_u64..=32 {
+            let mut state = seed;
+            let mut membership = [[false; DOCS]; 3];
+            for doc in 0..DOCS {
+                for term_membership in &mut membership {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    term_membership[doc] = state >> 63 != 0;
+                }
+            }
+            let docs_by_term = std::array::from_fn::<_, 3, _>(|term_index| {
+                membership[term_index]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(doc, present)| {
+                        present.then_some(u32::try_from(doc).expect("DOCS fits u32"))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let leaf = |term_index: usize| {
+                term(
+                    postings(&docs_by_term[term_index]),
+                    field,
+                    &snapshot,
+                    docs_by_term[term_index].len() as u64,
+                    docs_by_term[term_index].len() as u64,
+                    1.0,
+                )
+            };
+            let should_set = |order: [usize; 3]| {
+                let mut scorer = ReferenceScorer::boolean_unscored(
+                    order
+                        .into_iter()
+                        .map(|index| leaf(index).map(ScorerClause::should))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )?;
+                scorer.collect_doc_set(&AllLiveDocs)
+            };
+            let expected_union = (0..DOCS)
+                .filter(|&doc| membership.iter().any(|term| term[doc]))
+                .map(|doc| u32::try_from(doc).expect("DOCS fits u32"))
+                .collect::<Vec<_>>();
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                assert_eq!(
+                    should_set(order)?,
+                    expected_union,
+                    "Should result-set commutativity failed for seed {seed} order={order:?}",
+                );
+            }
+
+            let mut left_associated = ReferenceScorer::boolean_unscored(vec![
+                ScorerClause::must(ReferenceScorer::boolean_unscored(vec![
+                    ScorerClause::must(leaf(0)?),
+                    ScorerClause::must(leaf(1)?),
+                ])?),
+                ScorerClause::must(leaf(2)?),
+            ])?;
+            let mut right_associated = ReferenceScorer::boolean_unscored(vec![
+                ScorerClause::must(leaf(0)?),
+                ScorerClause::must(ReferenceScorer::boolean_unscored(vec![
+                    ScorerClause::must(leaf(1)?),
+                    ScorerClause::must(leaf(2)?),
+                ])?),
+            ])?;
+            let expected_intersection = (0..DOCS)
+                .filter(|&doc| membership.iter().all(|term| term[doc]))
+                .map(|doc| u32::try_from(doc).expect("DOCS fits u32"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                left_associated.collect_doc_set(&AllLiveDocs)?,
+                expected_intersection,
+                "left-associated Must drifted from the set oracle for seed {seed}",
+            );
+            assert_eq!(
+                right_associated.collect_doc_set(&AllLiveDocs)?,
+                expected_intersection,
+                "right-associated Must drifted from the set oracle for seed {seed}",
+            );
+
+            let ranked_should = || {
+                ReferenceScorer::boolean(vec![
+                    ScorerClause::should(leaf(0)?),
+                    ScorerClause::should(leaf(1)?),
+                    ScorerClause::should(leaf(2)?),
+                ])
+            };
+            let mut full_scorer = ranked_should()?;
+            let full = full_scorer.top_k(DOCS, &AllLiveDocs)?;
+            let mut scored_docids = full.iter().map(|hit| hit.global_docid).collect::<Vec<_>>();
+            scored_docids.sort_unstable();
+            assert_eq!(
+                scored_docids, expected_union,
+                "scored Should lowering drifted from the set oracle for seed {seed}",
+            );
+            let mut concatenated = Vec::new();
+            for offset in (0..DOCS).step_by(PAGE) {
+                let mut page_scorer = ranked_should()?;
+                let mut collector = TopDocsCollector::new(PAGE, offset)?;
+                collector.collect(&mut page_scorer, &AllLiveDocs)?;
+                concatenated.extend(collector.finish()?.hits);
+            }
+            assert_eq!(
+                concatenated, full,
+                "page concatenation drifted from the full ranking for seed {seed}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn global_collectors_page_count_and_materialize_only_winners()
     -> Result<(), Box<dyn std::error::Error>> {
         let lengths = vec![Some(1); 10];
@@ -5362,6 +7088,91 @@ mod tests {
                 "cannot score an exhausted numeric range"
             ))
         ));
+
+        let mut boosted = ReferenceScorer::numeric_range_with_boost(
+            field,
+            Bound::Included(NumericValue::I64(5)),
+            Bound::Excluded(NumericValue::I64(10)),
+            8,
+            2.5,
+        )?;
+        assert_eq!(boosted.score()?.to_bits(), 2.5_f32.to_bits());
+
+        let inner = ReferenceScorer::numeric_range(
+            field,
+            Bound::Included(NumericValue::I64(5)),
+            Bound::Excluded(NumericValue::I64(10)),
+            8,
+        )?;
+        let mut replaced = ReferenceScorer::constant_score(inner, 3.25)?;
+        assert_eq!(replaced.score()?.to_bits(), 3.25_f32.to_bits());
+        assert!(matches!(
+            ReferenceScorer::constant_score(replaced, f32::NAN),
+            Err(ArgusError::InvalidConstantBoost { boost_bits })
+                if boost_bits == f32::NAN.to_bits()
+        ));
+
+        let overlap = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::should(ReferenceScorer::numeric_range(
+                field,
+                Bound::Unbounded,
+                Bound::Included(NumericValue::I64(5)),
+                8,
+            )?),
+            ScorerClause::should(ReferenceScorer::numeric_range(
+                field,
+                Bound::Included(NumericValue::I64(5)),
+                Bound::Included(NumericValue::I64(10)),
+                8,
+            )?),
+        ])?;
+        let mut deduplicated = ReferenceScorer::constant_score(overlap, 4.0)?;
+        assert_eq!(deduplicated.cost(), 5, "overlapping matches count once");
+        assert_eq!(deduplicated.size_hint(), 5);
+        assert_eq!(deduplicated.score()?.to_bits(), 4.0_f32.to_bits());
+        assert_eq!(
+            deduplicated.collect_doc_set(&AllLiveDocs)?,
+            vec![100, 101, 102, 103, 104]
+        );
+
+        let high = ReferenceScorer::constant_score(
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Included(NumericValue::I64(0)),
+                Bound::Included(NumericValue::I64(0)),
+                8,
+            )?,
+            1.0e8,
+        )?;
+        let low = ReferenceScorer::constant_score(
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Unbounded,
+                Bound::Included(NumericValue::I64(5)),
+                8,
+            )?,
+            -1.0e8,
+        )?;
+        let unit = ReferenceScorer::constant_score(
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Unbounded,
+                Bound::Included(NumericValue::I64(10)),
+                8,
+            )?,
+            1.0,
+        )?;
+        let mut cancellation = ReferenceScorer::boolean(vec![
+            ScorerClause::must(unit),
+            ScorerClause::must(low),
+            ScorerClause::must(high),
+        ])?;
+        assert_eq!(cancellation.doc(), Some(101));
+        assert_eq!(
+            cancellation.score()?.to_bits(),
+            1.0_f32.to_bits(),
+            "unique-cardinality costs pin Tantivy's stable Must score order"
+        );
 
         let mut unscored = ReferenceScorer::numeric_range(
             field,
@@ -5704,6 +7515,864 @@ mod tests {
             ),
             Err(ArgusError::InvalidBoost { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn e410_zero_document_snapshot_has_no_average_or_tf_division() -> Result<(), ArgusError> {
+        let empty = snapshot(1, 0, 0)?;
+        assert_eq!(empty.doc_count(), 0);
+        assert_eq!(empty.total_tokens(), 0);
+        assert_eq!(empty.average_field_length(), None);
+        assert!(empty.tf_cache.iter().all(|value| value.to_bits() == 0));
+        assert!(matches!(
+            snapshot(1, 1, 0),
+            Err(ArgusError::InvalidSnapshot {
+                field_ord: 1,
+                reason: "an empty snapshot cannot contain field tokens",
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn maxscore_two_pass_preserves_swap_remove_score_bits() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const NUM_DOCS: u32 = 5_001;
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+        let mut rows_by_term = vec![vec![Posting::new(0, 1)], vec![Posting::new(5_000, 1)]];
+        rows_by_term.extend((0..6).map(|_| vec![Posting::new(5_000, 1)]));
+        let boosts = [5.0e7, 1.0e8, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let mut oracle = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+
+        let mut candidate = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut candidate_collector = TopDocsCollector::new(1, 0)?;
+        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+        let stats = candidate
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let candidate_hits = candidate_collector.finish()?.hits;
+        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+        assert_eq!(candidate_hits[0].global_docid, 5_000);
+        assert_eq!(stats.max_score_windows, 1);
+        assert_eq!(stats.block_max_wand_windows, 0);
+        assert_eq!(stats.candidate_docs, 1);
+        assert_eq!(stats.blocks_skipped, 0);
+
+        let small = expected_term_score(&snapshot, 1, fieldnorm_id, 1, 2.0);
+        let huge = expected_term_score(&snapshot, 1, fieldnorm_id, 1, 1.0e8);
+        // Every singleton scorer that exhausts at doc 5_000 is replaced in
+        // place with the active vector's last scorer. That cascade scores all
+        // six small terms before the huge term, rather than parse order's
+        // huge-then-small sequence.
+        let mut union_order = 0.0_f32;
+        for _ in 0..6 {
+            union_order += small;
+        }
+        union_order += huge;
+        let mut parse_order = huge;
+        for _ in 0..6 {
+            parse_order += small;
+        }
+        assert_ne!(union_order.to_bits(), parse_order.to_bits());
+        assert_eq!(candidate_hits[0].score.to_bits(), union_order.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn block_max_wand_skips_low_blocks_and_exact_count_disables_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 8_192;
+        let lengths = vec![Some(8); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS) * 8, u64::from(NUM_DOCS))?;
+        let rows_by_term = (0..9)
+            .map(|term_index| {
+                (0..NUM_DOCS)
+                    .map(|doc| {
+                        let frequency = if term_index == 0 && doc == 1 {
+                            32
+                        } else if term_index == 0 && doc == 4_352 {
+                            64
+                        } else {
+                            1
+                        };
+                        Posting::new(doc, frequency)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let boosts = [4.0, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01];
+        let fieldnorm_id = fieldnorm_to_id(8);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        for limit in [1, 10, 100, 1_000] {
+            let mut oracle = sealed_union(
+                &posting_lists,
+                None,
+                field,
+                &snapshot,
+                &rows_by_term,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut oracle_collector = TopDocsCollector::new(limit, 0)?;
+            oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+            let oracle_hits = oracle_collector.finish()?.hits;
+            let mut candidate = sealed_union(
+                &posting_lists,
+                Some(&block_max),
+                field,
+                &snapshot,
+                &rows_by_term,
+                &boosts,
+                NUM_DOCS,
+            )?;
+            let mut candidate_collector = TopDocsCollector::new(limit, 0)?;
+            candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+            let stats = candidate
+                .union_pruning_stats()
+                .expect("top-level union retains pruning stats");
+            let candidate_hits = candidate_collector.finish()?.hits;
+            assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+            assert_eq!(candidate_hits[0].global_docid, 4_352);
+            assert_eq!(stats.max_score_windows, 0);
+            assert_eq!(stats.block_max_wand_windows, 1);
+            if limit == 1 {
+                assert!(stats.blocks_skipped > 0);
+                assert!((1..UNION_HORIZON_U64).contains(&stats.candidate_docs));
+            }
+        }
+
+        let live = |doc: u32| !doc.is_multiple_of(7);
+        let mut live_oracle = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut live_oracle_collector = TopDocsCollector::new(3, 2)?;
+        live_oracle_collector.collect(&mut live_oracle, &live)?;
+        let live_oracle_hits = live_oracle_collector.finish()?.hits;
+        let mut live_candidate = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut live_candidate_collector = TopDocsCollector::new(3, 2)?;
+        live_candidate_collector.collect(&mut live_candidate, &live)?;
+        let live_stats = live_candidate
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let live_candidate_hits = live_candidate_collector.finish()?.hits;
+        assert_hits_bit_exact(&live_candidate_hits, &live_oracle_hits);
+        assert!(live_stats.block_max_wand_windows > 0);
+
+        let mut counted_oracle = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut oracle_collector = TopDocsCollector::with_exact_count(3, 2)?;
+        oracle_collector.collect(&mut counted_oracle, &live)?;
+        let oracle_counted = oracle_collector.finish()?;
+        let mut counted_candidate = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut candidate_collector = TopDocsCollector::with_exact_count(3, 2)?;
+        candidate_collector.collect(&mut counted_candidate, &live)?;
+        let counted_stats = counted_candidate
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let candidate_counted = candidate_collector.finish()?;
+        assert_hits_bit_exact(&candidate_counted.hits, &oracle_counted.hits);
+        assert_eq!(candidate_counted.total_count, Some(7_021));
+        assert_eq!(candidate_counted.total_count, oracle_counted.total_count);
+        assert_eq!(counted_stats, UnionPruningStats::default());
+        Ok(())
+    }
+
+    #[test]
+    fn bmw_term_bound_only_cursor_falls_back_without_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 8_192;
+        let lengths = vec![Some(8); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS) * 8, u64::from(NUM_DOCS))?;
+        let rows = (0..NUM_DOCS)
+            .map(|doc| Posting::new(doc, 1))
+            .collect::<Vec<_>>();
+
+        let mut oracle_clauses = Vec::new();
+        let mut bounded_clauses = Vec::new();
+        for _ in 0..BMW_MIN_CLAUSES {
+            oracle_clauses.push(ScorerClause::should(ReferenceScorer::term(
+                TermScorer::new(
+                    VecCursor::new(rows.clone(), u64::from(NUM_DOCS), NUM_DOCS),
+                    field,
+                    snapshot.clone(),
+                    u64::from(NUM_DOCS),
+                    1.0,
+                )?,
+            )));
+            bounded_clauses.push(ScorerClause::should(ReferenceScorer::term(
+                TermScorer::new(
+                    TermBoundOnlyCursor(VecCursor::new(
+                        rows.clone(),
+                        u64::from(NUM_DOCS),
+                        NUM_DOCS,
+                    )),
+                    field,
+                    snapshot.clone(),
+                    u64::from(NUM_DOCS),
+                    1.0,
+                )?,
+            )));
+        }
+        let mut oracle = ReferenceScorer::boolean(oracle_clauses)?;
+        let mut oracle_collector = TopDocsCollector::new(10, 0)?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+        let mut bounded = ReferenceScorer::boolean(bounded_clauses)?;
+        let mut bounded_collector = TopDocsCollector::new(10, 0)?;
+        bounded_collector.collect(&mut bounded, &AllLiveDocs)?;
+        let stats = bounded
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let bounded_hits = bounded_collector.finish()?.hits;
+        assert_hits_bit_exact(&bounded_hits, &oracle_hits);
+        assert_eq!(stats, UnionPruningStats::default());
+        Ok(())
+    }
+
+    #[test]
+    fn maxscore_equal_cutoff_keeps_better_docid_and_negative_weight_falls_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 5_001;
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+        let rows_by_term = vec![
+            vec![Posting::new(0, 1), Posting::new(5_000, 16)],
+            vec![Posting::new(0, 1), Posting::new(5_000, 16)],
+        ];
+        let boosts = [1.0, 1.0];
+        let fieldnorm_id = fieldnorm_to_id(1);
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+        let term_score = expected_term_score(&snapshot, 2, fieldnorm_id, 16, 1.0);
+        let cutoff = term_score + term_score;
+
+        let mut oracle = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
+        oracle_collector.record_live(10_000, Some(cutoff))?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+        let mut candidate = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut candidate_collector = TopDocsCollector::new(1, 0)?;
+        candidate_collector.record_live(10_000, Some(cutoff))?;
+        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+        let stats = candidate
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let candidate_hits = candidate_collector.finish()?.hits;
+        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+        assert_eq!(candidate_hits[0].global_docid, 5_000);
+        assert_eq!(candidate_hits[0].score.to_bits(), cutoff.to_bits());
+        assert_eq!(stats.max_score_windows, 1);
+        assert!(stats.candidate_docs >= 1);
+
+        let negative_boosts = [1.0, -0.25];
+        let mut fallback_oracle = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &negative_boosts,
+            NUM_DOCS,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
+        oracle_collector.collect(&mut fallback_oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+        let mut fallback = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &negative_boosts,
+            NUM_DOCS,
+        )?;
+        let mut fallback_collector = TopDocsCollector::new(1, 0)?;
+        fallback_collector.collect(&mut fallback, &AllLiveDocs)?;
+        let fallback_stats = fallback
+            .union_pruning_stats()
+            .expect("top-level union retains pruning stats");
+        let fallback_hits = fallback_collector.finish()?.hits;
+        assert_hits_bit_exact(&fallback_hits, &oracle_hits);
+        assert_eq!(fallback_stats, UnionPruningStats::default());
+        Ok(())
+    }
+
+    #[test]
+    fn randomized_maxscore_matches_exhaustive_for_pinned_k_matrix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 12_288;
+        let lengths = vec![Some(8); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS) * 8, u64::from(NUM_DOCS))?;
+        let fieldnorm_id = fieldnorm_to_id(8);
+        let boosts = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+        for seed in 1_u64..=3 {
+            let mut state = seed;
+            let mut rows_by_term = (0..8).map(|_| Vec::new()).collect::<Vec<_>>();
+            for doc in 0..NUM_DOCS {
+                for rows in &mut rows_by_term {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    if state >> 62 != 0 {
+                        let frequency = 1 + u32::try_from((state >> 54) & 15)
+                            .expect("randomized frequency nibble fits u32");
+                        rows.push(Posting::new(doc, frequency));
+                    }
+                }
+            }
+            let encoded_terms = rows_by_term
+                .iter()
+                .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let posting_lists = encoded_terms
+                .iter()
+                .map(|(postings, _)| postings.posting_list())
+                .collect::<Result<Vec<_>, _>>()?;
+            let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+            for k in [1, 10, 100, 1_000] {
+                let mut oracle = sealed_union(
+                    &posting_lists,
+                    None,
+                    field,
+                    &snapshot,
+                    &rows_by_term,
+                    &boosts,
+                    NUM_DOCS,
+                )?;
+                let mut oracle_collector = TopDocsCollector::new(k, 0)?;
+                oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+                let oracle_hits = oracle_collector.finish()?.hits;
+                let mut candidate = sealed_union(
+                    &posting_lists,
+                    Some(&block_max),
+                    field,
+                    &snapshot,
+                    &rows_by_term,
+                    &boosts,
+                    NUM_DOCS,
+                )?;
+                let mut candidate_collector = TopDocsCollector::new(k, 0)?;
+                candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+                let pruning_stats = candidate
+                    .union_pruning_stats()
+                    .expect("top-level union retains pruning stats");
+                let candidate_hits = candidate_collector.finish()?.hits;
+                assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+                assert!(
+                    pruning_stats.max_score_windows > 0,
+                    "seed {seed}, k {k} silently fell back"
+                );
+                assert_eq!(pruning_stats.block_max_wand_windows, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn randomized_block_max_wand_matches_exhaustive_for_pinned_k_matrix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 8_192;
+        let lengths = (0..NUM_DOCS)
+            .map(|doc| Some(if doc.is_multiple_of(2) { 4 } else { 16 }))
+            .collect::<Vec<_>>();
+        let total_tokens = lengths
+            .iter()
+            .map(|length| u64::from(length.expect("fixture length is present")))
+            .sum();
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, total_tokens, u64::from(NUM_DOCS))?;
+        let boosts = [4.0, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02];
+
+        for seed in 11_u64..=12 {
+            let mut state = seed;
+            let mut rows_by_term = (0..9).map(|_| Vec::new()).collect::<Vec<_>>();
+            for doc in 0..NUM_DOCS {
+                for rows in &mut rows_by_term {
+                    state = state
+                        .wrapping_mul(2_862_933_555_777_941_757)
+                        .wrapping_add(3_037_000_493);
+                    if state >> 62 != 0 {
+                        let frequency = 1 + u32::try_from((state >> 52) & 31)
+                            .expect("randomized frequency bits fit u32");
+                        rows.push(Posting::new(doc, frequency));
+                    }
+                }
+            }
+            assert!(
+                rows_by_term.iter().map(Vec::len).sum::<usize>()
+                    >= usize::try_from(BMW_MIN_TOTAL_COST).expect("BMW threshold fits usize")
+            );
+            let encoded_terms = rows_by_term
+                .iter()
+                .map(|rows| {
+                    EncodedPostingList::encode_with_block_max(rows, |doc| {
+                        field.fieldnorm_id(u64::from(doc))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let posting_lists = encoded_terms
+                .iter()
+                .map(|(postings, _)| postings.posting_list())
+                .collect::<Result<Vec<_>, _>>()?;
+            let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+            for k in [1, 10, 100, 1_000] {
+                let mut oracle = sealed_union(
+                    &posting_lists,
+                    None,
+                    field,
+                    &snapshot,
+                    &rows_by_term,
+                    &boosts,
+                    NUM_DOCS,
+                )?;
+                let mut oracle_collector = TopDocsCollector::new(k, 0)?;
+                oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+                let oracle_hits = oracle_collector.finish()?.hits;
+                let mut candidate = sealed_union(
+                    &posting_lists,
+                    Some(&block_max),
+                    field,
+                    &snapshot,
+                    &rows_by_term,
+                    &boosts,
+                    NUM_DOCS,
+                )?;
+                let mut candidate_collector = TopDocsCollector::new(k, 0)?;
+                candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+                let pruning_stats = candidate
+                    .union_pruning_stats()
+                    .expect("top-level union retains pruning stats");
+                let candidate_hits = candidate_collector.finish()?.hits;
+                assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+                assert_eq!(pruning_stats.max_score_windows, 0);
+                assert!(
+                    pruning_stats.block_max_wand_windows > 0,
+                    "seed {seed}, k {k} silently fell back"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "remote-only E4.4 disjunction performance profile"]
+    fn e44_disjunction_profile_100k_and_1m() -> Result<(), Box<dyn std::error::Error>> {
+        const PAIRED_ROUNDS: usize = 21;
+        const TRIALS: usize = 7;
+        for num_docs in [100_000_u32, 1_000_000] {
+            let fieldnorm_id = fieldnorm_to_id(8);
+            let lengths =
+                vec![Some(8); usize::try_from(num_docs).expect("profile count fits usize")];
+            let encoded_doclens = EncodedDocLenSection::encode(
+                0,
+                u64::from(num_docs),
+                &[1],
+                &[DocLenFieldInput::new(1, &lengths)],
+            )?;
+            let snapshot = snapshot(1, u64::from(num_docs) * 8, u64::from(num_docs))?;
+
+            let mut rows_by_term = Vec::with_capacity(8);
+            let mut rare = Vec::new();
+            rare.extend((0..16).map(|doc| Posting::new(doc, 64)));
+            rare.extend(
+                (8_192..num_docs)
+                    .step_by(8_192)
+                    .map(|doc| Posting::new(doc, 32)),
+            );
+            rows_by_term.push(rare);
+            for divisor in 2_u32..=9 {
+                rows_by_term.push(
+                    (0..num_docs)
+                        .filter(|doc| doc % divisor == divisor - 1)
+                        .map(|doc| Posting::new(doc, 1))
+                        .collect(),
+                );
+            }
+
+            let encoded_terms = rows_by_term
+                .iter()
+                .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let boosts = [4.0, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01];
+            for (strategy, clause_count, group_size) in [
+                (UnionPruningStrategy::MaxScore, 8, 1),
+                (UnionPruningStrategy::BlockMaxWand, 9, 1),
+            ] {
+                let encoded_terms = &encoded_terms[..clause_count];
+                let rows_by_term = &rows_by_term[..clause_count];
+                let boosts = &boosts[..clause_count];
+                let cold_exhaustive = timed_encoded_grouped_union(
+                    &encoded_doclens,
+                    encoded_terms,
+                    None,
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                )?;
+                let cold_pruned = timed_encoded_grouped_union(
+                    &encoded_doclens,
+                    encoded_terms,
+                    None,
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    true,
+                )?;
+                assert_hits_bit_exact(&cold_pruned.1, &cold_exhaustive.1);
+                let cached_metadata =
+                    validate_encoded_pruning_metadata(&encoded_doclens, encoded_terms)?;
+                let cache_payload_bytes = cached_metadata.iter().fold(0_usize, |bytes, term| {
+                    bytes.saturating_add(term.heap_bytes())
+                });
+
+                let null = frankensearch_core::bench_support::paired_median_ratio(
+                    PAIRED_ROUNDS,
+                    1,
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                            )
+                            .expect("run first exhaustive null arm"),
+                        );
+                    },
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                            )
+                            .expect("run second exhaustive null arm"),
+                        );
+                    },
+                );
+                let lever = frankensearch_core::bench_support::paired_median_ratio(
+                    PAIRED_ROUNDS,
+                    1,
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                            )
+                            .expect("run paired exhaustive arm"),
+                        );
+                    },
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                true,
+                            )
+                            .expect("run paired pruned arm"),
+                        );
+                    },
+                );
+
+                // Warm both paths before collecting alternating-order medians.
+                let _ = timed_encoded_grouped_union(
+                    &encoded_doclens,
+                    encoded_terms,
+                    Some(&cached_metadata),
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                )?;
+                let _ = timed_encoded_grouped_union(
+                    &encoded_doclens,
+                    encoded_terms,
+                    Some(&cached_metadata),
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    true,
+                )?;
+
+                let mut exhaustive_us = Vec::with_capacity(TRIALS);
+                let mut pruned_us = Vec::with_capacity(TRIALS);
+                let mut evidence = None;
+                for trial in 0..TRIALS {
+                    let run_exhaustive = || {
+                        timed_encoded_grouped_union(
+                            &encoded_doclens,
+                            encoded_terms,
+                            Some(&cached_metadata),
+                            &snapshot,
+                            rows_by_term,
+                            boosts,
+                            num_docs,
+                            10,
+                            group_size,
+                            false,
+                        )
+                    };
+                    let run_pruned = || {
+                        timed_encoded_grouped_union(
+                            &encoded_doclens,
+                            encoded_terms,
+                            Some(&cached_metadata),
+                            &snapshot,
+                            rows_by_term,
+                            boosts,
+                            num_docs,
+                            10,
+                            group_size,
+                            true,
+                        )
+                    };
+                    let (exhaustive, pruned) = if trial % 2 == 0 {
+                        (run_exhaustive()?, run_pruned()?)
+                    } else {
+                        let pruned = run_pruned()?;
+                        let exhaustive = run_exhaustive()?;
+                        (exhaustive, pruned)
+                    };
+                    assert_hits_bit_exact(&pruned.1, &exhaustive.1);
+                    match strategy {
+                        UnionPruningStrategy::MaxScore => {
+                            assert!(pruned.2.max_score_windows > 0);
+                            assert_eq!(pruned.2.block_max_wand_windows, 0);
+                        }
+                        UnionPruningStrategy::BlockMaxWand => {
+                            assert!(pruned.2.block_max_wand_windows > 0);
+                        }
+                    }
+                    exhaustive_us.push(exhaustive.0);
+                    pruned_us.push(pruned.0);
+                    let checksum = pruned.1.iter().fold(0_u64, |state, hit| {
+                        state
+                            .wrapping_mul(16_777_619)
+                            .wrapping_add(u64::from(hit.global_docid))
+                            .wrapping_add(u64::from(hit.score.to_bits()))
+                    });
+                    let current_evidence = (pruned.1.len(), checksum);
+                    if let Some(expected) = evidence {
+                        assert_eq!(current_evidence, expected);
+                    } else {
+                        evidence = Some(current_evidence);
+                    }
+                }
+                exhaustive_us.sort_unstable();
+                pruned_us.sort_unstable();
+                let exhaustive_median_us = exhaustive_us[TRIALS / 2];
+                let pruned_median_us = pruned_us[TRIALS / 2];
+                let (hit_count, checksum) = evidence.expect("profile executes at least one trial");
+                let strategy_label = match strategy {
+                    UnionPruningStrategy::MaxScore => "maxscore",
+                    UnionPruningStrategy::BlockMaxWand => "block_max_wand",
+                };
+                eprintln!(
+                    "e44_profile strategy={strategy_label} docs={num_docs} \
+                     cold_exhaustive_us={} cold_pruned_us={} cache_payload_bytes={} \
+                     exhaustive_median_us={exhaustive_median_us} \
+                     pruned_median_us={pruned_median_us} trials={TRIALS} hits={} \
+                     checksum={checksum} null_median={:.6} null_p5={:.6} null_p95={:.6} \
+                     lever_median={:.6} lever_p5={:.6} lever_p95={:.6} \
+                     paired_rounds={PAIRED_ROUNDS}",
+                    cold_exhaustive.0,
+                    cold_pruned.0,
+                    cache_payload_bytes,
+                    hit_count,
+                    null.median,
+                    null.p5,
+                    null.p95,
+                    lever.median,
+                    lever.p5,
+                    lever.p95,
+                );
+            }
+        }
         Ok(())
     }
 }

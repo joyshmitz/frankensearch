@@ -2294,7 +2294,7 @@ fn validate_composite_key(
     field_has_positions(schema, u16::from_be_bytes([key[0], key[1]]))
 }
 
-fn validate_query_term(
+pub(crate) fn validate_query_term(
     schema: SchemaDescriptor,
     field_ord: u16,
     term: &[u8],
@@ -2309,7 +2309,7 @@ fn validate_query_term(
     Ok(())
 }
 
-fn validate_bound_term(
+pub(crate) fn validate_bound_term(
     schema: SchemaDescriptor,
     field_ord: u16,
     bound: &Bound<&[u8]>,

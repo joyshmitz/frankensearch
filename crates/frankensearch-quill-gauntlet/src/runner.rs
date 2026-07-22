@@ -12,6 +12,7 @@ use std::pin::Pin;
 use asupersync::Cx;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::Instrument as _;
 
 use crate::GauntletError;
 use crate::artifact::{ArtifactObject, ArtifactStore, CampaignArtifactContext};
@@ -2486,20 +2487,29 @@ impl DifferentialCampaignEngine for crate::engine::QuillSubject {
         query: &'a GeneratedQueryCase,
         evidence_case: &'a DifferentialCase,
     ) -> CampaignFuture<'a, EngineObservation> {
-        Box::pin(async move {
-            self.require_committed()?;
-            if query.syntax != QuerySyntax::Default
-                || query.filters.created_from_ms.is_some()
-                || query.filters.created_to_ms.is_some()
-            {
-                return Err(GauntletError::InvalidCase {
-                    reason:
-                        "the scalar Quill adapter cannot lower CASS syntax or structured filters"
+        let query_span = tracing::info_span!(
+            target: "frankensearch.quill",
+            "frankensearch::quill::gauntlet::query",
+            query_id = %query.id,
+            query_seed = evidence_case.metadata.generator_seed.unwrap_or_default(),
+            corpus_hash = %evidence_case.metadata.corpus_hash.as_deref().unwrap_or("missing"),
+        );
+        Box::pin(
+            async move {
+                self.require_committed()?;
+                if query.syntax != QuerySyntax::Default
+                    || query.filters.created_from_ms.is_some()
+                    || query.filters.created_to_ms.is_some()
+                {
+                    return Err(GauntletError::InvalidCase {
+                        reason: "the scalar Quill adapter cannot lower CASS syntax or structured filters"
                             .to_owned(),
-                });
+                    });
+                }
+                crate::engine::GauntletEngine::observe(self, cx, evidence_case).await
             }
-            crate::engine::GauntletEngine::observe(self, cx, evidence_case).await
-        })
+            .instrument(query_span),
+        )
     }
 
     fn abort_corpus(&mut self) {
@@ -3324,16 +3334,47 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    const E410_RANK_GOLDEN_JSON: &str = include_str!("../fixtures/argus-e410-ranks-v1.json");
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct E410RankGolden {
+        schema_version: u32,
+        corpus_manifest_hash: String,
+        query_manifest_hash: String,
+        query_seed: u64,
+        cases: Vec<E410RankCase>,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct E410RankCase {
+        query_id: String,
+        ranked_document_ids: Vec<String>,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     fn trace_field_u64(line: &str, field: &str) -> Option<u64> {
+        trace_field_text(line, field)?.parse().ok()
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn trace_field_text<'a>(line: &'a str, field: &str) -> Option<&'a str> {
         let prefix = format!("{field}=");
-        line.split_ascii_whitespace().find_map(|part| {
-            part.strip_prefix(&prefix).and_then(|value| {
-                value
-                    .trim_matches(|ch: char| !ch.is_ascii_digit())
-                    .parse()
-                    .ok()
-            })
-        })
+        let start = line.find(&prefix)?.saturating_add(prefix.len());
+        let value = line.get(start..)?;
+        if let Some(quoted) = value.strip_prefix('"') {
+            return quoted.split_once('"').map(|(field_value, _)| field_value);
+        }
+        let end = value
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '}'))
+            .unwrap_or(value.len());
+        value.get(..end)
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn trace_has_text_field(line: &str, field: &str, expected: &str) -> bool {
+        trace_field_text(line, field) == Some(expected)
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -3348,6 +3389,114 @@ mod tests {
             .iter()
             .filter_map(|candidate| line.rfind(candidate))
             .all(|candidate_position| candidate_position <= stage_position)
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn assert_score_trace_contract(score: &str, context: &str) {
+        let plan = trace_field_text(score, "plan")
+            .unwrap_or_else(|| panic!("{context}: score span omitted plan: {score}"));
+        let segments_touched = trace_field_u64(score, "segments_touched");
+        let pruning_windows = trace_field_u64(score, "pruning_windows")
+            .unwrap_or_else(|| panic!("{context}: score span omitted pruning windows: {score}"));
+        let blocks_skipped = trace_field_u64(score, "blocks_skipped")
+            .unwrap_or_else(|| panic!("{context}: score span omitted skipped blocks: {score}"));
+        assert!(
+            trace_field_u64(score, "candidate_docs").is_some(),
+            "{context}: score span omitted candidate count: {score}",
+        );
+        assert_eq!(
+            segments_touched,
+            Some(1),
+            "{context}: each score span must describe exactly one touched leaf: {score}",
+        );
+        match plan {
+            "exhaustive" => {
+                assert_eq!(
+                    (pruning_windows, blocks_skipped),
+                    (0, 0),
+                    "{context}: exhaustive traversal reported pruning work: {score}",
+                );
+            }
+            "max_score" => {
+                assert!(
+                    pruning_windows > 0 && blocks_skipped == 0,
+                    "{context}: MaxScore counters are inconsistent: {score}",
+                );
+            }
+            "block_max_wand" | "mixed_pruning" => {
+                assert!(
+                    pruning_windows > 0,
+                    "{context}: block-pruned traversal reported no pruning window: {score}",
+                );
+            }
+            other => panic!("{context}: unknown score plan {other:?}: {score}"),
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn assert_harvested_query_trace_contract(logs: &str, golden: &E410RankGolden) {
+        use frankensearch_quill::tracing_conventions::{ARGUS_COLLECT, ARGUS_PARSE, ARGUS_SCORE};
+
+        for case in &golden.cases {
+            let query_lines = logs
+                .lines()
+                .filter(|line| trace_has_text_field(line, "query_id", &case.query_id))
+                .collect::<Vec<_>>();
+            let context = format!(
+                "corpus_hash={} query_seed={} query_id={}",
+                golden.corpus_manifest_hash, golden.query_seed, case.query_id,
+            );
+            assert!(
+                !query_lines.is_empty(),
+                "{context}: no correlated Quill trace records",
+            );
+            assert!(
+                query_lines.iter().any(|line| {
+                    trace_field_u64(line, "query_seed") == Some(golden.query_seed)
+                        && trace_has_text_field(line, "corpus_hash", &golden.corpus_manifest_hash)
+                }),
+                "{context}: trace omitted replay provenance",
+            );
+            let parse = query_lines
+                .iter()
+                .copied()
+                .find(|line| is_stage_close(line, ARGUS_PARSE))
+                .unwrap_or_else(|| panic!("{context}: missing parse close record"));
+            assert!(
+                parse.contains("query_root=")
+                    && trace_field_u64(parse, "query_shape_hash").is_some()
+                    && trace_field_u64(parse, "query_nodes").is_some_and(|count| count > 0)
+                    && trace_field_u64(parse, "query_depth").is_some_and(|depth| depth > 0)
+                    && parse.contains("duration_us="),
+                "{context}: parse trace lacks tree shape or timing: {parse}",
+            );
+            let score_lines = query_lines
+                .iter()
+                .copied()
+                .filter(|line| is_stage_close(line, ARGUS_SCORE))
+                .collect::<Vec<_>>();
+            assert!(
+                !score_lines.is_empty(),
+                "{context}: missing score close record",
+            );
+            for score in score_lines {
+                assert_score_trace_contract(score, &context);
+                assert!(
+                    score.contains("duration_us="),
+                    "{context}: score trace omitted timing: {score}",
+                );
+            }
+            let collect = query_lines
+                .iter()
+                .copied()
+                .find(|line| is_stage_close(line, ARGUS_COLLECT))
+                .unwrap_or_else(|| panic!("{context}: missing collect close record"));
+            assert!(
+                trace_field_u64(collect, "segments_touched").is_some_and(|count| count > 0)
+                    && collect.contains("duration_us="),
+                "{context}: collect trace lacks touched leaves or timing: {collect}",
+            );
+        }
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -3408,6 +3557,33 @@ mod tests {
             "seal span lacks a non-vacuous document count: {seal}",
         );
 
+        let parse = logs
+            .lines()
+            .find(|line| is_stage_close(line, ARGUS_PARSE))
+            .expect("parse close record");
+        assert!(
+            parse.contains("query_root=")
+                && trace_field_u64(parse, "query_shape_hash").is_some()
+                && trace_field_u64(parse, "query_nodes").is_some_and(|count| count > 0)
+                && trace_field_u64(parse, "query_depth").is_some_and(|depth| depth > 0),
+            "parse span lacks a privacy-safe tree shape: {parse}",
+        );
+
+        let score = logs
+            .lines()
+            .find(|line| is_stage_close(line, ARGUS_SCORE))
+            .expect("score close record");
+        assert_score_trace_contract(score, "scalar G1a aggregate trace");
+
+        let collect = logs
+            .lines()
+            .find(|line| is_stage_close(line, ARGUS_COLLECT))
+            .expect("collect close record");
+        assert!(
+            trace_field_u64(collect, "segments_touched").is_some_and(|count| count > 0),
+            "collect span lacks touched-segment evidence: {collect}",
+        );
+
         let close_position = |stage: &str| {
             logs.lines()
                 .position(|line| is_stage_close(line, stage))
@@ -3438,6 +3614,9 @@ mod tests {
             }),
             "live G1a trace did not execute Quill's count-free collector: {logs}",
         );
+        let golden: E410RankGolden = serde_json::from_str(E410_RANK_GOLDEN_JSON)
+            .expect("parse committed E4.10 rank-list golden for trace contract");
+        assert_harvested_query_trace_contract(logs, &golden);
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4659,6 +4838,7 @@ mod tests {
                     "all committed harvested relevance queries must enter the live campaign",
                 );
                 let mut observed_regression_hit = false;
+                let mut rank_cases = Vec::new();
                 for case in &first.cases {
                     let object_hash = case
                         .artifact_hash
@@ -4674,8 +4854,9 @@ mod tests {
                     assert_eq!(
                         case.disposition,
                         CampaignDisposition::Exact,
-                        "corpus_hash={} query_id={} first_divergence={:?} reason={:?} divergences={:?} subject_hits={:?} oracle_hits={:?}",
+                        "corpus_hash={} query_seed={} query_id={} first_divergence={:?} reason={:?} divergences={:?} subject_hits={:?} oracle_hits={:?}",
                         first.corpus_manifest_hash,
+                        fixture.query_suite.manifest.spec.seed,
                         case.case_id,
                         case.first_divergence,
                         case.reason,
@@ -4686,47 +4867,111 @@ mod tests {
                     assert_eq!(
                         case.comparison_status,
                         Some(ComparisonStatus::Exact),
-                        "corpus_hash={} query_id={} first_divergence={:?}",
+                        "corpus_hash={} query_seed={} query_id={} first_divergence={:?}",
                         first.corpus_manifest_hash,
+                        fixture.query_suite.manifest.spec.seed,
                         case.case_id,
                         case.first_divergence,
                     );
                     assert_eq!(
                         case.rank_class,
                         Some(RankClass::RankExact),
-                        "corpus_hash={} query_id={} first_divergence={:?}",
+                        "corpus_hash={} query_seed={} query_id={} first_divergence={:?}",
                         first.corpus_manifest_hash,
+                        fixture.query_suite.manifest.spec.seed,
                         case.case_id,
                         case.first_divergence,
                     );
                     assert!(
                         object.comparison.subject.snippets.is_empty()
                             && object.comparison.oracle.snippets.is_empty(),
-                        "corpus_hash={} query_id={} unexpectedly emitted snippets",
+                        "corpus_hash={} query_seed={} query_id={} unexpectedly emitted snippets",
                         first.corpus_manifest_hash,
+                        fixture.query_suite.manifest.spec.seed,
                         case.case_id,
                     );
-                    if fixture
+                    let generated = fixture
                         .query_suite
                         .cases
                         .iter()
                         .find(|query| query.id == case.case_id)
-                        .is_some_and(|query| query.source == "tests/fixtures/queries.json")
+                        .expect("campaign report case comes from the generated suite");
+                    if generated.source == "tests/fixtures/queries.json" {
+                        rank_cases.push(E410RankCase {
+                            query_id: case.case_id.clone(),
+                            ranked_document_ids: object
+                                .comparison
+                                .subject
+                                .hits
+                                .iter()
+                                .map(|hit| hit.doc_id.clone())
+                                .collect(),
+                        });
+                    }
+                    if generated.source == "tests/fixtures/queries.json"
                         && case.case_id == "harvested-22"
                     {
                         assert!(
                             !object.comparison.subject.hits.is_empty(),
-                            "corpus_hash={} duplicate-term regression query_id={} was vacuous",
+                            "corpus_hash={} query_seed={} duplicate-term regression query_id={} was vacuous",
                             first.corpus_manifest_hash,
+                            fixture.query_suite.manifest.spec.seed,
                             case.case_id,
                         );
                     }
                     observed_regression_hit |= !object.comparison.subject.hits.is_empty();
                 }
+                let actual_golden = E410RankGolden {
+                    schema_version: 1,
+                    corpus_manifest_hash: first.corpus_manifest_hash.clone(),
+                    query_manifest_hash: first.query_manifest_hash.clone(),
+                    query_seed: fixture.query_suite.manifest.spec.seed,
+                    cases: rank_cases,
+                };
+                let expected_golden: E410RankGolden = serde_json::from_str(E410_RANK_GOLDEN_JSON)
+                    .expect("parse committed E4.10 rank-list golden");
+                assert_eq!(
+                    actual_golden.schema_version, expected_golden.schema_version,
+                    "corpus_hash={} query_seed={} rank golden schema drifted",
+                    first.corpus_manifest_hash, actual_golden.query_seed,
+                );
+                assert_eq!(
+                    actual_golden.corpus_manifest_hash, expected_golden.corpus_manifest_hash,
+                    "corpus_hash={} query_seed={} rank golden corpus binding drifted",
+                    first.corpus_manifest_hash, actual_golden.query_seed,
+                );
+                assert_eq!(
+                    actual_golden.query_manifest_hash,
+                    expected_golden.query_manifest_hash,
+                    "corpus_hash={} query_seed={} rank golden query-manifest binding drifted; actual={}",
+                    first.corpus_manifest_hash,
+                    actual_golden.query_seed,
+                    serde_json::to_string_pretty(&actual_golden)
+                        .expect("serialize actual E4.10 rank-list golden"),
+                );
+                assert_eq!(
+                    actual_golden.query_seed, expected_golden.query_seed,
+                    "corpus_hash={} query_seed={} rank golden replay seed drifted",
+                    first.corpus_manifest_hash, actual_golden.query_seed,
+                );
+                assert_eq!(
+                    actual_golden.cases.len(),
+                    expected_golden.cases.len(),
+                    "corpus_hash={} query_seed={} rank golden case count drifted",
+                    first.corpus_manifest_hash,
+                    actual_golden.query_seed,
+                );
+                for (actual, expected) in actual_golden.cases.iter().zip(&expected_golden.cases) {
+                    assert_eq!(
+                        actual, expected,
+                        "corpus_hash={} query_seed={} query_id={} rank-list golden drifted",
+                        first.corpus_manifest_hash, actual_golden.query_seed, actual.query_id,
+                    );
+                }
                 assert!(
                     observed_regression_hit,
-                    "corpus_hash={} deterministic regression was vacuous",
-                    first.corpus_manifest_hash
+                    "corpus_hash={} query_seed={} deterministic regression was vacuous",
+                    first.corpus_manifest_hash, fixture.query_suite.manifest.spec.seed,
                 );
                 assert_eq!(
                     first.report_hash().expect("first report hash"),

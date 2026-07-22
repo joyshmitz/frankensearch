@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use asupersync::Cx;
-use frankensearch_quill::{QuillConfig, QuillIndex};
+use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchResult};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -742,9 +742,47 @@ fn quill_observe(
     // evidence and must never stand in for pagination or count-free execution.
     let observed = index.search_paginated(cx, &case.query, limit, offset, case.count_requested)?;
     let evidence = index.search_paginated(cx, &case.query, fetch_limit, 0, true)?;
+    quill_observation_from_results(&observed, &evidence, limit, offset, case.count_requested)
+}
+
+fn quill_observation_from_results(
+    observed: &QuillSearchResult,
+    evidence: &QuillSearchResult,
+    limit: usize,
+    offset: usize,
+    count_requested: bool,
+) -> Result<EngineObservation, GauntletError> {
+    let page_end = offset
+        .checked_add(limit)
+        .ok_or_else(|| GauntletError::InvalidObservation {
+            reason: "Quill observation page boundary does not fit usize".to_owned(),
+        })?;
     if observed.doc_count != evidence.doc_count {
         return Err(GauntletError::InvalidObservation {
             reason: "Quill collector modes disagreed on the committed document count".to_owned(),
+        });
+    }
+    if observed.diagnostics != evidence.diagnostics {
+        return Err(GauntletError::InvalidObservation {
+            reason: "Quill collector modes disagreed on parser diagnostics".to_owned(),
+        });
+    }
+    let expected_start = offset.min(evidence.hits.len());
+    let expected_end = page_end.min(evidence.hits.len());
+    let expected_page = &evidence.hits[expected_start..expected_end];
+    let rank_safe = observed.hits.len() == expected_page.len()
+        && observed
+            .hits
+            .iter()
+            .zip(expected_page)
+            .all(|(actual, expected)| {
+                actual.global_docid == expected.global_docid
+                    && actual.document_id == expected.document_id
+                    && actual.score.to_bits() == expected.score.to_bits()
+            });
+    if !rank_safe {
+        return Err(GauntletError::InvalidObservation {
+            reason: "Quill observed and exhaustive collector pages differ".to_owned(),
         });
     }
     let total_count = evidence
@@ -752,7 +790,7 @@ fn quill_observe(
         .ok_or_else(|| GauntletError::InvalidObservation {
             reason: "Quill tie-evidence observation omitted its exact count".to_owned(),
         })?;
-    let match_count = match (case.count_requested, observed.total_count) {
+    let match_count = match (count_requested, observed.total_count) {
         (true, Some(observed_count)) if observed_count == total_count => {
             CountState::Value(observed_count)
         }
@@ -1223,10 +1261,109 @@ impl GauntletEngine for TantivyOracle {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use frankensearch_core::DocId;
+    use frankensearch_quill::contract::fieldnorm_to_id;
+    use frankensearch_quill::delta::{
+        DeltaFieldNorm, DeltaNumericValue, DeltaSegment, DeltaSnapshot, DeltaStoredValue,
+        DeltaTermPosting,
+    };
+    use frankensearch_quill::scribe::{DOC_ORDS_PER_LEASE, DeltaFlushInput};
+    use frankensearch_quill::{
+        Analyzer, CURRENT_ENGINE_VERSION, FieldDescriptor, FieldKind, Query, QueryField,
+        QueryValue, SchemaDescriptor,
+    };
+
     use super::*;
+    use crate::comparator::{ComparisonStatus, RankClass};
+
+    const E55_ID_FIELD: u16 = 0;
+    const E55_CONTENT_FIELD: u16 = 1;
+    const E55_TITLE_FIELD: u16 = 2;
+    const E55_METADATA_FIELD: u16 = 3;
+    const E55_ORD_FIELD: u16 = 4;
+    const E55_I64_FIELD: u16 = 5;
+    const E55_U64_FIELD: u16 = 6;
+    const E55_TAG_FIELD: u16 = 7;
+    const E55_HISTORICAL_ID: &str = "sealed-replacement";
+    const E55_HISTORICAL_SEGMENT_ID: u64 = 0xe550_0000_0000_0001;
+    const E55_FIRST_SEGMENT_ID: u64 = 0xe550_0000_0000_0002;
+    const E55_SECOND_SEGMENT_ID: u64 = 0xe550_0000_0000_0003;
+    const E55_NIGHTLY_SEED: u64 = 0xe55c_0f0f_5eed_2026;
+
+    const E55_FIELDS: [FieldDescriptor; 8] = [
+        FieldDescriptor {
+            id: E55_ID_FIELD,
+            name: "id",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: E55_CONTENT_FIELD,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: E55_TITLE_FIELD,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: E55_METADATA_FIELD,
+            name: "metadata_json",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: E55_ORD_FIELD,
+            name: "ord",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: E55_I64_FIELD,
+            name: "signed_rank",
+            kind: FieldKind::I64 {
+                indexed: true,
+                fast: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: E55_U64_FIELD,
+            name: "unsigned_rank",
+            kind: FieldKind::U64 {
+                indexed: true,
+                fast: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: E55_TAG_FIELD,
+            name: "tag",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+    ];
+
+    const E55_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "quill-e55-mixed-residency-v1",
+        fields: &E55_FIELDS,
+    };
 
     struct CountingEngine {
         descriptor: EngineDescriptor,
@@ -1246,6 +1383,1659 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct E55Document {
+        id: String,
+        content: String,
+        title: String,
+        tag: String,
+        signed_rank: i64,
+        unsigned_rank: u64,
+    }
+
+    impl E55Document {
+        fn new(
+            id: impl Into<String>,
+            content: impl Into<String>,
+            title: impl Into<String>,
+            tag: impl Into<String>,
+            signed_rank: i64,
+            unsigned_rank: u64,
+        ) -> Self {
+            Self {
+                id: id.into(),
+                content: content.into(),
+                title: title.into(),
+                tag: tag.into(),
+                signed_rank,
+                unsigned_rank,
+            }
+        }
+    }
+
+    struct E55OwnedPosting {
+        field_ord: u16,
+        term: Vec<u8>,
+        frequency: u32,
+        positions: Option<Vec<u32>>,
+    }
+
+    fn e55_text_postings(field_ord: u16, text: &str) -> (u32, Vec<E55OwnedPosting>) {
+        let mut positions = BTreeMap::<String, Vec<u32>>::new();
+        for (position, term) in text.split_ascii_whitespace().enumerate() {
+            positions.entry(term.to_owned()).or_default().push(
+                u32::try_from(position).expect("E5.5 fixture token position fits the wire type"),
+            );
+        }
+        let token_count = positions.values().map(Vec::len).sum::<usize>();
+        let token_count =
+            u32::try_from(token_count).expect("E5.5 fixture token count fits the wire type");
+        let postings = positions
+            .into_iter()
+            .map(|(term, positions)| E55OwnedPosting {
+                field_ord,
+                frequency: u32::try_from(positions.len())
+                    .expect("E5.5 fixture frequency fits the wire type"),
+                term: term.into_bytes(),
+                positions: Some(positions),
+            })
+            .collect();
+        (token_count, postings)
+    }
+
+    fn e55_content_hash(document: &E55Document) -> u64 {
+        let mut canonical = Vec::new();
+        for value in [
+            document.id.as_bytes(),
+            document.content.as_bytes(),
+            document.title.as_bytes(),
+            document.tag.as_bytes(),
+        ] {
+            canonical.extend_from_slice(&value.len().to_be_bytes());
+            canonical.extend_from_slice(value);
+        }
+        canonical.extend_from_slice(&document.signed_rank.to_be_bytes());
+        canonical.extend_from_slice(&document.unsigned_rank.to_be_bytes());
+        xxh3_64(&canonical)
+    }
+
+    fn e55_apply_document(
+        delta: &mut DeltaSegment,
+        global_docid: u32,
+        document: &E55Document,
+    ) -> Option<u32> {
+        let (content_length, mut postings) =
+            e55_text_postings(E55_CONTENT_FIELD, &document.content);
+        let (title_length, title_postings) = e55_text_postings(E55_TITLE_FIELD, &document.title);
+        postings.insert(
+            0,
+            E55OwnedPosting {
+                field_ord: E55_ID_FIELD,
+                term: document.id.as_bytes().to_vec(),
+                frequency: 1,
+                positions: None,
+            },
+        );
+        postings.extend(title_postings);
+        postings.push(E55OwnedPosting {
+            field_ord: E55_TAG_FIELD,
+            term: document.tag.as_bytes().to_vec(),
+            frequency: 1,
+            positions: None,
+        });
+        postings.sort_by(|left, right| {
+            (left.field_ord, left.term.as_slice()).cmp(&(right.field_ord, right.term.as_slice()))
+        });
+        let borrowed_postings = postings
+            .iter()
+            .map(|posting| DeltaTermPosting {
+                field_ord: posting.field_ord,
+                term: &posting.term,
+                frequency: posting.frequency,
+                positions: posting.positions.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        let fieldnorms = [
+            DeltaFieldNorm {
+                field_ord: E55_ID_FIELD,
+                raw_length: 1,
+                fieldnorm_id: fieldnorm_to_id(1),
+            },
+            DeltaFieldNorm {
+                field_ord: E55_CONTENT_FIELD,
+                raw_length: content_length,
+                fieldnorm_id: fieldnorm_to_id(content_length),
+            },
+            DeltaFieldNorm {
+                field_ord: E55_TITLE_FIELD,
+                raw_length: title_length,
+                fieldnorm_id: fieldnorm_to_id(title_length),
+            },
+            DeltaFieldNorm {
+                field_ord: E55_TAG_FIELD,
+                raw_length: 1,
+                fieldnorm_id: fieldnorm_to_id(1),
+            },
+        ];
+        let numeric = [
+            DeltaNumericValue::i64(E55_I64_FIELD, document.signed_rank),
+            DeltaNumericValue::u64(E55_U64_FIELD, document.unsigned_rank),
+        ];
+        let ordinal = u64::from(global_docid).to_le_bytes();
+        let stored = [
+            DeltaStoredValue::new(E55_ID_FIELD, document.id.as_bytes()),
+            DeltaStoredValue::new(E55_CONTENT_FIELD, document.content.as_bytes()),
+            DeltaStoredValue::new(E55_TITLE_FIELD, document.title.as_bytes()),
+            DeltaStoredValue::new(E55_METADATA_FIELD, b"{}"),
+            DeltaStoredValue::new(E55_ORD_FIELD, &ordinal),
+            DeltaStoredValue::new(E55_TAG_FIELD, document.tag.as_bytes()),
+        ];
+        delta
+            .apply_document_with_values(
+                global_docid,
+                DocId::from(document.id.as_str()),
+                e55_content_hash(document),
+                &fieldnorms,
+                &borrowed_postings,
+                &numeric,
+                &stored,
+            )
+            .expect("apply complete E5.5 Delta document")
+            .replaced_delta_docid
+    }
+
+    struct E55DeltaBuilder {
+        delta: DeltaSegment,
+        first_docid: u32,
+        next_docid: u32,
+        live: BTreeMap<String, (u32, E55Document)>,
+    }
+
+    impl E55DeltaBuilder {
+        fn new(lease_base: u64) -> Self {
+            let first_docid =
+                u32::try_from(lease_base).expect("E5.5 Q1 lease base fits global docids");
+            Self {
+                delta: DeltaSegment::new(E55_SCHEMA, lease_base, usize::MAX / 2)
+                    .expect("construct E5.5 Delta"),
+                first_docid,
+                next_docid: first_docid,
+                live: BTreeMap::new(),
+            }
+        }
+
+        fn add(&mut self, document: E55Document) -> (u32, Option<u32>) {
+            let global_docid = self.next_docid;
+            self.next_docid = self
+                .next_docid
+                .checked_add(1)
+                .expect("E5.5 fixture stays inside the Q1 domain");
+            let expected_replacement = self.live.get(&document.id).map(|(docid, _)| *docid);
+            let replaced = e55_apply_document(&mut self.delta, global_docid, &document);
+            assert_eq!(replaced, expected_replacement, "Delta upsert witness");
+            self.live
+                .insert(document.id.clone(), (global_docid, document));
+            (global_docid, replaced)
+        }
+
+        fn delete(&mut self, document_id: &str) -> u32 {
+            let expected = self
+                .live
+                .remove(document_id)
+                .map(|(docid, _)| docid)
+                .expect("E5.5 delete names one live Delta row");
+            assert_eq!(
+                self.delta.delete_delta_id(document_id),
+                Some(expected),
+                "Delta delete witness"
+            );
+            expected
+        }
+
+        fn freeze(self, keeper_generation: u64) -> E55BuiltDelta {
+            let exclusive_end = self.next_docid;
+            assert!(exclusive_end > self.first_docid, "E5.5 Delta is nonempty");
+            let snapshot = Arc::new(self.delta.freeze(keeper_generation));
+            assert!(
+                snapshot.is_live_document(self.first_docid),
+                "first physical row is a permanent live Q1 anchor"
+            );
+            assert!(
+                snapshot.is_live_document(exclusive_end - 1),
+                "last physical row is a permanent live Q1 anchor"
+            );
+            E55BuiltDelta {
+                snapshot,
+                q1_range: (u64::from(self.first_docid), u64::from(exclusive_end)),
+                live: self.live,
+            }
+        }
+    }
+
+    struct E55BuiltDelta {
+        snapshot: Arc<DeltaSnapshot>,
+        q1_range: (u64, u64),
+        live: BTreeMap<String, (u32, E55Document)>,
+    }
+
+    #[derive(Clone)]
+    enum E55QueryInput {
+        Source(&'static str),
+        Preparsed(Query),
+    }
+
+    #[derive(Clone)]
+    struct E55QueryCase {
+        id: &'static str,
+        input: E55QueryInput,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum E55CollectorMode {
+        Full,
+        Paginated,
+        ExactCount,
+        ZeroLimit,
+        BeyondTotal,
+        DocSet,
+    }
+
+    impl E55CollectorMode {
+        const ALL: [Self; 6] = [
+            Self::Full,
+            Self::Paginated,
+            Self::ExactCount,
+            Self::ZeroLimit,
+            Self::BeyondTotal,
+            Self::DocSet,
+        ];
+
+        const fn id(self) -> &'static str {
+            match self {
+                Self::Full => "full",
+                Self::Paginated => "paginated",
+                Self::ExactCount => "exact-count",
+                Self::ZeroLimit => "zero-limit-exact-count",
+                Self::BeyondTotal => "offset-beyond-total",
+                Self::DocSet => "docset",
+            }
+        }
+    }
+
+    fn e55_query_cases() -> Vec<E55QueryCase> {
+        vec![
+            E55QueryCase {
+                id: "empty",
+                input: E55QueryInput::Source(""),
+            },
+            E55QueryCase {
+                id: "all",
+                input: E55QueryInput::Source("*"),
+            },
+            E55QueryCase {
+                id: "term",
+                input: E55QueryInput::Source("alpha"),
+            },
+            E55QueryCase {
+                id: "phrase",
+                input: E55QueryInput::Source("\"alpha beta\""),
+            },
+            E55QueryCase {
+                id: "boolean",
+                input: E55QueryInput::Source("alpha AND beta"),
+            },
+            E55QueryCase {
+                id: "boost-range-i64",
+                input: E55QueryInput::Preparsed(Query::Boost {
+                    query: Box::new(Query::Range {
+                        field_id: E55_I64_FIELD,
+                        lower: Bound::Included(QueryValue::I64(-7)),
+                        upper: Bound::Excluded(QueryValue::I64(8)),
+                    }),
+                    factor: 2.5,
+                }),
+            },
+            E55QueryCase {
+                id: "range-str",
+                input: E55QueryInput::Preparsed(Query::Range {
+                    field_id: E55_TAG_FIELD,
+                    lower: Bound::Included(QueryValue::Str("blue".to_owned())),
+                    upper: Bound::Included(QueryValue::Str("green".to_owned())),
+                }),
+            },
+            E55QueryCase {
+                id: "range-i64",
+                input: E55QueryInput::Preparsed(Query::Range {
+                    field_id: E55_I64_FIELD,
+                    lower: Bound::Included(QueryValue::I64(-7)),
+                    upper: Bound::Excluded(QueryValue::I64(8)),
+                }),
+            },
+            E55QueryCase {
+                id: "range-u64",
+                input: E55QueryInput::Preparsed(Query::Range {
+                    field_id: E55_U64_FIELD,
+                    lower: Bound::Included(QueryValue::U64(2)),
+                    upper: Bound::Included(QueryValue::U64(8)),
+                }),
+            },
+            E55QueryCase {
+                id: "set-str",
+                input: E55QueryInput::Preparsed(Query::Set {
+                    field_id: E55_TAG_FIELD,
+                    values: vec![
+                        QueryValue::Str("blue".to_owned()),
+                        QueryValue::Str("red".to_owned()),
+                    ],
+                }),
+            },
+            E55QueryCase {
+                id: "set-i64",
+                input: E55QueryInput::Preparsed(Query::Set {
+                    field_id: E55_I64_FIELD,
+                    values: vec![QueryValue::I64(-7), QueryValue::I64(9)],
+                }),
+            },
+            E55QueryCase {
+                id: "set-u64",
+                input: E55QueryInput::Preparsed(Query::Set {
+                    field_id: E55_U64_FIELD,
+                    values: vec![QueryValue::U64(2), QueryValue::U64(13)],
+                }),
+            },
+            E55QueryCase {
+                id: "glob",
+                input: E55QueryInput::Preparsed(Query::Glob {
+                    field_ids: vec![E55_CONTENT_FIELD, E55_TITLE_FIELD],
+                    pattern: "*lpha*".to_owned(),
+                }),
+            },
+        ]
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct E55FieldStatsWitness {
+        field_ord: u16,
+        total_tokens: u64,
+        doc_count: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct E55TermDfWitness {
+        field_ord: u16,
+        term: String,
+        doc_freq: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct E55StatsWitness {
+        bm25_doc_count: u64,
+        live_doc_count: u64,
+        fields: Vec<E55FieldStatsWitness>,
+        term_doc_freqs: Vec<E55TermDfWitness>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct E55ResidencyShape {
+        baseline_dead_keeper_segments: usize,
+        new_keeper_segments: usize,
+        delta_leaves: usize,
+        live_leaf_ranges: Vec<(u64, u64)>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct E410EdgeStateShape {
+        keeper_segments: usize,
+        keeper_at_seal_documents: u64,
+        keeper_tombstones: u64,
+        delta_leaves: usize,
+        delta_physical_documents: usize,
+        delta_live_documents: usize,
+        live_documents: u64,
+        tombstoned_docid: Option<u32>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct E55CaseEvidence {
+        diagnostics: Vec<String>,
+        observation: EngineObservation,
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    struct E55ResidencyEvidence {
+        seed: String,
+        corpus_hash: String,
+        extras_per_delta: usize,
+        state: &'static str,
+        shape: E55ResidencyShape,
+        stats: E55StatsWitness,
+        cases: BTreeMap<String, E55CaseEvidence>,
+    }
+
+    fn e55_differential_case(
+        fixture_id: String,
+        query_text: String,
+        mode: E55CollectorMode,
+        live_doc_count: u64,
+        seed: u64,
+        corpus_hash: u64,
+    ) -> DifferentialCase {
+        let (limit, offset, count_requested) = match mode {
+            E55CollectorMode::Full => (live_doc_count, 0, false),
+            E55CollectorMode::Paginated => (2, 1, false),
+            E55CollectorMode::ExactCount => (2, 0, true),
+            E55CollectorMode::ZeroLimit => (0, 0, true),
+            E55CollectorMode::BeyondTotal => (2, live_doc_count.saturating_add(5), false),
+            E55CollectorMode::DocSet => unreachable!("docset has no ranked case"),
+        };
+        DifferentialCase {
+            fixture_id,
+            query: query_text,
+            limit,
+            offset,
+            tie_expansion_limit: live_doc_count.saturating_add(8),
+            count_requested,
+            snippet_max_chars: None,
+            metadata: DifferentialCaseMetadata {
+                generator_id: Some("quill-e55-mixed-residency-v1".to_owned()),
+                generator_seed: Some(seed),
+                corpus_hash: Some(format!("{corpus_hash:016x}")),
+            },
+        }
+    }
+
+    fn e55_ranked_evidence(
+        index: &QuillIndex,
+        cx: &Cx,
+        query: &E55QueryCase,
+        mode: E55CollectorMode,
+        seed: u64,
+        corpus_hash: u64,
+    ) -> E55CaseEvidence {
+        let snapshot = index.search_snapshot();
+        let query_text = match &query.input {
+            E55QueryInput::Source(source) => (*source).to_owned(),
+            E55QueryInput::Preparsed(_) => format!("<preparsed:{}>", query.id),
+        };
+        let case = e55_differential_case(
+            format!("e55-{}-{}", query.id, mode.id()),
+            query_text,
+            mode,
+            snapshot.live_doc_count(),
+            seed,
+            corpus_hash,
+        );
+        case.validate_shape().expect("valid bounded E5.5 case");
+        let limit = usize::try_from(case.limit).expect("E5.5 limit fits usize");
+        let offset = usize::try_from(case.offset).expect("E5.5 offset fits usize");
+        let tie_expansion =
+            usize::try_from(case.tie_expansion_limit).expect("E5.5 tie expansion fits usize");
+        let fetch_limit = offset
+            .checked_add(limit)
+            .and_then(|value| value.checked_add(tie_expansion))
+            .expect("E5.5 evidence window fits usize");
+        let (observed, evidence) = match &query.input {
+            E55QueryInput::Source(source) => (
+                index
+                    .search_paginated(cx, source, limit, offset, case.count_requested)
+                    .expect("execute E5.5 source collector"),
+                index
+                    .search_paginated(cx, source, fetch_limit, 0, true)
+                    .expect("execute E5.5 source evidence collector"),
+            ),
+            E55QueryInput::Preparsed(parsed) => (
+                index
+                    .search_preparsed_paginated(cx, parsed, limit, offset, case.count_requested)
+                    .expect("execute E5.5 preparsed collector"),
+                index
+                    .search_preparsed_paginated(cx, parsed, fetch_limit, 0, true)
+                    .expect("execute E5.5 preparsed evidence collector"),
+            ),
+        };
+        let diagnostics = observed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{diagnostic:?}"))
+            .collect();
+        let observation = quill_observation_from_results(
+            &observed,
+            &evidence,
+            limit,
+            offset,
+            case.count_requested,
+        )
+        .expect("assemble E5.5 ranked observation");
+        match mode {
+            E55CollectorMode::ZeroLimit => {
+                assert!(observation.hits.is_empty(), "limit=0 returns no hits");
+                assert!(
+                    matches!(observation.match_count, CountState::Value(_)),
+                    "limit=0 retains exact-count evidence"
+                );
+            }
+            E55CollectorMode::BeyondTotal => {
+                assert!(
+                    observation.hits.is_empty(),
+                    "offset beyond total returns an empty page"
+                );
+                assert_eq!(
+                    observation.match_count,
+                    CountState::NotRequested,
+                    "count-free beyond-total page does not expose count work"
+                );
+            }
+            E55CollectorMode::Full
+            | E55CollectorMode::Paginated
+            | E55CollectorMode::ExactCount
+            | E55CollectorMode::DocSet => {}
+        }
+        E55CaseEvidence {
+            diagnostics,
+            observation,
+        }
+    }
+
+    fn e55_docset_evidence(index: &QuillIndex, cx: &Cx, query: &E55QueryCase) -> E55CaseEvidence {
+        let (docids, diagnostics) = match &query.input {
+            E55QueryInput::Source(source) => {
+                let docids = index
+                    .collect_docids(cx, source)
+                    .expect("execute E5.5 source docset collector");
+                let diagnostics = index
+                    .search_paginated(cx, source, 0, 0, true)
+                    .expect("collect E5.5 source diagnostic witness")
+                    .diagnostics
+                    .into_iter()
+                    .map(|diagnostic| format!("{diagnostic:?}"))
+                    .collect();
+                (docids, diagnostics)
+            }
+            E55QueryInput::Preparsed(parsed) => (
+                index
+                    .collect_preparsed_docids(cx, parsed)
+                    .expect("execute E5.5 preparsed docset collector"),
+                Vec::new(),
+            ),
+        };
+        assert!(
+            docids.windows(2).all(|window| window[0] < window[1]),
+            "E5.5 docset is sorted and unique"
+        );
+        let snapshot = index.search_snapshot();
+        let hits = docids
+            .into_iter()
+            .map(|global_docid| RankedHit {
+                doc_id: snapshot
+                    .materialize_document_id(global_docid)
+                    .expect("E5.5 docset winner materializes")
+                    .to_string(),
+                score_bits: 0.0_f32.to_bits(),
+                native_tie_key: NativeTieKey::QuillDocId {
+                    doc_id: global_docid,
+                },
+            })
+            .collect::<Vec<_>>();
+        let match_count =
+            u64::try_from(hits.len()).expect("E5.5 docset count fits the observation wire type");
+        E55CaseEvidence {
+            diagnostics,
+            observation: EngineObservation {
+                cutoff_tie_group: hits.clone(),
+                cutoff_tie_complete: true,
+                hits,
+                offset_tie_group: Vec::new(),
+                offset_tie_complete: false,
+                snippets: BTreeMap::new(),
+                match_count: CountState::Value(match_count),
+                doc_count: snapshot.live_doc_count(),
+                ast_differences: Vec::new(),
+            },
+        }
+    }
+
+    fn e55_config() -> QuillConfig {
+        QuillConfig {
+            deterministic_ingest: true,
+            glob_expansion_limit: 4_096,
+            ..QuillConfig::default()
+        }
+    }
+
+    fn e55_flush_input(segment_id: u64) -> DeltaFlushInput {
+        DeltaFlushInput {
+            segment_id,
+            created_unix_s: 0,
+            engine_version: CURRENT_ENGINE_VERSION,
+        }
+    }
+
+    async fn e55_index_with_live_history(cx: &Cx) -> (QuillIndex, usize, u32) {
+        let config = e55_config();
+        let mut index = QuillIndex::in_memory_with_schema(E55_SCHEMA, config)
+            .expect("construct historical E5.5 index");
+        let generation = index.search_snapshot().keeper_generation();
+        let mut historical = E55DeltaBuilder::new(0);
+        let (historical_docid, replaced) = historical.add(E55Document::new(
+            E55_HISTORICAL_ID,
+            "historicalonly alpha beta",
+            "historicalonly title",
+            "blue",
+            -7,
+            2,
+        ));
+        assert!(replaced.is_none());
+        let historical = historical.freeze(generation);
+        index
+            .publish_delta_table(vec![Arc::clone(&historical.snapshot)])
+            .expect("publish historical E5.5 Delta");
+        index
+            .seal_delta_snapshot(
+                cx,
+                historical.snapshot,
+                Vec::new(),
+                e55_flush_input(E55_HISTORICAL_SEGMENT_ID),
+            )
+            .await
+            .expect("seal historical E5.5 Delta");
+
+        assert_eq!(
+            index
+                .search_snapshot()
+                .materialize_document_id(historical_docid)
+                .as_deref(),
+            Some(E55_HISTORICAL_ID),
+            "the sealed upsert source remains live until its replacement is staged"
+        );
+        let baseline_history_segments = index.snapshot().segments().len();
+        (index, baseline_history_segments, historical_docid)
+    }
+
+    fn e55_tombstone_sealed_upsert_source(index: &QuillIndex, historical_docid: u32) -> QuillIndex {
+        let committed = index.snapshot().clone();
+        assert_eq!(
+            committed
+                .materialize_document_id(historical_docid)
+                .as_deref(),
+            Some(E55_HISTORICAL_ID),
+            "sealed upsert begins from a live Keeper row"
+        );
+        let mut tombstoned_manifest = committed
+            .next_manifest()
+            .expect("stage sealed-upsert tombstone generation");
+        assert!(
+            committed
+                .delete_document(&mut tombstoned_manifest, E55_HISTORICAL_ID)
+                .expect("stage sealed-upsert source tombstone")
+        );
+        let tombstoned = committed
+            .publish_owned_segments(&tombstoned_manifest, Vec::new())
+            .expect("publish sealed-upsert source tombstone");
+        assert_eq!(
+            tombstoned.materialize_document_id(historical_docid),
+            None,
+            "sealed-upsert source is physically retained but publicly retired"
+        );
+        QuillIndex::from_in_memory_snapshot(tombstoned, e55_config())
+            .expect("bind sealed-upsert Keeper successor")
+    }
+
+    fn e55_next_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    fn e55_add_seeded_documents(
+        builder: &mut E55DeltaBuilder,
+        seed: &mut u64,
+        shard: usize,
+        count: usize,
+    ) {
+        const TAGS: [&str; 6] = ["amber", "blue", "cyan", "green", "red", "violet"];
+        const CONTENTS: [&str; 6] = [
+            "alpha beta seeded",
+            "alpha gamma seeded",
+            "beta delta seeded",
+            "gamma omega seeded",
+            "alpha beta gamma seeded",
+            "omega violet seeded",
+        ];
+        for ordinal in 0..count {
+            let random = e55_next_random(seed);
+            let tag = TAGS
+                [usize::try_from(random % TAGS.len() as u64).expect("seeded tag index fits usize")];
+            let content = CONTENTS[usize::try_from((random >> 8) % CONTENTS.len() as u64)
+                .expect("seeded content index fits usize")];
+            let signed_rank =
+                i64::try_from((random >> 16) % 61).expect("seeded signed rank fits i64") - 30;
+            let unsigned_rank = (random >> 24) % 41;
+            builder.add(E55Document::new(
+                format!("seeded-{shard}-{ordinal:05}"),
+                content,
+                format!("seeded title {}", random % 7),
+                tag,
+                signed_rank,
+                unsigned_rank,
+            ));
+        }
+    }
+
+    struct E55LiveCorpus {
+        first: Arc<DeltaSnapshot>,
+        second: Arc<DeltaSnapshot>,
+        expected_ranges: Vec<(u64, u64)>,
+        expected_live: BTreeMap<String, u32>,
+        retired_docids: Vec<u32>,
+        replacement_docid: u32,
+        corpus_hash: u64,
+    }
+
+    fn e55_corpus_hash(live: &BTreeMap<String, (u32, E55Document)>) -> u64 {
+        let mut canonical = Vec::new();
+        for (id, (global_docid, document)) in live {
+            for value in [
+                id.as_bytes(),
+                document.content.as_bytes(),
+                document.title.as_bytes(),
+                document.tag.as_bytes(),
+            ] {
+                canonical.extend_from_slice(
+                    &u64::try_from(value.len())
+                        .expect("E5.5 fixture value length fits u64")
+                        .to_be_bytes(),
+                );
+                canonical.extend_from_slice(value);
+            }
+            canonical.extend_from_slice(&global_docid.to_be_bytes());
+            canonical.extend_from_slice(&document.signed_rank.to_be_bytes());
+            canonical.extend_from_slice(&document.unsigned_rank.to_be_bytes());
+        }
+        xxh3_64(&canonical)
+    }
+
+    fn e55_build_live_corpus(
+        index: &QuillIndex,
+        seed: u64,
+        extras_per_delta: usize,
+        historical_docid: u32,
+    ) -> E55LiveCorpus {
+        let lease_base = index
+            .snapshot()
+            .loaded_manifest()
+            .manifest
+            .docid_high_watermark;
+        assert_eq!(
+            lease_base % u64::from(DOC_ORDS_PER_LEASE),
+            0,
+            "historical Keeper preserves a Q1-aligned successor lease"
+        );
+        let second_lease_base = lease_base
+            .checked_add(u64::from(DOC_ORDS_PER_LEASE))
+            .expect("second E5.5 lease base fits u64");
+        assert!(
+            extras_per_delta + 16 < DOC_ORDS_PER_LEASE as usize,
+            "seeded E5.5 fixture stays within each Q1 lease"
+        );
+        let generation = index.search_snapshot().keeper_generation();
+        let mut random = seed;
+
+        let mut first = E55DeltaBuilder::new(lease_base);
+        first.add(E55Document::new(
+            "anchor-0-first",
+            "alpha beta anchor",
+            "alpha beta first",
+            "amber",
+            -20,
+            0,
+        ));
+        assert_eq!(
+            index
+                .search_snapshot()
+                .materialize_document_id(historical_docid)
+                .as_deref(),
+            Some(E55_HISTORICAL_ID),
+            "the sealed row is live when its Delta replacement is staged"
+        );
+        let (replacement_docid, replaced) = first.add(E55Document::new(
+            E55_HISTORICAL_ID,
+            "alpha beta replacementlive",
+            "replacementlive alpha",
+            "blue",
+            -7,
+            2,
+        ));
+        assert!(
+            replaced.is_none(),
+            "cross-residency replacement has no older row in its new Delta"
+        );
+        assert_eq!(
+            index
+                .search_snapshot()
+                .materialize_document_id(historical_docid)
+                .as_deref(),
+            Some(E55_HISTORICAL_ID),
+            "staging the replacement does not retire the live sealed source early"
+        );
+        let (upsert_old, replaced) = first.add(E55Document::new(
+            "delta-upsert",
+            "abandoned alpha",
+            "abandoned",
+            "red",
+            9,
+            13,
+        ));
+        assert!(replaced.is_none());
+        let (_, replaced) = first.add(E55Document::new(
+            "delta-upsert",
+            "alpha gamma upsertlive",
+            "upsertlive alpha",
+            "red",
+            9,
+            13,
+        ));
+        assert_eq!(replaced, Some(upsert_old));
+        first.add(E55Document::new(
+            "delta-delete-readd",
+            "abandoned beta",
+            "abandoned",
+            "green",
+            3,
+            8,
+        ));
+        let delete_old = first.delete("delta-delete-readd");
+        first.add(E55Document::new(
+            "delta-delete-readd",
+            "alpha beta readdlive",
+            "readdlive beta",
+            "green",
+            3,
+            8,
+        ));
+        first.add(E55Document::new(
+            "range-middle",
+            "beta range middle",
+            "range alpha",
+            "cyan",
+            0,
+            5,
+        ));
+        e55_add_seeded_documents(&mut first, &mut random, 0, extras_per_delta);
+        first.add(E55Document::new(
+            "anchor-0-last",
+            "omega anchor",
+            "omega final",
+            "violet",
+            20,
+            21,
+        ));
+        let first = first.freeze(generation);
+
+        let mut second = E55DeltaBuilder::new(second_lease_base);
+        second.add(E55Document::new(
+            "anchor-1-first",
+            "alpha beta anchor",
+            "alpha beta second",
+            "amber",
+            -11,
+            1,
+        ));
+        second.add(E55Document::new(
+            "second-blue",
+            "alpha beta blue",
+            "blue alpha",
+            "blue",
+            -7,
+            2,
+        ));
+        second.add(E55Document::new(
+            "second-green",
+            "beta gamma green",
+            "green beta",
+            "green",
+            7,
+            8,
+        ));
+        second.add(E55Document::new(
+            "second-red",
+            "alpha delta red",
+            "red alpha",
+            "red",
+            9,
+            13,
+        ));
+        second.add(E55Document::new(
+            "second-yellow",
+            "omega yellow",
+            "yellow omega",
+            "yellow",
+            30,
+            34,
+        ));
+        e55_add_seeded_documents(&mut second, &mut random, 1, extras_per_delta);
+        second.add(E55Document::new(
+            "anchor-1-last",
+            "alpha omega anchor",
+            "omega final",
+            "violet",
+            25,
+            40,
+        ));
+        let second = second.freeze(generation);
+
+        let mut live = first.live.clone();
+        for (id, row) in &second.live {
+            assert!(live.insert(id.clone(), row.clone()).is_none());
+        }
+        let corpus_hash = e55_corpus_hash(&live);
+        let expected_live = live
+            .iter()
+            .map(|(id, (global_docid, _))| (id.clone(), *global_docid))
+            .collect();
+        E55LiveCorpus {
+            expected_ranges: vec![first.q1_range, second.q1_range],
+            first: first.snapshot,
+            second: second.snapshot,
+            expected_live,
+            retired_docids: vec![upsert_old, delete_old],
+            replacement_docid,
+            corpus_hash,
+        }
+    }
+
+    fn e55_stats_witness(index: &QuillIndex) -> E55StatsWitness {
+        let snapshot = index.search_snapshot();
+        let fields = [
+            E55_ID_FIELD,
+            E55_CONTENT_FIELD,
+            E55_TITLE_FIELD,
+            E55_TAG_FIELD,
+        ]
+        .into_iter()
+        .map(|field_ord| {
+            let stats = snapshot
+                .bm25_field_stats(field_ord)
+                .expect("E5.5 indexed string field has composite statistics");
+            E55FieldStatsWitness {
+                field_ord,
+                total_tokens: stats.total_tokens,
+                doc_count: stats.doc_count,
+            }
+        })
+        .collect();
+        let terms: [(u16, &[u8]); 7] = [
+            (E55_ID_FIELD, E55_HISTORICAL_ID.as_bytes()),
+            (E55_CONTENT_FIELD, b"historicalonly"),
+            (E55_CONTENT_FIELD, b"alpha"),
+            (E55_CONTENT_FIELD, b"beta"),
+            (E55_CONTENT_FIELD, b"abandoned"),
+            (E55_TITLE_FIELD, b"alpha"),
+            (E55_TAG_FIELD, b"blue"),
+        ];
+        let term_doc_freqs = terms
+            .into_iter()
+            .map(|(field_ord, term)| E55TermDfWitness {
+                field_ord,
+                term: String::from_utf8(term.to_vec()).expect("E5.5 witness terms are UTF-8"),
+                doc_freq: snapshot
+                    .bm25_doc_freq(field_ord, term)
+                    .expect("collect E5.5 snapshot document frequency"),
+            })
+            .collect();
+        E55StatsWitness {
+            bm25_doc_count: snapshot.bm25_doc_count(),
+            live_doc_count: snapshot.live_doc_count(),
+            fields,
+            term_doc_freqs,
+        }
+    }
+
+    fn e55_live_leaf_ranges(index: &QuillIndex, baseline_dead_segments: usize) -> Vec<(u64, u64)> {
+        let snapshot = index.search_snapshot();
+        let mut ranges = snapshot
+            .keeper_snapshot()
+            .segments()
+            .iter()
+            .skip(baseline_dead_segments)
+            .map(|segment| {
+                let manifest = segment.manifest();
+                (manifest.docid_lo, manifest.docid_hi)
+            })
+            .collect::<Vec<_>>();
+        for delta in snapshot.delta_snapshots() {
+            let live_docids = delta
+                .live_documents()
+                .map(|(global_docid, _)| global_docid)
+                .collect::<Vec<_>>();
+            let first = *live_docids
+                .first()
+                .expect("E5.5 published Delta has a live first anchor");
+            let last = *live_docids
+                .last()
+                .expect("E5.5 published Delta has a live last anchor");
+            ranges.push((u64::from(first), u64::from(last) + 1));
+        }
+        ranges.sort_unstable();
+        ranges
+    }
+
+    fn e55_assert_identity_overlay(
+        index: &QuillIndex,
+        cx: &Cx,
+        expected_live: &BTreeMap<String, u32>,
+        retired_docids: &[u32],
+        replacement_docid: u32,
+    ) {
+        let snapshot = index.search_snapshot();
+        for (document_id, &global_docid) in expected_live {
+            assert_eq!(
+                snapshot
+                    .materialize_document_id(global_docid)
+                    .map(|value| value.to_string()),
+                Some(document_id.clone()),
+                "live Q1 materialization drifted for {document_id}"
+            );
+        }
+        for &retired_docid in retired_docids {
+            assert_eq!(
+                snapshot.materialize_document_id(retired_docid),
+                None,
+                "retired Q1 row {retired_docid} became visible"
+            );
+        }
+        let replacement_query = Query::Term {
+            fields: vec![QueryField::new(E55_ID_FIELD, 1.0)],
+            text: E55_HISTORICAL_ID.to_owned(),
+        };
+        assert_eq!(
+            index
+                .collect_preparsed_docids(cx, &replacement_query)
+                .expect("resolve sealed-history replacement by external ID"),
+            vec![replacement_docid],
+            "the tombstoned Keeper row must not mask or duplicate its live replacement"
+        );
+    }
+
+    struct E55CaptureContext<'a> {
+        baseline_dead_segments: usize,
+        expected_ranges: &'a [(u64, u64)],
+        expected_live: &'a BTreeMap<String, u32>,
+        retired_docids: &'a [u32],
+        replacement_docid: u32,
+        seed: u64,
+        corpus_hash: u64,
+        extras_per_delta: usize,
+    }
+
+    fn e55_capture_residency(
+        index: &QuillIndex,
+        cx: &Cx,
+        state: &'static str,
+        expected_new_keeper_segments: usize,
+        expected_delta_leaves: usize,
+        context: &E55CaptureContext<'_>,
+    ) -> E55ResidencyEvidence {
+        let snapshot = index.search_snapshot();
+        let raw_keeper_segments = snapshot.keeper_snapshot().segments().len();
+        let new_keeper_segments = raw_keeper_segments
+            .checked_sub(context.baseline_dead_segments)
+            .expect("E5.5 baseline segment count cannot exceed the current Keeper");
+        let shape = E55ResidencyShape {
+            baseline_dead_keeper_segments: context.baseline_dead_segments,
+            new_keeper_segments,
+            delta_leaves: snapshot.delta_count(),
+            live_leaf_ranges: e55_live_leaf_ranges(index, context.baseline_dead_segments),
+        };
+        assert_eq!(
+            shape.new_keeper_segments, expected_new_keeper_segments,
+            "E5.5 {state} new Keeper residency shape"
+        );
+        assert_eq!(
+            shape.delta_leaves, expected_delta_leaves,
+            "E5.5 {state} Delta residency shape"
+        );
+        assert_eq!(
+            shape.live_leaf_ranges, context.expected_ranges,
+            "E5.5 {state} preserves the exact two-leaf Q1 geometry"
+        );
+        e55_assert_identity_overlay(
+            index,
+            cx,
+            context.expected_live,
+            context.retired_docids,
+            context.replacement_docid,
+        );
+
+        let mut cases = BTreeMap::new();
+        for query in e55_query_cases() {
+            for mode in E55CollectorMode::ALL {
+                let evidence = match mode {
+                    E55CollectorMode::DocSet => e55_docset_evidence(index, cx, &query),
+                    E55CollectorMode::Full
+                    | E55CollectorMode::Paginated
+                    | E55CollectorMode::ExactCount
+                    | E55CollectorMode::ZeroLimit
+                    | E55CollectorMode::BeyondTotal => e55_ranked_evidence(
+                        index,
+                        cx,
+                        &query,
+                        mode,
+                        context.seed,
+                        context.corpus_hash,
+                    ),
+                };
+                let case_id = format!("{}::{}", query.id, mode.id());
+                assert!(
+                    cases.insert(case_id.clone(), evidence).is_none(),
+                    "duplicate E5.5 matrix case {case_id}"
+                );
+            }
+        }
+        E55ResidencyEvidence {
+            seed: format!("0x{:016x}", context.seed),
+            corpus_hash: format!("{:016x}", context.corpus_hash),
+            extras_per_delta: context.extras_per_delta,
+            state,
+            shape,
+            stats: e55_stats_witness(index),
+            cases,
+        }
+    }
+
+    fn e410_capture_edge_state(
+        index: &QuillIndex,
+        cx: &Cx,
+        state: &'static str,
+        expected: E410EdgeStateShape,
+    ) -> BTreeMap<String, E55CaseEvidence> {
+        let snapshot = index.search_snapshot();
+        let keeper = snapshot.keeper_snapshot();
+        assert_eq!(
+            keeper.segments().len(),
+            expected.keeper_segments,
+            "E4.10 {state} Keeper segment count",
+        );
+        assert_eq!(
+            keeper.at_seal_doc_count(),
+            expected.keeper_at_seal_documents,
+            "E4.10 {state} Keeper physical row count",
+        );
+        assert_eq!(
+            keeper.tombstone_count(),
+            expected.keeper_tombstones,
+            "E4.10 {state} Keeper tombstone count",
+        );
+        assert_eq!(
+            snapshot.delta_count(),
+            expected.delta_leaves,
+            "E4.10 {state} Delta leaf count",
+        );
+        assert_eq!(
+            snapshot
+                .delta_snapshots()
+                .iter()
+                .map(|delta| delta.segment().physical_document_count())
+                .sum::<usize>(),
+            expected.delta_physical_documents,
+            "E4.10 {state} Delta physical row count",
+        );
+        assert_eq!(
+            snapshot
+                .delta_snapshots()
+                .iter()
+                .map(|delta| delta.live_document_count())
+                .sum::<usize>(),
+            expected.delta_live_documents,
+            "E4.10 {state} Delta live row count",
+        );
+        assert_eq!(
+            snapshot.bm25_doc_count(),
+            expected.keeper_at_seal_documents.saturating_add(
+                u64::try_from(expected.delta_live_documents)
+                    .expect("E4.10 Delta live row count fits u64"),
+            ),
+            "E4.10 {state} BM25 lifecycle population",
+        );
+        assert_eq!(
+            snapshot.live_doc_count(),
+            expected.live_documents,
+            "E4.10 {state} live document count",
+        );
+        if let Some(global_docid) = expected.tombstoned_docid {
+            assert!(
+                keeper
+                    .segments()
+                    .iter()
+                    .any(|segment| segment.is_tombstoned(global_docid)),
+                "E4.10 {state} must physically retain tombstoned docid {global_docid}",
+            );
+        }
+        let mut cases = BTreeMap::new();
+        for query in e55_query_cases() {
+            for mode in E55CollectorMode::ALL {
+                let evidence = match mode {
+                    E55CollectorMode::DocSet => e55_docset_evidence(index, cx, &query),
+                    E55CollectorMode::Full
+                    | E55CollectorMode::Paginated
+                    | E55CollectorMode::ExactCount
+                    | E55CollectorMode::ZeroLimit
+                    | E55CollectorMode::BeyondTotal => e55_ranked_evidence(
+                        index,
+                        cx,
+                        &query,
+                        mode,
+                        0xe410,
+                        xxh3_64(state.as_bytes()),
+                    ),
+                };
+                let result_count = evidence.observation.hits.len();
+                tracing::info!(
+                    target: "frankensearch.quill.gauntlet.e410",
+                    state,
+                    query_id = query.id,
+                    collector = mode.id(),
+                    expected_doc_count = expected.live_documents,
+                    result_count,
+                    "completed E4.10 edge-state query case",
+                );
+                assert_eq!(
+                    evidence.observation.doc_count,
+                    expected.live_documents,
+                    "E4.10 {state} query={} collector={} doc_count",
+                    query.id,
+                    mode.id(),
+                );
+                let expected_matches =
+                    u64::from(expected.live_documents == 1 && query.id != "empty");
+                let expected_matching_hits =
+                    usize::try_from(expected_matches).expect("E4.10 match count fits usize");
+                let expected_hits = match mode {
+                    E55CollectorMode::Full
+                    | E55CollectorMode::ExactCount
+                    | E55CollectorMode::DocSet => expected_matching_hits,
+                    E55CollectorMode::Paginated
+                    | E55CollectorMode::ZeroLimit
+                    | E55CollectorMode::BeyondTotal => 0,
+                };
+                assert_eq!(
+                    evidence.observation.hits.len(),
+                    expected_hits,
+                    "E4.10 {state} query={} collector={} result cardinality",
+                    query.id,
+                    mode.id(),
+                );
+                if expected_hits == 1 {
+                    assert_eq!(
+                        evidence.observation.hits[0].doc_id,
+                        E55_HISTORICAL_ID,
+                        "E4.10 {state} query={} collector={} returned the wrong row",
+                        query.id,
+                        mode.id(),
+                    );
+                }
+                let expected_count = if matches!(
+                    mode,
+                    E55CollectorMode::ExactCount
+                        | E55CollectorMode::ZeroLimit
+                        | E55CollectorMode::DocSet
+                ) {
+                    CountState::Value(expected_matches)
+                } else {
+                    CountState::NotRequested
+                };
+                assert_eq!(
+                    evidence.observation.match_count,
+                    expected_count,
+                    "E4.10 {state} query={} collector={} count evidence",
+                    query.id,
+                    mode.id(),
+                );
+                let case_id = format!("{}::{}", query.id, mode.id());
+                assert!(
+                    cases.insert(case_id.clone(), evidence).is_none(),
+                    "duplicate E4.10 edge-state case {case_id}",
+                );
+            }
+        }
+        cases
+    }
+
+    fn e410_delta_only_index() -> QuillIndex {
+        let index = QuillIndex::in_memory_with_schema(E55_SCHEMA, e55_config())
+            .expect("construct strict E4.10 Delta-only index");
+        let generation = index.search_snapshot().keeper_generation();
+        let mut delta = E55DeltaBuilder::new(0);
+        let (_, replaced) = delta.add(E55Document::new(
+            E55_HISTORICAL_ID,
+            "historicalonly alpha beta",
+            "historicalonly title",
+            "blue",
+            -7,
+            2,
+        ));
+        assert!(replaced.is_none());
+        let delta = delta.freeze(generation);
+        index
+            .publish_delta_table(vec![delta.snapshot])
+            .expect("publish strict E4.10 Delta-only snapshot");
+        index
+    }
+
+    fn e55_first_native_key_divergence(
+        subject: &EngineObservation,
+        oracle: &EngineObservation,
+    ) -> Option<String> {
+        for (field, subject_hits, oracle_hits) in [
+            ("hits", &subject.hits, &oracle.hits),
+            (
+                "cutoff_tie_group",
+                &subject.cutoff_tie_group,
+                &oracle.cutoff_tie_group,
+            ),
+            (
+                "offset_tie_group",
+                &subject.offset_tie_group,
+                &oracle.offset_tie_group,
+            ),
+        ] {
+            if subject_hits.len() != oracle_hits.len() {
+                return Some(format!("/comparison/subject/{field}"));
+            }
+            if let Some((index, _)) = subject_hits.iter().zip(oracle_hits).enumerate().find(
+                |(_, (subject_hit, oracle_hit))| {
+                    subject_hit.native_tie_key != oracle_hit.native_tie_key
+                },
+            ) {
+                return Some(format!(
+                    "/comparison/subject/{field}/{index}/native_tie_key"
+                ));
+            }
+        }
+        None
+    }
+
+    fn e55_divergence_panic(
+        pointer: &str,
+        case_id: Option<&str>,
+        baseline: &E55ResidencyEvidence,
+        candidate: &E55ResidencyEvidence,
+        report: Option<&ComparisonReport>,
+        comparator_error: Option<&str>,
+    ) -> ! {
+        let payload = serde_json::json!({
+            "campaign": "quill-e55-mixed-residency-v1",
+            "case_id": case_id,
+            "first_divergence": pointer,
+            "comparison_report": report,
+            "comparator_error": comparator_error,
+            "state_lists": [baseline, candidate],
+        });
+        let encoded = serde_json::to_string_pretty(&payload)
+            .expect("serialize structured E5.5 divergence evidence");
+        panic!("E5.5 mixed-residency divergence\n{encoded}");
+    }
+
+    fn e55_assert_residency_exact(
+        baseline: &E55ResidencyEvidence,
+        candidate: &E55ResidencyEvidence,
+    ) {
+        if baseline.stats != candidate.stats {
+            e55_divergence_panic("/residency/stats", None, baseline, candidate, None, None);
+        }
+        if baseline.shape.baseline_dead_keeper_segments
+            != candidate.shape.baseline_dead_keeper_segments
+            || baseline.shape.live_leaf_ranges != candidate.shape.live_leaf_ranges
+        {
+            e55_divergence_panic(
+                "/residency/leaf_geometry",
+                None,
+                baseline,
+                candidate,
+                None,
+                None,
+            );
+        }
+        if baseline.cases.keys().ne(candidate.cases.keys()) {
+            e55_divergence_panic("/residency/cases", None, baseline, candidate, None, None);
+        }
+        for (case_id, oracle) in &baseline.cases {
+            let subject = candidate
+                .cases
+                .get(case_id)
+                .expect("E5.5 state matrix keys were checked");
+            if subject.diagnostics != oracle.diagnostics {
+                e55_divergence_panic(
+                    "/comparison/subject/diagnostics",
+                    Some(case_id),
+                    baseline,
+                    candidate,
+                    None,
+                    None,
+                );
+            }
+            let report = match compare_observations(
+                subject.observation.clone(),
+                oracle.observation.clone(),
+                ComparatorConfig::default(),
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    let error = error.to_string();
+                    e55_divergence_panic(
+                        "/comparison/comparator_contract",
+                        Some(case_id),
+                        baseline,
+                        candidate,
+                        None,
+                        Some(&error),
+                    );
+                }
+            };
+            if report.status != ComparisonStatus::Exact
+                || report.rank_class != RankClass::RankExact
+                || !report.divergences.is_empty()
+            {
+                let pointer = report.first_divergence.as_deref().unwrap_or("/comparison");
+                e55_divergence_panic(
+                    pointer,
+                    Some(case_id),
+                    baseline,
+                    candidate,
+                    Some(&report),
+                    None,
+                );
+            }
+            if let Some(pointer) =
+                e55_first_native_key_divergence(&subject.observation, &oracle.observation)
+            {
+                e55_divergence_panic(
+                    &pointer,
+                    Some(case_id),
+                    baseline,
+                    candidate,
+                    Some(&report),
+                    None,
+                );
+            }
+        }
+    }
+
+    async fn e55_run_mixed_residency_campaign(cx: &Cx, seed: u64, extras_per_delta: usize) {
+        let (index, baseline_dead_segments, historical_docid) =
+            e55_index_with_live_history(cx).await;
+        let mut corpus = e55_build_live_corpus(&index, seed, extras_per_delta, historical_docid);
+        let mut index = e55_tombstone_sealed_upsert_source(&index, historical_docid);
+        let successor_generation = index.search_snapshot().keeper_generation();
+        corpus.first = Arc::new(corpus.first.rebind_keeper_generation(successor_generation));
+        corpus.second = Arc::new(corpus.second.rebind_keeper_generation(successor_generation));
+        let mut retired_docids = corpus.retired_docids.clone();
+        retired_docids.push(historical_docid);
+        retired_docids.sort_unstable();
+        let context = E55CaptureContext {
+            baseline_dead_segments,
+            expected_ranges: &corpus.expected_ranges,
+            expected_live: &corpus.expected_live,
+            retired_docids: &retired_docids,
+            replacement_docid: corpus.replacement_docid,
+            seed,
+            corpus_hash: corpus.corpus_hash,
+            extras_per_delta,
+        };
+        tracing::info!(
+            target: "frankensearch.quill.gauntlet.e55",
+            seed,
+            corpus_hash = %format_args!("{:016x}", corpus.corpus_hash),
+            extras_per_delta,
+            live_documents = corpus.expected_live.len(),
+            baseline_dead_segments,
+            "starting deterministic E5.5 mixed-residency campaign"
+        );
+
+        index
+            .publish_delta_table(vec![Arc::clone(&corpus.first), Arc::clone(&corpus.second)])
+            .expect("publish complete all-Delta E5.5 table");
+        let all_delta = e55_capture_residency(&index, cx, "all_delta", 0, 2, &context);
+
+        let mixed_generation = index
+            .search_snapshot()
+            .keeper_generation()
+            .checked_add(1)
+            .expect("mixed E5.5 Keeper generation fits u64");
+        let surviving_second = Arc::new(corpus.second.rebind_keeper_generation(mixed_generation));
+        index
+            .seal_delta_snapshot(
+                cx,
+                Arc::clone(&corpus.first),
+                vec![Arc::clone(&surviving_second)],
+                e55_flush_input(E55_FIRST_SEGMENT_ID),
+            )
+            .await
+            .expect("seal first E5.5 Delta into mixed residency");
+        let mixed = e55_capture_residency(&index, cx, "mixed", 1, 1, &context);
+
+        index
+            .seal_delta_snapshot(
+                cx,
+                surviving_second,
+                Vec::new(),
+                e55_flush_input(E55_SECOND_SEGMENT_ID),
+            )
+            .await
+            .expect("seal second E5.5 Delta into all-sealed residency");
+        let all_sealed = e55_capture_residency(&index, cx, "all_sealed", 2, 0, &context);
+
+        e55_assert_residency_exact(&all_delta, &mixed);
+        e55_assert_residency_exact(&all_delta, &all_sealed);
+        e55_assert_residency_exact(&mixed, &all_sealed);
+        tracing::info!(
+            target: "frankensearch.quill.gauntlet.e55",
+            seed,
+            corpus_hash = %format_args!("{:016x}", corpus.corpus_hash),
+            case_count = all_delta.cases.len(),
+            "completed exact E5.5 all-Delta to mixed to all-sealed campaign"
+        );
+    }
+
+    #[test]
+    fn e410_edge_state_query_matrix_is_total_and_residency_exact() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let empty = QuillIndex::in_memory_with_schema(E55_SCHEMA, e55_config())
+                .expect("construct E4.10 empty index");
+            let empty_cases = e410_capture_edge_state(
+                &empty,
+                &cx,
+                "empty",
+                E410EdgeStateShape {
+                    keeper_segments: 0,
+                    keeper_at_seal_documents: 0,
+                    keeper_tombstones: 0,
+                    delta_leaves: 0,
+                    delta_physical_documents: 0,
+                    delta_live_documents: 0,
+                    live_documents: 0,
+                    tombstoned_docid: None,
+                },
+            );
+
+            let delta_only = e410_delta_only_index();
+            let delta_cases = e410_capture_edge_state(
+                &delta_only,
+                &cx,
+                "delta_only",
+                E410EdgeStateShape {
+                    keeper_segments: 0,
+                    keeper_at_seal_documents: 0,
+                    keeper_tombstones: 0,
+                    delta_leaves: 1,
+                    delta_physical_documents: 1,
+                    delta_live_documents: 1,
+                    live_documents: 1,
+                    tombstoned_docid: None,
+                },
+            );
+
+            let (single, _, _) = e55_index_with_live_history(&cx).await;
+            let single_cases = e410_capture_edge_state(
+                &single,
+                &cx,
+                "single_sealed",
+                E410EdgeStateShape {
+                    keeper_segments: 1,
+                    keeper_at_seal_documents: 1,
+                    keeper_tombstones: 0,
+                    delta_leaves: 0,
+                    delta_physical_documents: 0,
+                    delta_live_documents: 0,
+                    live_documents: 1,
+                    tombstoned_docid: None,
+                },
+            );
+
+            let (all_tombstoned_source, _, retired_docid) = e55_index_with_live_history(&cx).await;
+            let all_tombstoned =
+                e55_tombstone_sealed_upsert_source(&all_tombstoned_source, retired_docid);
+            let tombstoned_cases = e410_capture_edge_state(
+                &all_tombstoned,
+                &cx,
+                "all_tombstoned",
+                E410EdgeStateShape {
+                    keeper_segments: 1,
+                    keeper_at_seal_documents: 1,
+                    keeper_tombstones: 1,
+                    delta_leaves: 0,
+                    delta_physical_documents: 0,
+                    delta_live_documents: 0,
+                    live_documents: 0,
+                    tombstoned_docid: Some(retired_docid),
+                },
+            );
+
+            assert_eq!(
+                delta_cases, single_cases,
+                "strict Delta-only and single-sealed states must be bit-exact",
+            );
+            assert_eq!(
+                empty_cases, tombstoned_cases,
+                "empty and all-tombstoned states must expose the same public results",
+            );
+        });
+    }
+
+    #[test]
+    fn e55_mixed_residency_conformance_is_exact() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            e55_run_mixed_residency_campaign(&cx, 0x55, 0).await;
+        });
+    }
+
+    #[test]
+    #[ignore = "nightly-only fixed-seed mixed-residency conformance campaign"]
+    fn e55_seeded_mixed_residency_conformance_is_exact() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            e55_run_mixed_residency_campaign(&cx, E55_NIGHTLY_SEED, 512).await;
+        });
     }
 
     #[test]
@@ -1422,6 +3212,39 @@ mod tests {
             ));
         });
         assert_eq!(observe_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn quill_observation_rejects_any_count_free_rank_drift() {
+        let evidence = QuillSearchResult {
+            hits: vec![frankensearch_quill::QuillHit {
+                document_id: "winner".to_owned(),
+                global_docid: 7,
+                score: 3.5,
+            }],
+            total_count: Some(1),
+            doc_count: 1,
+            diagnostics: Vec::new(),
+        };
+        let observed = QuillSearchResult {
+            total_count: None,
+            ..evidence.clone()
+        };
+        let expected_reason = "Quill observed and exhaustive collector pages differ";
+
+        let mut wrong_external_id = observed.clone();
+        wrong_external_id.hits[0].document_id = "other".to_owned();
+        let mut wrong_native_tie_key = observed.clone();
+        wrong_native_tie_key.hits[0].global_docid = 8;
+        let mut wrong_score_bits = observed;
+        wrong_score_bits.hits[0].score = f32::from_bits(3.5_f32.to_bits() + 1);
+
+        for mismatch in [wrong_external_id, wrong_native_tie_key, wrong_score_bits] {
+            assert!(matches!(
+                quill_observation_from_results(&mismatch, &evidence, 1, 0, false),
+                Err(GauntletError::InvalidObservation { reason }) if reason == expected_reason
+            ));
+        }
     }
 
     #[test]
@@ -1682,6 +3505,136 @@ mod tests {
                 "encode length={length}"
             );
         }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn e410_controlled_public_search_semantics_match_oracle() {
+        let revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let mut subject = QuillSubject::in_memory(e55_config(), "e410-subject", false)
+            .expect("E4.10 Quill subject");
+        let mut oracle =
+            TantivyOracle::in_memory_scalar_g1a(&revision, false).expect("E4.10 Tantivy oracle");
+        let documents = vec![
+            frankensearch_core::IndexableDocument::new("title-hit", "quiet filler")
+                .with_title("Needle"),
+            frankensearch_core::IndexableDocument::new(
+                "content-hit",
+                "needle filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler",
+            )
+            .with_title("quiet"),
+            frankensearch_core::IndexableDocument::new(
+                "hyphen-hit",
+                "ERR-404 troubleshooting guide",
+            ),
+            frankensearch_core::IndexableDocument::new("case-hit", "MiXeDcAsE identifier"),
+            frankensearch_core::IndexableDocument::new("special-hit", "C++ interop"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            subject
+                .claim_fresh_campaign()
+                .expect("claim E4.10 subject campaign");
+            subject
+                .index_mut()
+                .expect("E4.10 subject index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index E4.10 subject corpus");
+            subject
+                .index_mut()
+                .expect("E4.10 subject index")
+                .commit(&cx)
+                .await
+                .expect("commit E4.10 subject corpus");
+            subject
+                .mark_committed()
+                .expect("publish E4.10 subject campaign");
+
+            oracle
+                .claim_fresh_campaign()
+                .expect("claim E4.10 oracle campaign");
+            oracle
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index E4.10 oracle corpus");
+            oracle
+                .mark_committed()
+                .expect("publish E4.10 oracle campaign");
+
+            let harness = DifferentialHarness::default();
+            let mut casefold_hits = None;
+            for (id, query) in [
+                ("title-boost", "needle"),
+                ("casefold-lower", "mixedcase"),
+                ("casefold-mixed", "MiXeDcAsE"),
+                ("hyphen", "ERR-404"),
+                ("special-chars", "C++"),
+                ("empty-query", ""),
+            ] {
+                let mut case = DifferentialCase::new(format!("e410-{id}"), query, 10);
+                case.snippet_max_chars = None;
+                let run = harness
+                    .run(&cx, &subject, &oracle, &case)
+                    .await
+                    .unwrap_or_else(|error| panic!("E4.10 case {id} failed: {error}"));
+                assert_eq!(
+                    run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "E4.10 case {id}: {:?}",
+                    run.comparison.divergences,
+                );
+                assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+                if id == "title-boost" {
+                    assert_eq!(
+                        run.comparison
+                            .subject
+                            .hits
+                            .first()
+                            .map(|hit| hit.doc_id.as_str()),
+                        Some("title-hit"),
+                        "title-field boost must outrank a content-only hit",
+                    );
+                }
+                let ids = run
+                    .comparison
+                    .subject
+                    .hits
+                    .iter()
+                    .map(|hit| hit.doc_id.clone())
+                    .collect::<Vec<_>>();
+                if id.starts_with("casefold-") {
+                    assert_eq!(
+                        ids,
+                        vec!["case-hit".to_owned()],
+                        "case-folded query must retrieve the intended mixed-case document",
+                    );
+                    if let Some(expected) = &casefold_hits {
+                        assert_eq!(&ids, expected, "case-folded queries changed the hit set");
+                    } else {
+                        casefold_hits = Some(ids.clone());
+                    }
+                }
+                if id == "hyphen" {
+                    assert!(
+                        ids.iter().any(|doc_id| doc_id == "hyphen-hit"),
+                        "hyphenated query must retrieve the intended document: {ids:?}",
+                    );
+                }
+                if id == "special-chars" {
+                    assert_eq!(
+                        ids,
+                        vec!["special-hit".to_owned()],
+                        "special-character query must retrieve the intended document",
+                    );
+                }
+                if id == "empty-query" {
+                    assert!(ids.is_empty(), "empty query must return no hits");
+                }
+            }
+        });
     }
 
     #[cfg(feature = "tantivy-oracle")]

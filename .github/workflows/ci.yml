@@ -130,6 +130,11 @@ jobs:
           GAUNTLET_ORACLE_DIRTY: "false"
         run: cargo test --profile release -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_default_profile_campaign_nightly_full_lane -- --ignored --exact --nocapture
 
+      - name: Nightly Quill E5.5 seeded mixed-state conformance
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 30
+        run: cargo test --profile release -p frankensearch-quill-gauntlet engine::tests::e55_seeded_mixed_residency_conformance_is_exact -- --ignored --exact
+
       - name: Nightly full validation (all features)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
         run: cargo test --workspace --all-features -- --nocapture

@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use arc_swap::ArcSwap;
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
@@ -36,7 +37,8 @@ use crate::quiver::{
     EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
     EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdHashLookupPlan,
     IdHashSection, IdMapCodecError, IdMapEntry, IdMapSection, NumericSection, PositionList,
-    PostingList, StatsSection, StoredMetaSection, aggregate_field_stats,
+    PostingList, StatsSection, StoredMetaSection, ValidatedTermPruningMetadata,
+    aggregate_field_stats,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{
@@ -428,6 +430,13 @@ pub enum KeeperError {
         /// Canonical published segment path.
         path: PathBuf,
         /// Segment reader diagnosis.
+        #[source]
+        source: QuillError,
+    },
+    /// Canonical segment bytes could not be staged for an idempotent install.
+    #[error("cannot stage Quill segment for publication: {source}")]
+    SegmentInstall {
+        /// Segment-layer write or validation diagnosis.
         #[source]
         source: QuillError,
     },
@@ -1627,6 +1636,104 @@ pub struct ResolvedDocumentId {
     pub global_docid: u32,
 }
 
+#[derive(Clone)]
+struct CachedRankPruningTerm {
+    term_ord: u32,
+    term_metadata: TermMetadata,
+    pruning: Arc<ValidatedTermPruningMetadata>,
+}
+
+const MAX_RANK_PRUNING_CACHE_TERMS: usize = 128;
+const MAX_RANK_PRUNING_CACHE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Sparse lock-free cache for immutable per-term rank-pruning metadata.
+///
+/// Searches overwhelmingly revisit a small vocabulary relative to the full
+/// dictionary, so a copy-on-write sorted sidecar avoids allocating one cache
+/// cell per durable term. Concurrent first touches may duplicate validation,
+/// but compare-and-swap publishes exactly one paired result and readers never
+/// block one another.
+struct RankPruningCache {
+    terms: ArcSwap<Vec<CachedRankPruningTerm>>,
+}
+
+impl RankPruningCache {
+    fn new() -> Self {
+        Self {
+            terms: ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+
+    fn get(
+        &self,
+        term_ord: u32,
+        term_metadata: TermMetadata,
+    ) -> Result<Option<Arc<ValidatedTermPruningMetadata>>, &'static str> {
+        let terms = self.terms.load();
+        let Ok(index) = terms.binary_search_by_key(&term_ord, |term| term.term_ord) else {
+            return Ok(None);
+        };
+        let cached = &terms[index];
+        if cached.term_metadata != term_metadata {
+            return Err("cached rank-pruning term metadata disagrees with TERMDICT");
+        }
+        Ok(Some(Arc::clone(&cached.pruning)))
+    }
+
+    fn insert(
+        &self,
+        term_ord: u32,
+        term_metadata: TermMetadata,
+        pruning: Arc<ValidatedTermPruningMetadata>,
+    ) -> Result<Arc<ValidatedTermPruningMetadata>, &'static str> {
+        loop {
+            let current = self.terms.load_full();
+            match current.binary_search_by_key(&term_ord, |term| term.term_ord) {
+                Ok(index) => {
+                    let cached = &current[index];
+                    if cached.term_metadata != term_metadata {
+                        return Err("concurrent rank-pruning cache entry disagrees with TERMDICT");
+                    }
+                    return Ok(Arc::clone(&cached.pruning));
+                }
+                Err(insertion) => {
+                    let retained_bytes = current.iter().fold(0_usize, |bytes, term| {
+                        bytes.saturating_add(term.pruning.heap_bytes())
+                    });
+                    if current.len() >= MAX_RANK_PRUNING_CACHE_TERMS
+                        || pruning.heap_bytes()
+                            > MAX_RANK_PRUNING_CACHE_PAYLOAD_BYTES.saturating_sub(retained_bytes)
+                    {
+                        return Ok(pruning);
+                    }
+                    let mut next = Vec::new();
+                    next.try_reserve_exact(current.len().saturating_add(1))
+                        .map_err(|_| "could not allocate rank-pruning cache sidecar")?;
+                    next.extend(current.iter().cloned());
+                    next.insert(
+                        insertion,
+                        CachedRankPruningTerm {
+                            term_ord,
+                            term_metadata,
+                            pruning: Arc::clone(&pruning),
+                        },
+                    );
+                    let next = Arc::new(next);
+                    let previous = self.terms.compare_and_swap(&current, next);
+                    if Arc::ptr_eq(&current, &previous) {
+                        return Ok(pruning);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.terms.load().len()
+    }
+}
+
 /// One immutable mapped or owned segment admitted by a recovered snapshot.
 ///
 /// Structural framing, MANIFEST witnesses, and the IDMAP-bound IDHASH identity
@@ -1640,6 +1747,7 @@ pub struct RecoveredSegment {
     tombstone_index: TombstoneIndex,
     id_lookup: IdHashLookupPlan,
     live_doc_count: u32,
+    rank_pruning_cache: Arc<RankPruningCache>,
 }
 
 impl RecoveredSegment {
@@ -1672,13 +1780,19 @@ impl RecoveredSegment {
         manifest: ManifestSegment,
         reader: RecoveredSegmentBacking,
     ) -> Result<Self, KeeperError> {
-        Self::bind_shared(path, manifest, Arc::new(reader))
+        Self::bind_shared(
+            path,
+            manifest,
+            Arc::new(reader),
+            Arc::new(RankPruningCache::new()),
+        )
     }
 
     fn bind_shared(
         path: PathBuf,
         manifest: ManifestSegment,
         reader: Arc<RecoveredSegmentBacking>,
+        rank_pruning_cache: Arc<RankPruningCache>,
     ) -> Result<Self, KeeperError> {
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
         let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
@@ -1731,12 +1845,41 @@ impl RecoveredSegment {
             tombstone_index,
             id_lookup,
             live_doc_count,
+            rank_pruning_cache,
         })
     }
 
     fn rebind(&self, manifest: ManifestSegment) -> Result<Self, KeeperError> {
         self.reader.validate_witnesses(&self.path, &manifest)?;
-        Self::bind_shared(self.path.clone(), manifest, Arc::clone(&self.reader))
+        Self::bind_shared(
+            self.path.clone(),
+            manifest,
+            Arc::clone(&self.reader),
+            Arc::clone(&self.rank_pruning_cache),
+        )
+    }
+
+    pub(crate) fn cached_rank_pruning_metadata(
+        &self,
+        term_ord: u32,
+        term_metadata: TermMetadata,
+    ) -> Result<Option<Arc<ValidatedTermPruningMetadata>>, &'static str> {
+        self.rank_pruning_cache.get(term_ord, term_metadata)
+    }
+
+    pub(crate) fn cache_rank_pruning_metadata(
+        &self,
+        term_ord: u32,
+        term_metadata: TermMetadata,
+        pruning: Arc<ValidatedTermPruningMetadata>,
+    ) -> Result<Arc<ValidatedTermPruningMetadata>, &'static str> {
+        self.rank_pruning_cache
+            .insert(term_ord, term_metadata, pruning)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_rank_pruning_term_count(&self) -> usize {
+        self.rank_pruning_cache.len()
     }
 
     /// Canonical published path, or a stable synthetic label for owned bytes.
@@ -2868,6 +3011,49 @@ impl KeeperWriter {
                 admission.ensure_directory_identity()?;
                 return Ok(published);
             }
+            let published = match &protection {
+                WriterProtection::Disabled => publish_pending_segment(pending),
+                #[cfg(feature = "durability")]
+                WriterProtection::Enabled(protector) => {
+                    publish_pending_segment_durable(pending, protector)
+                }
+            }?;
+            admission.ensure_directory_identity()?;
+            Ok(published)
+        })
+        .await
+    }
+
+    /// Reconcile or install retained canonical bytes under one mutation guard.
+    ///
+    /// Unlike a caller-created [`PendingSegmentFile`], this operation acquires
+    /// the process-wide writer guard before inspecting either the canonical
+    /// destination or retry temp. A dropped future may leave its blocking
+    /// closure running, but a retry cannot race that closure or manufacture a
+    /// redundant temp after the exact canonical file already won.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed lock, byte-conflict, segment-write, sidecar, or fsync
+    /// failure. Existing differing artifacts are preserved.
+    pub(crate) async fn publish_encoded_segment_retryable(
+        &self,
+        cx: &Cx,
+        encoded: Arc<EncodedSegment>,
+    ) -> Result<PathBuf, KeeperError> {
+        let guard = writer_mutation_guard(cx).await?;
+        let admission = Arc::clone(&self.admission);
+        let protection = self.protection.clone();
+        spawn_blocking(move || {
+            let _guard = guard;
+            admission.ensure_directory_identity()?;
+            if let Some(published) = reconcile_encoded_segment(&admission, &protection, &encoded)? {
+                admission.ensure_directory_identity()?;
+                return Ok(published);
+            }
+            let pending = encoded
+                .write_temp_retryable(&admission.directory)
+                .map_err(|source| KeeperError::SegmentInstall { source })?;
             let published = match &protection {
                 WriterProtection::Disabled => publish_pending_segment(pending),
                 #[cfg(feature = "durability")]
@@ -4207,6 +4393,68 @@ fn reconcile_published_segment(
             source: io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "published segment differs from the retry temp",
+            ),
+        });
+    }
+    File::open(&published)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| KeeperError::Io {
+            operation: "sync reconciled segment",
+            path: published.clone(),
+            source,
+        })?;
+    sync_directory(&admission.directory)?;
+    #[cfg(feature = "durability")]
+    if let WriterProtection::Enabled(protector) = protection {
+        ensure_matching_durability_sidecar(admission, protector, &published, &actual)?;
+        sync_directory(&admission.directory)?;
+    }
+    #[cfg(not(feature = "durability"))]
+    let _ = protection;
+    Ok(Some(published))
+}
+
+fn reconcile_encoded_segment(
+    admission: &WriterAdmissionInner,
+    protection: &WriterProtection,
+    encoded: &EncodedSegment,
+) -> Result<Option<PathBuf>, KeeperError> {
+    let published = admission
+        .directory
+        .join(canonical_segment_name(encoded.header().segment_id));
+    let metadata = match std::fs::symlink_metadata(&published) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "inspect retry segment destination",
+                path: published,
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.len() != encoded.file_len() {
+        return Err(KeeperError::Io {
+            operation: "reconcile encoded segment",
+            path: published,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "published segment is not the exact expected regular file",
+            ),
+        });
+    }
+    let actual = std::fs::read(&published).map_err(|source| KeeperError::Io {
+        operation: "read retry segment destination",
+        path: published.clone(),
+        source,
+    })?;
+    if actual.as_slice() != encoded.as_bytes() {
+        return Err(KeeperError::Io {
+            operation: "reconcile encoded segment",
+            path: published,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "published segment differs from the retained canonical bytes",
             ),
         });
     }
@@ -7788,7 +8036,18 @@ fn publish_manifest_locked<C, F>(
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
-    publish_manifest_choreography(directory, bytes, claim, |_, _| Ok(()))
+    #[cfg(test)]
+    {
+        let observed_directory = directory.clone();
+        publish_manifest_choreography(directory, bytes, claim, move |checkpoint, _| {
+            observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint);
+            Ok(())
+        })
+    }
+    #[cfg(not(test))]
+    {
+        publish_manifest_choreography(directory, bytes, claim, |_, _| Ok(()))
+    }
 }
 
 #[cfg(feature = "durability")]
@@ -7802,17 +8061,144 @@ fn publish_manifest_durable_locked<C, F>(
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
-    publish_manifest_durable_choreography(directory, bytes, claim, protector, |_, _| Ok(()))
+    #[cfg(test)]
+    {
+        let observed_directory = directory.clone();
+        publish_manifest_durable_choreography(
+            directory,
+            bytes,
+            claim,
+            protector,
+            move |checkpoint, _| {
+                observe_manifest_publish_checkpoint_for_test(&observed_directory, checkpoint);
+                Ok(())
+            },
+        )
+    }
+    #[cfg(not(test))]
+    {
+        publish_manifest_durable_choreography(directory, bytes, claim, protector, |_, _| Ok(()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublishCheckpoint {
+pub(crate) enum PublishCheckpoint {
     TempWritten,
     TempSynced,
     GenerationClaimed,
     CurrentMovedToPrevious,
     TempMovedToCurrent,
     DirectorySynced,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ManifestPublishPause {
+    checkpoint: PublishCheckpoint,
+    reached: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// One-shot control for pausing real MANIFEST choreography in cancellation
+/// tests after a named filesystem checkpoint has completed.
+#[cfg(test)]
+pub(crate) struct ManifestPublishPauseControl {
+    directory: PathBuf,
+    reached: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+static MANIFEST_PUBLISH_PAUSES: OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn manifest_publish_pauses() -> &'static std::sync::Mutex<BTreeMap<PathBuf, ManifestPublishPause>> {
+    MANIFEST_PUBLISH_PAUSES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Arm one real MANIFEST publisher checkpoint for a single directory.
+#[cfg(test)]
+pub(crate) fn pause_manifest_publish_at_checkpoint_for_test(
+    directory: &Path,
+    checkpoint: PublishCheckpoint,
+) -> ManifestPublishPauseControl {
+    let directory = normalize_publish_directory(directory.to_path_buf());
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let pause = ManifestPublishPause {
+        checkpoint,
+        reached: Arc::clone(&reached),
+        released: Arc::clone(&released),
+    };
+    let previous = manifest_publish_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(directory.clone(), pause);
+    assert!(
+        previous.is_none(),
+        "only one MANIFEST checkpoint pause may be armed per directory"
+    );
+    ManifestPublishPauseControl {
+        directory,
+        reached,
+        released,
+    }
+}
+
+#[cfg(test)]
+impl ManifestPublishPauseControl {
+    /// Whether the blocking publisher has completed the armed checkpoint.
+    pub(crate) fn is_reached(&self) -> bool {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Release the blocked choreography. Calling this more than once is safe.
+    pub(crate) fn release(&self) {
+        manifest_publish_pauses()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.directory);
+        let (released, wake) = self.released.as_ref();
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ManifestPublishPauseControl {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+fn observe_manifest_publish_checkpoint_for_test(directory: &Path, checkpoint: PublishCheckpoint) {
+    let pause = manifest_publish_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(directory)
+        .filter(|pause| pause.checkpoint == checkpoint)
+        .cloned();
+    let Some(pause) = pause else {
+        return;
+    };
+    pause
+        .reached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (released, wake) = pause.released.as_ref();
+    let mut released = released
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !*released {
+        released = wake
+            .wait(released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    drop(released);
 }
 
 fn publish_manifest_choreography<C, F, O>(
@@ -8342,7 +8728,7 @@ fn open_existing_manifest_temp(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
-fn validate_manifest_successor(
+pub(crate) fn validate_manifest_successor(
     previous: &Manifest,
     proposed: &Manifest,
 ) -> Result<(), KeeperError> {
@@ -10186,6 +10572,38 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn rank_pruning_cache_caps_unique_terms_and_rejects_dictionary_drift() {
+        let cache = RankPruningCache::new();
+        let term_metadata =
+            TermMetadata::without_positions(1, ByteSpan::new(0, 1), ByteSpan::new(0, 1));
+        for term_ord in
+            0..u32::try_from(MAX_RANK_PRUNING_CACHE_TERMS + 16).expect("cache test count fits u32")
+        {
+            cache
+                .insert(
+                    term_ord,
+                    term_metadata,
+                    Arc::new(ValidatedTermPruningMetadata::empty_for_cache_test()),
+                )
+                .expect("bounded cache admission");
+        }
+        assert_eq!(cache.len(), MAX_RANK_PRUNING_CACHE_TERMS);
+        assert!(
+            cache
+                .get(
+                    u32::try_from(MAX_RANK_PRUNING_CACHE_TERMS).expect("cache limit fits u32"),
+                    term_metadata,
+                )
+                .expect("bounded cache lookup")
+                .is_none(),
+            "terms beyond the cap must remain query-local"
+        );
+
+        let drifted = TermMetadata::without_positions(1, ByteSpan::new(1, 1), ByteSpan::new(0, 1));
+        assert!(cache.get(0, drifted).is_err());
+    }
 
     fn array_tombstone_bytes(chunk_id: u16, lows: &[u16]) -> Vec<u8> {
         let mut bytes = Vec::new();

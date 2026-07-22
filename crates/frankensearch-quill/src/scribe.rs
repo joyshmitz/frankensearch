@@ -42,10 +42,12 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
 
+use frankensearch_core::DocId;
 use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::contract::fieldnorm_to_id;
+use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
 use crate::grimoire::{
     ByteSpan, EncodedTermDictionary, MAX_TERM_BYTES, TermDictionaryError, TermInput, TermMetadata,
@@ -55,8 +57,8 @@ use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenFieldInput, EncodedDocLenSection, EncodedIdHashSection,
     EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
     EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError,
-    IdMapEntryInput, NumericCodecError, NumericValue, PositionCodecError, Posting, StatsCodecError,
-    StoredMetaCodecError,
+    IdMapEntryInput, NumericCodecError, NumericEntry, NumericFieldInput, NumericValue,
+    PositionCodecError, Posting, StatsCodecError, StoredMetaCodecError, StoredMetaFieldInput,
 };
 use crate::schema::{Analyzer as AnalyzerKind, FieldKind, SchemaDescriptor};
 use crate::segment::{EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput};
@@ -783,7 +785,7 @@ pub struct ArenaSpan {
 /// Not a general allocator: append-only between resets, no per-item free.
 /// [`reset`](Self::reset) retains every standard chunk at full capacity so a
 /// steady-state flush cycle performs zero global allocations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ByteArena {
     chunks: Vec<Vec<u8>>,
     chunk_size: usize,
@@ -906,11 +908,13 @@ impl Default for ByteArena {
 
 /// Collision bucket: hash → term id(s). The `Many` arm is exercised only on
 /// 64-bit hash collisions (or by tests injecting a degenerate hasher).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Bucket {
     One(u32),
     Many(Vec<u32>),
 }
+
+pub(crate) const TERM_BUCKET_BYTES_ESTIMATE: usize = 8 + std::mem::size_of::<Bucket>() + 8;
 
 /// Per-shard composite-key term interner.
 ///
@@ -922,7 +926,7 @@ enum Bucket {
 /// durable hashing elsewhere in Quill is xxh3 by contract, FSLX §2). Tests
 /// inject a constant hasher to force every key through the `Many`
 /// verification path.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TermInterner<S: BuildHasher = ahash::RandomState> {
     arena: ByteArena,
     spans: Vec<ArenaSpan>,
@@ -957,63 +961,89 @@ impl<S: BuildHasher> TermInterner<S> {
         }
     }
 
-    fn hash_key(&self, key: &[u8]) -> u64 {
+    fn hash_parts(&self, field_ord: u16, term: &[u8]) -> u64 {
         let mut h = self.hasher.build_hasher();
-        h.write(key);
+        h.write(&field_ord.to_be_bytes());
+        h.write(term);
         h.finish()
+    }
+
+    fn matches(&self, id: u32, field_ord: u16, term: &[u8]) -> bool {
+        let key = self.arena.resolve(self.spans[id as usize]);
+        key.len() == FIELD_PREFIX_BYTES + term.len()
+            && key[..FIELD_PREFIX_BYTES] == field_ord.to_be_bytes()
+            && key[FIELD_PREFIX_BYTES..] == *term
+    }
+
+    fn find_in_bucket(&self, hash: u64, field_ord: u16, term: &[u8]) -> Option<u32> {
+        match self.buckets.get(&hash)? {
+            Bucket::One(id) => self.matches(*id, field_ord, term).then_some(*id),
+            Bucket::Many(ids) => ids
+                .iter()
+                .copied()
+                .find(|id| self.matches(*id, field_ord, term)),
+        }
+    }
+
+    /// Find an existing composite term without mutating the interner.
+    pub(crate) fn find(&self, field_ord: u16, term: &[u8]) -> Option<u32> {
+        let hash = self.hash_parts(field_ord, term);
+        self.find_in_bucket(hash, field_ord, term)
     }
 
     /// Intern `(field_ord, term)`, returning the dense local id.
     ///
     /// Hot path: existing terms cost one hash + one arena compare and perform
-    /// zero allocations (the composite key is assembled in a reused scratch
-    /// buffer).
+    /// zero allocations (the prefix and term bytes are hashed directly;
+    /// composite-key scratch is populated only for a new term).
     ///
     /// # Panics
     /// Panics if the number of distinct terms exceeds `u32` — unreachable
     /// under the shard budget.
     pub fn intern(&mut self, field_ord: u16, term: &[u8]) -> u32 {
+        self.intern_accounted(field_ord, term).0
+    }
+
+    /// Intern a term and return its exact increment to [`Self::bytes_used`].
+    ///
+    /// The delta segment uses the increment to keep its seal check O(1). The
+    /// normal Scribe path needs only the dense id and uses [`Self::intern`].
+    pub(crate) fn intern_accounted(&mut self, field_ord: u16, term: &[u8]) -> (u32, usize) {
+        let hash = self.hash_parts(field_ord, term);
+        if let Some(id) = self.find_in_bucket(hash, field_ord, term) {
+            return (id, 0);
+        }
+
         self.key_scratch.clear();
         self.key_scratch.extend_from_slice(&field_ord.to_be_bytes());
         self.key_scratch.extend_from_slice(term);
-        let hash = self.hash_key(&self.key_scratch);
-
-        if let Some(bucket) = self.buckets.get(&hash) {
-            match bucket {
-                Bucket::One(id) => {
-                    if self.arena.resolve(self.spans[*id as usize]) == self.key_scratch.as_slice() {
-                        return *id;
-                    }
-                }
-                Bucket::Many(ids) => {
-                    for id in ids {
-                        if self.arena.resolve(self.spans[*id as usize])
-                            == self.key_scratch.as_slice()
-                        {
-                            return *id;
-                        }
-                    }
-                }
-            }
-        }
 
         // New term: copy the composite key into the arena, assign the next id.
         let span = self.arena.push(&self.key_scratch);
         let id = u32::try_from(self.spans.len()).expect("term id space exceeds u32");
         self.spans.push(span);
-        match self.buckets.entry(hash) {
+        let bucket_bytes = match self.buckets.entry(hash) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(Bucket::One(id));
+                TERM_BUCKET_BYTES_ESTIMATE
             }
             std::collections::hash_map::Entry::Occupied(mut o) => match o.get_mut() {
                 Bucket::One(existing) => {
                     let existing = *existing;
                     *o.get_mut() = Bucket::Many(vec![existing, id]);
+                    2 * std::mem::size_of::<u32>()
                 }
-                Bucket::Many(ids) => ids.push(id),
+                Bucket::Many(ids) => {
+                    ids.push(id);
+                    std::mem::size_of::<u32>()
+                }
             },
-        }
-        id
+        };
+        let added_bytes = FIELD_PREFIX_BYTES
+            .saturating_add(term.len())
+            .saturating_add(std::mem::size_of::<ArenaSpan>())
+            .saturating_add(bucket_bytes);
+        (id, added_bytes)
     }
 
     /// Number of distinct interned terms.
@@ -1069,7 +1099,6 @@ impl<S: BuildHasher> TermInterner<S> {
     /// [`Self::bytes_reserved`] for RSS diagnostics.
     #[must_use]
     pub fn bytes_used(&self) -> usize {
-        const BUCKET_ESTIMATE: usize = 8 + std::mem::size_of::<Bucket>() + 8;
         let collision_ids = self
             .buckets
             .values()
@@ -1080,14 +1109,13 @@ impl<S: BuildHasher> TermInterner<S> {
             .sum::<usize>();
         self.arena.bytes_used()
             + self.spans.len() * std::mem::size_of::<ArenaSpan>()
-            + self.buckets.len() * BUCKET_ESTIMATE
+            + self.buckets.len() * TERM_BUCKET_BYTES_ESTIMATE
             + collision_ids
     }
 
     /// Complete retained interner allocation for RSS/reuse diagnostics.
     #[must_use]
     pub fn bytes_reserved(&self) -> usize {
-        const BUCKET_ESTIMATE: usize = 8 + std::mem::size_of::<Bucket>() + 8;
         let collision_ids = self
             .buckets
             .values()
@@ -1103,7 +1131,11 @@ impl<S: BuildHasher> TermInterner<S> {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<ArenaSpan>()),
             )
-            .saturating_add(self.buckets.capacity().saturating_mul(BUCKET_ESTIMATE))
+            .saturating_add(
+                self.buckets
+                    .capacity()
+                    .saturating_mul(TERM_BUCKET_BYTES_ESTIMATE),
+            )
             .saturating_add(self.key_scratch.capacity())
             .saturating_add(collision_ids)
     }
@@ -2506,6 +2538,22 @@ pub struct FlushSegmentInput<'a> {
     pub documents: &'a [FlushDocumentInput<'a>],
 }
 
+/// Fixed metadata for sealing one immutable Delta epoch.
+///
+/// Delta owns its lease, live identity rows, and canonical per-document seal
+/// sidecars, so callers supply only the values persisted in the FSLX header.
+/// Supplying these values explicitly also makes Delta and accumulator seals
+/// byte-comparable under deterministic tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaFlushInput {
+    /// Collision-checked immutable segment identifier.
+    pub segment_id: u64,
+    /// Informational creation timestamp persisted in the segment header.
+    pub created_unix_s: i64,
+    /// Packed engine version persisted in the segment header.
+    pub engine_version: u32,
+}
+
 /// Execution strategy for the stable radix partition used during a Scribe flush.
 ///
 /// [`FlushMode::Automatic`] preserves the shipping behavior and may use Rayon
@@ -2556,6 +2604,20 @@ pub enum FlushError {
         expected: u32,
         /// Sidecar ordinal at this index.
         actual: u32,
+    },
+    /// Every live Delta identity must retain its canonical IDMAP witness.
+    #[error("live Delta document {global_docid} has no canonical content hash")]
+    MissingDeltaContentHash {
+        /// Global document identifier whose seal sidecar is incomplete.
+        global_docid: u32,
+    },
+    /// Every live Delta row must retain one raw length per indexed string field.
+    #[error("live Delta document {global_docid} has no raw length for field {field_ord}")]
+    MissingDeltaFieldLength {
+        /// Indexed string field ordinal.
+        field_ord: u16,
+        /// Global document identifier whose seal sidecar is incomplete.
+        global_docid: u32,
     },
     /// Rebase would leave the FSLX u32 global-document domain.
     #[error(
@@ -2788,14 +2850,6 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
             docid_lo,
             &doclen_columns,
         )?;
-    let term_sections = TermSectionLengths {
-        postings: durable_len(&postings_bytes, "POSTINGS length")?,
-        positions: schema_has_positions(schema)
-            .then(|| durable_len(&positions_bytes, "POSITIONS length"))
-            .transpose()?,
-        blockmax: durable_len(&blockmax_bytes, "BLOCKMAX length")?,
-    };
-    let termdict = EncodedTermDictionary::encode_sorted(schema, term_sections, &term_inputs)?;
 
     let doclen_inputs = expected_field_ords
         .iter()
@@ -2843,6 +2897,373 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
         .map(|field| FieldStats::new(field.field_ord(), field.total_tokens(), doc_count))
         .collect::<Vec<_>>();
     let stats = EncodedStatsSection::encode(&expected_field_ords, &stats_rows, doc_count)?;
+    let encoded = encode_canonical_segment(
+        DeltaFlushInput {
+            segment_id: input.segment_id,
+            created_unix_s: input.created_unix_s,
+            engine_version: input.engine_version,
+        },
+        schema,
+        docid_lo,
+        docid_hi,
+        doc_count,
+        (postings_bytes, positions_bytes, blockmax_bytes, term_inputs),
+        &doclen,
+        &id_map,
+        &id_hash,
+        numeric.as_ref(),
+        stored_meta.as_ref(),
+        &stats,
+    )?;
+    flush_span.record("result_count", u64::from(doc_count));
+    flush_span.record("output_bytes", encoded.file_len());
+    Ok(encoded)
+}
+
+/// Seal one immutable Delta epoch into the canonical FSLX mini-segment format.
+///
+/// Delta chains are already grouped by term, so this path skips only Scribe's
+/// token-row radix partition. It sorts terms by the shared interner's canonical
+/// composite bytes, folds Delta-local tombstones into holes, and then enters
+/// the same posting/block-max append and final section assembly used by
+/// [`flush_accumulator`]. The snapshot is borrowed for the complete build and
+/// remains independently publishable until Keeper makes the returned bytes
+/// durable.
+///
+/// # Errors
+///
+/// Returns [`FlushError`] when a live Delta row lacks a required seal sidecar,
+/// when an immutable Delta invariant is inconsistent, or when any canonical
+/// section codec rejects the lowered rows.
+pub fn flush_delta_snapshot(
+    snapshot: &DeltaSnapshot,
+    input: DeltaFlushInput,
+) -> Result<Option<EncodedSegment>, FlushError> {
+    let mut live_documents = Vec::new();
+    live_documents
+        .try_reserve_exact(snapshot.live_document_count())
+        .map_err(|_| FlushError::Allocation {
+            resource: "live Delta document table",
+            count: snapshot.live_document_count(),
+        })?;
+    live_documents.extend(snapshot.live_documents());
+    let Some(&(first_docid, _)) = live_documents.first() else {
+        return Ok(None);
+    };
+    let &(last_docid, _) = live_documents
+        .last()
+        .expect("a nonempty live Delta document table has a final row");
+    let docid_lo = u64::from(first_docid);
+    let docid_hi = u64::from(last_docid)
+        .checked_add(1)
+        .ok_or(FlushError::ArithmeticOverflow {
+            field: "exclusive Delta document high bound",
+        })?;
+    let span =
+        usize::try_from(docid_hi - docid_lo).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "Delta document span host size",
+        })?;
+    let doc_count =
+        u32::try_from(live_documents.len()).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "Delta segment document count",
+        })?;
+    let schema = snapshot.schema();
+
+    let (expected_field_ords, doclen_columns, stats_rows) =
+        build_delta_doclen_and_stats(snapshot, &live_documents, docid_lo, span, doc_count)?;
+    let term_streams =
+        encode_delta_term_streams(snapshot, docid_lo, &expected_field_ords, &doclen_columns)?;
+    let doclen_inputs = expected_field_ords
+        .iter()
+        .copied()
+        .zip(&doclen_columns)
+        .map(|(field_ord, values)| DocLenFieldInput::new(field_ord, values))
+        .collect::<Vec<_>>();
+    let doclen =
+        EncodedDocLenSection::encode(docid_lo, docid_hi, &expected_field_ords, &doclen_inputs)?;
+
+    let id_map_inputs = build_delta_id_map_inputs(snapshot, &live_documents, docid_lo, span)?;
+    let id_map = EncodedIdMapSection::encode(docid_lo, docid_hi, &id_map_inputs)?;
+    let id_hash = EncodedIdHashSection::encode(id_map.section()?)?;
+    let numeric = encode_delta_numeric(snapshot, &live_documents, docid_lo, docid_hi)?;
+    let stored_meta =
+        encode_delta_stored_meta(snapshot, &live_documents, docid_lo, docid_hi, span)?;
+    let stats = EncodedStatsSection::encode(&expected_field_ords, &stats_rows, doc_count)?;
+
+    encode_canonical_segment(
+        input,
+        schema,
+        docid_lo,
+        docid_hi,
+        doc_count,
+        term_streams,
+        &doclen,
+        &id_map,
+        &id_hash,
+        numeric.as_ref(),
+        stored_meta.as_ref(),
+        &stats,
+    )
+    .map(Some)
+}
+
+type LiveDeltaDocument<'a> = (u32, &'a DocId);
+type DeltaDoclenAndStats = (Vec<u16>, Vec<Vec<Option<u32>>>, Vec<FieldStats>);
+
+fn build_delta_doclen_and_stats(
+    snapshot: &DeltaSnapshot,
+    live_documents: &[LiveDeltaDocument<'_>],
+    docid_lo: u64,
+    span: usize,
+    doc_count: u32,
+) -> Result<DeltaDoclenAndStats, FlushError> {
+    let mut field_ords = Vec::new();
+    let indexed_field_count = snapshot
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+        .count();
+    field_ords
+        .try_reserve_exact(indexed_field_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta DOCLEN field ordinals",
+            count: indexed_field_count,
+        })?;
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(indexed_field_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta DOCLEN columns",
+            count: indexed_field_count,
+        })?;
+    let mut stats_rows = Vec::new();
+    stats_rows
+        .try_reserve_exact(indexed_field_count)
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta STATS rows",
+            count: indexed_field_count,
+        })?;
+
+    for field in snapshot
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+    {
+        let mut column = filled_vec(span, None, "Delta DOCLEN span")?;
+        let mut total_tokens = 0_u64;
+        for &(global_docid, _) in live_documents {
+            let relative = u64::from(global_docid).checked_sub(docid_lo).ok_or(
+                FlushError::ArithmeticOverflow {
+                    field: "Delta DOCLEN relative document index",
+                },
+            )?;
+            let relative =
+                usize::try_from(relative).map_err(|_| FlushError::ArithmeticOverflow {
+                    field: "Delta DOCLEN relative document host index",
+                })?;
+            let raw_length = snapshot
+                .segment()
+                .raw_field_length(field.id, global_docid)
+                .ok_or(FlushError::MissingDeltaFieldLength {
+                    field_ord: field.id,
+                    global_docid,
+                })?;
+            let slot = column
+                .get_mut(relative)
+                .ok_or(FlushError::ArithmeticOverflow {
+                    field: "Delta DOCLEN document span",
+                })?;
+            *slot = Some(raw_length);
+            total_tokens = total_tokens.checked_add(u64::from(raw_length)).ok_or(
+                FlushError::ArithmeticOverflow {
+                    field: "Delta STATS token numerator",
+                },
+            )?;
+        }
+        field_ords.push(field.id);
+        columns.push(column);
+        stats_rows.push(FieldStats::new(field.id, total_tokens, doc_count));
+    }
+    Ok((field_ords, columns, stats_rows))
+}
+
+fn build_delta_id_map_inputs<'a>(
+    snapshot: &'a DeltaSnapshot,
+    live_documents: &[LiveDeltaDocument<'a>],
+    docid_lo: u64,
+    span: usize,
+) -> Result<Vec<Option<IdMapEntryInput<'a>>>, FlushError> {
+    let mut entries = filled_vec(span, None, "Delta IDMAP span")?;
+    for &(global_docid, document_id) in live_documents {
+        let relative = u64::from(global_docid).checked_sub(docid_lo).ok_or(
+            FlushError::ArithmeticOverflow {
+                field: "Delta IDMAP relative document index",
+            },
+        )?;
+        let relative = usize::try_from(relative).map_err(|_| FlushError::ArithmeticOverflow {
+            field: "Delta IDMAP relative document host index",
+        })?;
+        let content_hash = snapshot
+            .content_hash(global_docid)
+            .ok_or(FlushError::MissingDeltaContentHash { global_docid })?;
+        let slot = entries
+            .get_mut(relative)
+            .ok_or(FlushError::ArithmeticOverflow {
+                field: "Delta IDMAP document span",
+            })?;
+        *slot = Some(IdMapEntryInput::new(document_id.as_str(), content_hash));
+    }
+    Ok(entries)
+}
+
+fn encode_delta_numeric(
+    snapshot: &DeltaSnapshot,
+    live_documents: &[LiveDeltaDocument<'_>],
+    docid_lo: u64,
+    docid_hi: u64,
+) -> Result<Option<EncodedNumericSection>, FlushError> {
+    let numeric_fields = snapshot
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.kind,
+                FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    if numeric_fields.is_empty() {
+        return Ok(None);
+    }
+
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(numeric_fields.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta NUMERIC columns",
+            count: numeric_fields.len(),
+        })?;
+    for field in &numeric_fields {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(live_documents.len())
+            .map_err(|_| FlushError::Allocation {
+                resource: "Delta NUMERIC entries",
+                count: live_documents.len(),
+            })?;
+        for &(global_docid, _) in live_documents {
+            let Some(value) = snapshot.numeric_value(field.id, global_docid) else {
+                continue;
+            };
+            entries.push(match value {
+                NumericValue::I64(value) => NumericEntry::i64(value, global_docid),
+                NumericValue::U64(value) => NumericEntry::u64(value, global_docid),
+            });
+        }
+        columns.push(entries);
+    }
+    let inputs = numeric_fields
+        .iter()
+        .zip(&columns)
+        .map(|(field, entries)| NumericFieldInput::new(field.id, entries))
+        .collect::<Vec<_>>();
+    Ok(Some(EncodedNumericSection::encode(
+        snapshot.schema(),
+        docid_lo,
+        docid_hi,
+        &inputs,
+    )?))
+}
+
+fn encode_delta_stored_meta<'a>(
+    snapshot: &'a DeltaSnapshot,
+    live_documents: &[LiveDeltaDocument<'a>],
+    docid_lo: u64,
+    docid_hi: u64,
+    span: usize,
+) -> Result<Option<EncodedStoredMetaSection>, FlushError> {
+    let stored_fields = snapshot
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| field.stored)
+        .collect::<Vec<_>>();
+    if stored_fields.is_empty() {
+        return Ok(None);
+    }
+
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(stored_fields.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta STOREDMETA columns",
+            count: stored_fields.len(),
+        })?;
+    for field in &stored_fields {
+        let mut values = filled_vec(span, None, "Delta STOREDMETA span")?;
+        for &(global_docid, _) in live_documents {
+            let relative = u64::from(global_docid).checked_sub(docid_lo).ok_or(
+                FlushError::ArithmeticOverflow {
+                    field: "Delta STOREDMETA relative document index",
+                },
+            )?;
+            let relative =
+                usize::try_from(relative).map_err(|_| FlushError::ArithmeticOverflow {
+                    field: "Delta STOREDMETA relative document host index",
+                })?;
+            let slot = values
+                .get_mut(relative)
+                .ok_or(FlushError::ArithmeticOverflow {
+                    field: "Delta STOREDMETA document span",
+                })?;
+            *slot = snapshot.stored_value(field.id, global_docid);
+        }
+        columns.push(values);
+    }
+    let expected_field_ords = stored_fields
+        .iter()
+        .map(|field| field.id)
+        .collect::<Vec<_>>();
+    let inputs = stored_fields
+        .iter()
+        .zip(&columns)
+        .map(|(field, values)| StoredMetaFieldInput::new(field.id, values))
+        .collect::<Vec<_>>();
+    Ok(Some(EncodedStoredMetaSection::encode(
+        docid_lo,
+        docid_hi,
+        &expected_field_ords,
+        &inputs,
+    )?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_canonical_segment(
+    input: DeltaFlushInput,
+    schema: SchemaDescriptor,
+    docid_lo: u64,
+    docid_hi: u64,
+    doc_count: u32,
+    term_streams: OrderedTermStreams<'_>,
+    doclen: &EncodedDocLenSection,
+    id_map: &EncodedIdMapSection,
+    id_hash: &EncodedIdHashSection,
+    numeric: Option<&EncodedNumericSection>,
+    stored_meta: Option<&EncodedStoredMetaSection>,
+    stats: &EncodedStatsSection,
+) -> Result<EncodedSegment, FlushError> {
+    let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) = term_streams;
+    let term_sections = TermSectionLengths {
+        postings: durable_len(&postings_bytes, "POSTINGS length")?,
+        positions: schema_has_positions(schema)
+            .then(|| durable_len(&positions_bytes, "POSITIONS length"))
+            .transpose()?,
+        blockmax: durable_len(&blockmax_bytes, "BLOCKMAX length")?,
+    };
+    let termdict = EncodedTermDictionary::encode_sorted(schema, term_sections, &term_inputs)?;
 
     let mut sections = Vec::new();
     sections
@@ -2863,10 +3284,10 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
     sections.push(SectionInput::new(SectionKind::DOCLEN, doclen.as_bytes()));
     sections.push(SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()));
     sections.push(SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()));
-    if let Some(numeric) = &numeric {
+    if let Some(numeric) = numeric {
         sections.push(SectionInput::new(SectionKind::NUMERIC, numeric.as_bytes()));
     }
-    if let Some(stored_meta) = &stored_meta {
+    if let Some(stored_meta) = stored_meta {
         sections.push(SectionInput::new(
             SectionKind::STOREDMETA,
             stored_meta.as_bytes(),
@@ -2874,7 +3295,7 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
     }
     sections.push(SectionInput::new(SectionKind::STATS, stats.as_bytes()));
 
-    let encoded = EncodedSegment::encode(
+    EncodedSegment::encode(
         SegmentHeaderInput {
             segment_id: input.segment_id,
             schema,
@@ -2886,10 +3307,7 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
         },
         &sections,
     )
-    .map_err(FlushError::from)?;
-    flush_span.record("result_count", u64::from(doc_count));
-    flush_span.record("output_bytes", encoded.file_len());
-    Ok(encoded)
+    .map_err(FlushError::from)
 }
 
 fn schema_has_positions(schema: SchemaDescriptor) -> bool {
@@ -3471,45 +3889,164 @@ fn encode_ordered_term_streams<'a, A: TokenAnalyzer>(
                     field_ord,
                     detail: "missing DOCLEN source column",
                 })?;
-        let (encoded_postings, encoded_blockmax) =
-            EncodedPostingList::encode_with_block_max(&postings, |global_docid| {
-                let relative = u64::from(global_docid).checked_sub(docid_lo)?;
-                let relative = usize::try_from(relative).ok()?;
-                field_doclens
-                    .get(relative)
-                    .copied()
-                    .flatten()
-                    .map(fieldnorm_to_id)
-            })?;
-        let encoded_positions = positions
-            .as_deref()
-            .map(|values| EncodedPositionList::encode(&postings, values))
-            .transpose()?;
-        let postings_span = append_span(
-            &mut postings_bytes,
-            encoded_postings.as_bytes(),
-            "POSTINGS span",
-        )?;
-        let positions_span = encoded_positions
-            .as_ref()
-            .map(|encoded| append_span(&mut positions_bytes, encoded.as_bytes(), "POSITIONS span"))
-            .transpose()?;
-        let blockmax_span = append_span(
-            &mut blockmax_bytes,
-            encoded_blockmax.as_bytes(),
-            "BLOCKMAX span",
-        )?;
-        let doc_freq = encoded_postings.doc_freq();
-        let metadata = positions_span.map_or_else(
-            || TermMetadata::without_positions(doc_freq, postings_span, blockmax_span),
-            |positions_span| {
-                TermMetadata::with_positions(doc_freq, postings_span, positions_span, blockmax_span)
-            },
-        );
         let (field_ord, term) = accumulator.terms().field_and_term(term_id_u32);
-        inputs.push(TermInput::new(field_ord, term, metadata));
+        append_canonical_term(
+            &mut postings_bytes,
+            &mut positions_bytes,
+            &mut blockmax_bytes,
+            &mut inputs,
+            field_ord,
+            term,
+            &postings,
+            positions.as_deref(),
+            docid_lo,
+            field_doclens,
+        )?;
     }
     Ok((postings_bytes, positions_bytes, blockmax_bytes, inputs))
+}
+
+fn encode_delta_term_streams<'a>(
+    snapshot: &'a DeltaSnapshot,
+    docid_lo: u64,
+    expected_field_ords: &[u16],
+    doclen_columns: &[Vec<Option<u32>>],
+) -> Result<OrderedTermStreams<'a>, FlushError> {
+    let sorted_terms = snapshot.segment().sorted_terms();
+    let mut postings_bytes = Vec::new();
+    let mut positions_bytes = Vec::new();
+    let mut blockmax_bytes = Vec::new();
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(sorted_terms.len())
+        .map_err(|_| FlushError::Allocation {
+            resource: "Delta TERMDICT inputs",
+            count: sorted_terms.len(),
+        })?;
+
+    for term in sorted_terms {
+        let field_ord = term.field_ord();
+        let field_index = expected_field_ords.binary_search(&field_ord).map_err(|_| {
+            FlushError::InvalidTokenColumn {
+                field_ord,
+                detail: "Delta term references a non-indexed field",
+            }
+        })?;
+        let field_doclens =
+            doclen_columns
+                .get(field_index)
+                .ok_or(FlushError::InvalidTokenColumn {
+                    field_ord,
+                    detail: "missing Delta DOCLEN source column",
+                })?;
+        let stores_positions = snapshot
+            .schema()
+            .fields
+            .get(usize::from(field_ord))
+            .is_some_and(|field| {
+                matches!(
+                    field.kind,
+                    FieldKind::Text {
+                        positions: true,
+                        ..
+                    }
+                )
+            });
+        let live_doc_freq = term.live_doc_freq();
+        if live_doc_freq == 0 {
+            continue;
+        }
+        let mut postings = Vec::new();
+        postings
+            .try_reserve_exact(live_doc_freq)
+            .map_err(|_| FlushError::Allocation {
+                resource: "Delta term postings",
+                count: live_doc_freq,
+            })?;
+        let mut positions = stores_positions.then(Vec::new);
+        for posting in term.postings() {
+            if !term.is_live(posting) {
+                continue;
+            }
+            postings.push(Posting::new(posting.global_docid, posting.frequency));
+            if let Some(values) = &mut positions {
+                let count = usize::try_from(posting.frequency).map_err(|_| {
+                    FlushError::ArithmeticOverflow {
+                        field: "Delta term position count",
+                    }
+                })?;
+                values
+                    .try_reserve(count)
+                    .map_err(|_| FlushError::Allocation {
+                        resource: "Delta term positions",
+                        count,
+                    })?;
+                let resolved = term
+                    .positions(posting)
+                    .ok_or(FlushError::InvalidTokenColumn {
+                        field_ord,
+                        detail: "position-indexed live Delta posting omitted positions",
+                    })?;
+                values.extend(resolved);
+            }
+        }
+        append_canonical_term(
+            &mut postings_bytes,
+            &mut positions_bytes,
+            &mut blockmax_bytes,
+            &mut inputs,
+            field_ord,
+            term.term(),
+            &postings,
+            positions.as_deref(),
+            docid_lo,
+            field_doclens,
+        )?;
+    }
+    Ok((postings_bytes, positions_bytes, blockmax_bytes, inputs))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_canonical_term<'a>(
+    postings_bytes: &mut Vec<u8>,
+    positions_bytes: &mut Vec<u8>,
+    blockmax_bytes: &mut Vec<u8>,
+    inputs: &mut Vec<TermInput<'a>>,
+    field_ord: u16,
+    term: &'a [u8],
+    postings: &[Posting],
+    positions: Option<&[u32]>,
+    docid_lo: u64,
+    field_doclens: &[Option<u32>],
+) -> Result<(), FlushError> {
+    let (encoded_postings, encoded_blockmax) =
+        EncodedPostingList::encode_with_block_max(postings, |global_docid| {
+            let relative = u64::from(global_docid).checked_sub(docid_lo)?;
+            let relative = usize::try_from(relative).ok()?;
+            field_doclens
+                .get(relative)
+                .copied()
+                .flatten()
+                .map(fieldnorm_to_id)
+        })?;
+    let encoded_positions = positions
+        .map(|values| EncodedPositionList::encode(postings, values))
+        .transpose()?;
+    let postings_span = append_span(postings_bytes, encoded_postings.as_bytes(), "POSTINGS span")?;
+    let positions_span = encoded_positions
+        .as_ref()
+        .map(|encoded| append_span(positions_bytes, encoded.as_bytes(), "POSITIONS span"))
+        .transpose()?;
+    let blockmax_span = append_span(blockmax_bytes, encoded_blockmax.as_bytes(), "BLOCKMAX span")?;
+    let doc_freq = encoded_postings.doc_freq();
+    let metadata = positions_span.map_or_else(
+        || TermMetadata::without_positions(doc_freq, postings_span, blockmax_span),
+        |positions_span| {
+            TermMetadata::with_positions(doc_freq, postings_span, positions_span, blockmax_span)
+        },
+    );
+    inputs.push(TermInput::new(field_ord, term, metadata));
+    Ok(())
 }
 
 fn build_term_rows(
@@ -5876,6 +6413,28 @@ mod tests {
     }
 
     #[test]
+    fn collision_bucket_growth_reports_exact_live_byte_increments() {
+        let mut interner: TermInterner<ConstBuild> =
+            TermInterner::with_hasher(ConstBuild::default());
+        let mut ids = Vec::new();
+        for (field_ord, term) in [(0, b"alpha".as_slice()), (1, b"beta"), (2, b"gamma")] {
+            let before = interner.bytes_used();
+            let (id, added_bytes) = interner.intern_accounted(field_ord, term);
+            assert_eq!(interner.bytes_used() - before, added_bytes);
+            ids.push(id);
+        }
+        assert_eq!(interner.find(0, b"alpha"), Some(ids[0]));
+        assert_eq!(interner.find(1, b"beta"), Some(ids[1]));
+        assert_eq!(interner.find(2, b"gamma"), Some(ids[2]));
+
+        let before_duplicate = interner.bytes_used();
+        let (duplicate, duplicate_bytes) = interner.intern_accounted(1, b"beta");
+        assert_eq!(duplicate, ids[1]);
+        assert_eq!(duplicate_bytes, 0);
+        assert_eq!(interner.bytes_used(), before_duplicate);
+    }
+
+    #[test]
     fn budget_accounting_is_monotone_and_bounded() {
         let mut interner = TermInterner::new();
         let long = vec![b'x'; MAX_TERM_BYTES];
@@ -6526,6 +7085,443 @@ mod tests {
         assert_eq!(stored_field.get(65_538), Some(b"stored-a".as_slice()));
         assert_eq!(stored_field.get(65_539), None);
         assert_eq!(stored_field.get(65_541), Some(b"stored-b".as_slice()));
+    }
+
+    // ── E1.8: Scribe unit/property tests (tokenizer/CASS parity, accumulator
+    //          invariants, radix-flush determinism). E2E ingest round-trip and
+    //          the LabRuntime cancellation leak-oracle live in
+    //          `crates/frankensearch-quill/tests/scribe_e2e.rs`.
+
+    /// First token-stream divergence as `(source byte offset, lane index mod 32)`
+    /// so a failing lane-edge sweep case pinpoints the straddling boundary.
+    fn first_divergent_offset(a: &[AnalyzedToken], b: &[AnalyzedToken]) -> Option<(usize, usize)> {
+        for (ta, tb) in a.iter().zip(b.iter()) {
+            if ta != tb {
+                return Some((ta.offset_from, ta.offset_from % 32));
+            }
+        }
+        if a.len() == b.len() {
+            return None;
+        }
+        let shared = a.len().min(b.len());
+        let off = a
+            .get(shared)
+            .or_else(|| b.get(shared))
+            .map_or(0, |token| token.offset_from);
+        Some((off, off % 32))
+    }
+
+    #[test]
+    fn e18_tokenizer_lane_edge_sweep_1_to_129_bytes_matches_scalar_and_incumbent() {
+        // Sweep a separator (hence a token start AND end) across every byte
+        // offset for inputs sized 1..=129 bytes, so a token boundary lands at
+        // every 8/16/32-byte SWAR lane edge. Parity vs the scalar char-walk
+        // oracle on every case; vs the shipping incumbent on the lane-edge
+        // subset to bound tokenizer-construction cost.
+        for len in 1..=129usize {
+            for sep_pos in 0..len {
+                let input: String = (0..len)
+                    .map(|i| if i == sep_pos { ' ' } else { 'a' })
+                    .collect();
+                let swar = analyzed_tokens(&input);
+                let scalar = scalar_reference_tokens(&input);
+                if let Some((off, lane)) = first_divergent_offset(&swar, &scalar) {
+                    panic!(
+                        "len={len} sep_pos={sep_pos}: SWAR diverged from the scalar reference at byte offset {off} (lane {lane}) for {input:?}"
+                    );
+                }
+                if sep_pos % 8 == 0 {
+                    let incumbent = incumbent_tokens(&input);
+                    if let Some((off, lane)) = first_divergent_offset(&swar, &incumbent) {
+                        panic!(
+                            "len={len} sep_pos={sep_pos}: SWAR diverged from the shipping incumbent at byte offset {off} (lane {lane}) for {input:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Multi-byte scalars (2/3/4 bytes) straddling every lane edge.
+        for mb in ['é', '中', '𠀀'] {
+            for pad in 0..40usize {
+                let mut input = "a".repeat(pad);
+                input.push(mb);
+                input.push_str("bb");
+                let swar = analyzed_tokens(&input);
+                let scalar = scalar_reference_tokens(&input);
+                if let Some((off, lane)) = first_divergent_offset(&swar, &scalar) {
+                    panic!(
+                        "mb={mb:?} pad={pad}: SWAR diverged from the scalar reference at byte offset {off} (lane {lane}) for {input:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn e18_cass_family_parity_including_cjk_extension_b() {
+        // CJK Extension-B (U+20000..=U+2A6DF, 4-byte UTF-8) is inside
+        // `is_cass_cjk`, so the native CASS families must bigram-decompose it
+        // exactly like the shipping incumbent. Mix Ext-B with ASCII, hyphens,
+        // and BMP CJK so hyphen-normalize and prefix-normalize both exercise it.
+        let cases = [
+            "\u{20000}\u{20001}\u{2A6DF}",
+            "alpha-\u{20000}\u{20001}",
+            "\u{20000}beta\u{4E00}\u{20002}",
+            "POL-358 \u{20000}\u{20001} gamma",
+            "\u{20000}-\u{20001}-code",
+            "mix\u{20000}東京\u{2A700}tail",
+        ];
+        for kind in [
+            AnalyzerKind::CassHyphenNormalize,
+            AnalyzerKind::CassPrefixNormalize,
+        ] {
+            for case in cases {
+                assert_eq!(
+                    cass_tokens(kind, case),
+                    incumbent_cass_tokens(kind, case),
+                    "native CASS {kind:?} diverged from the shipping incumbent for {case:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e18_accumulator_invariants_hold_under_randomized_doc_streams() {
+        // Randomized ascending-doc-ord streams must keep every parallel column
+        // aligned, doc ords monotonic, and the reset-reuse contract intact
+        // (logical state cleared, scratch capacity retained).
+        let mut rng = DeterministicRng(0x1f9a_c3d7_5e21_0b46);
+        for _round in 0..64 {
+            let mut accumulator =
+                ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+            let doc_count = 1 + rng.choose(24);
+            let mut previous: Option<u32> = None;
+            let mut expected_docs = 0_u32;
+            let mut expected_tokens = 0_usize;
+            for _ in 0..doc_count {
+                let doc_ord =
+                    previous.map_or(0, |prev| prev + 1 + u32::try_from(rng.choose(4)).unwrap());
+                previous = Some(doc_ord);
+                let keyword = randomized_text(&mut rng);
+                let positional = randomized_text(&mut rng);
+                let plain = randomized_text(&mut rng);
+                let accumulation = accumulator
+                    .add_document_with_stored(
+                        doc_ord,
+                        &[
+                            IndexedFieldValue::new(0, &keyword),
+                            IndexedFieldValue::new(1, &positional),
+                            IndexedFieldValue::new(2, &plain),
+                        ],
+                        &[StoredFieldValue::new(3, keyword.as_bytes())],
+                    )
+                    .expect("randomized document accumulates");
+                expected_docs += 1;
+                expected_tokens += usize::try_from(accumulation.admitted_tokens).unwrap();
+            }
+
+            assert_eq!(
+                accumulator.document_count(),
+                usize::try_from(expected_docs).unwrap()
+            );
+            assert_eq!(accumulator.token_count(), expected_tokens);
+            let ords = accumulator.document_ords();
+            assert!(
+                ords.windows(2).all(|pair| pair[0] < pair[1]),
+                "document ords must be strictly ascending: {ords:?}"
+            );
+            for field in accumulator.fields() {
+                let rows = field.term_ids().len();
+                assert_eq!(field.doc_ords().len(), rows, "doc_ords column width drift");
+                assert!(
+                    field.fieldnorm_ids().len() <= accumulator.document_count(),
+                    "fieldnorm ids cannot exceed one per document"
+                );
+                if let Some(positions) = field.positions() {
+                    assert_eq!(positions.len(), rows, "positions column width drift");
+                }
+                assert!(
+                    field.doc_ords().windows(2).all(|pair| pair[0] <= pair[1]),
+                    "per-field doc ords must be non-decreasing"
+                );
+            }
+            assert!(accumulator.bytes_reserved() >= accumulator.bytes_used());
+
+            // Reset-reuse: logical state clears, scratch capacity is retained,
+            // and the accumulator is immediately usable again.
+            let reserved_before = accumulator.bytes_reserved();
+            accumulator.reset();
+            assert_eq!(accumulator.document_count(), 0);
+            assert_eq!(accumulator.token_count(), 0);
+            assert!(accumulator.document_ords().is_empty());
+            assert!(
+                accumulator.bytes_reserved() >= reserved_before / 2,
+                "reset must retain most scratch capacity for reuse"
+            );
+            accumulator
+                .add_document(0, &[IndexedFieldValue::new(1, "reuse after reset")])
+                .expect("accumulator is reusable after reset");
+            assert_eq!(accumulator.document_count(), 1);
+        }
+    }
+
+    #[test]
+    fn e18_radix_flush_is_deterministic_across_100_seeds() {
+        // Same accumulator input -> byte-identical segment, and the Automatic
+        // (possibly Rayon) path matches the serial Scalar reference, over 100
+        // randomized seeds spanning the parallel-radix row-count threshold.
+        for seed in 0..100_u64 {
+            let mut rng = DeterministicRng(0xd1b5_4f00_a37e_c119 ^ seed.wrapping_mul(0x9E37_79B9));
+            let mut accumulator =
+                ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+            let doc_count = 4 + rng.choose(28);
+            let mut identities = Vec::with_capacity(doc_count);
+            let mut doc_ord = 0_u32;
+            for index in 0..doc_count {
+                doc_ord += u32::try_from(rng.choose(3)).unwrap();
+                let keyword = format!("doc-{seed}-{index}");
+                let positional = randomized_text(&mut rng);
+                let plain = randomized_text(&mut rng);
+                accumulator
+                    .add_document_with_stored(
+                        doc_ord,
+                        &[
+                            IndexedFieldValue::new(0, &keyword),
+                            IndexedFieldValue::new(1, &positional),
+                            IndexedFieldValue::new(2, &plain),
+                        ],
+                        &[StoredFieldValue::new(3, positional.as_bytes())],
+                    )
+                    .expect("seeded document accumulates");
+                identities.push((doc_ord, keyword));
+                doc_ord += 1;
+            }
+            let flush_docs: Vec<FlushDocumentInput<'_>> = identities
+                .iter()
+                .map(|(ord, id)| {
+                    FlushDocumentInput::from_canonical_content(*ord, id, id.as_bytes())
+                })
+                .collect();
+            let input = FlushSegmentInput {
+                segment_id: 0x5EED_0000 | seed,
+                lease_docid_base: 65_536,
+                created_unix_s: 1_700_000_000,
+                engine_version: 0x0001_0002,
+                documents: &flush_docs,
+            };
+
+            let scalar_a = flush_accumulator_with_mode(&accumulator, input, FlushMode::Scalar)
+                .expect("scalar flush a");
+            let scalar_b = flush_accumulator_with_mode(&accumulator, input, FlushMode::Scalar)
+                .expect("scalar flush b");
+            assert_eq!(
+                scalar_a.as_bytes(),
+                scalar_b.as_bytes(),
+                "seed {seed}: repeated scalar flush must be byte-identical"
+            );
+            let automatic = flush_accumulator_with_mode(&accumulator, input, FlushMode::Automatic)
+                .expect("automatic flush");
+            assert_eq!(
+                automatic.as_bytes(),
+                scalar_a.as_bytes(),
+                "seed {seed}: automatic radix flush must match the scalar reference"
+            );
+            SegmentReader::from_bytes(automatic.as_bytes(), MIXED_POSITION_SCHEMA)
+                .expect("seeded segment reopens")
+                .verify()
+                .expect("seeded segment witnesses verify");
+        }
+    }
+
+    #[test]
+    fn e18_e2e_ingest_roundtrip_reopens_idmap_doclens_and_postings() {
+        // Full accumulate -> flush -> reopen round-trip over a randomized 40-doc
+        // corpus: every document id round-trips through IDMAP, each indexed field
+        // reopens its DOCLEN, and every interned term's POSTINGS decode with the
+        // exact recorded doc_freq. (The 2-doc exhaustive exact-position readback
+        // is `radix_flush_is_byte_identical_and_reopens_every_section`; this
+        // covers scale + randomization.)
+        let mut rng = DeterministicRng(0x00e2_e0e2_face_1234);
+        let mut accumulator =
+            ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid mixed schema");
+        let doc_count = 40_usize;
+        let lease_base = 65_536_u64;
+        let mut doc_ord = 0_u32;
+        let mut identities = Vec::with_capacity(doc_count);
+        for index in 0..doc_count {
+            doc_ord += u32::try_from(rng.choose(3)).unwrap();
+            let id = format!("e2e-doc-{index}");
+            accumulator
+                .add_document_with_stored(
+                    doc_ord,
+                    &[
+                        IndexedFieldValue::new(0, &id),
+                        IndexedFieldValue::new(1, &randomized_text(&mut rng)),
+                        IndexedFieldValue::new(2, &randomized_text(&mut rng)),
+                    ],
+                    &[StoredFieldValue::new(3, id.as_bytes())],
+                )
+                .expect("e2e document accumulates");
+            identities.push((doc_ord, id));
+            doc_ord += 1;
+        }
+        let flush_docs: Vec<FlushDocumentInput<'_>> = identities
+            .iter()
+            .map(|(ord, id)| FlushDocumentInput::from_canonical_content(*ord, id, id.as_bytes()))
+            .collect();
+        let input = FlushSegmentInput {
+            segment_id: 0x00E2_E000,
+            lease_docid_base: lease_base,
+            created_unix_s: 1_700_000_000,
+            engine_version: 0x0001_0002,
+            documents: &flush_docs,
+        };
+        let segment = flush_accumulator(&accumulator, input).expect("e2e flush");
+        let reader = SegmentReader::from_bytes(segment.as_bytes(), MIXED_POSITION_SCHEMA)
+            .expect("segment reopens");
+        reader.verify().expect("all section witnesses verify");
+        assert_eq!(
+            reader.header().doc_count,
+            u32::try_from(doc_count).expect("doc count fits u32")
+        );
+
+        // IDMAP: every ingested document id round-trips at its global docid.
+        let id_map = IdMapSection::parse(
+            reader
+                .section(SectionKind::IDMAP)
+                .expect("IDMAP checksum")
+                .expect("IDMAP required"),
+            reader.header().docid_lo,
+            reader.header().docid_hi,
+        )
+        .expect("IDMAP reopens");
+        for (ord, id) in &identities {
+            let global = lease_base + u64::from(*ord);
+            assert_eq!(
+                id_map.get(global).expect("id present").document_id(),
+                id.as_str(),
+                "IDMAP round-trip drift at global docid {global}"
+            );
+        }
+
+        // DOCLEN: reopens (verify() already checked its witness) with the
+        // always-populated keyword field present, and returns a fieldnorm for
+        // every ingested keyword document. The fieldnorm array is indexed over
+        // the dense global-docid range, so its length tracks the range span, not
+        // the sparse document count.
+        let doclen = crate::quiver::DocLenSection::parse(
+            reader
+                .section(SectionKind::DOCLEN)
+                .expect("DOCLEN checksum")
+                .expect("DOCLEN required"),
+            reader.header().docid_lo,
+            reader.header().docid_hi,
+            &[0, 1, 2],
+        )
+        .expect("DOCLEN reopens");
+        let keyword_doclen = doclen.field(0).expect("keyword field DOCLEN reopens");
+        for (ord, _) in &identities {
+            let global = lease_base + u64::from(*ord);
+            assert!(
+                keyword_doclen.fieldnorm_id(global).is_some(),
+                "keyword fieldnorm missing for global docid {global}"
+            );
+        }
+
+        // POSTINGS: every interned term decodes with the recorded doc_freq.
+        let postings_bytes = reader
+            .section(SectionKind::POSTINGS)
+            .expect("POSTINGS checksum")
+            .expect("POSTINGS required");
+        let positions_bytes = reader
+            .section(SectionKind::POSITIONS)
+            .expect("POSITIONS checksum")
+            .expect("POSITIONS required");
+        let blockmax_bytes = reader
+            .section(SectionKind::BLOCKMAX)
+            .expect("BLOCKMAX checksum")
+            .expect("BLOCKMAX required");
+        let dictionary = TermDictionary::parse(
+            reader
+                .section(SectionKind::TERMDICT)
+                .expect("TERMDICT checksum")
+                .expect("TERMDICT required"),
+            MIXED_POSITION_SCHEMA,
+            TermSectionLengths {
+                postings: u64::try_from(postings_bytes.len()).expect("POSTINGS length"),
+                positions: Some(u64::try_from(positions_bytes.len()).expect("POSITIONS length")),
+                blockmax: u64::try_from(blockmax_bytes.len()).expect("BLOCKMAX length"),
+            },
+        )
+        .expect("TERMDICT reopens");
+        assert_eq!(dictionary.term_count() as usize, accumulator.terms().len());
+        for term_id in 0..u32::try_from(accumulator.terms().len()).expect("term count fits u32") {
+            let (field_ord, term) = accumulator.terms().field_and_term(term_id);
+            let metadata = dictionary
+                .lookup(field_ord, term)
+                .expect("term lookup is valid")
+                .expect("every interned term is emitted")
+                .metadata;
+            let start = usize::try_from(metadata.postings.offset).expect("posting offset");
+            let end = start + usize::try_from(metadata.postings.len).expect("posting length");
+            let posting_list = PostingList::parse(&postings_bytes[start..end], metadata.doc_freq)
+                .expect("posting list reopens");
+            assert_eq!(
+                posting_list.decode_all().expect("postings decode").len(),
+                usize::try_from(metadata.doc_freq).expect("doc freq fits usize"),
+                "doc_freq drift for field {field_ord} term {:?}",
+                String::from_utf8_lossy(term)
+            );
+        }
+    }
+
+    #[test]
+    fn e18_cancelled_commit_seals_no_segment_and_leaves_no_temp_files() {
+        // Leak oracle: a batch is ingested (accumulated in memory), then the
+        // seal/commit is cancelled mid-flight. commit() must return Cancelled and
+        // publish nothing — no `seg-*.fslx` and no staged temp file in the index
+        // directory; the accumulator arenas drop when the index drops. (The
+        // manifest-slot variant is
+        // keeper::tests::invalid_or_cancelled_proposal_creates_no_manifest_slot.)
+        use crate::index::{QuillIndex, QuillIndexError};
+        use frankensearch_core::IndexableDocument;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temp index directory");
+            let mut index =
+                QuillIndex::create(&cx, directory.path(), crate::config::QuillConfig::default())
+                    .await
+                    .expect("create shipping-schema index");
+            let documents = [
+                IndexableDocument::new("cancel-a", "alpha beta gamma alpha"),
+                IndexableDocument::new("cancel-b", "delta epsilon delta"),
+            ];
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("uncancelled ingest accumulates the batch");
+
+            cx.set_cancel_requested(true);
+            let cancelled = matches!(
+                index.commit(&cx).await,
+                Err(QuillIndexError::Cancelled { .. })
+            );
+            assert!(cancelled, "cancelled commit must return Cancelled");
+
+            let mut artifacts = Vec::new();
+            for entry in std::fs::read_dir(directory.path()).expect("read index directory") {
+                let entry = entry.expect("directory entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("seg-") || name.contains(".tmp") {
+                    artifacts.push(name);
+                }
+            }
+            assert!(
+                artifacts.is_empty(),
+                "cancelled commit sealed or staged segment artifacts: {artifacts:?}"
+            );
+        });
     }
 
     #[test]

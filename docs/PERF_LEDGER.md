@@ -6091,6 +6091,107 @@ normalize_signal's single-pass rewrite is ~14% SLOWER at n192/n1536, and neighbo
 v2 mutual is ~1.2× slower — both warrant follow-up before any KEEP claim. Any future KEEP/REJECT
 row for these benches must quote the lever median AND its null p5/p95 from the same run.
 
+## 2026-07-19 — Direct-term MaxScore + Block-Max WAND rank-safe pruning (`bd-quill-e4-argus-3ycz.4`, SapphireHill)
+
+The retained E4.4 path adds exact two-pass MaxScore for root unions with 2–8
+direct term children and Block-Max WAND for direct 9+-term unions above the
+physical-list cost threshold. Every skip ceiling is reconstructed at query time
+from validated `(max_frequency, min_fieldnorm)` metadata plus the live
+snapshot's idf/avgdl; no stored impact scalar participates. Sealed terms use
+paired POSTINGS/BLOCKMAX metadata, while Delta supplies conservative whole-term
+bounds for MaxScore and deliberately opts out of BMW because it has no physical
+skip blocks. Exact-count, zero-limit, unsupported, and nested scorer shapes stay
+on the compressed POSTINGS-only exhaustive path.
+
+Repeated validation is amortized by a lock-free-read, bounded-admission cache
+owned by each immutable recovered segment (maximum 128 terms and 16 MiB of
+validated payload). Cache identity includes the complete term dictionary
+metadata, and construction privately pairs each BLOCKMAX row with the exact
+POSTINGS block table it validated. Exact-count queries never initiate cache
+population. The cache payload numbers below exclude the small cache-row and
+`Arc` bookkeeping overhead.
+
+Authoritative profile: strict remote execution on RCH worker `hz1`, release
+profile with LTO, one final binary, 21 alternating paired rounds plus seven
+alternating-order latency trials. The timer starts before DOCLEN/POSTINGS cursor
+opening and includes scorer construction, collection, and finish. Warm arms
+reuse the segment-equivalent validated metadata cache; a separate single cold
+observation includes POSTINGS parse and full BLOCKMAX validation. Ratios are
+pruned/exhaustive, so `< 1` is faster:
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=hz1 \
+  rch exec -- cargo test --profile release -p frankensearch-quill \
+  argus::tests::e44_disjunction_profile_100k_and_1m -- \
+  --ignored --exact --nocapture
+```
+
+| strategy | docs | warm exhaustive median | warm pruned median | lever median [p5, p95] | A/A null [p5, p95] | speedup | cached payload |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| MaxScore, 8 direct terms | 100k | 7,674 us | 535 us | **0.069302 [0.063037, 0.072217]** | 0.997529 [0.818903, 1.016239] | **14.43×** | 64,656 B |
+| BMW, 9 direct terms | 100k | 7,800 us | 1,603 us | **0.198811 [0.193835, 0.205571]** | 0.999935 [0.983390, 1.012372] | **5.03×** | 68,832 B |
+| MaxScore, 8 direct terms | 1M | 83,417 us | 2,624 us | **0.032588 [0.031035, 0.044329]** | 0.996991 [0.870855, 1.060778] | **30.69×** | 644,544 B |
+| BMW, 9 direct terms | 1M | 79,093 us | 19,846 us | **0.176633 [0.155324, 0.256451]** | 1.007424 [0.945164, 1.112317] | **5.66×** | 686,256 B |
+
+Every lever median is below its same-binary null p5. The single cold observations
+also favored pruning: 10,035→2,821 us and 8,390→3,398 us at 100k; 103,635→19,448
+us and 102,474→34,928 us at 1M for MaxScore and BMW respectively. These cold
+numbers are setup-inclusive routing evidence, not substituted for the paired
+warm claim.
+
+Rank safety is separately pinned by exact global-docid and `f32::to_bits()`
+comparison against exhaustive collection at k={1,10,100,1000}, randomized
+corpora, tombstones/offsets, and mixed sealed+Delta snapshots whose live avgdl
+differs from seal-time avgdl. The final strict-remote Quill suite passed 431
+tests (0 failed, 2 ignored, one known flaky symlink case explicitly filtered).
+The rejected nested-union attempt and its 19–26% regression are retained in
+`docs/NEGATIVE_EVIDENCE.md`.
+
+**Decision: KEEP.** Ship direct-term MaxScore, direct high-clause BMW, the
+bounded validated-metadata cache, exact-count bypass, structural/runtime
+fail-closed gates, and the retained ignored profile.
+
+## 2026-07-19 — One-pass Quill concat assembly, partial keep (`bd-quill-e3-keeper-ndtk.5`, SapphireHill)
+
+The retained concat path preflights exact IDMAP and STOREDMETA layouts, then
+emits both directly into one pre-sized final FSLX allocation. A generalized
+IDHASH builder validates the conceptual source-domain IDMAP without first
+materializing its durable bytes; Keeper then reparses the emitted IDMAP and
+cross-validates that same IDHASH before final segment verification. This removes
+the dominant intermediate-buffer and page-fault churn while preserving the
+canonical writer's byte layout.
+
+The authoritative comparison used one strict-remote release-LTO binary on
+pinned RCH worker `ovh-a` (`51.222.245.56`), SHA-256
+`9852128d3075bcd58df4452edc33e0a157fd90e4da8c15729c4411800027d06b`.
+The corrected Criterion harness used 20 flat samples, 500 ms warm-up, and 5 s
+measurement; every sample retained all immutable outputs until after the
+stopwatch read. Physical bytes are exact source FSLX plus merged-output FSLX.
+
+```text
+TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a \
+  rch exec -- cargo bench --profile release \
+  -p frankensearch-quill --bench concat_merge_ab
+```
+
+| sources | physical bytes | restored-control median | one-pass median | one-pass ns/B | improvement |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 2,745,208 | 4,248,149.542 ns | 2,398,286.155 ns | 0.873626390 | **43.55%** |
+| 4 | 7,277,512 | 10,576,223.174 ns | 4,082,846.360 ns | 0.561022278 | **61.40%** |
+| 8 | 16,354,280 | 24,303,723.300 ns | 10,209,196.348 ns | 0.624252266 | **57.99%** |
+| 16 | 34,543,016 | 67,813,377.125 ns | 22,033,773.409 ns | 0.637864783 | **67.51%** |
+
+Criterion classified every arm as improved (`p = 0.00`). The final rebased
+strict-remote Quill suite passed **437 tests, 0 failed, 2 ignored**. Exact
+oracles cover final FSLX bytes, IDMAP and STOREDMETA concat bytes, IDHASH
+source-domain equivalence, and short/long/out-of-order assembler writes. A
+separate fresh-eyes review found no blocker.
+
+**Decision: PARTIAL KEEP.** Ship the absolute throughput win and reproducible
+benchmark correction, but do not close E3.5: normalized max/min spread is
+`1.557204454x`, above the bead's `1.35x` flatness gate. The remaining fixed-cost
+problem is now at two-source fan-in; closure evidence is recorded in
+`docs/NEGATIVE_EVIDENCE.md`.
 ## 2026-07-22 — LANDED: Quill SWAR default tokenizer — length-dependent, decidable win on long tokens (`bd-quill-e1-scribe-bejd.1`, FuchsiaMaple)
 
 `FrankensearchTokenizer::analyze` (Quill's default analyzer, on the ingest and query hot paths)

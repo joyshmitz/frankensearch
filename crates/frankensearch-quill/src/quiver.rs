@@ -335,6 +335,7 @@ mod bitpack {
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ops::{Bound, Range};
+use std::sync::Arc;
 
 use frankensearch_core::DocId;
 use thiserror::Error;
@@ -649,6 +650,16 @@ pub enum PostingCodecError {
     MetadataAllocation {
         /// Zero-based block index that could not be reserved.
         block_index: usize,
+    },
+    /// A cached validated block table was paired with a different POSTINGS span.
+    #[error(
+        "cached POSTINGS metadata expects {expected} bytes, but the selected term span has {actual}"
+    )]
+    CachedMetadataLengthMismatch {
+        /// Byte length validated when the cache entry was created.
+        expected: usize,
+        /// Byte length of the immutable term span selected by TERMDICT.
+        actual: usize,
     },
     /// A bounded collection request exceeded its explicit posting budget.
     #[error("posting materialization limit {limit} exceeded by {actual} postings")]
@@ -1128,6 +1139,41 @@ impl<'a> PostingList<'a> {
         PostingCursor::new(self.bytes, &self.blocks)
     }
 
+    /// Consume this validated view into a cursor that owns its block metadata.
+    ///
+    /// The durable bytes remain borrowed, while the validated block table moves
+    /// behind shared ownership. Cloning the resulting cursor therefore does not
+    /// copy the term's complete block table.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the already-validated immutable bytes fail to
+    /// decode, which indicates an internal reader invariant regression.
+    pub fn into_cursor(self) -> Result<PostingCursor<'a>, PostingCodecError> {
+        PostingCursor::from_owned(self.bytes, self.blocks)
+    }
+
+    /// Consume this posting view into one score-capable cached metadata value.
+    ///
+    /// BLOCKMAX is validated against this exact POSTINGS value and DOCLEN
+    /// reader inside the constructor, so callers cannot combine independently
+    /// validated terms.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed BLOCKMAX error for malformed wire data or any
+    /// POSTINGS/DOCLEN cross-section mismatch.
+    pub(crate) fn into_pruning_metadata(
+        self,
+        block_max_bytes: &[u8],
+        fieldnorms: DocLenField<'_>,
+    ) -> Result<ValidatedTermPruningMetadata, BlockMaxError> {
+        let block_max = BlockMaxList::parse(block_max_bytes, &self, fieldnorms)?;
+        Ok(ValidatedTermPruningMetadata::from_validated(
+            self, block_max,
+        ))
+    }
+
     /// Test-only convenience; production callers must select an explicit cap.
     ///
     /// # Errors
@@ -1176,16 +1222,123 @@ impl<'a> PostingList<'a> {
     }
 }
 
+/// Shared, fully cross-validated metadata for one immutable sealed term.
+///
+/// The posting block table and score-capable BLOCKMAX rows are constructed as
+/// one value only after POSTINGS, BLOCKMAX, and DOCLEN validation succeeds.
+/// Keeping them behind one `Arc` prevents production cursors from pairing
+/// bounds with another term's block layout.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedTermPruningMetadata {
+    postings_bytes_len: usize,
+    doc_freq: u32,
+    posting_blocks: Vec<PostingBlockMeta>,
+    block_max: Vec<BlockMaxEntry>,
+}
+
+impl ValidatedTermPruningMetadata {
+    fn from_validated(postings: PostingList<'_>, block_max: BlockMaxList<'_>) -> Self {
+        debug_assert_eq!(postings.block_count(), block_max.entry_count());
+        debug_assert_eq!(
+            u64::try_from(postings.as_bytes().len()).ok(),
+            Some(block_max.posting_bytes_len())
+        );
+        Self {
+            postings_bytes_len: postings.bytes.len(),
+            doc_freq: postings.doc_freq,
+            posting_blocks: postings.blocks,
+            block_max: block_max.entries,
+        }
+    }
+
+    /// Empty paired metadata used only to exercise cache admission policy.
+    #[cfg(test)]
+    pub(crate) fn empty_for_cache_test() -> Self {
+        Self {
+            postings_bytes_len: 0,
+            doc_freq: 0,
+            posting_blocks: Vec::new(),
+            block_max: Vec::new(),
+        }
+    }
+
+    /// Open a lazy cursor over the exact immutable term span validated here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invariant error if TERMDICT selected a span with a
+    /// different byte length or if the validated first block cannot reopen.
+    pub(crate) fn cursor<'a>(
+        self: &Arc<Self>,
+        postings_bytes: &'a [u8],
+    ) -> Result<PostingCursor<'a>, PostingCodecError> {
+        if postings_bytes.len() != self.postings_bytes_len {
+            return Err(PostingCodecError::CachedMetadataLengthMismatch {
+                expected: self.postings_bytes_len,
+                actual: postings_bytes.len(),
+            });
+        }
+        PostingCursor::from_blocks(
+            postings_bytes,
+            PostingCursorBlocks::Pruning(Arc::clone(self)),
+        )
+    }
+
+    /// Validated TERMDICT document frequency.
+    #[must_use]
+    pub(crate) const fn doc_freq(&self) -> u32 {
+        self.doc_freq
+    }
+
+    /// Score-capable bound rows paired one-for-one with `posting_blocks`.
+    #[must_use]
+    pub(crate) fn block_max(&self) -> &[BlockMaxEntry] {
+        &self.block_max
+    }
+
+    /// Retained heap payload used by this cache entry, excluding `Arc` and
+    /// sparse-cache row overhead.
+    #[must_use]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.posting_blocks
+            .len()
+            .saturating_mul(std::mem::size_of::<PostingBlockMeta>())
+            .saturating_add(
+                self.block_max
+                    .len()
+                    .saturating_mul(std::mem::size_of::<BlockMaxEntry>()),
+            )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CursorState {
     Positioned { block: usize, within: usize },
     Exhausted,
 }
 
+#[derive(Clone)]
+enum PostingCursorBlocks<'a> {
+    Borrowed(&'a [PostingBlockMeta]),
+    Owned(Arc<[PostingBlockMeta]>),
+    Pruning(Arc<ValidatedTermPruningMetadata>),
+}
+
+impl PostingCursorBlocks<'_> {
+    fn as_slice(&self) -> &[PostingBlockMeta] {
+        match self {
+            Self::Borrowed(blocks) => blocks,
+            Self::Owned(blocks) => blocks,
+            Self::Pruning(metadata) => &metadata.posting_blocks,
+        }
+    }
+}
+
 /// Lazy posting cursor with block-level `advance` skipping.
+#[derive(Clone)]
 pub struct PostingCursor<'a> {
     bytes: &'a [u8],
-    blocks: &'a [PostingBlockMeta],
+    blocks: PostingCursorBlocks<'a>,
     state: CursorState,
     decoded_docs: [u32; POSTINGS_PER_BLOCK],
     decoded_freqs: [u32; POSTINGS_PER_BLOCK],
@@ -1194,6 +1347,20 @@ pub struct PostingCursor<'a> {
 
 impl<'a> PostingCursor<'a> {
     fn new(bytes: &'a [u8], blocks: &'a [PostingBlockMeta]) -> Result<Self, PostingCodecError> {
+        Self::from_blocks(bytes, PostingCursorBlocks::Borrowed(blocks))
+    }
+
+    fn from_owned(
+        bytes: &'a [u8],
+        blocks: Vec<PostingBlockMeta>,
+    ) -> Result<Self, PostingCodecError> {
+        Self::from_blocks(bytes, PostingCursorBlocks::Owned(Arc::from(blocks)))
+    }
+
+    fn from_blocks(
+        bytes: &'a [u8],
+        blocks: PostingCursorBlocks<'a>,
+    ) -> Result<Self, PostingCodecError> {
         let mut cursor = Self {
             bytes,
             blocks,
@@ -1202,7 +1369,7 @@ impl<'a> PostingCursor<'a> {
             decoded_freqs: [0; POSTINGS_PER_BLOCK],
             decoded_count: 0,
         };
-        if !blocks.is_empty() {
+        if !cursor.blocks.as_slice().is_empty() {
             cursor.load_block(0)?;
             cursor.state = CursorState::Positioned {
                 block: 0,
@@ -1213,13 +1380,12 @@ impl<'a> PostingCursor<'a> {
     }
 
     fn load_block(&mut self, block_index: usize) -> Result<(), PostingCodecError> {
-        let block = self
-            .blocks
-            .get(block_index)
-            .ok_or(PostingCodecError::ArithmeticOverflow {
+        let block = self.blocks.as_slice().get(block_index).ok_or(
+            PostingCodecError::ArithmeticOverflow {
                 block_offset: self.bytes.len(),
                 field: "cursor block index",
-            })?;
+            },
+        )?;
         let base_posting_ordinal = usize::try_from(block.base_posting_ordinal).map_err(|_| {
             PostingCodecError::ArithmeticOverflow {
                 block_offset: block.byte_offset,
@@ -1266,13 +1432,30 @@ impl<'a> PostingCursor<'a> {
         self.current().map(|posting| posting.freq)
     }
 
+    /// Current zero-based posting-block index.
+    #[must_use]
+    pub const fn block_index(&self) -> Option<usize> {
+        match self.state {
+            CursorState::Positioned { block, .. } => Some(block),
+            CursorState::Exhausted => None,
+        }
+    }
+
+    /// Validated inclusive last docid of the current posting block.
+    #[must_use]
+    pub fn block_last_doc(&self) -> Option<u32> {
+        self.block_index()
+            .and_then(|index| self.blocks.as_slice().get(index))
+            .map(|block| block.last_doc)
+    }
+
     /// Current zero-based posting ordinal for later POSITIONS alignment.
     #[must_use]
     pub fn posting_ordinal(&self) -> Option<u32> {
         let CursorState::Positioned { block, within } = self.state else {
             return None;
         };
-        let base = self.blocks.get(block)?.base_posting_ordinal;
+        let base = self.blocks.as_slice().get(block)?.base_posting_ordinal;
         base.checked_add(u32::try_from(within).ok()?)
     }
 
@@ -1295,7 +1478,7 @@ impl<'a> PostingCursor<'a> {
         }
 
         let next_block = block + 1;
-        if next_block >= self.blocks.len() {
+        if next_block >= self.blocks.as_slice().len() {
             self.state = CursorState::Exhausted;
             self.decoded_count = 0;
             return Ok(None);
@@ -1338,7 +1521,7 @@ impl<'a> PostingCursor<'a> {
             return Ok(self.current());
         }
 
-        let later = &self.blocks[current_block + 1..];
+        let later = &self.blocks.as_slice()[current_block + 1..];
         let relative_block = later.partition_point(|block| block.last_doc < target);
         if relative_block == later.len() {
             self.state = CursorState::Exhausted;
@@ -1351,7 +1534,7 @@ impl<'a> PostingCursor<'a> {
             self.decoded_docs[..self.decoded_count].partition_point(|doc_id| *doc_id < target);
         if within == self.decoded_count {
             return Err(PostingCodecError::ArithmeticOverflow {
-                block_offset: self.blocks[block].byte_offset,
+                block_offset: self.blocks.as_slice()[block].byte_offset,
                 field: "validated block last_doc",
             });
         }
@@ -11182,9 +11365,12 @@ impl StatsSection {
 pub struct SnapshotFieldStats {
     /// Stable schema field ordinal.
     pub field_ord: u16,
-    /// Checked sum of the live segments' at-seal token numerators.
+    /// Checked snapshot token numerator under the BM25 lifecycle contract.
+    ///
+    /// Keeper rows remain at-seal until compaction; Delta-local tombstones are
+    /// excluded immediately.
     pub total_tokens: u64,
-    /// Checked sum of at-seal segment document counts.
+    /// Keeper at-seal rows plus live Delta rows used as BM25 `N`.
     pub doc_count: u64,
 }
 
@@ -12195,6 +12381,82 @@ mod tests {
         assert_eq!(cursor.next()?, None);
         assert_eq!(cursor.next()?, None);
         assert_eq!(cursor.advance(0)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn consumed_cursor_matches_borrowed_cursor_across_blocks() -> TestResult {
+        let expected = sparse_postings(400, 100);
+        let encoded = EncodedPostingList::encode(&expected)?;
+        let borrowed_list = encoded.posting_list()?;
+        let owned_list = encoded.posting_list()?;
+        let mut borrowed = borrowed_list.cursor()?;
+        let mut owned = owned_list.into_cursor()?;
+        let mut owned_clone = owned.clone();
+
+        loop {
+            assert_eq!(owned.current(), borrowed.current());
+            assert_eq!(owned_clone.current(), borrowed.current());
+            assert_eq!(owned.posting_ordinal(), borrowed.posting_ordinal());
+            assert_eq!(owned_clone.posting_ordinal(), borrowed.posting_ordinal());
+            assert_eq!(owned.block_index(), borrowed.block_index());
+            assert_eq!(owned_clone.block_index(), borrowed.block_index());
+            assert_eq!(owned.block_last_doc(), borrowed.block_last_doc());
+            assert_eq!(owned_clone.block_last_doc(), borrowed.block_last_doc());
+
+            let next = borrowed.next()?;
+            assert_eq!(owned.next()?, next);
+            assert_eq!(owned_clone.next()?, next);
+            if next.is_none() {
+                break;
+            }
+        }
+
+        let targets = [
+            0,
+            expected[127].doc_id,
+            expected[127].doc_id + 1,
+            expected[255].doc_id + 1,
+            expected.last().ok_or("non-empty fixture")?.doc_id,
+            u32::MAX,
+        ];
+        for target in targets {
+            let borrowed_list = encoded.posting_list()?;
+            let mut borrowed = borrowed_list.cursor()?;
+            let mut owned = encoded.posting_list()?.into_cursor()?;
+            assert_eq!(owned.advance(target)?, borrowed.advance(target)?);
+            assert_eq!(owned.block_index(), borrowed.block_index());
+            assert_eq!(owned.block_last_doc(), borrowed.block_last_doc());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn consumed_cursor_clone_retains_u32_max_block_state() -> TestResult {
+        let mut expected = dense_postings(POSTINGS_PER_BLOCK, 0);
+        expected.push(Posting::new(u32::MAX, 9));
+        let encoded = EncodedPostingList::encode(&expected)?;
+        let mut cursor = encoded.posting_list()?.into_cursor()?;
+
+        assert_eq!(cursor.block_index(), Some(0));
+        assert_eq!(cursor.block_last_doc(), Some(127));
+        assert_eq!(cursor.advance(u32::MAX)?, expected.last().copied());
+        assert_eq!(cursor.doc(), Some(u32::MAX));
+        assert_eq!(cursor.posting_ordinal(), Some(128));
+        assert_eq!(cursor.block_index(), Some(1));
+        assert_eq!(cursor.block_last_doc(), Some(u32::MAX));
+
+        let mut cloned = cursor.clone();
+        assert_eq!(cursor.next()?, None);
+        assert_eq!(cursor.block_index(), None);
+        assert_eq!(cursor.block_last_doc(), None);
+        assert_eq!(cloned.doc(), Some(u32::MAX));
+        assert_eq!(cloned.block_index(), Some(1));
+        assert_eq!(cloned.block_last_doc(), Some(u32::MAX));
+        assert_eq!(cloned.advance(u32::MAX)?, expected.last().copied());
+        assert_eq!(cloned.next()?, None);
+        assert_eq!(cloned.next()?, None);
+        assert_eq!(cloned.advance(u32::MAX)?, None);
         Ok(())
     }
 

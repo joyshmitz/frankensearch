@@ -20,6 +20,7 @@ frankensearch-core = { workspace = true }
 frankensearch-index = { workspace = true }
 frankensearch-durability = { workspace = true, optional = true }
 asupersync = { workspace = true }
+arc-swap = { workspace = true }
 wide = { workspace = true }
 bytemuck = { workspace = true }
 rayon = { workspace = true }

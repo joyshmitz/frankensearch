@@ -99,4 +99,6 @@ pub use rrf::{
 };
 pub use searcher::TwoTierSearcher;
 pub use smooth::{SmoothConfig, neighbor_smooth, neighbor_smooth_ranked};
+#[cfg(feature = "quill")]
+pub use sync_searcher::QuillSyncLexicalSearch;
 pub use sync_searcher::{SyncLexicalSearch, SyncSearchIterator, SyncTwoTierSearcher};
