@@ -9,6 +9,7 @@ repository.workspace = true
 [features]
 default = []
 lexical = ["dep:frankensearch-lexical"]
+quill = ["dep:frankensearch-quill"]
 rerank = ["dep:frankensearch-rerank"]
 graph = []
 # Exposes bench-only twins of private code paths (e.g. `GraphRanker::rank_phase1_flat`) and the
@@ -24,6 +25,7 @@ frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true }
 frankensearch-index = { workspace = true }
 frankensearch-lexical = { workspace = true, optional = true }
+frankensearch-quill = { workspace = true, optional = true }
 frankensearch-rerank = { workspace = true, optional = true }
 asupersync = { workspace = true }
 ahash = { workspace = true }
