@@ -1,7 +1,7 @@
 //! Concurrency model, lock ordering, and contention policy for the fsfs indexing pipeline.
 //!
 //! This module defines the canonical concurrency strategy for all shared resources
-//! in the fsfs pipeline: `FrankenSQLite` catalog, FSVI vector indices, Tantivy lexical
+//! in the fsfs pipeline: `FrankenSQLite` catalog, FSVI vector indices, lexical
 //! indices, the embedding queue, and the index cache. It codifies lock ordering to
 //! prevent deadlocks, provides contention mitigation via backoff, and includes
 //! crash-recovery primitives for stale lock detection.
@@ -18,7 +18,7 @@
 //! 2. **`EmbeddingQueue`** — In-memory job queue (short critical sections)
 //! 3. **`IndexCache`** — Atomic index snapshot (Arc swap under `RwLock`)
 //! 4. **`FsviSegment`** — Per-segment vector index file locks
-//! 5. **`TantivyWriter`** — Single `IndexWriter` per directory (long-held during commits)
+//! 5. **`LexicalWriter`** — Single lexical writer per directory (long-held during commits)
 //! 6. **`AdaptiveState`** — Fusion parameter updates (rare writes)
 //!
 //! # Reader/Writer Isolation
@@ -27,7 +27,7 @@
 //!   writers; writers serialize at commit time only if pages conflict.
 //! - **FSVI**: Append-only segments. Readers see consistent snapshots via `Arc` cloning
 //!   from `IndexCache`. The `RefreshWorker` is the single writer.
-//! - **Tantivy**: Built-in single-writer model. fsfs ensures exactly one `IndexWriter`
+//! - **Lexical index**: fsfs ensures exactly one writer
 //!   per index directory via [`ResourceToken`].
 
 #![allow(clippy::module_name_repetitions)]
@@ -55,8 +55,8 @@ pub enum LockLevel {
     IndexCache = 3,
     /// Per-segment FSVI vector index file.
     FsviSegment = 4,
-    /// Tantivy `IndexWriter` (single-writer, long-held).
-    TantivyWriter = 5,
+    /// Lexical index writer (single-writer, long-held).
+    LexicalWriter = 5,
     /// Adaptive fusion parameter state.
     AdaptiveState = 6,
 }
@@ -70,7 +70,7 @@ impl LockLevel {
             Self::EmbeddingQueue => "embedding_queue",
             Self::IndexCache => "index_cache",
             Self::FsviSegment => "fsvi_segment",
-            Self::TantivyWriter => "tantivy_writer",
+            Self::LexicalWriter => "lexical_writer",
             Self::AdaptiveState => "adaptive_state",
         }
     }
@@ -153,8 +153,8 @@ pub enum ResourceId {
     Catalog(PathBuf),
     /// A specific FSVI segment file.
     FsviSegment(PathBuf),
-    /// The Tantivy index directory.
-    TantivyIndex(PathBuf),
+    /// The lexical index directory.
+    LexicalIndex(PathBuf),
     /// The in-memory embedding queue (singleton).
     EmbeddingQueue,
     /// The index cache (singleton).
@@ -166,7 +166,7 @@ impl std::fmt::Display for ResourceId {
         match self {
             Self::Catalog(p) => write!(f, "catalog:{}", p.display()),
             Self::FsviSegment(p) => write!(f, "fsvi:{}", p.display()),
-            Self::TantivyIndex(p) => write!(f, "tantivy:{}", p.display()),
+            Self::LexicalIndex(p) => write!(f, "lexical:{}", p.display()),
             Self::EmbeddingQueue => write!(f, "embedding_queue"),
             Self::IndexCache => write!(f, "index_cache"),
         }
@@ -594,8 +594,8 @@ pub struct PipelineStageAccess {
     pub queue: AccessMode,
     /// Access to FSVI vector indices.
     pub fsvi: AccessMode,
-    /// Access to Tantivy lexical index.
-    pub tantivy: AccessMode,
+    /// Access to the lexical index.
+    pub lexical: AccessMode,
     /// Access to index cache.
     pub cache: AccessMode,
 }
@@ -609,7 +609,7 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
             catalog: AccessMode::ReadWrite,
             queue: AccessMode::ReadWrite,
             fsvi: AccessMode::None,
-            tantivy: AccessMode::None,
+            lexical: AccessMode::None,
             cache: AccessMode::None,
         },
         PipelineStageAccess {
@@ -617,7 +617,7 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
             catalog: AccessMode::ReadWrite,
             queue: AccessMode::None,
             fsvi: AccessMode::None,
-            tantivy: AccessMode::None,
+            lexical: AccessMode::None,
             cache: AccessMode::None,
         },
         PipelineStageAccess {
@@ -625,7 +625,7 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
             catalog: AccessMode::ReadWrite,
             queue: AccessMode::ReadWrite,
             fsvi: AccessMode::ReadWrite,
-            tantivy: AccessMode::None,
+            lexical: AccessMode::None,
             cache: AccessMode::None,
         },
         PipelineStageAccess {
@@ -633,7 +633,7 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
             catalog: AccessMode::ReadWrite,
             queue: AccessMode::ReadWrite,
             fsvi: AccessMode::ReadWrite,
-            tantivy: AccessMode::None,
+            lexical: AccessMode::None,
             cache: AccessMode::None,
         },
         PipelineStageAccess {
@@ -641,7 +641,7 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
             catalog: AccessMode::ReadWrite,
             queue: AccessMode::None,
             fsvi: AccessMode::None,
-            tantivy: AccessMode::ReadWrite,
+            lexical: AccessMode::ReadWrite,
             cache: AccessMode::None,
         },
         PipelineStageAccess {
@@ -649,7 +649,7 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
             catalog: AccessMode::ReadOnly,
             queue: AccessMode::None,
             fsvi: AccessMode::ReadOnly,
-            tantivy: AccessMode::ReadOnly,
+            lexical: AccessMode::ReadOnly,
             cache: AccessMode::ReadOnly,
         },
         PipelineStageAccess {
@@ -657,7 +657,7 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
             catalog: AccessMode::ReadOnly,
             queue: AccessMode::ReadWrite,
             fsvi: AccessMode::ReadWrite,
-            tantivy: AccessMode::None,
+            lexical: AccessMode::None,
             cache: AccessMode::ReadWrite,
         },
         PipelineStageAccess {
@@ -665,7 +665,7 @@ pub const fn pipeline_access_matrix() -> &'static [PipelineStageAccess] {
             catalog: AccessMode::ReadWrite,
             queue: AccessMode::None,
             fsvi: AccessMode::ReadWrite,
-            tantivy: AccessMode::ReadWrite,
+            lexical: AccessMode::ReadWrite,
             cache: AccessMode::ReadWrite,
         },
     ]
@@ -1346,8 +1346,8 @@ mod tests {
         assert!(LockLevel::Catalog < LockLevel::EmbeddingQueue);
         assert!(LockLevel::EmbeddingQueue < LockLevel::IndexCache);
         assert!(LockLevel::IndexCache < LockLevel::FsviSegment);
-        assert!(LockLevel::FsviSegment < LockLevel::TantivyWriter);
-        assert!(LockLevel::TantivyWriter < LockLevel::AdaptiveState);
+        assert!(LockLevel::FsviSegment < LockLevel::LexicalWriter);
+        assert!(LockLevel::LexicalWriter < LockLevel::AdaptiveState);
     }
 
     #[test]
@@ -1388,7 +1388,7 @@ mod tests {
     #[test]
     fn lock_level_display() {
         assert_eq!(format!("{}", LockLevel::Catalog), "catalog(1)");
-        assert_eq!(format!("{}", LockLevel::TantivyWriter), "tantivy_writer(5)");
+        assert_eq!(format!("{}", LockLevel::LexicalWriter), "lexical_writer(5)");
     }
 
     #[test]
@@ -1644,7 +1644,7 @@ mod tests {
         let query_stage = matrix.iter().find(|s| s.stage == "serve_queries").unwrap();
         assert_eq!(query_stage.catalog, AccessMode::ReadOnly);
         assert_eq!(query_stage.fsvi, AccessMode::ReadOnly);
-        assert_eq!(query_stage.tantivy, AccessMode::ReadOnly);
+        assert_eq!(query_stage.lexical, AccessMode::ReadOnly);
         assert_eq!(query_stage.cache, AccessMode::ReadOnly);
         assert_eq!(query_stage.queue, AccessMode::None);
     }

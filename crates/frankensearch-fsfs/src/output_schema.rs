@@ -415,6 +415,18 @@ pub struct SearchHitPayload {
     pub in_both_sources: bool,
 }
 
+/// Durable Quill generation visible to a fresh process.
+///
+/// This block deliberately reports published cross-process freshness, never
+/// process-local Delta visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFreshnessPayload {
+    pub published_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_publish_unix: Option<i64>,
+    pub live_writer: bool,
+}
+
 /// Search payload embedded in `OutputEnvelope::data` for `fsfs search`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchPayload {
@@ -425,6 +437,8 @@ pub struct SearchPayload {
     pub hits: Vec<SearchHitPayload>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub degradation_advice: BTreeMap<String, DegradationAdvice>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub index_freshness: Option<IndexFreshnessPayload>,
 }
 
 impl SearchPayload {
@@ -443,6 +457,7 @@ impl SearchPayload {
             returned_hits,
             hits,
             degradation_advice: BTreeMap::new(),
+            index_freshness: None,
         }
     }
 
@@ -455,6 +470,12 @@ impl SearchPayload {
             .into_iter()
             .map(|item| (item.reason_code.clone(), item))
             .collect();
+        self
+    }
+
+    #[must_use]
+    pub const fn with_index_freshness(mut self, freshness: IndexFreshnessPayload) -> Self {
+        self.index_freshness = Some(freshness);
         self
     }
 
@@ -867,7 +888,7 @@ fn context_for_error(err: &frankensearch_core::SearchError) -> Option<String> {
     match err {
         SearchError::EmbedderUnavailable { .. } => Some(
             "Without an embedding model, semantic search is unavailable. \
-             Lexical (keyword) search via BM25 may still work if a Tantivy index exists."
+             Lexical (keyword) search via BM25 may still work if a lexical index exists."
                 .to_owned(),
         ),
         SearchError::ModelNotFound { .. } => Some(
@@ -1142,9 +1163,15 @@ mod tests {
                 },
             ],
         );
-        let payload = payload.with_degradation_advice(
-            crate::degradation_advisor::synthetic_degradation_advice_fixture(),
-        );
+        let payload = payload
+            .with_degradation_advice(
+                crate::degradation_advisor::synthetic_degradation_advice_fixture(),
+            )
+            .with_index_freshness(IndexFreshnessPayload {
+                published_generation: 42,
+                last_publish_unix: Some(1_700_000_000),
+                live_writer: true,
+            });
         assert!(!payload.is_empty());
 
         let json = serde_json::to_string(&payload).expect("serialize payload");
@@ -1152,6 +1179,14 @@ mod tests {
         assert_eq!(decoded, payload);
         assert_eq!(decoded.returned_hits, 2);
         assert_eq!(decoded.degradation_advice.len(), 6);
+        assert_eq!(
+            decoded.index_freshness,
+            Some(IndexFreshnessPayload {
+                published_generation: 42,
+                last_publish_unix: Some(1_700_000_000),
+                live_writer: true,
+            })
+        );
         assert_eq!(
             decoded
                 .degradation_advice

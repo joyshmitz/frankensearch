@@ -117,6 +117,8 @@ pub enum CliCommand {
     /// Show index health and status.
     #[default]
     Status,
+    /// Force pending lexical writes into a durable published generation.
+    Flush,
     /// Show score decomposition for a document+query pair.
     Explain,
     /// Manage configuration (get/set/list/reset).
@@ -157,6 +159,7 @@ impl CliCommand {
         "index",
         "watch",
         "status",
+        "flush",
         "explain",
         "config",
         "download-models",
@@ -870,6 +873,7 @@ fn parse_command(token: &str) -> SearchResult<CliCommand> {
         "index" | "idx" => Ok(CliCommand::Index),
         "watch" | "w" => Ok(CliCommand::Watch),
         "status" | "st" => Ok(CliCommand::Status),
+        "flush" => Ok(CliCommand::Flush),
         "explain" | "ex" => Ok(CliCommand::Explain),
         "config" | "cfg" => Ok(CliCommand::Config),
         "download-models" | "download" | "dl" => Ok(CliCommand::Download),
@@ -1102,6 +1106,10 @@ mod tests {
         assert_eq!(
             parse_cli_args(["doctor"]).unwrap().command,
             CliCommand::Doctor
+        );
+        assert_eq!(
+            parse_cli_args(["flush"]).unwrap().command,
+            CliCommand::Flush
         );
         assert_eq!(
             parse_cli_args(["watch"]).unwrap().command,

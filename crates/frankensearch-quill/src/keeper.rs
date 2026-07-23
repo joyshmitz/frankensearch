@@ -3,8 +3,8 @@
 //! This module owns the hand-rolled MANIFEST v1 wire format, Q1 range
 //! validation, two-slot recovery, cross-process writer ownership, staged
 //! durability repair, serialized publication, and writer-admitted garbage
-//! collection. It also owns the structural Q1 concat-merge primitive; tier
-//! selection and tombstone-folding compaction remain later policy milestones.
+//! collection. It also owns the structural Q1 concat-merge primitive, the
+//! bound-consecutive tier planner, and tombstone-folding compaction.
 
 use std::cmp::Ordering;
 #[cfg(unix)]
@@ -1306,6 +1306,226 @@ impl ManifestSegment {
         }
         self.tombstones.insert(global_docid)
     }
+}
+
+/// Size class assigned from one segment's Q1 covering-interval width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentSizeTier {
+    /// Width is at most [`TierMergePolicy::small_max_docid_width`].
+    Small,
+    /// Width is above small and at most [`TierMergePolicy::medium_max_docid_width`].
+    Medium,
+    /// Width exceeds the medium boundary.
+    Large,
+}
+
+/// Explicit configuration consumed by the bound-consecutive tier planner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TierMergePolicy {
+    /// Same-tier run length that triggers one concat merge.
+    pub fanout: usize,
+    /// Inclusive upper width of the small tier.
+    pub small_max_docid_width: u64,
+    /// Inclusive upper width of the medium tier.
+    pub medium_max_docid_width: u64,
+    /// Maximum fraction of the output hull occupied by inter-segment holes.
+    pub max_hole_ratio: f64,
+}
+
+impl TierMergePolicy {
+    /// Build the Keeper policy from Quill's validated engine configuration.
+    #[must_use]
+    pub const fn from_config(config: &crate::config::QuillConfig) -> Self {
+        Self {
+            fanout: config.tier_fanout,
+            small_max_docid_width: config.tier_small_max_docid_width,
+            medium_max_docid_width: config.tier_medium_max_docid_width,
+            max_hole_ratio: config.merge_max_hole_ratio,
+        }
+    }
+
+    /// Classify one nonempty covering interval by width.
+    #[must_use]
+    pub const fn classify_width(self, width: u64) -> SegmentSizeTier {
+        if width <= self.small_max_docid_width {
+            SegmentSizeTier::Small
+        } else if width <= self.medium_max_docid_width {
+            SegmentSizeTier::Medium
+        } else {
+            SegmentSizeTier::Large
+        }
+    }
+}
+
+/// One exact manifest slice selected for a Q1-preserving concat merge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierMergePlan {
+    /// Common size tier of every source segment.
+    pub tier: SegmentSizeTier,
+    /// Source identities in current manifest order.
+    pub source_segment_ids: Vec<u64>,
+    /// Inclusive lower bound of the output hull.
+    pub docid_lo: u64,
+    /// Exclusive upper bound of the output hull.
+    pub docid_hi: u64,
+    /// Fraction of the output hull represented by gaps between sources.
+    pub hole_ratio: f64,
+}
+
+/// Typed failure from allocation-free policy scanning or plan materialization.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum TierPolicyError {
+    /// A policy must merge at least two segments at a time.
+    #[error("tier merge fanout must be at least two, got {fanout}")]
+    InvalidFanout {
+        /// Rejected fanout.
+        fanout: usize,
+    },
+    /// The tier boundaries must be nonzero and strictly ascending.
+    #[error("tier boundaries must satisfy 0 < small < medium, got small={small}, medium={medium}")]
+    InvalidBoundaries {
+        /// Rejected small boundary.
+        small: u64,
+        /// Rejected medium boundary.
+        medium: u64,
+    },
+    /// The optional hole-ratio gate must be a finite fraction.
+    #[error("tier merge hole ratio must be finite and in [0, 1], got {ratio}")]
+    InvalidHoleRatio {
+        /// Rejected ratio rendered without float equality in the error type.
+        ratio: String,
+    },
+    /// A standalone segment supplied to the planner has an empty or reversed interval.
+    #[error("segment {segment_id} has invalid docid interval [{docid_lo}, {docid_hi})")]
+    InvalidSegmentRange {
+        /// Rejected segment identity.
+        segment_id: u64,
+        /// Inclusive lower bound.
+        docid_lo: u64,
+        /// Exclusive upper bound.
+        docid_hi: u64,
+    },
+    /// Standalone planner inputs must already be sorted and pairwise disjoint.
+    #[error("segments {left_segment_id} and {right_segment_id} overlap or are out of docid order")]
+    InvalidSegmentOrder {
+        /// Earlier segment identity.
+        left_segment_id: u64,
+        /// Later segment identity.
+        right_segment_id: u64,
+    },
+    /// A selected source-id vector could not be reserved.
+    #[error("could not allocate {count} tier merge source ids")]
+    Allocation {
+        /// Requested source count.
+        count: usize,
+    },
+}
+
+/// Select the first same-tier, bound-consecutive manifest run admitted by the
+/// optional hole-ratio gate.
+///
+/// The planner validates interval ordering and disjointness before selecting an
+/// uninterrupted slice. That slice is therefore exactly Q1 R2: the output hull
+/// cannot contain a skipped live interval, including when it crosses shards.
+///
+/// # Errors
+///
+/// Returns [`TierPolicyError`] for an invalid standalone policy, malformed
+/// segment layout, or allocation failure. Engine callers normally construct
+/// the policy from a validated [`crate::config::QuillConfig`].
+pub fn plan_tier_merge(
+    segments: &[ManifestSegment],
+    policy: TierMergePolicy,
+) -> Result<Option<TierMergePlan>, TierPolicyError> {
+    validate_tier_policy(policy)?;
+    validate_tier_segments(segments)?;
+    if segments.len() < policy.fanout {
+        return Ok(None);
+    }
+    for sources in segments.windows(policy.fanout) {
+        let first = &sources[0];
+        let tier = policy.classify_width(first.docid_hi - first.docid_lo);
+        if sources
+            .iter()
+            .any(|segment| policy.classify_width(segment.docid_hi - segment.docid_lo) != tier)
+        {
+            continue;
+        }
+        let docid_lo = first.docid_lo;
+        let docid_hi = sources[sources.len() - 1].docid_hi;
+        let hull_width = docid_hi - docid_lo;
+        let occupied_width = sources
+            .iter()
+            .map(|segment| segment.docid_hi - segment.docid_lo)
+            .sum::<u64>();
+        let hole_width = hull_width.saturating_sub(occupied_width);
+        let hole_ratio = if hull_width == 0 {
+            0.0
+        } else {
+            hole_width as f64 / hull_width as f64
+        };
+        if hole_ratio > policy.max_hole_ratio {
+            continue;
+        }
+        let mut source_segment_ids = Vec::new();
+        source_segment_ids
+            .try_reserve_exact(sources.len())
+            .map_err(|_| TierPolicyError::Allocation {
+                count: sources.len(),
+            })?;
+        source_segment_ids.extend(sources.iter().map(|segment| segment.segment_id));
+        return Ok(Some(TierMergePlan {
+            tier,
+            source_segment_ids,
+            docid_lo,
+            docid_hi,
+            hole_ratio,
+        }));
+    }
+    Ok(None)
+}
+
+fn validate_tier_policy(policy: TierMergePolicy) -> Result<(), TierPolicyError> {
+    if policy.fanout < 2 {
+        return Err(TierPolicyError::InvalidFanout {
+            fanout: policy.fanout,
+        });
+    }
+    if policy.small_max_docid_width == 0
+        || policy.medium_max_docid_width <= policy.small_max_docid_width
+    {
+        return Err(TierPolicyError::InvalidBoundaries {
+            small: policy.small_max_docid_width,
+            medium: policy.medium_max_docid_width,
+        });
+    }
+    if !policy.max_hole_ratio.is_finite() || !(0.0..=1.0).contains(&policy.max_hole_ratio) {
+        return Err(TierPolicyError::InvalidHoleRatio {
+            ratio: policy.max_hole_ratio.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_tier_segments(segments: &[ManifestSegment]) -> Result<(), TierPolicyError> {
+    for segment in segments {
+        if segment.docid_lo >= segment.docid_hi {
+            return Err(TierPolicyError::InvalidSegmentRange {
+                segment_id: segment.segment_id,
+                docid_lo: segment.docid_lo,
+                docid_hi: segment.docid_hi,
+            });
+        }
+    }
+    for pair in segments.windows(2) {
+        if pair[0].docid_hi > pair[1].docid_lo {
+            return Err(TierPolicyError::InvalidSegmentOrder {
+                left_segment_id: pair[0].segment_id,
+                right_segment_id: pair[1].segment_id,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Snapshot-level field statistics rolled up over referenced segments.
@@ -11617,6 +11837,209 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn tier_test_segment(segment_id: u64, docid_lo: u64, docid_hi: u64) -> ManifestSegment {
+        ManifestSegment {
+            segment_id,
+            seal_seq: segment_id,
+            file_len: 1,
+            file_xxh3: segment_id,
+            docid_lo,
+            docid_hi,
+            doc_count: u32::try_from(docid_hi - docid_lo).expect("test segment width fits u32"),
+            tombstones: TombstoneSet::default(),
+        }
+    }
+
+    fn apply_tier_test_plan(
+        segments: &mut Vec<ManifestSegment>,
+        plan: &TierMergePlan,
+        output_segment_id: u64,
+    ) {
+        let start = segments
+            .iter()
+            .position(|segment| segment.segment_id == plan.source_segment_ids[0])
+            .expect("planned first source remains live");
+        let end = start + plan.source_segment_ids.len();
+        assert_eq!(
+            segments[start..end]
+                .iter()
+                .map(|segment| segment.segment_id)
+                .collect::<Vec<_>>(),
+            plan.source_segment_ids,
+            "policy plan must name one uninterrupted manifest slice",
+        );
+        let doc_count = segments[start..end]
+            .iter()
+            .map(|segment| segment.doc_count)
+            .sum();
+        segments.splice(
+            start..end,
+            [ManifestSegment {
+                segment_id: output_segment_id,
+                seal_seq: output_segment_id,
+                file_len: 1,
+                file_xxh3: output_segment_id,
+                docid_lo: plan.docid_lo,
+                docid_hi: plan.docid_hi,
+                doc_count,
+                tombstones: TombstoneSet::default(),
+            }],
+        );
+    }
+
+    fn assert_pairwise_disjoint(segments: &[ManifestSegment]) {
+        for pair in segments.windows(2) {
+            assert!(
+                pair[0].docid_hi <= pair[1].docid_lo,
+                "covering intervals overlap: {:?} then {:?}",
+                pair[0],
+                pair[1],
+            );
+        }
+    }
+
+    #[test]
+    fn tier_planner_classifies_widths_and_selects_only_bound_consecutive_runs() {
+        let policy = TierMergePolicy {
+            fanout: 3,
+            small_max_docid_width: 16,
+            medium_max_docid_width: 64,
+            max_hole_ratio: 0.5,
+        };
+        assert_eq!(policy.classify_width(16), SegmentSizeTier::Small);
+        assert_eq!(policy.classify_width(17), SegmentSizeTier::Medium);
+        assert_eq!(policy.classify_width(65), SegmentSizeTier::Large);
+
+        let segments = vec![
+            tier_test_segment(1, 0, 4),
+            tier_test_segment(2, 6, 10),
+            tier_test_segment(3, 12, 16),
+            tier_test_segment(4, 80, 112),
+        ];
+        let plan = plan_tier_merge(&segments, policy)
+            .expect("valid policy")
+            .expect("three small consecutive sources merge");
+        assert_eq!(plan.source_segment_ids, [1, 2, 3]);
+        assert_eq!((plan.docid_lo, plan.docid_hi), (0, 16));
+        assert!((plan.hole_ratio - 0.25).abs() < f64::EPSILON);
+
+        let rejected = plan_tier_merge(
+            &segments,
+            TierMergePolicy {
+                max_hole_ratio: 0.24,
+                ..policy
+            },
+        )
+        .expect("valid restrictive policy");
+        assert!(rejected.is_none(), "hole gate must decline the run");
+
+        let mut empty = tier_test_segment(9, 20, 21);
+        empty.docid_hi = empty.docid_lo;
+        assert!(matches!(
+            plan_tier_merge(&[empty], policy),
+            Err(TierPolicyError::InvalidSegmentRange { segment_id: 9, .. })
+        ));
+        assert!(matches!(
+            plan_tier_merge(&[segments[1].clone(), segments[0].clone()], policy),
+            Err(TierPolicyError::InvalidSegmentOrder {
+                left_segment_id: 2,
+                right_segment_id: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn tier_policy_bounds_segment_count_under_ten_thousand_watch_batches() {
+        let policy = TierMergePolicy {
+            fanout: 8,
+            small_max_docid_width: 64,
+            medium_max_docid_width: 512,
+            max_hole_ratio: 0.5,
+        };
+        let mut segments = Vec::new();
+        let mut next_output_id = 10_001_u64;
+        for batch in 0..10_000_u64 {
+            segments.push(tier_test_segment(batch + 1, batch, batch + 1));
+            while let Some(plan) = plan_tier_merge(&segments, policy).expect("valid watch policy") {
+                apply_tier_test_plan(&mut segments, &plan, next_output_id);
+                next_output_id += 1;
+            }
+        }
+        let tier_count_bound = 3 * (policy.fanout - 1);
+        assert!(
+            segments.len() <= tier_count_bound,
+            "{} live segments exceeded the S/M/L bound {tier_count_bound}",
+            segments.len(),
+        );
+        assert!(
+            plan_tier_merge(&segments, policy)
+                .expect("valid final policy")
+                .is_none(),
+            "watch simulation must drain every eligible same-tier run",
+        );
+        assert_pairwise_disjoint(&segments);
+    }
+
+    #[test]
+    fn interleaved_multi_shard_random_merge_schedule_preserves_q1_intervals() {
+        let policy = TierMergePolicy {
+            fanout: 4,
+            small_max_docid_width: 65_536,
+            medium_max_docid_width: 8 * 65_536,
+            max_hole_ratio: 1.0,
+        };
+        let mut rng = 0x51a7_d15c_0de5_1234_u64;
+        let mut next_ord = [0_u64; 4];
+        let mut lease_base = [None; 4];
+        let mut next_block_base = 0_u64;
+        let mut segments = Vec::new();
+        let mut next_id = 1_u64;
+        for _ in 0..2_000 {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            let random = rng.wrapping_mul(0x2545_f491_4f6c_dd1d);
+            let shard = usize::try_from(random % 4).expect("shard fits usize");
+            let width = 1 + (random >> 8) % 17;
+            let base = *lease_base[shard].get_or_insert_with(|| {
+                let granted = next_block_base;
+                next_block_base += 65_536;
+                next_ord[shard] = 0;
+                granted
+            });
+            let lo = base + next_ord[shard];
+            let hi = lo + width;
+            next_ord[shard] += width;
+            segments.push(tier_test_segment(next_id, lo, hi));
+            next_id += 1;
+            segments.sort_unstable_by_key(|segment| segment.docid_lo);
+            assert_pairwise_disjoint(&segments);
+
+            let merge_budget = usize::try_from((random >> 16) % 5).expect("budget fits usize");
+            let mut retired_for_merge = false;
+            for _ in 0..merge_budget {
+                let Some(plan) = plan_tier_merge(&segments, policy).expect("valid random policy")
+                else {
+                    break;
+                };
+                apply_tier_test_plan(&mut segments, &plan, next_id);
+                next_id += 1;
+                if !retired_for_merge {
+                    // Production concat retires every live shard session so a
+                    // later append cannot land inside the new union hull.
+                    lease_base.fill(None);
+                    retired_for_merge = true;
+                }
+                assert_pairwise_disjoint(&segments);
+            }
+        }
+        while let Some(plan) = plan_tier_merge(&segments, policy).expect("valid drain policy") {
+            apply_tier_test_plan(&mut segments, &plan, next_id);
+            next_id += 1;
+            assert_pairwise_disjoint(&segments);
+        }
+    }
 
     #[test]
     fn rank_pruning_cache_caps_unique_terms_and_rejects_dictionary_drift() {

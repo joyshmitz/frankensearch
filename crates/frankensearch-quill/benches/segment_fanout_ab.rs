@@ -102,7 +102,7 @@ async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
         deterministic_ingest: true,
         ..QuillConfig::default()
     };
-    let mut index = QuillIndex::in_memory(config).expect("in-memory bench index");
+    let index = QuillIndex::in_memory(config).expect("in-memory bench index");
     let mut state = seed | 1;
     for segment in 0..shape.segments {
         let mut batch = Vec::with_capacity(shape.docs_per_segment);

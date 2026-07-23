@@ -26,7 +26,7 @@ pub enum QueryPhase {
     Classify,
     /// Fast-tier embedding (potion-128M, ~0.57ms).
     FastEmbed,
-    /// BM25 lexical retrieval via Tantivy.
+    /// BM25 lexical retrieval via the configured lexical engine.
     LexicalRetrieve,
     /// Fast-tier vector search (FSVI scan).
     FastVectorSearch,

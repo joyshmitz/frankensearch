@@ -14,6 +14,11 @@ tantivy-oracle = [
     "dep:frankensearch-lexical",
     "frankensearch-lexical/tantivy-oracle",
 ]
+perf-harness = [
+    "tantivy-oracle",
+    "frankensearch-lexical/bench-internals",
+    "frankensearch-quill/bench-internals",
+]
 
 [dependencies]
 asupersync = { workspace = true }
@@ -30,9 +35,15 @@ rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
+criterion = { workspace = true }
 frankensearch-quill = { workspace = true, features = ["bench-internals"] }
 tempfile = "3.27"
 tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "perf_matrix"
+harness = false
+required-features = ["perf-harness"]
 
 [lints]
 workspace = true

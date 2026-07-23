@@ -6611,3 +6611,66 @@ exact release benchmark binary within the remote timeout. Retain the exact
 SWAR/scalar parity gates and 64-pass interleaving; require both A/A p5–p95 bands
 wholly inside 0.97–1.03, every shipping/candidate Criterion CV below 5%, short
 candidate/shipping <=0.97, and no decidable long-token regression before KEEP.
+
+## 2026-07-23 — KEEP: fragmented sub-10k Quill snapshots use segment-parallel scoring (`bd-quill-e7-integration-flip-d0tx.2`, RoseMaple)
+
+The fsfs 5,000-row watch contract retained one 5,000-document seed segment
+while 100 immutable 50-row replacement leaves accumulated. A temporary
+same-worker component profile isolated the miss: planning was 0.018 ms p95,
+flush/publication 7.620 ms, and explicit commit 0.005 ms, while the required
+post-publication visibility query cost 32.261 ms p95. The existing ranked
+query fan-out remained serial because its only gate was 10,000 live documents,
+even though the snapshot had enough independent leaves to amortize Rayon.
+
+One lever extends the already bit-exact `sealed_segment_fanout` decision:
+snapshots with at least eight sealed segments now fan out even below 10,000
+live documents. The two-segment below-gate control stays serial. The collector,
+scoring, merge, ordering, and materialization paths are unchanged.
+
+Exact strict-remote same-worker ovh-a release-perf contract results:
+
+| state | initial docs/s | watch updates/s | update-to-searchable p95 |
+|---|---:|---:|---:|
+| baseline `e663dff4` | 73,713 | 2,716 | 32.766 ms |
+| eight-segment fan-out | 69,279 | **5,462** | **13.017 ms** |
+
+The candidate clears the full 20k/5k/25ms contract while doubling watch
+throughput and cutting p95 by about 60%. The lower initial number remains more
+than 3.4x above its gate and is unaffected by this query-only predicate.
+Correctness proof: the full Quill library suite passed 473 tests with zero
+failures and two intentional ignores, including the seeded bit-exact
+serial-versus-fanned ranked and doc-id parity matrices; strict Quill
+library/test Clippy passed with `-D warnings`.
+
+**Decision: KEEP.** Fragmentation is now an independent fan-out signal; the
+document-count threshold still protects genuinely small, unfragmented
+snapshots.
+
+## 2026-07-23 — REJECT: fsfs lexical debounce floor retune is an update-to-searchable p95 wash (`bd-quill-e7-integration-flip-d0tx.2`, RoseMaple)
+
+The final E7.2 acceptance gate compared the shipping 6 ms lexical debounce
+base with the admitted 3 ms floor in the deterministic fsfs pressure harness.
+The harness now calls the production adaptive-debounce helper rather than
+copying its formula. A query edit recomputes the window before scheduling a
+refresh, so the simulated 64 ms typing cadence and 12-character query install
+the same 7 ms adaptive window in both arms. Each observation then adds the
+measured Quill watch-query p95 anchor of 13.017 ms and the scenario's
+deterministic pressure penalty.
+
+Strict-remote ovh-a results:
+
+| pressure scenario | shipping 6 ms base p95 | candidate 3 ms base p95 | shipping/candidate invocations |
+|---|---:|---:|---:|
+| gradual ramp-up | 36.017 ms | 36.017 ms | 40 / 40 |
+| spike and recovery | 36.017 ms | 36.017 ms | 25 / 25 |
+| hysteresis oscillation | 24.017 ms | 24.017 ms | 30 / 30 |
+| long-run soak fault injection | 20.017 ms | 20.017 ms | 180 / 180 |
+
+The full pressure harness passed all 15 tests and all 35 oracles. The scoped
+fsfs Clippy command reached the crate but remained blocked by 48 pre-existing
+crate-wide `-D warnings` findings; none named the changed pressure harness.
+
+**Decision: REJECT the 3 ms retune and retain the shipping 6 ms base.** It
+cannot improve steady query-edit latency because production adaptive
+recomputation replaces it before search scheduling, and the pressure evidence
+shows neither a p95 nor invocation-count benefit.

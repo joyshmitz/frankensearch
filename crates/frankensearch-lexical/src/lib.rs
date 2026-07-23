@@ -467,17 +467,26 @@ struct SchemaFields {
 
 /// Build the frankensearch Tantivy schema.
 fn build_schema() -> (Schema, SchemaFields) {
+    build_schema_with_positions(true)
+}
+
+fn build_schema_with_positions(positions: bool) -> (Schema, SchemaFields) {
     let mut builder = Schema::builder();
 
     // ID: exact-match only, stored for retrieval.
     let id = builder.add_text_field("id", STRING | STORED);
 
     // Content: full-text indexed with our custom tokenizer, stored for snippet use.
+    let index_record_option = if positions {
+        tantivy::schema::IndexRecordOption::WithFreqsAndPositions
+    } else {
+        tantivy::schema::IndexRecordOption::WithFreqs
+    };
     let content_options = TextOptions::default()
         .set_indexing_options(
             TextFieldIndexing::default()
                 .set_tokenizer(TOKENIZER_NAME)
-                .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
+                .set_index_option(index_record_option),
         )
         .set_stored();
     let content = builder.add_text_field("content", content_options);
@@ -487,7 +496,7 @@ fn build_schema() -> (Schema, SchemaFields) {
         .set_indexing_options(
             TextFieldIndexing::default()
                 .set_tokenizer(TOKENIZER_NAME)
-                .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
+                .set_index_option(index_record_option),
         )
         .set_stored();
     let title = builder.add_text_field("title", title_options);
@@ -510,6 +519,18 @@ fn build_schema() -> (Schema, SchemaFields) {
         ord: Some(ord),
     };
     (schema, fields)
+}
+
+#[cfg(feature = "bench-internals")]
+fn validate_benchmark_writer_threads(writer_threads: usize) -> SearchResult<()> {
+    if writer_threads == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "tantivy.writer_threads".to_owned(),
+            value: writer_threads.to_string(),
+            reason: "benchmark writer thread count must be positive".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Fused equivalent of Tantivy's `SimpleTokenizer` followed by `LowerCaser`.
@@ -797,6 +818,172 @@ impl TantivyIndex {
         let (schema, fields) = build_schema();
         let index = Index::create_in_ram(schema.clone());
         Self::from_index(index, schema, fields, None, writer_heap_bytes)
+    }
+
+    /// Create an in-memory oracle with an explicitly pinned benchmark schema,
+    /// writer count, and heap budget.
+    ///
+    /// This is the same shipping analyzer, document conversion, writer, and
+    /// commit path used by [`LexicalSearch`]. Only the knobs that the Quill QG
+    /// matrix must hold equal across engines are exposed. Shipping callers use
+    /// [`Self::in_memory`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error for zero writer threads, or the ordinary
+    /// Tantivy writer-construction error for an unsupported heap budget.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn in_memory_with_benchmark_config(
+        writer_heap_bytes: usize,
+        writer_threads: usize,
+        positions: bool,
+    ) -> SearchResult<Self> {
+        validate_benchmark_writer_threads(writer_threads)?;
+        let (schema, fields) = build_schema_with_positions(positions);
+        let index = Index::create_in_ram(schema.clone());
+        Self::from_index_with_writer_threads(
+            index,
+            schema,
+            fields,
+            None,
+            writer_heap_bytes,
+            Some(writer_threads),
+        )
+    }
+
+    /// Create an on-disk oracle with the same explicit benchmark pins as
+    /// [`Self::in_memory_with_benchmark_config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed filesystem, invalid-config, or Tantivy construction
+    /// error.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn create_with_benchmark_config(
+        path: &Path,
+        writer_heap_bytes: usize,
+        writer_threads: usize,
+        positions: bool,
+    ) -> SearchResult<Self> {
+        validate_benchmark_writer_threads(writer_threads)?;
+        let (schema, fields) = build_schema_with_positions(positions);
+        std::fs::create_dir_all(path).map_err(|error| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(error),
+        })?;
+        let index = Index::create_in_dir(path, schema.clone()).map_err(|error| {
+            SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            }
+        })?;
+        Self::from_index_with_writer_threads(
+            index,
+            schema,
+            fields,
+            Some(path.to_path_buf()),
+            writer_heap_bytes,
+            Some(writer_threads),
+        )
+    }
+
+    /// Reopen an on-disk oracle with the benchmark's pinned writer budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed missing-index, invalid-config, or Tantivy construction
+    /// error.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn open_with_benchmark_config(
+        path: &Path,
+        writer_heap_bytes: usize,
+        writer_threads: usize,
+        positions: bool,
+    ) -> SearchResult<Self> {
+        validate_benchmark_writer_threads(writer_threads)?;
+        if !path.exists() {
+            return Err(SearchError::IndexNotFound {
+                path: path.to_path_buf(),
+            });
+        }
+        let (schema, fields) = build_schema_with_positions(positions);
+        let index = Index::open_in_dir(path).map_err(|error| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(error),
+        })?;
+        Self::from_index_with_writer_threads(
+            index,
+            schema,
+            fields,
+            Some(path.to_path_buf()),
+            writer_heap_bytes,
+            Some(writer_threads),
+        )
+    }
+
+    /// Disable automatic segment merging for a force-merge benchmark setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cancellation or writer-lock error.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn benchmark_disable_auto_merge(&self, cx: &Cx) -> SearchResult<()> {
+        let writer =
+            self.writer.lock(cx).await.map_err(|error| {
+                Self::map_writer_lock_error("tantivy.benchmark_no_merge", error)
+            })?;
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        Ok(())
+    }
+
+    /// Force-merge every currently searchable segment and reload the reader.
+    ///
+    /// This exists only for QG-5's same-binary oracle arm. It invokes
+    /// Tantivy's real merge machinery and waits for the merge future; no
+    /// benchmark-only codec or document path is involved.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cancellation, writer-lock, merge, or reader-reload
+    /// error.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub async fn benchmark_force_merge(&self, cx: &Cx) -> SearchResult<()> {
+        let segment_ids =
+            self.index
+                .searchable_segment_ids()
+                .map_err(|error| SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(error),
+                })?;
+        if segment_ids.len() < 2 {
+            return Ok(());
+        }
+        {
+            let mut writer = self
+                .writer
+                .lock(cx)
+                .await
+                .map_err(|error| Self::map_writer_lock_error("tantivy.force_merge", error))?;
+            writer
+                .merge(&segment_ids)
+                .wait()
+                .map_err(|error| SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(error),
+                })?;
+        }
+        self.reader
+            .reload()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(error),
+            })?;
+        Ok(())
     }
 
     /// Return `(searchable_segments, managed_index_bytes)` for index-build benchmarks.

@@ -24,6 +24,9 @@ use frankensearch_fsfs::pressure::{
     REASON_RESOURCE_QUALITY_DEFERRED, ResourceAdmissionMode, ResourceLane,
     ResourcePressureGovernor, ResourcePressureGovernorConfig, ResourcePressureInput,
 };
+use frankensearch_fsfs::runtime::{
+    FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MS, adaptive_lexical_debounce_ms,
+};
 
 // ─── Scenario types ──────────────────────────────────────────────────────
 
@@ -177,6 +180,21 @@ struct OracleResult {
     oracle_name: String,
     passed: bool,
     detail: String,
+}
+
+/// Same-worker release-perf p95 for Quill's published watch query.
+///
+/// The pressure harness adds the shipping adaptive debounce and a deterministic
+/// pressure penalty around this measured service-time anchor.
+const QUILL_WATCH_QUERY_P95_US: u64 = 13_017;
+const SIMULATED_QUERY_CHARS: usize = 12;
+const SIMULATED_TYPING_CADENCE_MS: u64 = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DebounceRetuneEvidence {
+    configured_base_ms: u64,
+    update_to_searchable_p95_us: u64,
+    search_invocations: usize,
 }
 
 // ─── Scenario generators ─────────────────────────────────────────────────
@@ -1269,6 +1287,55 @@ fn run_simulation_core(scenario: &SimulationScenario) -> SimulationTrace {
     }
 }
 
+const fn pressure_search_penalty_us(state: PressureState) -> u64 {
+    match state {
+        PressureState::Normal => 0,
+        PressureState::Constrained => 4_000,
+        PressureState::Degraded => 8_000,
+        PressureState::Emergency => 16_000,
+    }
+}
+
+fn simulate_lexical_debounce_retune(
+    scenario: &SimulationScenario,
+    configured_base_ms: u64,
+) -> DebounceRetuneEvidence {
+    let trace = run_simulation_core(scenario);
+    assert!(
+        !trace.pressure_trace.is_empty(),
+        "debounce evidence requires a pressure-bearing scenario"
+    );
+
+    let adaptive_debounce_ms =
+        adaptive_lexical_debounce_ms(SIMULATED_TYPING_CADENCE_MS, SIMULATED_QUERY_CHARS);
+    let mut update_to_searchable_us = trace
+        .pressure_trace
+        .iter()
+        .map(|record| {
+            // `mark_query_dirty` records the edit and recomputes the adaptive
+            // window before the refresh can be scheduled. The configured base
+            // is therefore intentionally replaced in both arms.
+            adaptive_debounce_ms
+                .saturating_mul(1_000)
+                .saturating_add(QUILL_WATCH_QUERY_P95_US)
+                .saturating_add(pressure_search_penalty_us(record.to))
+        })
+        .collect::<Vec<_>>();
+    update_to_searchable_us.sort_unstable();
+    let p95_index = update_to_searchable_us
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1);
+    let update_to_searchable_p95_us = update_to_searchable_us[p95_index];
+
+    DebounceRetuneEvidence {
+        configured_base_ms,
+        update_to_searchable_p95_us,
+        search_invocations: update_to_searchable_us.len(),
+    }
+}
+
 /// Full simulation: runs core simulation + all oracle invariant checks.
 fn run_full_simulation(scenario: &SimulationScenario) -> SimulationTrace {
     let mut trace = run_simulation_core(scenario);
@@ -1993,6 +2060,50 @@ fn artifact_bundle_emission_writes_replay_manifest() {
             .contains("full_simulation_suite_all_oracles_pass"),
         "Replay command should target full simulation suite test"
     );
+}
+
+#[test]
+fn lexical_debounce_floor_is_update_to_searchable_p95_wash_under_pressure() {
+    let scenarios = [
+        scenario_gradual_ramp_up(),
+        scenario_spike_and_recovery(),
+        scenario_hysteresis_oscillation(),
+        scenario_long_run_soak_fault_injection(),
+    ];
+
+    for scenario in &scenarios {
+        let shipping = simulate_lexical_debounce_retune(scenario, FSFS_TUI_LEXICAL_DEBOUNCE_MS);
+        let floor = simulate_lexical_debounce_retune(scenario, FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS);
+
+        eprintln!(
+            "lexical debounce evidence: scenario={} shipping-base={}ms floor-base={}ms \
+             shipping-update-to-searchable-p95={}.{:03}ms \
+             floor-update-to-searchable-p95={}.{:03}ms \
+             shipping-invocations={} floor-invocations={}",
+            scenario.name,
+            shipping.configured_base_ms,
+            floor.configured_base_ms,
+            shipping.update_to_searchable_p95_us / 1_000,
+            shipping.update_to_searchable_p95_us % 1_000,
+            floor.update_to_searchable_p95_us / 1_000,
+            floor.update_to_searchable_p95_us % 1_000,
+            shipping.search_invocations,
+            floor.search_invocations,
+        );
+
+        assert_eq!(
+            shipping.update_to_searchable_p95_us, floor.update_to_searchable_p95_us,
+            "{}: lowering the configured base must not claim a p95 win after \
+             production query-edit handling replaces both arms with the same \
+             adaptive debounce",
+            scenario.name
+        );
+        assert_eq!(
+            shipping.search_invocations, floor.search_invocations,
+            "{}: a debounce retune must not change pressure-harness search invocation count",
+            scenario.name
+        );
+    }
 }
 
 #[test]

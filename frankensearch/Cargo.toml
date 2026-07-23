@@ -13,9 +13,14 @@ hash = ["frankensearch-embed/hash"]
 model2vec = ["frankensearch-embed/model2vec"]
 fastembed = ["frankensearch-embed/fastembed"]
 lexical = ["dep:frankensearch-lexical"]
+lexical-tantivy = ["lexical"]
+quill = ["dep:frankensearch-quill"]
 graph = ["frankensearch-fusion/graph"]
 storage = ["dep:frankensearch-storage"]
-durability = ["dep:frankensearch-durability"]
+durability = [
+    "dep:frankensearch-durability",
+    "frankensearch-quill?/durability",
+]
 fts5 = ["storage", "frankensearch-storage/fts5"]
 rerank = ["dep:frankensearch-rerank", "frankensearch-rerank/native", "frankensearch-fusion/rerank"]
 native = ["dep:frankensearch-rerank", "frankensearch-rerank/native", "frankensearch-fusion/rerank"]
@@ -35,6 +40,7 @@ frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true }
 frankensearch-index = { workspace = true }
 frankensearch-lexical = { workspace = true, optional = true }
+frankensearch-quill = { workspace = true, optional = true }
 frankensearch-fusion = { workspace = true }
 frankensearch-rerank = { workspace = true, optional = true }
 frankensearch-storage = { workspace = true, optional = true }
@@ -56,6 +62,7 @@ toml = { workspace = true }
 [[bench]]
 name = "search_bench"
 harness = false
+required-features = ["lexical-tantivy"]
 
 [[bench]]
 name = "index_builder_lexical_staging"

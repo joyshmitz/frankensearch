@@ -26,12 +26,12 @@ use tracing::instrument;
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
-#[cfg(feature = "lexical")]
+#[cfg(all(feature = "lexical", not(feature = "quill")))]
 use frankensearch_core::traits::LexicalSearch;
 use frankensearch_core::traits::{Embedder, MetricsExporter};
 use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocument};
-#[cfg(all(feature = "durability", feature = "lexical"))]
-use frankensearch_durability::DurableTantivyIndex;
+#[cfg(all(feature = "durability", feature = "quill"))]
+use frankensearch_durability::FileProtector;
 #[cfg(feature = "durability")]
 use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviProtector};
 use frankensearch_embed::auto_detect::EmbedderStack;
@@ -39,8 +39,10 @@ use frankensearch_index::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
     VECTOR_INDEX_QUALITY_FILENAME,
 };
-#[cfg(feature = "lexical")]
+#[cfg(all(feature = "lexical", not(feature = "quill")))]
 use frankensearch_lexical::TantivyIndex;
+#[cfg(feature = "quill")]
+use frankensearch_quill::{QuillConfig, QuillIndex};
 
 /// Statistics from a completed index build.
 #[derive(Debug, Clone)]
@@ -81,7 +83,10 @@ pub struct IndexBuilder {
     embedder_stack: Option<EmbedderStack>,
     batch_size: usize,
     on_progress: Option<Box<dyn FnMut(IndexProgress) + Send>>,
-    #[cfg(all(feature = "lexical", feature = "bench-internals"))]
+    #[cfg(all(
+        any(feature = "lexical", feature = "quill"),
+        feature = "bench-internals"
+    ))]
     clone_lexical_staging_for_benchmark: bool,
 }
 
@@ -96,7 +101,10 @@ impl IndexBuilder {
             embedder_stack: None,
             batch_size: 32,
             on_progress: None,
-            #[cfg(all(feature = "lexical", feature = "bench-internals"))]
+            #[cfg(all(
+                any(feature = "lexical", feature = "quill"),
+                feature = "bench-internals"
+            ))]
             clone_lexical_staging_for_benchmark: false,
         }
     }
@@ -130,7 +138,10 @@ impl IndexBuilder {
     }
 
     /// Retain the former deep-clone staging path for same-binary performance comparisons.
-    #[cfg(all(feature = "lexical", feature = "bench-internals"))]
+    #[cfg(all(
+        any(feature = "lexical", feature = "quill"),
+        feature = "bench-internals"
+    ))]
     #[doc(hidden)]
     #[must_use]
     pub fn with_clone_lexical_staging_for_benchmark(mut self) -> Self {
@@ -218,15 +229,18 @@ impl IndexBuilder {
         let mut errors = Vec::new();
         let mut doc_count = 0usize;
         let mut embed_ms = 0.0f64;
-        #[cfg(feature = "lexical")]
+        #[cfg(any(feature = "lexical", feature = "quill"))]
         let mut lexical_docs = Vec::with_capacity(total);
-        #[cfg(feature = "lexical")]
+        #[cfg(any(feature = "lexical", feature = "quill"))]
         let mut failed_documents = Vec::new();
 
         // Keep the old borrowed loop available only for the same-binary benchmark arm. This is the
         // exact former residency behavior: all originals stay in `self.documents` while successful
         // documents are deep-cloned into lexical staging.
-        #[cfg(all(feature = "lexical", feature = "bench-internals"))]
+        #[cfg(all(
+            any(feature = "lexical", feature = "quill"),
+            feature = "bench-internals"
+        ))]
         if self.clone_lexical_staging_for_benchmark {
             for (batch_idx, batch) in self.documents.chunks(self.batch_size).enumerate() {
                 let batch_start = Instant::now();
@@ -301,7 +315,10 @@ impl IndexBuilder {
             }
         }
 
-        #[cfg(all(feature = "lexical", not(feature = "bench-internals")))]
+        #[cfg(all(
+            any(feature = "lexical", feature = "quill"),
+            not(feature = "bench-internals")
+        ))]
         {
             // `build` owns the input documents, so move successful values into lexical staging.
             let mut documents = std::mem::take(&mut self.documents).into_iter();
@@ -344,7 +361,7 @@ impl IndexBuilder {
 
         // Without lexical indexing there is no staging clone to remove, so retain the former path
         // and its metrics/drop timing exactly.
-        #[cfg(not(feature = "lexical"))]
+        #[cfg(not(any(feature = "lexical", feature = "quill")))]
         for (batch_idx, batch) in self.documents.chunks(self.batch_size).enumerate() {
             let batch_start = Instant::now();
             for doc in batch {
@@ -395,27 +412,10 @@ impl IndexBuilder {
             }
         };
 
-        #[cfg(feature = "lexical")]
+        #[cfg(any(feature = "lexical", feature = "quill"))]
         if !lexical_docs.is_empty() {
             let lexical_path = self.data_dir.join("lexical");
-            let lexical = match TantivyIndex::create(&lexical_path) {
-                Ok(lexical) => lexical,
-                Err(error) => {
-                    export_error(metrics_exporter.as_ref(), &error);
-                    return Err(error);
-                }
-            };
-            if let Err(error) = lexical.index_documents(cx, &lexical_docs).await {
-                export_error(metrics_exporter.as_ref(), &error);
-                return Err(error);
-            }
-            if let Err(error) = lexical.commit(cx).await {
-                export_error(metrics_exporter.as_ref(), &error);
-                return Err(error);
-            }
-
-            #[cfg(feature = "durability")]
-            if let Err(error) = protect_lexical_durability(&lexical, &lexical_path) {
+            if let Err(error) = build_lexical_index(cx, &lexical_path, &lexical_docs).await {
                 export_error(metrics_exporter.as_ref(), &error);
                 return Err(error);
             }
@@ -457,7 +457,7 @@ impl IndexBuilder {
 
         // Match the former borrowed-input lifetime: failed documents remain resident until the
         // entire index build, including lexical commit and metrics export, has completed.
-        #[cfg(feature = "lexical")]
+        #[cfg(any(feature = "lexical", feature = "quill"))]
         drop(failed_documents);
 
         Ok(stats)
@@ -569,6 +569,42 @@ fn compute_index_size_bytes(data_dir: &Path) -> u64 {
     fast_bytes.saturating_add(file_size_bytes(&quality_path))
 }
 
+#[cfg(feature = "quill")]
+async fn build_lexical_index(
+    cx: &Cx,
+    data_dir: &Path,
+    documents: &[IndexableDocument],
+) -> SearchResult<()> {
+    let config = QuillConfig {
+        bulk_load_mode: true,
+        ..QuillConfig::default()
+    };
+
+    #[cfg(feature = "durability")]
+    let lexical = {
+        let protector =
+            FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())?;
+        QuillIndex::create_durable(cx, data_dir, config, protector).await?
+    };
+    #[cfg(not(feature = "durability"))]
+    let lexical = QuillIndex::create(cx, data_dir, config).await?;
+
+    lexical.index_documents(cx, documents).await?;
+    let _ = lexical.finish_bulk_load(cx).await?;
+    Ok(())
+}
+
+#[cfg(all(feature = "lexical", not(feature = "quill")))]
+async fn build_lexical_index(
+    cx: &Cx,
+    data_dir: &Path,
+    documents: &[IndexableDocument],
+) -> SearchResult<()> {
+    let lexical = TantivyIndex::create(data_dir)?;
+    lexical.index_documents(cx, documents).await?;
+    lexical.commit(cx).await
+}
+
 #[cfg(feature = "durability")]
 fn protect_durability_sidecars(data_dir: &Path) -> SearchResult<()> {
     let protector = FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())?;
@@ -593,18 +629,6 @@ fn protect_durability_sidecars(data_dir: &Path) -> SearchResult<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "durability", feature = "lexical"))]
-fn protect_lexical_durability(index: &TantivyIndex, data_dir: &Path) -> SearchResult<()> {
-    let durable = DurableTantivyIndex::new(
-        index.index_handle(),
-        data_dir.to_path_buf(),
-        Arc::new(DefaultSymbolCodec),
-        DurabilityConfig::default(),
-    )?;
-    let _ = durable.protect_segments()?;
-    Ok(())
-}
-
 fn file_size_bytes(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
@@ -625,13 +649,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    #[cfg(feature = "lexical")]
+    #[cfg(all(feature = "lexical", not(feature = "quill")))]
     use frankensearch_core::traits::LexicalSearch;
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     #[cfg(feature = "durability")]
     use frankensearch_durability::FsviProtector;
-    #[cfg(feature = "lexical")]
+    #[cfg(all(feature = "lexical", not(feature = "quill")))]
     use frankensearch_lexical::TantivyIndex;
 
     use super::*;
@@ -673,10 +697,10 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "lexical")]
+    #[cfg(any(feature = "lexical", feature = "quill"))]
     struct SelectiveFailEmbedder;
 
-    #[cfg(feature = "lexical")]
+    #[cfg(any(feature = "lexical", feature = "quill"))]
     impl Embedder for SelectiveFailEmbedder {
         fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async move {
@@ -694,11 +718,11 @@ mod tests {
             4
         }
 
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "selective-fail"
         }
 
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "selective-fail"
         }
 
@@ -888,7 +912,7 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "lexical")]
+    #[cfg(any(feature = "lexical", feature = "quill"))]
     #[test]
     fn build_wires_lexical_index_when_feature_enabled() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -903,13 +927,24 @@ mod tests {
 
             assert_eq!(stats.doc_count, 2);
 
-            let lexical = TantivyIndex::open(&dir.path().join("lexical")).unwrap();
-            let hits = lexical.search(&cx, "Alpha", 5).await.unwrap();
+            #[cfg(feature = "quill")]
+            let hits = {
+                let lexical =
+                    QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
+                        .await
+                        .unwrap();
+                lexical.search_results(&cx, "Alpha", 5).unwrap()
+            };
+            #[cfg(all(feature = "lexical", not(feature = "quill")))]
+            let hits = {
+                let lexical = TantivyIndex::open(&dir.path().join("lexical")).unwrap();
+                lexical.search(&cx, "Alpha", 5).await.unwrap()
+            };
             assert!(!hits.is_empty());
         });
     }
 
-    #[cfg(feature = "lexical")]
+    #[cfg(any(feature = "lexical", feature = "quill"))]
     #[test]
     fn lexical_staging_excludes_fast_embedding_failures() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -929,17 +964,44 @@ mod tests {
             assert_eq!(stats.error_count, 1);
             assert_eq!(stats.errors[0].0, "doc-failed");
 
-            let lexical = TantivyIndex::open(&dir.path().join("lexical")).unwrap();
-            let successful = lexical.search_doc_ids(&cx, "sentinel", 10).unwrap();
-            assert_eq!(successful.len(), 2);
-            assert!(successful.iter().any(|hit| hit.doc_id == "doc-first"));
-            assert!(successful.iter().any(|hit| hit.doc_id == "doc-last"));
-            assert!(
+            #[cfg(feature = "quill")]
+            let successful_ids = {
+                let lexical =
+                    QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
+                        .await
+                        .unwrap();
+                assert!(
+                    lexical
+                        .search_doc_ids(&cx, "excluded", 10)
+                        .unwrap()
+                        .is_empty()
+                );
                 lexical
-                    .search_doc_ids(&cx, "excluded", 10)
+                    .search_doc_ids(&cx, "sentinel", 10)
                     .unwrap()
-                    .is_empty()
-            );
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>()
+            };
+            #[cfg(all(feature = "lexical", not(feature = "quill")))]
+            let successful_ids = {
+                let lexical = TantivyIndex::open(&dir.path().join("lexical")).unwrap();
+                assert!(
+                    lexical
+                        .search_doc_ids(&cx, "excluded", 10)
+                        .unwrap()
+                        .is_empty()
+                );
+                lexical
+                    .search_doc_ids(&cx, "sentinel", 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.doc_id.to_string())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(successful_ids.len(), 2);
+            assert!(successful_ids.iter().any(|doc_id| doc_id == "doc-first"));
+            assert!(successful_ids.iter().any(|doc_id| doc_id == "doc-last"));
         });
     }
 
@@ -968,6 +1030,35 @@ mod tests {
             };
             let fast_sidecar = FsviProtector::sidecar_path(&fast_path);
             assert!(fast_sidecar.exists());
+
+            #[cfg(feature = "quill")]
+            {
+                let lexical_dir = dir.path().join("lexical");
+                let protected_sources = std::fs::read_dir(&lexical_dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|extension| extension == "fec"))
+                    .filter_map(|sidecar| {
+                        sidecar
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    protected_sources
+                        .iter()
+                        .any(|name| name.ends_with(".fslx.fec")),
+                    "bulk-built Quill segment must have a generic FileProtector sidecar: \
+                     {protected_sources:?}"
+                );
+                assert!(
+                    protected_sources.iter().any(|name| name == "MANIFEST.fec"),
+                    "published Quill manifest must have a generic FileProtector sidecar: \
+                     {protected_sources:?}"
+                );
+            }
         });
     }
 

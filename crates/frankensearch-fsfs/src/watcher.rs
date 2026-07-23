@@ -124,6 +124,19 @@ pub trait WatchIngestPipeline: Send + Sync {
         batch: &[WatchIngestOp],
         rt: &asupersync::runtime::Runtime,
     ) -> SearchResult<usize>;
+
+    /// Poll an out-of-band durable flush request.
+    ///
+    /// The default is a no-op for test and dry-run sinks. Live index writers
+    /// use this hook so a separate CLI process can request a publication
+    /// barrier without acquiring the writer lease itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns any durable publication or acknowledgement failure.
+    fn poll_flush_barrier(&self, _rt: &asupersync::runtime::Runtime) -> SearchResult<bool> {
+        Ok(false)
+    }
 }
 
 /// No-op ingest sink used by tests and dry-run scenarios.
@@ -656,6 +669,15 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
                 &mut pending,
                 Some(&mount_table),
             );
+        }
+
+        match context.ingest.poll_flush_barrier(&rt) {
+            Ok(true) => debug!("watcher acknowledged a durable flush barrier"),
+            Ok(false) => {}
+            Err(error) => {
+                context.stats.add_error();
+                warn!(error = %error, "watcher failed to acknowledge a durable flush barrier");
+            }
         }
 
         if !policy.watching_enabled {

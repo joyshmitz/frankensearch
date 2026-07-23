@@ -22,14 +22,17 @@ use asupersync::runtime::{RuntimeBuilder, spawn_blocking};
 use dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
-    HitExplanation, IndexableDocument, LexicalSearch, ScoreComponent, SearchError, SearchResult,
+    HitExplanation, IndexableDocument, ScoreComponent, SearchError, SearchResult,
 };
 use frankensearch_embed::{
     ConsentSource, DownloadConsent, EmbedderStack, HashAlgorithm, HashEmbedder, ModelDownloader,
     ModelLifecycle, ModelManifest, ensure_default_semantic_models,
 };
 use frankensearch_index::VectorIndex;
-use frankensearch_lexical::{SnippetConfig, TantivyIndex};
+use frankensearch_quill::{
+    DEFAULT_SCHEMA, KeeperError, KeeperSnapshot, QuillConfig, QuillIndex, QuillIndexError,
+    QuillSearchIndex, SegmentStats, SegmentStatsProvider, SnippetConfig,
+};
 use frankensearch_storage::{
     EmbeddingVectorSink, IngestAction, IngestRequest, IngestResult, JobQueueConfig,
     PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
@@ -84,12 +87,15 @@ use crate::file_classification::{
     FileClassificationContractDefinition, FileClassificationDecision,
     IngestAction as FileClassificationIngestAction,
 };
+use crate::lexical_pipeline::{LexicalMutation, LexicalPipeline, QuillLexicalBackend};
 use crate::lifecycle::{
     DiskBudgetAction, DiskBudgetSnapshot, DiskBudgetStage, IndexStorageBreakdown, LifecycleTracker,
     ResourceLimits, ResourceUsage, WatchdogConfig,
 };
 use crate::mount_info::{MountTable, read_system_mounts};
-use crate::output_schema::{OutputEnvelope, SearchHitPayload, SearchOutputPhase, SearchPayload};
+use crate::output_schema::{
+    IndexFreshnessPayload, OutputEnvelope, SearchHitPayload, SearchOutputPhase, SearchPayload,
+};
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
     HostPressureCollector, PressureController, PressureControllerConfig, PressureSignal,
@@ -194,7 +200,7 @@ pub enum VectorIndexWriteAction {
 pub struct IndexStoragePaths {
     /// Vector-index roots (FSVI shards, WAL, checkpoints).
     pub vector_index_roots: Vec<PathBuf>,
-    /// Lexical-index roots (Tantivy segments and metadata).
+    /// Lexical-index roots (segments and metadata).
     pub lexical_index_roots: Vec<PathBuf>,
     /// Catalog/database files (`FrankenSQLite` and sidecars).
     pub catalog_files: Vec<PathBuf>,
@@ -343,6 +349,9 @@ const FSFS_VECTOR_MANIFEST_FILE: &str = "vector/index_manifest.json";
 const FSFS_LEXICAL_MANIFEST_FILE: &str = "lexical/index_manifest.json";
 const FSFS_VECTOR_INDEX_FILE: &str = "vector/index.fsvi";
 const FSFS_EXPLAIN_SESSION_FILE: &str = "explain/last_search_session.json";
+const FSFS_FLUSH_REQUEST_FILE: &str = ".fsfs-flush-request.json";
+const FSFS_FLUSH_ACK_FILE: &str = ".fsfs-flush-ack.json";
+const FSFS_FLUSH_POLL_MS: u64 = 25;
 const EXPLAIN_SESSION_SCHEMA_VERSION: &str = "fsfs.explain.session.v1";
 const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded";
 const REASON_DISCOVERY_FILE_PERMISSION_DENIED: &str = "discovery.file.permission_denied";
@@ -360,10 +369,12 @@ const FSFS_TUI_SEARCH_RENDER_MIN_INTERVAL_MS: u64 = 16;
 const FSFS_TUI_SEARCH_RENDER_IDLE_HEARTBEAT_MS: u64 = 180;
 const FSFS_TUI_STATUS_REFRESH_MS: u64 = 15_000;
 const FSFS_TUI_STATUS_REFRESH_ACTIVE_GRACE_MS: u64 = 2_500;
-const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 6;
+/// Shipping lexical search debounce before the first adaptive recomputation.
+pub const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 6;
 const FSFS_TUI_SEMANTIC_DEBOUNCE_MS: u64 = 36;
 const FSFS_TUI_QUALITY_DEBOUNCE_MS: u64 = 160;
-const FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS: u64 = 3;
+/// Minimum lexical debounce admitted by the adaptive search policy.
+pub const FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS: u64 = 3;
 const FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS: u64 = 20;
 const FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS: u64 = 6;
 const FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS: u64 = 24;
@@ -394,6 +405,27 @@ const FSFS_TUI_FAST_STAGE_SNIPPET_MAX_CHARS: usize = 120;
 const FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION: usize = 384;
 const FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD: usize = 5;
 const FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER: usize = 1;
+
+/// Compute the lexical debounce installed after a query edit.
+///
+/// The helper is shared with the deterministic pressure harness so debounce
+/// retune evidence exercises the shipping policy instead of duplicating it.
+#[must_use]
+pub fn adaptive_lexical_debounce_ms(typing_cadence_ms: u64, query_char_count: usize) -> u64 {
+    let cadence_ms = typing_cadence_ms.clamp(
+        FSFS_TUI_TYPING_INTERVAL_MIN_MS,
+        FSFS_TUI_TYPING_INTERVAL_MAX_MS,
+    );
+    let lexical = cadence_ms.div_ceil(10).clamp(
+        FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
+    );
+    if query_char_count <= FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD {
+        lexical.min(FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS)
+    } else {
+        lexical
+    }
+}
 const FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER: usize = 2;
 const FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL: usize = usize::MAX;
 // This controls fast-phase head breadth, not final output cardinality.
@@ -493,7 +525,7 @@ impl SemanticVoiDecision {
 
 struct SearchExecutionResources {
     index_root: PathBuf,
-    lexical_index: Option<TantivyIndex>,
+    lexical_index: Option<QuillSearchIndex>,
     vector_index: Option<VectorIndex>,
     fast_embedder: Option<Arc<dyn Embedder>>,
     quality_embedder: Option<Arc<dyn Embedder>>,
@@ -923,13 +955,8 @@ impl SearchDashboardState {
                 FSFS_TUI_TYPING_INTERVAL_MIN_MS,
                 FSFS_TUI_TYPING_INTERVAL_MAX_MS,
             );
-        let mut lexical = cadence_ms.div_ceil(10).clamp(
-            FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
-            FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
-        );
-        if self.query_input.value().chars().count() <= FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD {
-            lexical = lexical.min(FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS);
-        }
+        let lexical =
+            adaptive_lexical_debounce_ms(cadence_ms, self.query_input.value().chars().count());
         let mut semantic = lexical.saturating_mul(4).saturating_add(8).clamp(
             FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
             FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
@@ -1568,10 +1595,10 @@ const fn sanitize_explain_score(score: f64) -> f64 {
 /// Live ingest pipeline that re-indexes changed files detected by the watcher.
 ///
 /// Reads file content, canonicalizes, embeds, and updates both the lexical
-/// (Tantivy) and semantic (FSVI) indexes incrementally.
+/// (Quill) and semantic (FSVI) indexes incrementally.
 struct LiveIngestPipeline {
     target_root: PathBuf,
-    lexical_index: TantivyIndex,
+    lexical_index: QuillIndex,
     vector_index: Arc<std::sync::Mutex<VectorIndex>>,
     embedder: Arc<dyn Embedder>,
     canonicalizer: DefaultCanonicalizer,
@@ -1616,12 +1643,48 @@ impl WatchIngestPipeline for LiveIngestPipeline {
         let cx = Cx::for_request();
         rt.block_on(self.apply_batch_inner(&cx, batch))
     }
+
+    fn poll_flush_barrier(
+        &self,
+        rt: &asupersync::runtime::Runtime,
+    ) -> frankensearch_core::SearchResult<bool> {
+        let cx = Cx::for_request();
+        rt.block_on(self.acknowledge_flush_barrier(&cx))
+    }
 }
 
 impl LiveIngestPipeline {
+    async fn acknowledge_flush_barrier(&self, cx: &Cx) -> SearchResult<bool> {
+        let Some(directory) = self.lexical_index.directory() else {
+            return Ok(false);
+        };
+        let request_path = directory.join(FSFS_FLUSH_REQUEST_FILE);
+        let Some(request) =
+            read_durable_json::<FsfsFlushRequest>(&request_path, "fsfs.flush.request.read")?
+        else {
+            return Ok(false);
+        };
+        let ack_path = directory.join(FSFS_FLUSH_ACK_FILE);
+        if read_durable_json::<FsfsFlushAck>(&ack_path, "fsfs.flush.ack.read")?
+            .is_some_and(|ack| ack.request_id == request.request_id)
+        {
+            return Ok(false);
+        }
+
+        self.lexical_index.commit(cx).await?;
+        let ack = FsfsFlushAck {
+            request_id: request.request_id,
+            index_freshness: FsfsRuntime::index_freshness_payload(
+                self.lexical_index.segment_stats(),
+            ),
+        };
+        write_durable_json(&ack_path, &ack, "fsfs.flush.ack.write")?;
+        Ok(true)
+    }
+
     fn new(
         target_root: PathBuf,
-        lexical_index: TantivyIndex,
+        lexical_index: QuillIndex,
         vector_index: VectorIndex,
         embedder: Arc<dyn Embedder>,
     ) -> Self {
@@ -1689,9 +1752,26 @@ impl LiveIngestPipeline {
     }
 
     async fn prune_indexes(&self, cx: &Cx, rel_key: &str) -> frankensearch_core::SearchResult<()> {
-        self.lexical_index.delete_document(cx, rel_key).await?;
+        let mutations = [LexicalMutation::delete(
+            rel_key,
+            0,
+            IngestionClass::Skip,
+            "watch_delete",
+        )];
+        self.apply_lexical_mutations(cx, &mutations).await?;
         self.soft_delete_vector(rel_key);
         Ok(())
+    }
+
+    async fn apply_lexical_mutations(
+        &self,
+        cx: &Cx,
+        mutations: &[LexicalMutation],
+    ) -> SearchResult<()> {
+        let backend = QuillLexicalBackend::new(&self.lexical_index);
+        let mut pipeline = LexicalPipeline::new(backend);
+        let _stats = pipeline.apply_incremental(mutations)?;
+        pipeline.backend_mut().flush(cx).await
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1953,7 +2033,16 @@ impl LiveIngestPipeline {
         if let Some(classification) = classification_metadata.as_ref() {
             doc = attach_file_classification_metadata(doc, classification);
         }
-        self.lexical_index.index_document(cx, &doc).await?;
+        let mut mutation = LexicalMutation::upsert(
+            rel_key.clone(),
+            u64::try_from(revision).unwrap_or(0),
+            ingestion_class,
+            canonical.clone(),
+            "watch_upsert",
+        );
+        mutation.title.clone_from(&doc.title);
+        mutation.metadata.clone_from(&doc.metadata);
+        self.apply_lexical_mutations(cx, &[mutation]).await?;
 
         if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
             if let Some(storage_ctx) = storage_ctx {
@@ -2094,6 +2183,24 @@ struct FsfsIndexStatus {
     lexical_index_bytes: u64,
     metadata_bytes: u64,
     embedding_cache_bytes: u64,
+    index_freshness: Option<IndexFreshnessPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsfsFlushPayload {
+    index_path: String,
+    index_freshness: IndexFreshnessPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsfsFlushRequest {
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsfsFlushAck {
+    request_id: String,
+    index_freshness: IndexFreshnessPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4289,6 +4396,10 @@ impl FsfsRuntime {
             self.run_status_command()?;
             return Ok(());
         }
+        if command == CliCommand::Flush {
+            self.run_flush_command(cx).await?;
+            return Ok(());
+        }
         if command == CliCommand::Download {
             self.run_download_command().await?;
             return Ok(());
@@ -4675,7 +4786,9 @@ impl FsfsRuntime {
 
     #[allow(clippy::too_many_lines)]
     async fn run_search_serve_stdio_command(&self, cx: &Cx) -> SearchResult<()> {
-        let mut resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
+        let mut resources = self
+            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
+            .await?;
         let stdin = std::io::stdin();
         let mut line = String::new();
         let mut hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
@@ -4781,7 +4894,9 @@ impl FsfsRuntime {
             path: socket_path.clone(),
         };
 
-        let resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
+        let resources = self
+            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
+            .await?;
         let hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         let shared = Arc::new(std::sync::Mutex::new((resources, hot_cache)));
@@ -4961,6 +5076,11 @@ impl FsfsRuntime {
         hot_cache: &mut HashMap<SearchCacheKey, Vec<SearchPayload>>,
         hot_cache_enabled: bool,
     ) -> SearchResult<SearchServeResponse> {
+        if let Some(index) = resources.lexical_index.as_ref()
+            && index.refresh(cx).await?
+        {
+            hot_cache.clear();
+        }
         let mode = parse_search_execution_mode(request.mode.as_deref())?;
         let requested_limit = request.limit.unwrap_or_else(|| {
             self.cli_input
@@ -5930,11 +6050,15 @@ impl FsfsRuntime {
             })
             .collect();
 
-        SearchPayload::new(
-            original_query,
-            SearchOutputPhase::Refined,
-            total_candidates,
-            hits,
+        let freshness = payloads.iter().find_map(|payload| payload.index_freshness);
+        Self::attach_index_freshness(
+            SearchPayload::new(
+                original_query,
+                SearchOutputPhase::Refined,
+                total_candidates,
+                hits,
+            ),
+            freshness,
         )
     }
 
@@ -6126,6 +6250,14 @@ impl FsfsRuntime {
         let mut payload =
             orchestrator.build_search_payload(query, phase, &limited, snippets_by_doc);
         payload.total_candidates = fused.len();
+        payload
+    }
+
+    fn attach_index_freshness(
+        mut payload: SearchPayload,
+        freshness: Option<IndexFreshnessPayload>,
+    ) -> SearchPayload {
+        payload.index_freshness = freshness;
         payload
     }
 
@@ -6337,7 +6469,7 @@ impl FsfsRuntime {
         let mut merged = Vec::with_capacity(fused_head.len().saturating_add(lexical_full.len()));
         // We only need to dedupe against the fused head.
         //
-        // Lexical candidates are produced from Tantivy doc addresses and are expected
+        // Lexical candidates are produced from stable engine document ids and are expected
         // to be unique under normal upsert/index invariants. Growing a full-set for the
         // entire lexical tail is unnecessary and expensive on large corpora.
         // `ahash` (not SipHash) for the doc_id dedup probed once per lexical-tail
@@ -6428,7 +6560,7 @@ impl FsfsRuntime {
         mode: SearchExecutionMode,
         phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
-        let mut resources = self.prepare_search_execution_resources(mode)?;
+        let mut resources = self.prepare_search_execution_resources(cx, mode).await?;
         self.execute_search_phase_artifacts_with_mode_using_resources(
             cx,
             query,
@@ -6455,17 +6587,19 @@ impl FsfsRuntime {
         flags: SearchExecutionFlags,
         mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        let index_freshness = resources
+            .lexical_index
+            .as_ref()
+            .map(|index| Self::index_freshness_payload(index.segment_stats()));
         let normalized_query = Self::normalize_search_query(query);
         let filter_expr = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
         if normalized_query.is_empty() {
             let artifact = SearchPhaseArtifact {
                 phase: SearchOutputPhase::Initial,
                 fused: Vec::new(),
-                payload: SearchPayload::new(
-                    String::new(),
-                    SearchOutputPhase::Initial,
-                    0,
-                    Vec::new(),
+                payload: Self::attach_index_freshness(
+                    SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new()),
+                    index_freshness,
                 ),
             };
             if let Some(sink) = phase_sink.as_deref_mut() {
@@ -6477,7 +6611,7 @@ impl FsfsRuntime {
         let lexical_doc_count = resources
             .lexical_index
             .as_ref()
-            .map(TantivyIndex::doc_count);
+            .map(|index| index.segment_stats().live_docs);
         let vector_doc_count = resources.vector_index.as_ref().map(|index| {
             index
                 .record_count()
@@ -6556,7 +6690,7 @@ impl FsfsRuntime {
                         if let Some(snippet) = hit.snippet.as_ref()
                             && !snippet.trim().is_empty()
                         {
-                            snippets_by_doc.insert(hit.doc_id.clone(), snippet.clone());
+                            snippets_by_doc.insert(hit.document_id.clone(), snippet.clone());
                         }
                     }
 
@@ -6567,12 +6701,12 @@ impl FsfsRuntime {
                         lexical
                             .search_doc_ids(cx, &normalized_query, output_limit)?
                             .into_iter()
-                            .map(|hit| LexicalCandidate::new(hit.doc_id, hit.bm25_score))
+                            .map(|hit| LexicalCandidate::new(hit.document_id, hit.score))
                             .collect::<Vec<_>>()
                     } else {
                         snippet_hits
                             .into_iter()
-                            .map(|hit| LexicalCandidate::new(hit.doc_id, hit.bm25_score))
+                            .map(|hit| LexicalCandidate::new(hit.document_id, hit.score))
                             .collect::<Vec<_>>()
                     };
                     let lexical_head_budget = lexical_budget.min(planning_limit).max(1);
@@ -6586,7 +6720,7 @@ impl FsfsRuntime {
                     let full_candidates = lexical
                         .search_doc_ids(cx, &normalized_query, output_limit)?
                         .into_iter()
-                        .map(|hit| LexicalCandidate::new(hit.doc_id, hit.bm25_score))
+                        .map(|hit| LexicalCandidate::new(hit.document_id, hit.score))
                         .collect::<Vec<_>>();
                     let lexical_head_budget = lexical_budget.min(planning_limit).max(1);
                     let head_candidates = full_candidates
@@ -6769,15 +6903,18 @@ impl FsfsRuntime {
             } else {
                 filtered_initial_head.clone()
             };
-        let payload = Self::build_limited_payload(
-            orchestrator,
-            &normalized_query,
-            SearchOutputPhase::Initial,
-            &fused_initial,
-            &snippets_by_doc,
-            output_limit,
-        )
-        .with_degradation_advice(resources.degradation_advice.clone());
+        let payload = Self::attach_index_freshness(
+            Self::build_limited_payload(
+                orchestrator,
+                &normalized_query,
+                SearchOutputPhase::Initial,
+                &fused_initial,
+                &snippets_by_doc,
+                output_limit,
+            )
+            .with_degradation_advice(resources.degradation_advice.clone()),
+            index_freshness,
+        );
         let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
 
         let initial_artifact = SearchPhaseArtifact {
@@ -6848,13 +6985,16 @@ impl FsfsRuntime {
                             &fused_initial,
                             output_limit,
                         );
-                        let refined_payload = Self::build_limited_payload(
-                            orchestrator,
-                            &normalized_query,
-                            SearchOutputPhase::Refined,
-                            &fused_refined,
-                            &snippets_by_doc,
-                            output_limit,
+                        let refined_payload = Self::attach_index_freshness(
+                            Self::build_limited_payload(
+                                orchestrator,
+                                &normalized_query,
+                                SearchOutputPhase::Refined,
+                                &fused_refined,
+                                &snippets_by_doc,
+                                output_limit,
+                            ),
+                            index_freshness,
                         );
                         let refined_artifact = SearchPhaseArtifact {
                             phase: SearchOutputPhase::Refined,
@@ -6886,15 +7026,18 @@ impl FsfsRuntime {
                             Some(&resources.index_root),
                             &error,
                         ));
-                        let failed_payload = Self::build_limited_payload(
-                            orchestrator,
-                            &normalized_query,
-                            SearchOutputPhase::RefinementFailed,
-                            &fused_initial,
-                            &snippets_by_doc,
-                            output_limit,
-                        )
-                        .with_degradation_advice(advice);
+                        let failed_payload = Self::attach_index_freshness(
+                            Self::build_limited_payload(
+                                orchestrator,
+                                &normalized_query,
+                                SearchOutputPhase::RefinementFailed,
+                                &fused_initial,
+                                &snippets_by_doc,
+                                output_limit,
+                            )
+                            .with_degradation_advice(advice),
+                            index_freshness,
+                        );
                         let failed_artifact = SearchPhaseArtifact {
                             phase: SearchOutputPhase::RefinementFailed,
                             fused: fused_initial.clone(),
@@ -6915,15 +7058,18 @@ impl FsfsRuntime {
                     original_error: None,
                     replay_command: None,
                 }));
-                let failed_payload = Self::build_limited_payload(
-                    orchestrator,
-                    &normalized_query,
-                    SearchOutputPhase::RefinementFailed,
-                    &fused_initial,
-                    &snippets_by_doc,
-                    output_limit,
-                )
-                .with_degradation_advice(advice);
+                let failed_payload = Self::attach_index_freshness(
+                    Self::build_limited_payload(
+                        orchestrator,
+                        &normalized_query,
+                        SearchOutputPhase::RefinementFailed,
+                        &fused_initial,
+                        &snippets_by_doc,
+                        output_limit,
+                    )
+                    .with_degradation_advice(advice),
+                    index_freshness,
+                );
                 let failed_artifact = SearchPhaseArtifact {
                     phase: SearchOutputPhase::RefinementFailed,
                     fused: fused_initial.clone(),
@@ -7350,6 +7496,114 @@ impl FsfsRuntime {
         }
 
         Ok(())
+    }
+
+    async fn run_flush_command(&self, cx: &Cx) -> SearchResult<()> {
+        let index_root = self.resolve_status_index_root()?;
+        let lexical_path = index_root.join("lexical");
+        if !lexical_path.exists() {
+            return Err(SearchError::IndexNotFound { path: lexical_path });
+        }
+
+        let index_freshness =
+            match QuillIndex::open(cx, &lexical_path, QuillConfig::default()).await {
+                Ok(lexical) => {
+                    lexical.commit(cx).await?;
+                    drop(lexical);
+                    Self::index_freshness_payload(
+                        KeeperSnapshot::open(&lexical_path, DEFAULT_SCHEMA)?.segment_stats(),
+                    )
+                }
+                Err(QuillIndexError::Keeper(KeeperError::WriterBusy { .. })) => {
+                    self.request_live_flush(cx, &lexical_path).await?
+                }
+                Err(error) => return Err(error.into()),
+            };
+        let payload = FsfsFlushPayload {
+            index_path: lexical_path.display().to_string(),
+            index_freshness,
+        };
+
+        if self.cli_input.format == OutputFormat::Table {
+            println!("lexical index: {}", payload.index_path);
+            println!(
+                "published generation: {}",
+                payload.index_freshness.published_generation
+            );
+            println!(
+                "last publish unix: {}",
+                payload
+                    .index_freshness
+                    .last_publish_unix
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+            );
+            return Ok(());
+        }
+
+        let meta = meta_for_format("flush", self.cli_input.format);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout.write_all(b"\n").map_err(SearchError::Io)?;
+        }
+        Ok(())
+    }
+
+    async fn request_live_flush(
+        &self,
+        cx: &Cx,
+        lexical_path: &Path,
+    ) -> SearchResult<IndexFreshnessPayload> {
+        let request = FsfsFlushRequest {
+            request_id: format!(
+                "{:032x}-{:08x}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                std::process::id()
+            ),
+        };
+        let request_path = lexical_path.join(FSFS_FLUSH_REQUEST_FILE);
+        write_durable_json(&request_path, &request, "fsfs.flush.request.write")?;
+
+        let budget_ms = QuillConfig::default()
+            .max_visibility_lag_ms
+            .saturating_mul(2)
+            .max(2_000);
+        let started = Instant::now();
+        let ack_path = lexical_path.join(FSFS_FLUSH_ACK_FILE);
+        loop {
+            if cx.is_cancel_requested() {
+                return Err(SearchError::Cancelled {
+                    phase: "fsfs.flush".to_owned(),
+                    reason: "runtime cancellation requested while waiting for live writer"
+                        .to_owned(),
+                });
+            }
+            if let Some(ack) = read_durable_json::<FsfsFlushAck>(&ack_path, "fsfs.flush.ack.read")?
+                && ack.request_id == request.request_id
+            {
+                let observed = KeeperSnapshot::open(lexical_path, DEFAULT_SCHEMA)?.segment_stats();
+                if observed.published_generation >= ack.index_freshness.published_generation {
+                    return Ok(Self::index_freshness_payload(observed));
+                }
+            }
+
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if elapsed_ms >= budget_ms {
+                return Err(SearchError::SearchTimeout {
+                    elapsed_ms,
+                    budget_ms,
+                });
+            }
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                Duration::from_millis(FSFS_FLUSH_POLL_MS),
+            )
+            .await;
+        }
     }
 
     /// Soft-delete documents by exact doc ID or prefix match.
@@ -8025,6 +8279,21 @@ impl FsfsRuntime {
     }
 
     fn collect_status_payload(&self) -> SearchResult<FsfsStatusPayload> {
+        self.collect_status_payload_with_lexical_stats(None)
+    }
+
+    const fn index_freshness_payload(stats: SegmentStats) -> IndexFreshnessPayload {
+        IndexFreshnessPayload {
+            published_generation: stats.published_generation,
+            last_publish_unix: stats.last_publish_unix,
+            live_writer: stats.live_writer,
+        }
+    }
+
+    fn collect_status_payload_with_lexical_stats(
+        &self,
+        lexical_stats: Option<SegmentStats>,
+    ) -> SearchResult<FsfsStatusPayload> {
         let index_root = self.resolve_status_index_root()?;
         let sentinel = Self::read_index_sentinel(&index_root)?;
         let stale_files = Self::count_stale_files(&index_root, sentinel.as_ref())?;
@@ -8035,11 +8304,23 @@ impl FsfsRuntime {
             catalog_files: vec![PathBuf::from(&self.config.storage.db_path)],
             embedding_cache_roots: vec![index_root.join("cache")],
         };
-        let usage = self.collect_index_storage_usage(&storage_paths)?;
+        let mut usage = self.collect_index_storage_usage(&storage_paths)?;
+        let lexical_path = index_root.join("lexical");
+        let lexical_stats = if lexical_stats.is_some() || !lexical_path.exists() {
+            lexical_stats
+        } else {
+            Some(KeeperSnapshot::open(&lexical_path, DEFAULT_SCHEMA)?.segment_stats())
+        };
+        if let Some(stats) = lexical_stats {
+            usage.lexical_index_bytes = stats.managed_disk_bytes;
+        }
         let tracked_index_bytes = Some(usage.total_bytes());
         let tracker = self.new_runtime_lifecycle_tracker(&storage_paths);
+        let resource_usage = ResourceUsage::from_index_storage(usage);
+        let budget_snapshot = tracker.evaluate_usage_budget(&resource_usage);
+        tracker.set_resource_usage(resource_usage);
         let disk_budget = self.apply_storage_emergency_override(
-            self.evaluate_storage_disk_budget(&tracker, &storage_paths)?,
+            budget_snapshot,
             tracked_index_bytes,
             tracker.resource_limits().max_index_bytes,
         );
@@ -8089,6 +8370,7 @@ impl FsfsRuntime {
                 lexical_index_bytes: usage.lexical_index_bytes,
                 metadata_bytes: usage.catalog_bytes,
                 embedding_cache_bytes: usage.embedding_cache_bytes,
+                index_freshness: lexical_stats.map(Self::index_freshness_payload),
             },
             models: self.collect_model_statuses()?,
             config: config_status,
@@ -8621,6 +8903,8 @@ impl FsfsRuntime {
                 && checkpoint.target_root == target_root_label
                 && checkpoint.index_root == index_root_label
         });
+        let discard_undurable_lexical_generation =
+            existing_checkpoint.is_some() && !checkpoint_metadata_valid;
         let checkpoint_manifests = if checkpoint_metadata_valid {
             match Self::read_checkpoint_manifest_generation(
                 &index_root,
@@ -8709,7 +8993,21 @@ impl FsfsRuntime {
         };
 
         let lexical_path = index_root.join("lexical");
-        let lexical_index = TantivyIndex::create(&lexical_path)?;
+        // One-shot construction uses Quill's routed shard set and suppresses
+        // ordinary tier merges until the final bulk concat. Watch sessions use
+        // the deterministic singleton policy in `build_live_ingest_pipeline`.
+        let lexical_index = QuillIndex::create(
+            cx,
+            &lexical_path,
+            QuillConfig {
+                bulk_load_mode: true,
+                ..QuillConfig::default()
+            },
+        )
+        .await?;
+        if discard_undurable_lexical_generation {
+            lexical_index.delete_all(cx).await?;
+        }
 
         let canonicalizer = DefaultCanonicalizer::default();
         let file_classification_contract = FileClassificationContractDefinition::default();
@@ -8783,11 +9081,7 @@ impl FsfsRuntime {
             vector_index.soft_delete_batch(&stale_vector_ids)?;
         }
 
-        let mut lexical_reconciliation_ids = lexical_index
-            .all_doc_ids()?
-            .into_iter()
-            .map(|doc_id| doc_id.to_string())
-            .collect::<BTreeSet<_>>();
+        let mut lexical_reconciliation_ids = BTreeSet::new();
         if let Some(previous_manifests) = reconciliation_manifests.as_ref() {
             lexical_reconciliation_ids.extend(
                 previous_manifests
@@ -8804,8 +9098,22 @@ impl FsfsRuntime {
                     .map(|(file_key, _)| file_key.clone()),
             );
         }
-        for file_key in lexical_reconciliation_ids {
-            lexical_index.delete_document(cx, &file_key).await?;
+        if !lexical_reconciliation_ids.is_empty() {
+            let mutations = lexical_reconciliation_ids
+                .into_iter()
+                .map(|file_key| {
+                    LexicalMutation::delete(
+                        file_key,
+                        0,
+                        IngestionClass::Skip,
+                        "bulk_reconciliation",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let backend = QuillLexicalBackend::new(&lexical_index);
+            let mut pipeline = LexicalPipeline::new(backend);
+            let _stats = pipeline.apply_initial(&mutations)?;
+            pipeline.backend_mut().flush(cx).await?;
         }
         let mut observed_reason_codes: BTreeSet<String> =
             stats.reason_codes.iter().cloned().collect();
@@ -9000,10 +9308,24 @@ impl FsfsRuntime {
                             IngestionClass::MetadataOnly | IngestionClass::Skip
                         )
                 })
-                .map(|pending| pending.document.clone())
+                .map(|pending| {
+                    let mut mutation = LexicalMutation::upsert(
+                        pending.file_key.clone(),
+                        u64::try_from(pending.revision).unwrap_or(0),
+                        pending.ingestion_class,
+                        pending.document.content.clone(),
+                        pending.reason_code.clone(),
+                    );
+                    mutation.title.clone_from(&pending.document.title);
+                    mutation.metadata.clone_from(&pending.document.metadata);
+                    mutation
+                })
                 .collect::<Vec<_>>();
             if !lexical_batch.is_empty() {
-                lexical_index.index_documents(cx, &lexical_batch).await?;
+                let backend = QuillLexicalBackend::new(&lexical_index);
+                let mut pipeline = LexicalPipeline::new(backend);
+                let _stats = pipeline.apply_initial(&lexical_batch)?;
+                pipeline.backend_mut().flush(cx).await?;
             }
             lexical_elapsed_ms =
                 lexical_elapsed_ms.saturating_add(lexical_start.elapsed().as_millis());
@@ -9627,7 +9949,7 @@ impl FsfsRuntime {
         checkpoint.updated_at_ms = pressure_timestamp_ms();
         write_indexing_checkpoint(&index_root, &checkpoint)?;
         let lexical_commit_start = Instant::now();
-        lexical_index.commit(cx).await?;
+        lexical_index.finish_bulk_load(cx).await?;
         lexical_elapsed_ms =
             lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
@@ -9676,12 +9998,13 @@ impl FsfsRuntime {
             remove_indexing_checkpoint(&index_root)?;
         }
 
-        let storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
+        let mut storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
             lexical_index_roots: vec![index_root.join("lexical")],
             catalog_files: vec![PathBuf::from(&self.config.storage.db_path)],
             embedding_cache_roots: vec![index_root.join("cache")],
         })?;
+        storage_usage.lexical_index_bytes = lexical_index.segment_stats().managed_disk_bytes;
         let elapsed_ms = total_start.elapsed().as_millis();
 
         let final_stage = if embedder_degraded {
@@ -9858,8 +10181,9 @@ impl FsfsRuntime {
         Ok(stack?.quality_arc())
     }
 
-    fn prepare_search_execution_resources(
+    async fn prepare_search_execution_resources(
         &self,
+        cx: &Cx,
         mode: SearchExecutionMode,
     ) -> SearchResult<SearchExecutionResources> {
         let index_root = self.resolve_status_index_root()?;
@@ -9878,7 +10202,7 @@ impl FsfsRuntime {
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
         let lexical_index = if lexical_path.exists() {
-            Some(TantivyIndex::open(&lexical_path)?)
+            Some(QuillSearchIndex::open(cx, &lexical_path, QuillConfig::default()).await?)
         } else {
             None
         };
@@ -10066,8 +10390,9 @@ impl FsfsRuntime {
     ///
     /// Returns the pipeline and a cloned `Arc` to the vector index so callers
     /// can compact the WAL on graceful shutdown.
-    fn build_live_ingest_pipeline(
+    async fn build_live_ingest_pipeline(
         &self,
+        cx: &Cx,
     ) -> SearchResult<(LiveIngestPipeline, Arc<std::sync::Mutex<VectorIndex>>)> {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
@@ -10082,7 +10407,16 @@ impl FsfsRuntime {
         let lexical_path = index_root.join("lexical");
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
-        let lexical_index = TantivyIndex::create(&lexical_path)?;
+        let lexical_index = QuillIndex::create(
+            cx,
+            &lexical_path,
+            QuillConfig {
+                max_ingest_shards: 1,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            },
+        )
+        .await?;
         let vector_index = VectorIndex::open(&vector_path)?;
         let embedder = self.resolve_fast_embedder()?;
 
@@ -10983,7 +11317,9 @@ impl FsfsRuntime {
         };
         let mut state =
             SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color);
-        let mut resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
+        let mut resources = self
+            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
+            .await?;
 
         match FtuiSession::enter() {
             Ok(mut session) => {
@@ -11149,7 +11485,11 @@ impl FsfsRuntime {
                 edited_at.elapsed() < Duration::from_millis(FSFS_TUI_STATUS_REFRESH_ACTIVE_GRACE_MS)
             });
             if status_refresh_due && (!user_typing_recently || force_status_refresh) {
-                match self.collect_status_payload() {
+                let lexical_stats = resources
+                    .lexical_index
+                    .as_ref()
+                    .map(SegmentStatsProvider::segment_stats);
+                match self.collect_status_payload_with_lexical_stats(lexical_stats) {
                     Ok(payload) => {
                         state.status_payload = payload;
                         state.mode_hint = self.search_mode_hint()?;
@@ -11215,7 +11555,11 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
 
         loop {
-            state.status_payload = self.collect_status_payload()?;
+            let lexical_stats = resources
+                .lexical_index
+                .as_ref()
+                .map(SegmentStatsProvider::segment_stats);
+            state.status_payload = self.collect_status_payload_with_lexical_stats(lexical_stats)?;
             state.mode_hint = self.search_mode_hint()?;
 
             write!(stdout, "\u{1b}[2J\u{1b}[H").map_err(tui_io_error)?;
@@ -11707,7 +12051,7 @@ impl FsfsRuntime {
             );
 
         if watch_enabled_for_command {
-            match self.build_live_ingest_pipeline() {
+            match self.build_live_ingest_pipeline(cx).await {
                 Ok((pipeline, vi_handle)) => {
                     let target_root = self.resolve_target_root()?;
                     let watcher = FsWatcher::new(
@@ -11969,6 +12313,7 @@ fn print_cli_help() {
     println!("  watch [path]              Alias for index --watch");
     println!("  explain <result-id>       Explain ranking details");
     println!("  status                    Show index and runtime status");
+    println!("  flush                     Publish pending lexical writes durably");
     println!("  config <action>           Manage configuration");
     println!("  download-models [model]   Download/verify embedding models");
     println!("  doctor                    Run local health checks");
@@ -11999,16 +12344,16 @@ fn print_cli_help() {
 const fn completion_script(shell: CompletionShell) -> &'static str {
     match shell {
         CompletionShell::Bash => {
-            "complete -W \"search serve index watch explain status config download-models download doctor update completions uninstall help version append-batch delete compact daemon\" fsfs"
+            "complete -W \"search serve index watch explain status flush config download-models download doctor update completions uninstall help version append-batch delete compact daemon\" fsfs"
         }
         CompletionShell::Zsh => {
-            "compdef '_arguments \"1: :((search serve index watch explain status config download-models download doctor update completions uninstall help version append-batch delete compact daemon))\"' fsfs"
+            "compdef '_arguments \"1: :((search serve index watch explain status flush config download-models download doctor update completions uninstall help version append-batch delete compact daemon))\"' fsfs"
         }
         CompletionShell::Fish => {
-            "complete -c fsfs -f -a \"search serve index watch explain status config download-models download doctor update completions uninstall help version append-batch delete compact daemon\""
+            "complete -c fsfs -f -a \"search serve index watch explain status flush config download-models download doctor update completions uninstall help version append-batch delete compact daemon\""
         }
         CompletionShell::PowerShell => {
-            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','serve','index','watch','explain','status','config','download-models','download','doctor','update','completions','uninstall','help','version','append-batch','delete','compact','daemon' | Where-Object { $_ -like \"$wordToComplete*\" } }"
+            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','update','completions','uninstall','help','version','append-batch','delete','compact','daemon' | Where-Object { $_ -like \"$wordToComplete*\" } }"
         }
     }
 }
@@ -14202,7 +14547,7 @@ fn decode_basic_html_entities(source: &str) -> String {
     out
 }
 
-/// Parse a Tantivy HTML snippet into styled spans.
+/// Parse an engine HTML snippet into styled spans.
 ///
 /// Decodes HTML entities, converts `<b>` regions into `bold_style` spans,
 /// strips any other HTML tags, and truncates the *visible* text to
@@ -15238,6 +15583,16 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     if let Some(source_hash_hex) = status.index.source_hash_hex.as_deref() {
         let _ = writeln!(out, "  source hash: {source_hash_hex}");
     }
+    if let Some(freshness) = status.index.index_freshness {
+        let last_publish = freshness
+            .last_publish_unix
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+        let _ = writeln!(
+            out,
+            "  published generation: {}  last publish unix: {}  live writer: {}",
+            freshness.published_generation, last_publish, freshness.live_writer,
+        );
+    }
 
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", paint("MODELS", "1;38;5;214", no_color));
@@ -15936,6 +16291,34 @@ fn write_durable(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Res
     Ok(())
 }
 
+fn read_durable_json<T>(path: &Path, subsystem: &'static str) -> SearchResult<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let data = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|source| SearchError::SubsystemError {
+            subsystem,
+            source: Box::new(source),
+        })
+}
+
+fn write_durable_json<T>(path: &Path, value: &T, subsystem: &'static str) -> SearchResult<()>
+where
+    T: Serialize,
+{
+    let json = serde_json::to_vec(value).map_err(|source| SearchError::SubsystemError {
+        subsystem,
+        source: Box::new(source),
+    })?;
+    write_durable(path, json).map_err(SearchError::Io)
+}
+
 fn read_indexing_checkpoint(index_root: &Path) -> SearchResult<Option<IndexingCheckpoint>> {
     let path = index_root.join(FSFS_CHECKPOINT_FILE);
     let data = match fs::read_to_string(&path) {
@@ -16015,6 +16398,7 @@ fn emit_lite_build_model_hint(model_root: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::future::{Future, poll_fn};
     use std::io::Write as _;
@@ -16029,11 +16413,14 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::{
-        Embedder, IndexableDocument, LexicalSearch, ModelCategory, SearchFuture,
+        Embedder, IndexableDocument, LexicalSearch, ModelCategory, SearchError, SearchFuture,
     };
     use frankensearch_embed::{HashEmbedder, ModelManifest};
     use frankensearch_index::VectorIndex;
-    use frankensearch_lexical::TantivyIndex;
+    use frankensearch_quill::{
+        DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillIndex, QuillSearchIndex,
+        SegmentStatsProvider,
+    };
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
 
@@ -16045,13 +16432,14 @@ mod tests {
         FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS, FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
         FSFS_TUI_QUALITY_DEBOUNCE_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
         FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
-        FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
-        IndexStoragePaths, InterfaceMode, LiveIngestPipeline, SearchDashboardState,
-        SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources,
-        SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
-        VectorPipelineInput, VectorSchedulingTier, degradation_controller_config_for_profile,
-        detect_context_preview_format, is_likely_html_fragment,
-        normalize_html_fragment_for_markdown, render_status_table,
+        FsfsFlushAck, FsfsFlushRequest, FsfsIndexStatus, FsfsModelStatus, FsfsRuntime,
+        FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, InterfaceMode, LiveIngestPipeline,
+        SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources,
+        SearchServeRequest, SemanticGateDecisionInput, SemanticRecallDecisionInput,
+        VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
+        degradation_controller_config_for_profile, detect_context_preview_format,
+        is_likely_html_fragment, normalize_html_fragment_for_markdown, read_durable_json,
+        render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -16062,7 +16450,9 @@ mod tests {
     use crate::lifecycle::{
         DiskBudgetAction, DiskBudgetStage, LifecycleTracker, ResourceLimits, WatchdogConfig,
     };
-    use crate::output_schema::{SearchHitPayload, SearchOutputPhase, SearchPayload};
+    use crate::output_schema::{
+        IndexFreshnessPayload, SearchHitPayload, SearchOutputPhase, SearchPayload,
+    };
     #[cfg(target_os = "linux")]
     use crate::pressure::HostPressureCollector;
     use crate::pressure::{DegradationStage, PressureSignal, PressureState, QueryCapabilityMode};
@@ -16074,6 +16464,26 @@ mod tests {
         TOON_STREAM_RECORD_SEPARATOR_BYTE, decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+
+    async fn create_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
+        QuillIndex::create(
+            cx,
+            path,
+            QuillConfig {
+                max_ingest_shards: 1,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            },
+        )
+        .await
+        .expect("create Quill index")
+    }
+
+    async fn open_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
+        QuillIndex::open(cx, path, QuillConfig::default())
+            .await
+            .expect("open Quill index")
+    }
 
     #[test]
     fn async_runtime_retries_do_not_use_blocking_thread_sleep() {
@@ -16228,6 +16638,11 @@ mod tests {
                 lexical_index_bytes: 512 * 1024,
                 metadata_bytes: 0,
                 embedding_cache_bytes: 0,
+                index_freshness: Some(IndexFreshnessPayload {
+                    published_generation: 7,
+                    last_publish_unix: Some(1_700_000_000),
+                    live_writer: false,
+                }),
             },
             models: vec![FsfsModelStatus {
                 tier: "quality".to_owned(),
@@ -16524,6 +16939,111 @@ mod tests {
         assert!(!response.cached);
         assert!(response.payloads.is_empty());
         assert_eq!(response.error.as_deref(), Some("parse failure"));
+    }
+
+    #[test]
+    fn search_serve_refreshes_quill_and_invalidates_hot_cache() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("index root");
+            let lexical_path = temp.path().join("lexical");
+            let writer = create_test_quill(&cx, &lexical_path).await;
+            writer
+                .index_document(&cx, &IndexableDocument::new("alpha.md", "alpha token"))
+                .await
+                .expect("stage first document");
+            writer.commit(&cx).await.expect("publish first document");
+
+            let reader = QuillSearchIndex::open(&cx, &lexical_path, QuillConfig::default())
+                .await
+                .expect("open serve reader");
+            let mut resources = SearchExecutionResources {
+                index_root: temp.path().to_path_buf(),
+                lexical_index: Some(reader),
+                vector_index: None,
+                fast_embedder: None,
+                quality_embedder: None,
+                fast_embedder_attempted: true,
+                quality_embedder_attempted: true,
+                degradation_advice: Vec::new(),
+            };
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut hot_cache = HashMap::new();
+            let request = |query: &str| SearchServeRequest {
+                query: query.to_owned(),
+                limit: Some(10),
+                mode: Some("lexical_only".to_owned()),
+                filter: None,
+            };
+
+            let first = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("alpha"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("serve first publication");
+            assert!(!first.cached);
+            assert!(
+                first
+                    .payloads
+                    .iter()
+                    .any(|payload| { payload.hits.iter().any(|hit| hit.path == "alpha.md") })
+            );
+            let cached = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("alpha"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("serve cached first publication");
+            assert!(cached.cached);
+
+            writer
+                .index_document(&cx, &IndexableDocument::new("beta.md", "beta token"))
+                .await
+                .expect("stage successor document");
+            writer
+                .commit(&cx)
+                .await
+                .expect("publish successor document");
+
+            let refreshed = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("alpha"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("serve refreshed publication");
+            assert!(
+                !refreshed.cached,
+                "publication refresh must clear hot cache"
+            );
+            let successor = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request("beta"),
+                    &mut resources,
+                    &mut hot_cache,
+                    true,
+                )
+                .await
+                .expect("serve successor publication");
+            assert!(
+                successor
+                    .payloads
+                    .iter()
+                    .any(|payload| { payload.hits.iter().any(|hit| hit.path == "beta.md") })
+            );
+        });
     }
 
     #[cfg(unix)]
@@ -17759,7 +18279,7 @@ mod tests {
             fs::create_dir_all(index_root.join("vector")).expect("vector dir");
             let lexical_path = index_root.join("lexical");
             let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
-            let lexical_seed = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let lexical_seed = create_test_quill(&cx, &lexical_path).await;
             lexical_seed
                 .commit(&cx)
                 .await
@@ -17781,7 +18301,8 @@ mod tests {
                 ..CliInput::default()
             });
             let (pipeline, _vi_handle) = runtime
-                .build_live_ingest_pipeline()
+                .build_live_ingest_pipeline(&cx)
+                .await
                 .expect("build live ingest pipeline");
             let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
@@ -17855,7 +18376,7 @@ mod tests {
             let lexical_path = index_root.join("lexical");
             let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
 
-            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let lexical_index = create_test_quill(&cx, &lexical_path).await;
             let mut vector_writer =
                 VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
             vector_writer
@@ -17910,7 +18431,7 @@ mod tests {
 
     #[test]
     fn live_ingest_rejects_absolute_parent_dir_file_key() {
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let target_root = temp.path().join("project");
             fs::create_dir_all(&target_root).expect("target root");
@@ -17919,7 +18440,7 @@ mod tests {
             fs::create_dir_all(index_root.join("vector")).expect("vector dir");
             let lexical_path = index_root.join("lexical");
             let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
-            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let lexical_index = create_test_quill(&cx, &lexical_path).await;
             let vector_writer =
                 VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
             vector_writer.finish().expect("finish vector index");
@@ -17949,7 +18470,7 @@ mod tests {
     fn live_ingest_accepts_canonical_file_paths_with_symlink_cli_root() {
         use std::os::unix::fs::symlink;
 
-        run_test_with_cx(|_cx| async move {
+        run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
             let canonical_root = temp.path().join("canonical-project");
             let symlink_root = temp.path().join("project-link");
@@ -17975,7 +18496,7 @@ mod tests {
             fs::create_dir_all(index_root.join("vector")).expect("vector dir");
             let lexical_path = index_root.join("lexical");
             let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
-            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let lexical_index = create_test_quill(&cx, &lexical_path).await;
             let vector_writer =
                 VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
             vector_writer.finish().expect("finish vector index");
@@ -18014,7 +18535,7 @@ mod tests {
             let lexical_path = index_root.join("lexical");
             let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
 
-            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let lexical_index = create_test_quill(&cx, &lexical_path).await;
             let mut vector_writer =
                 VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
             vector_writer
@@ -18099,7 +18620,7 @@ mod tests {
             let lexical_path = index_root.join("lexical");
             let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
 
-            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let lexical_index = create_test_quill(&cx, &lexical_path).await;
             let mut vector_writer =
                 VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
             vector_writer
@@ -18173,7 +18694,7 @@ mod tests {
             let lexical_path = index_root.join("lexical");
             let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
 
-            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let lexical_index = create_test_quill(&cx, &lexical_path).await;
             let mut vector_writer =
                 VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
             vector_writer
@@ -18503,9 +19024,8 @@ mod tests {
             let vector_index = VectorIndex::open(&index_root.join(super::FSFS_VECTOR_INDEX_FILE))
                 .expect("open fsvi");
             assert!(vector_index.record_count() >= 1);
-            let lexical_index =
-                TantivyIndex::open(&index_root.join("lexical")).expect("open tantivy");
-            assert!(lexical_index.doc_count() >= 1);
+            let lexical_index = open_test_quill(&cx, &index_root.join("lexical")).await;
+            assert!(lexical_index.segment_stats().live_docs >= 1);
             let hits = lexical_index
                 .search(&cx, "index", 5)
                 .await
@@ -18529,7 +19049,7 @@ mod tests {
             .expect("write live source");
 
             let lexical_path = index_root.join("lexical");
-            let lexical = TantivyIndex::create(&lexical_path).expect("create orphan lexical index");
+            let lexical = create_test_quill(&cx, &lexical_path).await;
             lexical
                 .index_document(
                     &cx,
@@ -18593,7 +19113,8 @@ mod tests {
                 ..CliInput::default()
             });
             let search_result = search_runtime
-                .prepare_search_execution_resources(super::SearchExecutionMode::Full)
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::Full)
+                .await
                 .map(|_| ());
             assert!(
                 search_result.is_err(),
@@ -18635,7 +19156,7 @@ mod tests {
                 super::BTreeSet::from(["src/live.rs".to_owned()])
             );
 
-            let lexical = TantivyIndex::open(&lexical_path).expect("open rebuilt lexical index");
+            let lexical = open_test_quill(&cx, &lexical_path).await;
             assert!(
                 lexical
                     .search(&cx, "undurable_orphan_token", 10)
@@ -18648,7 +19169,7 @@ mod tests {
                 .search_doc_ids(&cx, "durable_live_token", 10)
                 .expect("query live token")
                 .into_iter()
-                .map(|hit| hit.doc_id.to_string())
+                .map(|hit| hit.document_id)
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(live_ids, super::BTreeSet::from(["src/live.rs".to_owned()]));
         });
@@ -18706,21 +19227,20 @@ mod tests {
                 .await
                 .expect("reindex legacy generation");
 
-            let lexical = TantivyIndex::open(&index_root.join("lexical"))
-                .expect("open reconciled lexical index");
+            let lexical = open_test_quill(&cx, &index_root.join("lexical")).await;
             assert!(
                 lexical
                     .search(&cx, "migration_stale_token", 10)
                     .await
                     .expect("query stale legacy token")
                     .is_empty(),
-                "legacy manifest labels must not preserve stale Tantivy rows"
+                "legacy manifest labels must not preserve stale lexical rows"
             );
             let live_ids = lexical
                 .search_doc_ids(&cx, "migration_live_token", 10)
                 .expect("query live token")
                 .into_iter()
-                .map(|hit| hit.doc_id.to_string())
+                .map(|hit| hit.document_id)
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(live_ids, super::BTreeSet::from(["src/live.rs".to_owned()]));
 
@@ -18778,8 +19298,12 @@ mod tests {
                 })
                 .await;
             assert!(
-                interrupted.is_err(),
-                "first run must stop after a checkpoint"
+                matches!(
+                    &interrupted,
+                    Err(frankensearch_core::SearchError::InvalidConfig { field, .. })
+                        if field == "test.interrupt_after_checkpoint"
+                ),
+                "first run must stop at the deterministic test checkpoint: {interrupted:?}"
             );
 
             let index_root = project.join(".frankensearch");
@@ -18787,7 +19311,11 @@ mod tests {
                 .expect("read checkpoint")
                 .expect("checkpoint published before callback");
             assert_eq!(checkpoint.schema_version, 2);
-            assert!(checkpoint.artifacts_durable);
+            assert!(
+                checkpoint.artifacts_durable,
+                "interrupted checkpoint with {} files must be durable",
+                checkpoint.files.len()
+            );
             assert_eq!(checkpoint.files.len(), 1_024);
             assert!(
                 checkpoint.files.values().all(|entry| {
@@ -18835,13 +19363,12 @@ mod tests {
                 .into_iter()
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(partial_vector_ids, partial_manifest_ids);
-            let partial_lexical =
-                TantivyIndex::open(&index_root.join("lexical")).expect("open partial Tantivy");
+            let partial_lexical = open_test_quill(&cx, &index_root.join("lexical")).await;
             let partial_lexical_ids = partial_lexical
                 .search_doc_ids(&cx, "resume_common", FILE_COUNT)
-                .expect("query partial Tantivy")
+                .expect("query partial lexical index")
                 .into_iter()
-                .map(|hit| hit.doc_id.to_string())
+                .map(|hit| hit.document_id)
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(partial_lexical_ids, partial_manifest_ids);
             drop(partial_lexical);
@@ -18909,13 +19436,12 @@ mod tests {
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(vector_ids, expected_ids);
 
-            let lexical_index =
-                TantivyIndex::open(&index_root.join("lexical")).expect("open resumed Tantivy");
+            let lexical_index = open_test_quill(&cx, &index_root.join("lexical")).await;
             let lexical_ids = lexical_index
                 .search_doc_ids(&cx, "resume_common", FILE_COUNT)
-                .expect("query resumed Tantivy")
+                .expect("query resumed lexical index")
                 .into_iter()
-                .map(|hit| hit.doc_id.to_string())
+                .map(|hit| hit.document_id)
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(lexical_ids, expected_ids);
 
@@ -19091,7 +19617,7 @@ mod tests {
 
             let index_dir = temp.path().join(".frankensearch");
             let lexical_path = index_dir.join("lexical");
-            drop(TantivyIndex::create(&lexical_path).expect("create lexical index"));
+            drop(create_test_quill(&cx, &lexical_path).await);
             let mut config = FsfsConfig::default();
             config.storage.index_dir = index_dir.display().to_string();
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
@@ -19292,6 +19818,14 @@ mod tests {
                 !payload.hits.is_empty(),
                 "expected lexical hits after fallback"
             );
+            let freshness = payload
+                .index_freshness
+                .expect("search payload should expose Quill freshness");
+            assert!(freshness.published_generation > 0);
+            assert!(
+                !freshness.live_writer,
+                "read-only search must not manufacture a live writer lease"
+            );
         });
     }
 
@@ -19301,7 +19835,7 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let index_dir = temp.path().join(".frankensearch");
             let lexical_path = index_dir.join("lexical");
-            drop(TantivyIndex::create(&lexical_path).expect("create lexical index"));
+            drop(create_test_quill(&cx, &lexical_path).await);
             let mut config = FsfsConfig::default();
             config.storage.index_dir = index_dir.display().to_string();
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
@@ -19319,6 +19853,7 @@ mod tests {
             assert_eq!(payload.phase, SearchOutputPhase::Initial);
             assert!(payload.is_empty());
             assert_eq!(payload.total_candidates, 0);
+            assert!(payload.index_freshness.is_some());
         });
     }
 
@@ -19679,7 +20214,7 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let lexical_path = temp.path().join("lexical");
             let vector_path = temp.path().join("fast-cancel.fsvi");
-            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            let lexical_index = create_test_quill(&cx, &lexical_path).await;
             // Lexical is *available* (the old fallback guard's condition) but
             // its head is empty for this query, which force-runs the
             // semantic stage straight into the cancelling embedder.
@@ -19691,6 +20226,10 @@ mod tests {
                 .await
                 .expect("seed lexical doc");
             lexical_index.commit(&cx).await.expect("commit lexical");
+            drop(lexical_index);
+            let lexical_index = QuillSearchIndex::open(&cx, &lexical_path, QuillConfig::default())
+                .await
+                .expect("open read-only lexical index");
 
             let fast_embedder = HashEmbedder::default_384();
             let query_vector = fast_embedder.embed_sync("alpha beta");
@@ -19966,119 +20505,296 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn runtime_status_payload_reports_index_and_model_state() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let project = temp.path().join("project");
-        let index_root = project.join(".frankensearch");
-        let vector_root = index_root.join("vector");
-        let lexical_root = index_root.join("lexical");
-        fs::create_dir_all(project.join("src")).expect("create project source dir");
-        fs::create_dir_all(&vector_root).expect("create vector dir");
-        fs::create_dir_all(&lexical_root).expect("create lexical dir");
-        fs::create_dir_all(index_root.join("cache")).expect("create cache dir");
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            let index_root = project.join(".frankensearch");
+            let vector_root = index_root.join("vector");
+            let lexical_root = index_root.join("lexical");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::create_dir_all(&vector_root).expect("create vector dir");
+            fs::create_dir_all(&lexical_root).expect("create lexical dir");
+            fs::create_dir_all(index_root.join("cache")).expect("create cache dir");
+            let lexical = create_test_quill(&cx, &lexical_root).await;
+            lexical
+                .commit(&cx)
+                .await
+                .expect("commit status Quill index");
+            drop(lexical);
+            let lexical_stats = KeeperSnapshot::open(&lexical_root, DEFAULT_SCHEMA)
+                .expect("open status Quill snapshot")
+                .segment_stats();
+            let expected_lexical_bytes = lexical_stats.managed_disk_bytes;
+            let expected_generation = lexical_stats.published_generation;
+            let expected_last_publish_unix = lexical_stats.last_publish_unix;
 
-        let source_file = project.join("src/lib.rs");
-        fs::write(&source_file, "pub fn status() {}\n").expect("write source file");
+            let source_file = project.join("src/lib.rs");
+            fs::write(&source_file, "pub fn status() {}\n").expect("write source file");
 
-        let manifest = vec![super::IndexManifestEntry {
-            file_key: source_file.display().to_string(),
-            revision: 0,
-            ingestion_class: "full_semantic_lexical".to_owned(),
-            canonical_bytes: 21,
-            reason_code: "test.reason".to_owned(),
-        }];
-        fs::write(
-            index_root.join(super::FSFS_VECTOR_MANIFEST_FILE),
-            serde_json::to_string_pretty(&manifest).expect("serialize vector manifest"),
-        )
-        .expect("write vector manifest");
-        fs::write(
-            index_root.join(super::FSFS_LEXICAL_MANIFEST_FILE),
-            serde_json::to_string_pretty(&manifest).expect("serialize lexical manifest"),
-        )
-        .expect("write lexical manifest");
-        fs::write(
-            index_root.join(super::FSFS_VECTOR_INDEX_FILE),
-            vec![0_u8; 32],
-        )
-        .expect("write vector index");
+            let manifest = vec![super::IndexManifestEntry {
+                file_key: source_file.display().to_string(),
+                revision: 0,
+                ingestion_class: "full_semantic_lexical".to_owned(),
+                canonical_bytes: 21,
+                reason_code: "test.reason".to_owned(),
+            }];
+            fs::write(
+                index_root.join(super::FSFS_VECTOR_MANIFEST_FILE),
+                serde_json::to_string_pretty(&manifest).expect("serialize vector manifest"),
+            )
+            .expect("write vector manifest");
+            fs::write(
+                index_root.join(super::FSFS_LEXICAL_MANIFEST_FILE),
+                serde_json::to_string_pretty(&manifest).expect("serialize lexical manifest"),
+            )
+            .expect("write lexical manifest");
+            fs::write(
+                index_root.join(super::FSFS_VECTOR_INDEX_FILE),
+                vec![0_u8; 32],
+            )
+            .expect("write vector index");
 
-        let sentinel = super::IndexSentinel {
-            schema_version: 1,
-            generation_complete: true,
-            generated_at_ms: super::pressure_timestamp_ms(),
-            command: "index".to_owned(),
-            target_root: project.display().to_string(),
-            index_root: index_root.display().to_string(),
-            discovered_files: 1,
-            indexed_files: 1,
-            skipped_files: 0,
-            reason_codes: vec!["test.reason".to_owned()],
-            total_canonical_bytes: 21,
-            source_hash_hex: "feedface".to_owned(),
-        };
-        fs::write(
-            index_root.join(super::FSFS_SENTINEL_FILE),
-            serde_json::to_string_pretty(&sentinel).expect("serialize sentinel"),
-        )
-        .expect("write sentinel");
+            let sentinel = super::IndexSentinel {
+                schema_version: 1,
+                generation_complete: true,
+                generated_at_ms: super::pressure_timestamp_ms(),
+                command: "index".to_owned(),
+                target_root: project.display().to_string(),
+                index_root: index_root.display().to_string(),
+                discovered_files: 1,
+                indexed_files: 1,
+                skipped_files: 0,
+                reason_codes: vec!["test.reason".to_owned()],
+                total_canonical_bytes: 21,
+                source_hash_hex: "feedface".to_owned(),
+            };
+            fs::write(
+                index_root.join(super::FSFS_SENTINEL_FILE),
+                serde_json::to_string_pretty(&sentinel).expect("serialize sentinel"),
+            )
+            .expect("write sentinel");
 
-        let model_root = temp.path().join("models");
-        fs::create_dir_all(model_root.join("potion-multilingual-128M")).expect("create model dir");
-        fs::write(
-            model_root
-                .join("potion-multilingual-128M")
-                .join("weights.bin"),
-            vec![1_u8; 64],
-        )
-        .expect("write model bytes");
+            let model_root = temp.path().join("models");
+            fs::create_dir_all(model_root.join("potion-multilingual-128M"))
+                .expect("create model dir");
+            fs::write(
+                model_root
+                    .join("potion-multilingual-128M")
+                    .join("weights.bin"),
+                vec![1_u8; 64],
+            )
+            .expect("write model bytes");
 
-        let mut config = FsfsConfig::default();
-        config.storage.index_dir = ".frankensearch".to_owned();
-        config.storage.db_path = temp.path().join("fsfs.db").display().to_string();
-        config.indexing.model_dir = model_root.display().to_string();
-        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-            command: CliCommand::Status,
-            index_dir: Some(index_root.clone()),
-            ..CliInput::default()
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.storage.db_path = temp.path().join("fsfs.db").display().to_string();
+            config.indexing.model_dir = model_root.display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Status,
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+
+            let payload = runtime
+                .collect_status_payload()
+                .expect("status payload should be collected");
+            assert_eq!(payload.index.path, index_root.display().to_string());
+            assert_eq!(payload.index.indexed_files, Some(1));
+            assert_eq!(payload.index.discovered_files, Some(1));
+            assert_eq!(payload.index.stale_files, Some(1));
+            assert!(payload.index.size_bytes >= 32);
+            assert_eq!(payload.index.lexical_index_bytes, expected_lexical_bytes);
+            assert_eq!(
+                payload.index.index_freshness,
+                Some(IndexFreshnessPayload {
+                    published_generation: expected_generation,
+                    last_publish_unix: expected_last_publish_unix,
+                    live_writer: false,
+                })
+            );
+            assert_eq!(payload.models[0].tier, "fast");
+            assert!(payload.models[0].cached);
+            assert_eq!(payload.models[1].tier, "quality");
+            assert!(payload.models[1].cached);
+            assert_eq!(
+                payload.runtime.tracked_index_bytes,
+                Some(payload.index.size_bytes)
+            );
+            assert!(payload.runtime.disk_budget_bytes.is_some());
+            assert!(
+                payload.runtime.disk_budget_stage.is_some(),
+                "status payload should expose disk budget stage"
+            );
+            assert!(
+                payload.runtime.disk_budget_action.is_some(),
+                "status payload should expose disk budget action"
+            );
+            assert!(
+                payload.runtime.disk_budget_reason_code.is_some(),
+                "status payload should expose disk budget reason code"
+            );
+            assert!(!payload.runtime.storage_pressure_emergency);
+
+            let table = render_status_table(&payload, true);
+            assert!(table.contains("disk budget stage:"));
+            assert!(table.contains("disk budget action:"));
+            assert!(table.contains("disk budget reason:"));
+            assert!(table.contains("disk budget bytes:"));
+            assert!(table.contains("storage pressure emergency: false"));
+            assert!(table.contains("published generation:"));
+            assert!(table.contains("live writer: false"));
         });
+    }
 
-        let payload = runtime
-            .collect_status_payload()
-            .expect("status payload should be collected");
-        assert_eq!(payload.index.path, index_root.display().to_string());
-        assert_eq!(payload.index.indexed_files, Some(1));
-        assert_eq!(payload.index.discovered_files, Some(1));
-        assert_eq!(payload.index.stale_files, Some(1));
-        assert!(payload.index.size_bytes >= 32);
-        assert_eq!(payload.models[0].tier, "fast");
-        assert!(payload.models[0].cached);
-        assert_eq!(payload.models[1].tier, "quality");
-        assert!(payload.models[1].cached);
-        assert_eq!(
-            payload.runtime.tracked_index_bytes,
-            Some(payload.index.size_bytes)
-        );
-        assert!(payload.runtime.disk_budget_bytes.is_some());
-        assert!(
-            payload.runtime.disk_budget_stage.is_some(),
-            "status payload should expose disk budget stage"
-        );
-        assert!(
-            payload.runtime.disk_budget_action.is_some(),
-            "status payload should expose disk budget action"
-        );
-        assert!(
-            payload.runtime.disk_budget_reason_code.is_some(),
-            "status payload should expose disk budget reason code"
-        );
-        assert!(!payload.runtime.storage_pressure_emergency);
+    #[test]
+    fn runtime_flush_command_is_an_idempotent_publication_barrier() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join(".frankensearch");
+            let lexical_root = index_root.join("lexical");
+            let lexical = create_test_quill(&cx, &lexical_root).await;
+            lexical
+                .commit(&cx)
+                .await
+                .expect("commit initial Quill generation");
+            let initial_generation = lexical.segment_stats().published_generation;
+            drop(lexical);
 
-        let table = render_status_table(&payload, true);
-        assert!(table.contains("disk budget stage:"));
-        assert!(table.contains("disk budget action:"));
-        assert!(table.contains("disk budget reason:"));
-        assert!(table.contains("disk budget bytes:"));
-        assert!(table.contains("storage pressure emergency: false"));
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Flush,
+                format: OutputFormat::Json,
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+
+            runtime
+                .run_flush_command(&cx)
+                .await
+                .expect("first publication barrier");
+            runtime
+                .run_flush_command(&cx)
+                .await
+                .expect("repeated publication barrier");
+
+            let lexical = open_test_quill(&cx, &lexical_root).await;
+            assert!(
+                lexical.segment_stats().published_generation >= initial_generation,
+                "flush must preserve or advance the published generation"
+            );
+        });
+    }
+
+    #[test]
+    fn live_ingest_pipeline_acknowledges_cross_process_flush_request() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            let index_root = target_root.join(".frankensearch");
+            let lexical_root = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector parent");
+            VectorIndex::create(&vector_path, "fnv1a-256", 256)
+                .expect("create vector index")
+                .finish()
+                .expect("finish vector index");
+
+            let lexical = create_test_quill(&cx, &lexical_root).await;
+            lexical
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("pending.md", "flush visibility token"),
+                )
+                .await
+                .expect("stage unpublished document");
+            let generation_before = lexical.segment_stats().published_generation;
+            let pipeline = LiveIngestPipeline::new(
+                target_root,
+                lexical,
+                VectorIndex::open(&vector_path).expect("open vector index"),
+                Arc::new(HashEmbedder::default_256()),
+            );
+            let requester_path = lexical_root.clone();
+            let requester = std::thread::spawn(move || {
+                let runtime = FsfsRuntime::new(FsfsConfig::default());
+                let scheduler = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("requester scheduler");
+                let request_cx = Cx::for_request();
+                scheduler.block_on(runtime.request_live_flush(&request_cx, &requester_path))
+            });
+            let request_path = lexical_root.join(super::FSFS_FLUSH_REQUEST_FILE);
+            for _ in 0..200 {
+                if request_path.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let request =
+                read_durable_json::<FsfsFlushRequest>(&request_path, "fsfs.flush.test.request")
+                    .expect("read flush request")
+                    .expect("flush request exists");
+
+            assert!(
+                pipeline
+                    .acknowledge_flush_barrier(&cx)
+                    .await
+                    .expect("acknowledge flush request")
+            );
+            let ack = read_durable_json::<FsfsFlushAck>(
+                &lexical_root.join(super::FSFS_FLUSH_ACK_FILE),
+                "fsfs.flush.test.ack",
+            )
+            .expect("read flush ack")
+            .expect("flush ack exists");
+            assert_eq!(ack.request_id, request.request_id);
+            assert!(ack.index_freshness.published_generation > generation_before);
+            assert!(ack.index_freshness.live_writer);
+            let requested_freshness = requester
+                .join()
+                .expect("requester thread")
+                .expect("requester observes acknowledgement");
+            assert_eq!(
+                requested_freshness.published_generation,
+                ack.index_freshness.published_generation
+            );
+            assert!(requested_freshness.live_writer);
+            assert!(
+                !pipeline
+                    .acknowledge_flush_barrier(&cx)
+                    .await
+                    .expect("idempotent acknowledged request")
+            );
+
+            let reader = QuillSearchIndex::open(&cx, &lexical_root, QuillConfig::default())
+                .await
+                .expect("open published reader");
+            assert_eq!(
+                reader
+                    .search_doc_ids(&cx, "visibility", 10)
+                    .expect("query flushed publication")[0]
+                    .document_id,
+                "pending.md"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_flush_command_reports_missing_lexical_index() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join(".frankensearch");
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Flush,
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+
+            assert!(matches!(
+                runtime.run_flush_command(&cx).await,
+                Err(SearchError::IndexNotFound { .. })
+            ));
+        });
     }
 
     #[test]

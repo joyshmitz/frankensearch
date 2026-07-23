@@ -7489,7 +7489,7 @@ mod tests {
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("temp index directory");
-            let mut index =
+            let index =
                 QuillIndex::create(&cx, directory.path(), crate::config::QuillConfig::default())
                     .await
                     .expect("create shipping-schema index");

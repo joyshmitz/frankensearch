@@ -27,7 +27,7 @@ path = "src/main.rs"
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "download"] }
 frankensearch-index = { workspace = true }
-frankensearch-lexical = { workspace = true }
+frankensearch-quill = { workspace = true }
 frankensearch-storage = { workspace = true }
 frankensearch-tui = { workspace = true }
 ftui-core = { workspace = true }

@@ -919,10 +919,14 @@ fn offset_tie_group(
 
 fn quill_config_hash(config: &QuillConfig) -> String {
     let canonical = format!(
-        "scribe={};delta={};fanout={};compact={:016x};holes={:016x};glob={};shards={};deterministic={};visibility_ms={}",
+        "scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};shards={};deterministic={};visibility_ms={}",
         config.scribe_shard_budget_bytes,
         config.delta_budget_bytes,
         config.tier_fanout,
+        config.tier_small_max_docid_width,
+        config.tier_medium_max_docid_width,
+        config.bulk_load_mode,
+        config.bulk_publish_segment_cadence,
         config.compaction_tombstone_density.to_bits(),
         config.merge_max_hole_ratio.to_bits(),
         config.glob_expansion_limit,
@@ -2013,7 +2017,7 @@ mod tests {
 
     async fn e55_index_with_live_history(cx: &Cx) -> (QuillIndex, usize, u32) {
         let config = e55_config();
-        let mut index = QuillIndex::in_memory_with_schema(E55_SCHEMA, config)
+        let index = QuillIndex::in_memory_with_schema(E55_SCHEMA, config)
             .expect("construct historical E5.5 index");
         let generation = index.search_snapshot().keeper_generation();
         let mut historical = E55DeltaBuilder::new(0);
@@ -2866,7 +2870,7 @@ mod tests {
         let (index, baseline_dead_segments, historical_docid) =
             e55_index_with_live_history(cx).await;
         let mut corpus = e55_build_live_corpus(&index, seed, extras_per_delta, historical_docid);
-        let mut index = e55_tombstone_sealed_upsert_source(&index, historical_docid);
+        let index = e55_tombstone_sealed_upsert_source(&index, historical_docid);
         let successor_generation = index.search_snapshot().keeper_generation();
         corpus.first = Arc::new(corpus.first.rebind_keeper_generation(successor_generation));
         corpus.second = Arc::new(corpus.second.rebind_keeper_generation(successor_generation));
@@ -3071,6 +3075,34 @@ mod tests {
                 "tier_fanout",
                 QuillConfig {
                     tier_fanout: baseline_config.tier_fanout + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "tier_small_max_docid_width",
+                QuillConfig {
+                    tier_small_max_docid_width: baseline_config.tier_small_max_docid_width + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "tier_medium_max_docid_width",
+                QuillConfig {
+                    tier_medium_max_docid_width: baseline_config.tier_medium_max_docid_width + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "bulk_load_mode",
+                QuillConfig {
+                    bulk_load_mode: !baseline_config.bulk_load_mode,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "bulk_publish_segment_cadence",
+                QuillConfig {
+                    bulk_publish_segment_cadence: baseline_config.bulk_publish_segment_cadence + 1,
                     ..baseline_config.clone()
                 },
             ),

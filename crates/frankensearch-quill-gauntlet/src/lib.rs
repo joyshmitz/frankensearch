@@ -13,6 +13,7 @@ mod artifact;
 mod comparator;
 mod engine;
 mod generator;
+mod perf;
 mod runner;
 mod version_contract;
 
@@ -48,6 +49,12 @@ pub use generator::{
     SharedEdgeCase, SharedFixtureSuite, SharedRelevanceQuery, SkippedRepositoryEntry,
     SourceFileDigest, SyntheticCorpus, SyntheticCorpusIter, SyntheticCorpusSpec, UnicodeLane,
     XLARGE_DOCUMENT_COUNT, ZipfExponent,
+};
+pub use perf::{
+    DistributionSummary, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MAX_CV_PCT, PERF_MIN_RUNS,
+    PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES, PerfCellResult, PerfCellSpec,
+    PerfCorpus, PerfGate, PerfGateArtifact, PerfMatrixSpec, PerfQueryClass, PerfTopology,
+    PositionMode, machine_fingerprint, peak_rss_bytes, perf_writer_heap_bytes, validate_matrix,
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CampaignCaseResult, CampaignConfig, CampaignDisposition,

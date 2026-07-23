@@ -378,7 +378,7 @@ intent and contextual relevance matters.
 If you want to embed `frankensearch` directly in your Rust app, this is the
 minimum end-to-end flow:
 
-```rust,ignore
+```rust,no_run
 use std::sync::Arc;
 
 use frankensearch::{
@@ -402,7 +402,9 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
         .expect("index build should succeed");
 
     // 3) Open and search
-    let index = Arc::new(TwoTierIndex::open("./my_index", TwoTierConfig::default()).unwrap());
+    let index = Arc::new(
+        TwoTierIndex::open(std::path::Path::new("./my_index"), TwoTierConfig::default()).unwrap()
+    );
     let searcher = TwoTierSearcher::new(
         index,
         Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>,
@@ -415,11 +417,27 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
         .expect("search should succeed");
 
     println!("results={} phase1_ms={:.2}", results.len(), metrics.phase1_total_ms);
+
+    #[cfg(feature = "quill")]
+    {
+        let lexical = frankensearch::QuillIndex::open(
+            &cx,
+            "./my_index/lexical",
+            frankensearch::QuillConfig::default(),
+        )
+        .await
+        .expect("open Quill lexical index");
+        let lexical_hits = lexical
+            .search_results(&cx, "ownership", 10)
+            .expect("search Quill lexical index");
+        assert!(!lexical_hits.is_empty());
+    }
 });
 ```
 
 Notes:
 - For production semantic quality, use `model2vec` + `fastembed` (or `EmbedderStack::auto_detect_with`).
+- Enable `quill` for the native bulk-built lexical index; use `lexical-tantivy` only for the explicit Tantivy oracle/comparator lane during migration.
 - Use `search_collect_with_text` or full `search(...)` when you need negation filtering (`-term`) and rerank text access.
 - Keep `TwoTierConfig` explicit in code for reproducible behavior across environments.
 

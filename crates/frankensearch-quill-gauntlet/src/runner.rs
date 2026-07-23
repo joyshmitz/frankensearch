@@ -6413,6 +6413,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     fn documents_content_hash(documents: &[GeneratedDocument]) -> String {
         let mut hasher = Sha256::new();
         for document in documents {
