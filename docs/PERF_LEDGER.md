@@ -1,5 +1,38 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-23 — KEEP: WAL `decode_vector` f16 SIMD-widen — closes the last scalar consumer of the `vector_at_f32` route-next (`bd-y3hf`, cc)
+
+The 2026-07-16 `vector_at_f32` SIMD-widen KEEP (BlackThrush) explicitly deferred one consumer:
+"the `wal::decode_vector` open-time f16 decode is the one remaining scalar consumer — a colder
+route-next left for a follow-up." `wal.rs::decode_vector` still materialized an f16-stored vector
+to `Vec<f32>` with a scalar `half::f16::to_f32` loop, while the f16 dot kernels and both
+`vector_at_f32` decoders already widen 8 f16 per 16-byte block via the crate's `widen8_f16_bytes`
+(the Giesen magic-factor widen, bit-identical to `to_f32`).
+
+Applied the identical KEPT pattern: the F16 arm now `as_chunks::<16>()` → SIMD-widen 8 lanes per
+block → scalar tail for the last `< 8`. Byte-for-byte identical output (the widen is the same
+`pub(crate)` kernel the dot path ships), pinned by a new
+`decode_vector_f16_simd_matches_scalar_bit_exact` test (dim 13 = one 8-lane block + a 5-element
+tail, values spanning normal / subnormal / signed-zero / ±inf / NaN encodings, `to_bits()`
+compare) plus the existing WAL F16 round-trip suite. 63/63 index-lib WAL tests green; scoped
+clippy `-D warnings` clean.
+
+MEASURED (`vector_decode_f16_ab`, the same-binary A/B that already asserts widen == scalar
+byte-identity before timing — the shipped WAL op is byte-identical to this bench's `widen` arm;
+Criterion 100 samples, widen/scalar `<1` wins, disjoint CIs):
+
+| dim | scalar | widen (SIMD) | ratio |
+|---|---|---|---|
+| 256 | 459.83 ns | 110.00 ns | **0.239 (~4.18×)** |
+| 384 | 638.32 ns | 187.77 ns | **0.294 (~3.40×)** |
+| 768 | 1422.4 ns | 347.79 ns | **0.245 (~4.09×)** |
+
+**Decision: KEEP.** This is open-time (WAL replay) decode, not a query hot path, so end-to-end
+impact is a faster incremental-index reload rather than a search-latency change — a
+consistency-completion of the f16-widen sibling family (all f16→f32 decode consumers now route
+through the SIMD kernel). Zero algorithmic risk: byte-identical to the already-KEPT operation.
+Route-next from the sibling family is now fully closed.
+
 ## 2026-07-23 — KEEP: Quill per-width posting-unpack dispatcher — banded SIMD for widths 4-28 (`bd-bz7q`, cc)
 
 Sanctioned follow-up to the 2026-07-17 global-wide-unpack REJECT

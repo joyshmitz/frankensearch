@@ -281,13 +281,25 @@ fn parse_batch(
 
 fn decode_vector(bytes: &[u8], dimension: usize, quantization: Quantization) -> Vec<f32> {
     let vec = match quantization {
-        Quantization::F16 => bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .take(dimension)
-            .map(|chunk| f16::from_le_bytes(*chunk).to_f32())
-            .collect(),
+        Quantization::F16 => {
+            // SIMD-widen 8 little-endian f16 per 16-byte block
+            // (`widen8_f16_bytes`, the same magic-factor widen the f16 dot
+            // kernels use — bit-identical to the scalar `f16::to_f32`), then a
+            // scalar tail for the last < 8. The last remaining scalar consumer
+            // of the vector_at_f32 SIMD-widen route-next (bd-y3hf).
+            let f16_bytes = dimension * 2;
+            let source = &bytes[..f16_bytes.min(bytes.len())];
+            let mut out = Vec::with_capacity(dimension);
+            let (blocks, remainder) = source.as_chunks::<16>();
+            for arr in blocks {
+                out.extend_from_slice(&crate::simd::widen8_f16_bytes(arr).to_array());
+            }
+            for chunk in remainder.as_chunks::<2>().0 {
+                out.push(f16::from_le_bytes(*chunk).to_f32());
+            }
+            out.truncate(dimension);
+            out
+        }
         Quantization::F32 => bytes
             .as_chunks::<4>()
             .0
@@ -507,6 +519,52 @@ mod tests {
             doc_id: doc_id.into(),
             doc_id_hash: crate::fnv1a_hash(doc_id.as_bytes()),
             embedding: vec![base; dim],
+        }
+    }
+
+    #[test]
+    fn decode_vector_f16_simd_matches_scalar_bit_exact() {
+        // Exercise both the SIMD 16-byte block path and the scalar tail: dim
+        // 13 = one 8-lane block + a 5-element remainder. Values span normal,
+        // subnormal, signed, and non-finite f16 encodings so any magic-factor
+        // widen mismatch surfaces as a bit difference (bd-y3hf).
+        let f16_values: [f16; 13] = [
+            f16::from_f32(0.0),
+            f16::from_f32(-0.0),
+            f16::from_f32(1.5),
+            f16::from_f32(-2.25),
+            f16::from_f32(65504.0),
+            f16::from_f32(-65504.0),
+            f16::from_bits(0x0001),
+            f16::from_bits(0x8001),
+            f16::INFINITY,
+            f16::NEG_INFINITY,
+            f16::NAN,
+            f16::from_f32(0.333_251),
+            f16::from_f32(-123.4),
+        ];
+        let mut bytes = Vec::with_capacity(f16_values.len() * 2);
+        for value in f16_values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let simd = decode_vector(&bytes, f16_values.len(), Quantization::F16);
+        let scalar: Vec<f32> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(f16_values.len())
+            .map(|chunk| f16::from_le_bytes(*chunk).to_f32())
+            .collect();
+
+        assert_eq!(simd.len(), f16_values.len());
+        assert_eq!(scalar.len(), f16_values.len());
+        for (index, (lhs, rhs)) in simd.iter().zip(scalar.iter()).enumerate() {
+            assert_eq!(
+                lhs.to_bits(),
+                rhs.to_bits(),
+                "SIMD-widen f16 decode diverged from scalar at lane {index}",
+            );
         }
     }
 
