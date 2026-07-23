@@ -919,10 +919,14 @@ fn offset_tie_group(
 
 fn quill_config_hash(config: &QuillConfig) -> String {
     let canonical = format!(
-        "scribe={};delta={};fanout={};compact={:016x};holes={:016x};glob={};shards={};deterministic={};visibility_ms={}",
+        "scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};shards={};deterministic={};visibility_ms={}",
         config.scribe_shard_budget_bytes,
         config.delta_budget_bytes,
         config.tier_fanout,
+        config.tier_small_max_docid_width,
+        config.tier_medium_max_docid_width,
+        config.bulk_load_mode,
+        config.bulk_publish_segment_cadence,
         config.compaction_tombstone_density.to_bits(),
         config.merge_max_hole_ratio.to_bits(),
         config.glob_expansion_limit,
@@ -3071,6 +3075,34 @@ mod tests {
                 "tier_fanout",
                 QuillConfig {
                     tier_fanout: baseline_config.tier_fanout + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "tier_small_max_docid_width",
+                QuillConfig {
+                    tier_small_max_docid_width: baseline_config.tier_small_max_docid_width + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "tier_medium_max_docid_width",
+                QuillConfig {
+                    tier_medium_max_docid_width: baseline_config.tier_medium_max_docid_width + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "bulk_load_mode",
+                QuillConfig {
+                    bulk_load_mode: !baseline_config.bulk_load_mode,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "bulk_publish_segment_cadence",
+                QuillConfig {
+                    bulk_publish_segment_cadence: baseline_config.bulk_publish_segment_cadence + 1,
                     ..baseline_config.clone()
                 },
             ),

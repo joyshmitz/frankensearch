@@ -12,6 +12,12 @@ pub const DEFAULT_SCRIBE_SHARD_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_DELTA_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 /// Default number of same-tier segments that triggers a merge.
 pub const DEFAULT_TIER_FANOUT: usize = 8;
+/// Default inclusive upper bound for the small segment tier: one Q1 lease.
+pub const DEFAULT_TIER_SMALL_MAX_DOCID_WIDTH: u64 = 1 << 16;
+/// Default inclusive upper bound for the medium segment tier: eight Q1 leases.
+pub const DEFAULT_TIER_MEDIUM_MAX_DOCID_WIDTH: u64 = 8 << 16;
+/// Default number of sealed mini-segments between bulk-build publications.
+pub const DEFAULT_BULK_PUBLISH_SEGMENT_CADENCE: usize = 64;
 /// Default live-segment tombstone density that triggers compaction.
 pub const DEFAULT_COMPACTION_TOMBSTONE_DENSITY: f64 = 0.20;
 /// Default maximum hole ratio accepted by the concat-merge policy.
@@ -36,6 +42,14 @@ pub struct QuillConfig {
     pub delta_budget_bytes: usize,
     /// Number of segments at one tier that triggers promotion/merge.
     pub tier_fanout: usize,
+    /// Inclusive maximum docid-range width classified as a small segment.
+    pub tier_small_max_docid_width: u64,
+    /// Inclusive maximum docid-range width classified as a medium segment.
+    pub tier_medium_max_docid_width: u64,
+    /// Suppress ordinary tier merges until [`crate::QuillIndex::finish_bulk_load`].
+    pub bulk_load_mode: bool,
+    /// Sealed mini-segments between crash-resumable bulk MANIFEST publishes.
+    pub bulk_publish_segment_cadence: usize,
     /// Per-segment tombstone density that triggers compaction.
     pub compaction_tombstone_density: f64,
     /// Maximum fraction of holes tolerated by concat-merge policy.
@@ -58,6 +72,10 @@ impl Default for QuillConfig {
             scribe_shard_budget_bytes: DEFAULT_SCRIBE_SHARD_BUDGET_BYTES,
             delta_budget_bytes: DEFAULT_DELTA_BUDGET_BYTES,
             tier_fanout: DEFAULT_TIER_FANOUT,
+            tier_small_max_docid_width: DEFAULT_TIER_SMALL_MAX_DOCID_WIDTH,
+            tier_medium_max_docid_width: DEFAULT_TIER_MEDIUM_MAX_DOCID_WIDTH,
+            bulk_load_mode: false,
+            bulk_publish_segment_cadence: DEFAULT_BULK_PUBLISH_SEGMENT_CADENCE,
             compaction_tombstone_density: DEFAULT_COMPACTION_TOMBSTONE_DENSITY,
             merge_max_hole_ratio: DEFAULT_MERGE_MAX_HOLE_RATIO,
             glob_expansion_limit: DEFAULT_GLOB_EXPANSION_LIMIT,
@@ -85,6 +103,24 @@ impl QuillConfig {
                 "must be at least 2",
             ));
         }
+        if self.tier_small_max_docid_width == 0 {
+            return Err(invalid_config(
+                "tier_small_max_docid_width",
+                &self.tier_small_max_docid_width,
+                "must be greater than zero",
+            ));
+        }
+        if self.tier_medium_max_docid_width <= self.tier_small_max_docid_width {
+            return Err(invalid_config(
+                "tier_medium_max_docid_width",
+                &self.tier_medium_max_docid_width,
+                "must be greater than tier_small_max_docid_width",
+            ));
+        }
+        require_positive(
+            "bulk_publish_segment_cadence",
+            self.bulk_publish_segment_cadence,
+        )?;
         require_fraction_open_closed(
             "compaction_tombstone_density",
             self.compaction_tombstone_density,
@@ -170,6 +206,10 @@ mod tests {
                 scribe_shard_budget_bytes: 64 * 1024 * 1024,
                 delta_budget_bytes: 8 * 1024 * 1024,
                 tier_fanout: 8,
+                tier_small_max_docid_width: 65_536,
+                tier_medium_max_docid_width: 524_288,
+                bulk_load_mode: false,
+                bulk_publish_segment_cadence: 64,
                 compaction_tombstone_density: 0.20,
                 merge_max_hole_ratio: 0.50,
                 glob_expansion_limit: 16_384,
@@ -223,5 +263,23 @@ mod tests {
         ));
         config.max_visibility_lag_ms = 1;
         assert!(config.validate().is_ok());
+
+        config.tier_small_max_docid_width = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "tier_small_max_docid_width"
+        ));
+        config = QuillConfig::default();
+        config.tier_medium_max_docid_width = config.tier_small_max_docid_width;
+        assert!(matches!(
+            config.validate(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "tier_medium_max_docid_width"
+        ));
+        config = QuillConfig::default();
+        config.bulk_publish_segment_cadence = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "bulk_publish_segment_cadence"
+        ));
     }
 }

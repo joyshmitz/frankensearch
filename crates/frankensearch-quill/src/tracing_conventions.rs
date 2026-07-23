@@ -59,10 +59,12 @@ pub const ARGUS_SCORE: &str = "frankensearch::quill::argus::score";
 pub const ARGUS_COLLECT: &str = "frankensearch::quill::argus::collect";
 /// Keeper index open/recovery.
 pub const KEEPER_OPEN: &str = "frankensearch::quill::keeper::open";
-/// Keeper delta seal.
-pub const KEEPER_SEAL: &str = "frankensearch::quill::keeper::seal";
-/// Keeper durable commit/publish.
-pub const KEEPER_COMMIT: &str = "frankensearch::quill::keeper::commit";
+/// Unified Keeper seal, publish, and policy-merge lifecycle family.
+pub const KEEPER_LIFECYCLE: &str = "frankensearch::quill::keeper::lifecycle";
+/// Compatibility alias for the unified Keeper lifecycle family.
+pub const KEEPER_SEAL: &str = KEEPER_LIFECYCLE;
+/// Compatibility alias for the unified Keeper lifecycle family.
+pub const KEEPER_COMMIT: &str = KEEPER_LIFECYCLE;
 /// Keeper tombstone compaction.
 pub const KEEPER_COMPACT: &str = "frankensearch::quill::keeper::compact";
 
@@ -79,8 +81,7 @@ pub const ALL_SPAN_NAMES: &[&str] = &[
     ARGUS_SCORE,
     ARGUS_COLLECT,
     KEEPER_OPEN,
-    KEEPER_SEAL,
-    KEEPER_COMMIT,
+    KEEPER_LIFECYCLE,
     KEEPER_COMPACT,
 ];
 

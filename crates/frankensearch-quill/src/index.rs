@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use asupersync::Cx;
@@ -40,8 +40,9 @@ use crate::grimoire::{
 };
 use crate::keeper::{
     CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, KeeperError, KeeperSnapshot,
-    KeeperWriter, Manifest, ManifestFieldStats, ManifestSegment, RecoveredSegment, TombstoneSet,
-    validate_manifest_successor,
+    KeeperWriter, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats,
+    ManifestSegment, RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet,
+    plan_tier_merge, validate_manifest_successor,
 };
 use crate::query::{
     BooleanOperator, DefaultQueryParser, Occur, Query, QueryDiagnostic, QueryExplanation,
@@ -55,9 +56,9 @@ use crate::quiver::{
 };
 use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
-    AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, DeltaFlushInput, FlushDocumentInput,
-    FlushError, FlushMode, FlushSegmentInput, IndexedFieldValue, StoredFieldValue,
-    flush_accumulator_with_mode, flush_delta_snapshot,
+    AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator,
+    FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, IndexedFieldValue, ShardRouter,
+    StoredFieldValue, flush_accumulator_with_mode, flush_delta_snapshot,
 };
 use crate::segment::{EncodedSegment, SectionKind};
 use crate::snippet::{SnippetConfig, SnippetGenerator, SnippetTerm};
@@ -91,6 +92,9 @@ pub enum QuillIndexError {
     /// A scalar accumulator could not be sealed.
     #[error(transparent)]
     Flush(#[from] FlushError),
+    /// Bound-consecutive tier planning failed.
+    #[error(transparent)]
+    TierPolicy(#[from] TierPolicyError),
     /// A term dictionary was malformed or incompatible with its sections.
     #[error(transparent)]
     Dictionary(#[from] TermDictionaryError),
@@ -1019,10 +1023,42 @@ struct PendingIdentity {
 }
 
 struct StagedFlush {
+    shard: usize,
     encoded: EncodedSegment,
     manifest_segment: ManifestSegment,
     pending_field_stats: BTreeMap<u16, (u64, u32)>,
     next_seal_seq: u64,
+}
+
+struct ScribeShardState {
+    accumulator: ColumnarAccumulator,
+    identities: Vec<PendingIdentity>,
+    current_lease_base: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleTrigger {
+    ArenaBudget,
+    LeaseBoundary,
+    VisibilityLag,
+    ExplicitFlush,
+    BulkCadence,
+    BulkFinish,
+    TierFanout,
+}
+
+impl LifecycleTrigger {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArenaBudget => "arena_budget",
+            Self::LeaseBoundary => "lease_boundary",
+            Self::VisibilityLag => "visibility_lag",
+            Self::ExplicitFlush => "explicit_flush",
+            Self::BulkCadence => "bulk_cadence",
+            Self::BulkFinish => "bulk_finish",
+            Self::TierFanout => "tier_fanout",
+        }
+    }
 }
 
 struct PendingDeltaSeal {
@@ -1104,10 +1140,10 @@ pub struct QuillSearchIndex {
 struct QuillWriterState {
     reader: QuillReader,
     backend: IndexBackend,
-    accumulator: ColumnarAccumulator,
-    identities: Vec<PendingIdentity>,
+    shards: Vec<ScribeShardState>,
+    shard_router: ShardRouter,
+    docid_allocator: DocIdAllocator,
     uncommitted_ids: BTreeSet<String>,
-    current_lease_base: Option<u64>,
     next_lease_base: u64,
     next_seal_seq: u64,
     staged_flush: Option<StagedFlush>,
@@ -1116,6 +1152,7 @@ struct QuillWriterState {
     pending_field_stats: BTreeMap<u16, (u64, u32)>,
     pending_manifest: Option<Manifest>,
     pending_delta_seal: Option<PendingDeltaSeal>,
+    unpublished_since: Option<Instant>,
 }
 
 impl Deref for QuillWriterState {
@@ -1358,9 +1395,23 @@ impl QuillWriterState {
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         let parser = DefaultQueryParser::new(schema)?;
-        let accumulator = ColumnarAccumulator::new(schema)?;
         let manifest = &backend.snapshot().loaded_manifest().manifest;
         let next_lease_base = next_lease_boundary(manifest.docid_high_watermark)?;
+        let detected_parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        let shard_router = ShardRouter::from_config(&config, detected_parallelism);
+        let docid_allocator = DocIdAllocator::open(next_lease_base, shard_router.shard_count())
+            .map_err(|error| invalid_state(error.to_string()))?;
+        let mut shards = Vec::new();
+        shards
+            .try_reserve_exact(shard_router.shard_count())
+            .map_err(|_| invalid_state("could not allocate Scribe shard table"))?;
+        for _ in 0..shard_router.shard_count() {
+            shards.push(ScribeShardState {
+                accumulator: ColumnarAccumulator::new(schema)?,
+                identities: Vec::new(),
+                current_lease_base: None,
+            });
+        }
         let next_seal_seq = manifest
             .segments
             .iter()
@@ -1381,10 +1432,10 @@ impl QuillWriterState {
                 published_snapshot,
             },
             backend,
-            accumulator,
-            identities: Vec::new(),
+            shards,
+            shard_router,
+            docid_allocator,
             uncommitted_ids: BTreeSet::new(),
-            current_lease_base: None,
             next_lease_base,
             next_seal_seq,
             staged_flush: None,
@@ -1393,6 +1444,7 @@ impl QuillWriterState {
             pending_field_stats: BTreeMap::new(),
             pending_manifest: None,
             pending_delta_seal: None,
+            unpublished_since: None,
         })
     }
 
@@ -1632,6 +1684,9 @@ impl QuillWriterState {
             .install_prepared_sealed(Arc::new(self.backend.snapshot().clone()), pending.prepared);
         self.next_seal_seq = pending.next_seal_seq;
         self.next_lease_base = self.next_lease_base.max(pending.successor_watermark);
+        self.docid_allocator =
+            DocIdAllocator::open(self.next_lease_base, self.shard_router.shard_count())
+                .map_err(|error| invalid_state(error.to_string()))?;
         Ok(installed)
     }
 
@@ -1644,7 +1699,9 @@ impl QuillWriterState {
     /// Whether the writer holds documents or installed segments not yet visible.
     #[must_use]
     pub fn has_uncommitted_changes(&self) -> bool {
-        self.accumulator.document_count() != 0
+        self.shards
+            .iter()
+            .any(|shard| shard.accumulator.document_count() != 0)
             || self.staged_flush.is_some()
             || !self.pending_segments.is_empty()
             || self.pending_manifest.is_some()
@@ -1655,7 +1712,7 @@ impl QuillWriterState {
         !self.published_snapshot.load().delta_snapshots().is_empty()
     }
 
-    /// Accumulate one bounded batch into the single scalar shard.
+    /// Route and accumulate one bounded batch into the production Scribe shard set.
     ///
     /// A budget or lease boundary seals an immutable segment, but no newly
     /// installed segment becomes searchable until [`Self::commit`] publishes
@@ -1703,67 +1760,122 @@ impl QuillWriterState {
                     "installed segments await MANIFEST publication; retry commit before indexing",
                 ));
             }
-            let mut arena_bytes_used_high_water = self.accumulator.bytes_used();
-            let mut arena_bytes_reserved_high_water = self.accumulator.bytes_reserved();
-            for document in documents {
-                check_cancel(cx, "index")?;
-                if document.id.is_empty() {
-                    return Err(invalid_state("document id must be nonempty"));
+            if documents.is_empty() {
+                return Ok(());
+            }
+            let shard_id = self.shard_router.route_batch();
+            let document_count = u32::try_from(documents.len())
+                .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
+            let allocated = self
+                .docid_allocator
+                .alloc_batch(shard_id, document_count)
+                .map_err(|error| invalid_state(error.to_string()))?;
+            self.next_lease_base = self.docid_allocator.watermark();
+            let mut arena_bytes_used_high_water = self
+                .shards
+                .iter()
+                .map(|shard| shard.accumulator.bytes_used())
+                .max()
+                .unwrap_or(0);
+            let mut arena_bytes_reserved_high_water = self
+                .shards
+                .iter()
+                .map(|shard| shard.accumulator.bytes_reserved())
+                .max()
+                .unwrap_or(0);
+            let mut document_index = 0_usize;
+            for (span_index, span) in allocated.spans().iter().copied().enumerate() {
+                let lease_changed = self.shards[shard_id]
+                    .current_lease_base
+                    .is_some_and(|base| base != span.lease_base);
+                if lease_changed {
+                    self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
+                        .await?;
                 }
-                if self.uncommitted_ids.contains(&document.id)
-                    || self
-                        .backend
-                        .snapshot()
-                        .resolve_document_id(&document.id)?
-                        .is_some()
-                {
-                    return Err(invalid_state(format!(
-                        "duplicate live document id {:?}",
-                        document.id
-                    )));
-                }
-                let lease_base = self.ensure_lease()?;
-                let doc_ord = u32::try_from(self.accumulator.document_count())
-                    .map_err(|_| invalid_state("accumulator document count does not fit u32"))?;
-                let global_docid = lease_base
-                    .checked_add(u64::from(doc_ord))
-                    .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
-                    .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
+                self.shards[shard_id].current_lease_base = Some(span.lease_base);
+                for span_offset in 0..span.len {
+                    let document = &documents[document_index];
+                    document_index += 1;
+                    check_cancel(cx, "index")?;
+                    if document.id.is_empty() {
+                        return Err(invalid_state("document id must be nonempty"));
+                    }
+                    if self.uncommitted_ids.contains(&document.id)
+                        || self
+                            .backend
+                            .snapshot()
+                            .resolve_document_id(&document.id)?
+                            .is_some()
+                    {
+                        return Err(invalid_state(format!(
+                            "duplicate live document id {:?}",
+                            document.id
+                        )));
+                    }
+                    let doc_ord = span
+                        .ord_start
+                        .checked_add(span_offset)
+                        .ok_or_else(|| invalid_state("lease-relative document ordinal overflow"))?;
+                    let global_docid = span
+                        .lease_base
+                        .checked_add(u64::from(doc_ord))
+                        .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
+                        .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
 
-                let metadata = canonical_metadata(&document.metadata)?;
-                let ordinal = global_docid.to_le_bytes();
-                let title = document.title.as_deref().unwrap_or("");
-                let indexed = [
-                    IndexedFieldValue::new(ID_FIELD, &document.id),
-                    IndexedFieldValue::new(CONTENT_FIELD, &document.content),
-                    IndexedFieldValue::new(TITLE_FIELD, title),
-                ];
-                let stored = [
-                    StoredFieldValue::new(METADATA_FIELD, &metadata),
-                    StoredFieldValue::new(ORD_FIELD, &ordinal),
-                ];
-                let accumulated =
-                    self.accumulator
-                        .add_document_with_values(doc_ord, &indexed, &[], &stored)?;
-                arena_bytes_used_high_water =
-                    arena_bytes_used_high_water.max(accumulated.bytes_used);
-                arena_bytes_reserved_high_water =
-                    arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
-                let canonical_content = canonical_document_preimage(document, &metadata)?;
-                self.identities.push(PendingIdentity {
-                    doc_ord,
-                    document_id: document.id.clone(),
-                    canonical_content,
-                });
-                self.uncommitted_ids.insert(document.id.clone());
+                    let metadata = canonical_metadata(&document.metadata)?;
+                    let ordinal = global_docid.to_le_bytes();
+                    let title = document.title.as_deref().unwrap_or("");
+                    let indexed = [
+                        IndexedFieldValue::new(ID_FIELD, &document.id),
+                        IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+                        IndexedFieldValue::new(TITLE_FIELD, title),
+                    ];
+                    let stored = [
+                        StoredFieldValue::new(METADATA_FIELD, &metadata),
+                        StoredFieldValue::new(ORD_FIELD, &ordinal),
+                    ];
+                    let accumulated = self.shards[shard_id].accumulator.add_document_with_values(
+                        doc_ord,
+                        &indexed,
+                        &[],
+                        &stored,
+                    )?;
+                    arena_bytes_used_high_water =
+                        arena_bytes_used_high_water.max(accumulated.bytes_used);
+                    arena_bytes_reserved_high_water =
+                        arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
+                    let canonical_content = canonical_document_preimage(document, &metadata)?;
+                    self.shards[shard_id].identities.push(PendingIdentity {
+                        doc_ord,
+                        document_id: document.id.clone(),
+                        canonical_content,
+                    });
+                    self.uncommitted_ids.insert(document.id.clone());
+                    self.unpublished_since.get_or_insert_with(Instant::now);
 
-                if self.accumulator.document_count() == DOC_ORDS_PER_LEASE as usize
-                    || self
+                    if self.shards[shard_id]
                         .accumulator
                         .should_flush(self.config.scribe_shard_budget_bytes)
-                {
-                    self.flush_current(cx).await?;
+                    {
+                        self.flush_shard(cx, shard_id, LifecycleTrigger::ArenaBudget)
+                            .await?;
+                        self.shards[shard_id].current_lease_base = Some(span.lease_base);
+                        self.publish_bulk_cadence_if_due(cx).await?;
+                    }
                 }
+                if span_index + 1 < allocated.spans().len() {
+                    self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
+                        .await?;
+                    self.publish_bulk_cadence_if_due(cx).await?;
+                }
+            }
+            debug_assert_eq!(document_index, documents.len());
+            let visibility_due = self.unpublished_since.is_some_and(|started| {
+                started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
+            });
+            if visibility_due {
+                self.commit_with_trigger(cx, LifecycleTrigger::VisibilityLag)
+                    .await?;
             }
             ingest_span.record(
                 "result_count",
@@ -1791,6 +1903,15 @@ impl QuillWriterState {
     /// or cancellation failures. Installed-but-unreferenced segments remain
     /// invisible and are retained for a publication retry.
     pub async fn commit(&mut self, cx: &Cx) -> Result<&KeeperSnapshot, QuillIndexError> {
+        self.commit_with_trigger(cx, LifecycleTrigger::ExplicitFlush)
+            .await
+    }
+
+    async fn commit_with_trigger(
+        &mut self,
+        cx: &Cx,
+        trigger: LifecycleTrigger,
+    ) -> Result<&KeeperSnapshot, QuillIndexError> {
         check_cancel(cx, "commit")?;
         if self.pending_delta_seal.is_some() {
             return Err(invalid_state(
@@ -1802,10 +1923,34 @@ impl QuillWriterState {
                 "scalar commit cannot run while process-local Delta epochs are active",
             ));
         }
-        self.flush_current(cx).await?;
+        for shard in 0..self.shards.len() {
+            self.flush_shard(cx, shard, trigger).await?;
+        }
+        self.publish_pending_segments(cx, trigger).await?;
+        if !self.config.bulk_load_mode {
+            self.apply_tier_policy(cx).await?;
+        }
+        Ok(self.backend.snapshot())
+    }
+
+    async fn publish_bulk_cadence_if_due(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
+        if self.config.bulk_load_mode
+            && self.pending_segments.len() >= self.config.bulk_publish_segment_cadence
+        {
+            self.publish_pending_segments(cx, LifecycleTrigger::BulkCadence)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_pending_segments(
+        &mut self,
+        cx: &Cx,
+        trigger: LifecycleTrigger,
+    ) -> Result<(), QuillIndexError> {
         check_cancel(cx, "commit publish")?;
         if self.pending_segments.is_empty() {
-            return Ok(self.backend.snapshot());
+            return Ok(());
         }
 
         self.prepare_pending_manifest()?;
@@ -1819,8 +1964,10 @@ impl QuillWriterState {
             .prepare_sealed_manifest(self.schema, &manifest)?;
         let commit_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
-            crate::tracing_conventions::KEEPER_COMMIT,
-            phase = "commit",
+            crate::tracing_conventions::KEEPER_LIFECYCLE,
+            phase = "publish",
+            trigger = trigger.as_str(),
+            action = "publish",
             generation = manifest.generation,
             segment_count = manifest.segments.len(),
             doc_count = manifest.field_stats.first().map_or(0, |row| row.doc_count),
@@ -1874,7 +2021,130 @@ impl QuillWriterState {
         self.pending_field_stats.clear();
         self.pending_manifest = None;
         self.uncommitted_ids.clear();
+        for shard in &self.shards {
+            self.uncommitted_ids.extend(
+                shard
+                    .identities
+                    .iter()
+                    .map(|identity| identity.document_id.clone()),
+            );
+        }
+        if self
+            .shards
+            .iter()
+            .all(|shard| shard.accumulator.document_count() == 0)
+        {
+            self.unpublished_since = None;
+        }
+        Ok(())
+    }
+
+    async fn apply_tier_policy(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
+        loop {
+            let policy = TierMergePolicy::from_config(&self.config);
+            let plan = plan_tier_merge(
+                &self.backend.snapshot().loaded_manifest().manifest.segments,
+                policy,
+            )?;
+            let Some(plan) = plan else {
+                return Ok(());
+            };
+            let output_segment_id =
+                self.derive_policy_segment_id(&plan.source_segment_ids, b"tier")?;
+            let created_unix_s = self.created_unix_s()?;
+            let policy_span = tracing::info_span!(
+                target: crate::tracing_conventions::TARGET,
+                crate::tracing_conventions::KEEPER_LIFECYCLE,
+                phase = "merge",
+                trigger = LifecycleTrigger::TierFanout.as_str(),
+                action = "concat_merge",
+                tier = ?plan.tier,
+                source_count = plan.source_segment_ids.len(),
+                docid_lo = plan.docid_lo,
+                docid_hi = plan.docid_hi,
+                hole_ratio = plan.hole_ratio,
+                segment_id = output_segment_id,
+                duration_us = tracing::field::Empty,
+            );
+            let _policy_timer = crate::tracing_conventions::StageTimer::new(&policy_span);
+            self.concat_merge(
+                cx,
+                &plan.source_segment_ids,
+                output_segment_id,
+                created_unix_s,
+            )
+            .instrument(policy_span)
+            .await?;
+        }
+    }
+
+    async fn finish_bulk_load(&mut self, cx: &Cx) -> Result<&KeeperSnapshot, QuillIndexError> {
+        if !self.config.bulk_load_mode {
+            return Err(invalid_state(
+                "finish_bulk_load requires bulk_load_mode in QuillConfig",
+            ));
+        }
+        self.commit_with_trigger(cx, LifecycleTrigger::BulkFinish)
+            .await?;
+        let source_segment_ids = self
+            .backend
+            .snapshot()
+            .loaded_manifest()
+            .manifest
+            .segments
+            .iter()
+            .map(|segment| segment.segment_id)
+            .collect::<Vec<_>>();
+        if source_segment_ids.len() > 1 {
+            let output_segment_id =
+                self.derive_policy_segment_id(&source_segment_ids, b"bulk-finish")?;
+            let created_unix_s = self.created_unix_s()?;
+            let bulk_span = tracing::info_span!(
+                target: crate::tracing_conventions::TARGET,
+                crate::tracing_conventions::KEEPER_LIFECYCLE,
+                phase = "merge",
+                trigger = LifecycleTrigger::BulkFinish.as_str(),
+                action = "concat_merge",
+                source_count = source_segment_ids.len(),
+                segment_id = output_segment_id,
+                duration_us = tracing::field::Empty,
+            );
+            let _bulk_timer = crate::tracing_conventions::StageTimer::new(&bulk_span);
+            self.concat_merge(cx, &source_segment_ids, output_segment_id, created_unix_s)
+                .instrument(bulk_span)
+                .await?;
+        }
+        self.publish_bulk_completion(cx).await?;
+        self.reader.config.bulk_load_mode = false;
         Ok(self.backend.snapshot())
+    }
+
+    async fn publish_bulk_completion(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
+        let current = &self.backend.snapshot().loaded_manifest().manifest;
+        if current.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS == 0 {
+            return Ok(());
+        }
+        let mut manifest = self.backend.snapshot().next_manifest()?;
+        manifest.flags &= !MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
+        manifest.last_publish_unix_s = 0;
+        if matches!(&self.backend, IndexBackend::Durable(_)) {
+            manifest.last_publish_unix_s = wall_clock_unix_s()?;
+        }
+        let prepared = self
+            .published_snapshot
+            .prepare_sealed_manifest(self.schema, &manifest)?;
+        check_cancel(cx, "bulk completion publish")?;
+        match &mut self.backend {
+            IndexBackend::Durable(writer) => {
+                writer.publish(cx, &manifest).await?;
+            }
+            IndexBackend::Memory(snapshot) => {
+                *snapshot = snapshot.publish_owned_segments(&manifest, Vec::new())?;
+            }
+        }
+        self.published_snapshot
+            .install_prepared_sealed(Arc::new(self.backend.snapshot().clone()), prepared);
+        Ok(())
     }
 
     /// Replace one exact committed manifest run with a Q1 concat merge.
@@ -1902,6 +2172,7 @@ impl QuillWriterState {
                 "concat merge requires a fully committed scalar index",
             ));
         }
+        self.retire_ingest_leases()?;
         let next_seal_seq = self
             .next_seal_seq
             .checked_add(1)
@@ -1941,6 +2212,27 @@ impl QuillWriterState {
         );
         self.next_seal_seq = next_seal_seq;
         Ok(self.backend.snapshot())
+    }
+
+    fn retire_ingest_leases(&mut self) -> Result<(), QuillIndexError> {
+        if self
+            .shards
+            .iter()
+            .any(|shard| shard.accumulator.document_count() != 0)
+        {
+            return Err(invalid_state(
+                "cannot retire ingest leases while a Scribe shard is nonempty",
+            ));
+        }
+        let burn = self.docid_allocator.end_session();
+        self.next_lease_base = self.next_lease_base.max(burn.final_watermark);
+        self.docid_allocator =
+            DocIdAllocator::open(self.next_lease_base, self.shard_router.shard_count())
+                .map_err(|error| invalid_state(error.to_string()))?;
+        for shard in &mut self.shards {
+            shard.current_lease_base = None;
+        }
+        Ok(())
     }
 
     /// Fold tombstones into immutable positional holes for eligible segments.
@@ -2120,6 +2412,11 @@ impl QuillWriterState {
             .segments
             .sort_unstable_by_key(|segment| segment.docid_lo);
         manifest.docid_high_watermark = self.next_lease_base;
+        if self.config.bulk_load_mode {
+            manifest.flags |= MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
+        } else {
+            manifest.flags &= !MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
+        }
         manifest.field_stats = merge_field_stats(&manifest.field_stats, &self.pending_field_stats)?;
         if matches!(&self.backend, IndexBackend::Durable(_)) {
             // Retain one exact, explicitly stamped image until publication
@@ -2132,49 +2429,69 @@ impl QuillWriterState {
         Ok(())
     }
 
-    async fn flush_current(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
-        if self.staged_flush.is_none() && self.accumulator.document_count() == 0 {
-            return Ok(());
-        }
-        let seal_span = tracing::info_span!(
-            target: crate::tracing_conventions::TARGET,
-            crate::tracing_conventions::KEEPER_SEAL,
-            phase = "seal",
-            segment_id = tracing::field::Empty,
-            doc_count = self.accumulator.document_count(),
-            token_count = self.accumulator.token_count(),
-            result_count = tracing::field::Empty,
-            output_bytes = tracing::field::Empty,
-            arena_bytes_used_high_water = self.accumulator.bytes_used(),
-            arena_bytes_reserved_high_water = self.accumulator.bytes_reserved(),
-            duration_us = tracing::field::Empty,
-        );
-        let _seal_timer = crate::tracing_conventions::StageTimer::new(&seal_span);
-        let instrumented = seal_span.clone();
-        async {
-            check_cancel(cx, "flush")?;
-            self.prepare_current_flush()?;
-            if let Some(staged) = self.staged_flush.as_ref() {
-                seal_span.record("segment_id", staged.manifest_segment.segment_id);
-                seal_span.record("result_count", u64::from(staged.manifest_segment.doc_count));
-                seal_span.record("output_bytes", staged.encoded.file_len());
+    async fn flush_shard(
+        &mut self,
+        cx: &Cx,
+        requested_shard: usize,
+        trigger: LifecycleTrigger,
+    ) -> Result<(), QuillIndexError> {
+        loop {
+            let shard = self
+                .staged_flush
+                .as_ref()
+                .map_or(requested_shard, |staged| staged.shard);
+            if self.staged_flush.is_none()
+                && self.shards[requested_shard].accumulator.document_count() == 0
+            {
+                return Ok(());
             }
-            self.install_staged_flush(cx).await
+            let state = &self.shards[shard];
+            let seal_span = tracing::info_span!(
+                target: crate::tracing_conventions::TARGET,
+                crate::tracing_conventions::KEEPER_LIFECYCLE,
+                phase = "seal",
+                trigger = trigger.as_str(),
+                action = "seal",
+                shard_id = shard,
+                segment_id = tracing::field::Empty,
+                doc_count = state.accumulator.document_count(),
+                token_count = state.accumulator.token_count(),
+                result_count = tracing::field::Empty,
+                output_bytes = tracing::field::Empty,
+                arena_bytes_used_high_water = state.accumulator.bytes_used(),
+                arena_bytes_reserved_high_water = state.accumulator.bytes_reserved(),
+                duration_us = tracing::field::Empty,
+            );
+            let _seal_timer = crate::tracing_conventions::StageTimer::new(&seal_span);
+            let instrumented = seal_span.clone();
+            async {
+                check_cancel(cx, "flush")?;
+                self.prepare_shard_flush(shard)?;
+                if let Some(staged) = self.staged_flush.as_ref() {
+                    seal_span.record("segment_id", staged.manifest_segment.segment_id);
+                    seal_span.record("result_count", u64::from(staged.manifest_segment.doc_count));
+                    seal_span.record("output_bytes", staged.encoded.file_len());
+                }
+                self.install_staged_flush(cx).await
+            }
+            .instrument(instrumented)
+            .await?;
+            if shard == requested_shard {
+                return Ok(());
+            }
         }
-        .instrument(instrumented)
-        .await
     }
 
-    fn prepare_current_flush(&mut self) -> Result<(), QuillIndexError> {
-        if self.staged_flush.is_some() || self.accumulator.document_count() == 0 {
+    fn prepare_shard_flush(&mut self, shard: usize) -> Result<(), QuillIndexError> {
+        if self.staged_flush.is_some() || self.shards[shard].accumulator.document_count() == 0 {
             return Ok(());
         }
-        let lease_docid_base = self
+        let lease_docid_base = self.shards[shard]
             .current_lease_base
             .ok_or_else(|| invalid_state("nonempty accumulator has no Q1 lease"))?;
         let created_unix_s = self.created_unix_s()?;
-        let segment_id = self.derive_segment_id(lease_docid_base, created_unix_s)?;
-        let documents = self
+        let segment_id = self.derive_segment_id(shard, lease_docid_base, created_unix_s)?;
+        let documents = self.shards[shard]
             .identities
             .iter()
             .map(|identity| {
@@ -2186,7 +2503,7 @@ impl QuillWriterState {
             })
             .collect::<Vec<_>>();
         let encoded = flush_accumulator_with_mode(
-            &self.accumulator,
+            &self.shards[shard].accumulator,
             FlushSegmentInput {
                 segment_id,
                 lease_docid_base,
@@ -2197,10 +2514,10 @@ impl QuillWriterState {
             FlushMode::Scalar,
         )?;
         let manifest_segment = manifest_segment(&encoded, self.next_seal_seq);
-        let document_count = u32::try_from(self.accumulator.document_count())
+        let document_count = u32::try_from(self.shards[shard].accumulator.document_count())
             .map_err(|_| invalid_state("segment document count does not fit u32"))?;
         let mut pending_field_stats = self.pending_field_stats.clone();
-        for field in self.accumulator.fields() {
+        for field in self.shards[shard].accumulator.fields() {
             let entry = pending_field_stats
                 .entry(field.field_ord())
                 .or_insert((0, 0));
@@ -2226,6 +2543,7 @@ impl QuillWriterState {
                 .map_err(|_| invalid_state("could not reserve owned segment bookkeeping"))?;
         }
         self.staged_flush = Some(StagedFlush {
+            shard,
             encoded,
             manifest_segment,
             pending_field_stats,
@@ -2247,6 +2565,7 @@ impl QuillWriterState {
             writer.publish_segment(cx, pending).await?;
         }
         let StagedFlush {
+            shard,
             encoded,
             manifest_segment,
             pending_field_stats,
@@ -2261,28 +2580,15 @@ impl QuillWriterState {
         self.pending_segments.push(manifest_segment);
         self.pending_field_stats = pending_field_stats;
         self.next_seal_seq = next_seal_seq;
-        self.accumulator.reset();
-        self.identities.clear();
-        self.current_lease_base = None;
+        self.shards[shard].accumulator.reset();
+        self.shards[shard].identities.clear();
+        self.shards[shard].current_lease_base = None;
         Ok(())
-    }
-
-    fn ensure_lease(&mut self) -> Result<u64, QuillIndexError> {
-        if let Some(base) = self.current_lease_base {
-            return Ok(base);
-        }
-        let base = self.next_lease_base;
-        let next = base
-            .checked_add(u64::from(DOC_ORDS_PER_LEASE))
-            .filter(|next| *next <= MAX_GLOBAL_DOCID_EXCLUSIVE)
-            .ok_or_else(|| invalid_state("global Q1 document-id lease space exhausted"))?;
-        self.current_lease_base = Some(base);
-        self.next_lease_base = next;
-        Ok(base)
     }
 
     fn derive_segment_id(
         &self,
+        shard: usize,
         lease_base: u64,
         created_unix_s: i64,
     ) -> Result<u64, QuillIndexError> {
@@ -2296,7 +2602,7 @@ impl QuillWriterState {
             .ok_or_else(|| invalid_state("manifest generation exhausted"))?;
         let schema_id = self.schema.schema_id()?;
         let mut batch_hasher = Xxh3::new();
-        for identity in &self.identities {
+        for identity in &self.shards[shard].identities {
             let len = u64::try_from(identity.canonical_content.len()).map_err(|_| {
                 invalid_state("canonical document preimage length does not fit u64")
             })?;
@@ -2329,6 +2635,51 @@ impl QuillWriterState {
         }
         Err(invalid_state(
             "could not derive a collision-free segment id",
+        ))
+    }
+
+    fn derive_policy_segment_id(
+        &self,
+        source_segment_ids: &[u64],
+        domain: &[u8],
+    ) -> Result<u64, QuillIndexError> {
+        let generation = self
+            .backend
+            .snapshot()
+            .loaded_manifest()
+            .manifest
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid_state("manifest generation exhausted"))?;
+        let schema_id = self.schema.schema_id()?;
+        let mut source_hasher = Xxh3::new();
+        source_hasher.update(domain);
+        for source in source_segment_ids {
+            source_hasher.update(&source.to_le_bytes());
+        }
+        let source_digest = source_hasher.digest();
+        for salt in 0_u64..=u64::from(u16::MAX) {
+            let mut preimage = [0_u8; 40];
+            preimage[..8].copy_from_slice(&schema_id.to_le_bytes());
+            preimage[8..16].copy_from_slice(&generation.to_le_bytes());
+            preimage[16..24].copy_from_slice(&source_digest.to_le_bytes());
+            preimage[24..32].copy_from_slice(&self.next_seal_seq.to_le_bytes());
+            preimage[32..].copy_from_slice(&salt.to_le_bytes());
+            let candidate = xxh3_64(&preimage);
+            if self
+                .backend
+                .snapshot()
+                .loaded_manifest()
+                .manifest
+                .segments
+                .iter()
+                .all(|segment| segment.segment_id != candidate)
+            {
+                return Ok(candidate);
+            }
+        }
+        Err(invalid_state(
+            "could not derive a collision-free policy segment id",
         ))
     }
 
@@ -3414,6 +3765,10 @@ impl QuillIndex {
     }
 
     /// Build an owned-buffer index for one explicit compile-time schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, schema, or parser failures.
     #[cfg(feature = "bench-internals")]
     pub fn in_memory_with_schema(
         schema: SchemaDescriptor,
@@ -3425,6 +3780,10 @@ impl QuillIndex {
     }
 
     /// Bind an existing owned Keeper snapshot to the private writer facade.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, schema, or snapshot-validation failures.
     #[cfg(feature = "bench-internals")]
     pub fn from_in_memory_snapshot(
         snapshot: KeeperSnapshot,
@@ -3562,6 +3921,25 @@ impl QuillIndex {
     pub async fn commit(&self, cx: &Cx) -> Result<Arc<KeeperSnapshot>, QuillIndexError> {
         let mut writer = self.lock_writer(cx, "commit writer lock").await?;
         writer.commit(cx).await?;
+        drop(writer);
+        Ok(self.snapshot())
+    }
+
+    /// Finish an explicitly configured bulk build with one final
+    /// bound-consecutive concat pass and clear the durable bulk marker.
+    ///
+    /// Intermediate MANIFEST generations remain crash-resumable according to
+    /// [`QuillConfig::bulk_publish_segment_cadence`]. After this succeeds the
+    /// shard set has at most one sealed segment and ordinary tier merging is
+    /// re-enabled for subsequent commits.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-bulk writer and propagates writer-lock, seal, concat,
+    /// publication, or cancellation failures.
+    pub async fn finish_bulk_load(&self, cx: &Cx) -> Result<Arc<KeeperSnapshot>, QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "bulk finish writer lock").await?;
+        writer.finish_bulk_load(cx).await?;
         drop(writer);
         Ok(self.snapshot())
     }
@@ -3742,6 +4120,10 @@ impl QuillIndex {
     }
 
     /// Execute one already-built query tree through the ranked mixed-state path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, query execution, cursor, or allocation failures.
     #[cfg(feature = "bench-internals")]
     pub fn search_preparsed_paginated(
         &self,
@@ -3756,6 +4138,10 @@ impl QuillIndex {
     }
 
     /// Execute one already-built query tree through the scoreless id-set path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, query execution, or allocation failures.
     #[cfg(feature = "bench-internals")]
     pub fn collect_preparsed_docids(
         &self,
@@ -3782,6 +4168,11 @@ impl QuillIndex {
     }
 
     /// Bench-only forced sealed fan-out path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed parsing, lowering, search, and cancellation
+    /// failures as [`Self::search`].
     #[cfg(feature = "bench-internals")]
     pub fn bench_search_sealed_forced(
         &self,
@@ -6183,6 +6574,17 @@ mod tests {
         QuillConfig {
             deterministic_ingest: true,
             ..QuillConfig::default()
+        }
+    }
+
+    fn assert_pairwise_disjoint_manifest(segments: &[ManifestSegment]) {
+        for pair in segments.windows(2) {
+            assert!(
+                pair[0].docid_hi <= pair[1].docid_lo,
+                "manifest intervals overlap: {:?} then {:?}",
+                pair[0],
+                pair[1],
+            );
         }
     }
 
@@ -9735,7 +10137,7 @@ mod tests {
             }
         }
         run_with_cx(|cx| async move {
-            let mut index = QuillIndex::in_memory(deterministic_config()).expect("algebra index");
+            let index = QuillIndex::in_memory(deterministic_config()).expect("algebra index");
             index
                 .index_documents(&cx, &e410_algebra_documents())
                 .await
@@ -10658,6 +11060,186 @@ mod tests {
     }
 
     #[test]
+    fn production_writer_routes_batches_across_resolved_shards_with_disjoint_leases() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_ingest_shards: 4,
+                ..QuillConfig::default()
+            };
+            let detected = std::thread::available_parallelism().map_or(1, usize::from);
+            let expected_shards = config.resolved_ingest_shards(detected);
+            let mut index = QuillIndex::in_memory(config).expect("multi-shard memory index");
+            assert_eq!(
+                index.writer_mut().shard_router.shard_count(),
+                expected_shards
+            );
+
+            for batch in 0..expected_shards.max(2) {
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new(
+                            format!("shard-{batch}"),
+                            "cross shard tier policy fixture",
+                        )],
+                    )
+                    .await
+                    .expect("route one production batch");
+            }
+            index.commit(&cx).await.expect("publish routed batches");
+            let snapshot = index.snapshot();
+            assert_pairwise_disjoint_manifest(
+                snapshot.loaded_manifest().manifest.segments.as_slice(),
+            );
+            if expected_shards > 1 {
+                let ranges = snapshot
+                    .segments()
+                    .iter()
+                    .map(|segment| (segment.manifest().docid_lo, segment.manifest().docid_hi))
+                    .collect::<Vec<_>>();
+                assert!(
+                    ranges
+                        .iter()
+                        .any(|(lo, _)| *lo >= u64::from(DOC_ORDS_PER_LEASE)),
+                    "a resolved multi-shard writer must consume independent Q1 leases",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn bulk_cadence_publishes_intermediate_manifests_and_finish_leaves_one_segment() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                scribe_shard_budget_bytes: 1,
+                deterministic_ingest: true,
+                bulk_load_mode: true,
+                bulk_publish_segment_cadence: 3,
+                tier_fanout: 2,
+                merge_max_hole_ratio: 1.0,
+                ..QuillConfig::default()
+            };
+            let index = QuillIndex::in_memory(config).expect("bulk memory index");
+            let documents = (0..7)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("bulk-{ordinal}"),
+                        format!("bulk cadence document {ordinal}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate bulk fixture");
+
+            let intermediate = index.snapshot();
+            assert_eq!(intermediate.segments().len(), 6);
+            assert_eq!(intermediate.doc_count(), 6);
+            assert_ne!(
+                intermediate.loaded_manifest().manifest.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
+                0,
+            );
+            assert!(index.has_uncommitted_changes());
+
+            let finished = index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finish bulk fixture");
+            assert_eq!(finished.segments().len(), 1);
+            assert_eq!(finished.doc_count(), 7);
+            assert_eq!(
+                finished.loaded_manifest().manifest.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
+                0,
+            );
+            assert!(!index.has_uncommitted_changes());
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "bulk", 10, 0, true)
+                    .expect("search finished bulk index")
+                    .total_count,
+                Some(7),
+            );
+        });
+    }
+
+    #[test]
+    fn commit_applies_tier_policy_to_cross_shard_bound_consecutive_run() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_ingest_shards: 2,
+                tier_fanout: 2,
+                merge_max_hole_ratio: 1.0,
+                ..QuillConfig::default()
+            };
+            let index = QuillIndex::in_memory(config).expect("tier policy memory index");
+            index
+                .index_documents(&cx, &[IndexableDocument::new("tier-a", "shared alpha")])
+                .await
+                .expect("route first tier batch");
+            index
+                .index_documents(&cx, &[IndexableDocument::new("tier-b", "shared beta")])
+                .await
+                .expect("route second tier batch");
+            index.commit(&cx).await.expect("publish and tier merge");
+
+            let snapshot = index.snapshot();
+            assert_eq!(snapshot.segments().len(), 1);
+            assert_eq!(snapshot.doc_count(), 2);
+            let merged_hi = snapshot.segments()[0].manifest().docid_hi;
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "shared", 10, 0, true)
+                    .expect("query tier-merged snapshot")
+                    .total_count,
+                Some(2),
+            );
+
+            index
+                .index_documents(&cx, &[IndexableDocument::new("tier-after", "shared gamma")])
+                .await
+                .expect("append after tier merge");
+            index.commit(&cx).await.expect("publish post-merge append");
+            let post_merge = index.snapshot();
+            assert_pairwise_disjoint_manifest(
+                post_merge.loaded_manifest().manifest.segments.as_slice(),
+            );
+            assert!(
+                post_merge
+                    .segments()
+                    .iter()
+                    .any(|segment| segment.manifest().docid_lo >= merged_hi),
+                "lease retirement must place future batches above the merged hull",
+            );
+        });
+    }
+
+    #[test]
+    fn visibility_lag_uses_the_same_lifecycle_commit_boundary() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                deterministic_ingest: true,
+                max_visibility_lag_ms: 1,
+                ..QuillConfig::default()
+            };
+            let index = QuillIndex::in_memory(config).expect("visibility memory index");
+            index
+                .index_documents(&cx, &[IndexableDocument::new("lag-a", "visibility alpha")])
+                .await
+                .expect("accumulate first visibility batch");
+            assert_eq!(index.doc_count(), 0, "sub-bound changes stay unpublished");
+
+            std::thread::sleep(Duration::from_millis(2));
+            index
+                .index_documents(&cx, &[IndexableDocument::new("lag-b", "visibility beta")])
+                .await
+                .expect("lag-bound batch forces publication");
+            assert_eq!(index.doc_count(), 2);
+            assert!(!index.has_uncommitted_changes());
+        });
+    }
+
+    #[test]
     fn scoreless_docset_collector_is_wired_across_committed_segments() {
         run_with_cx(|cx| async move {
             let documents = fixture_documents();
@@ -11144,7 +11726,7 @@ mod tests {
             };
             assert!(matches!(error, QuillIndexError::InvalidState { .. }));
             let writer = index.writer_mut();
-            assert_eq!(writer.accumulator.document_count(), 1);
+            assert_eq!(writer.shards[0].accumulator.document_count(), 1);
             assert!(writer.staged_flush.is_none());
             assert!(writer.pending_segments.is_empty());
             assert!(writer.pending_owned_segments.is_empty());
@@ -11165,7 +11747,7 @@ mod tests {
                 .expect("accumulate fixture");
             index
                 .writer_mut()
-                .flush_current(&cx)
+                .flush_shard(&cx, 0, LifecycleTrigger::ExplicitFlush)
                 .await
                 .expect("install immutable segment");
             index
@@ -11212,7 +11794,7 @@ mod tests {
                     .expect("accumulate abandoned batch");
                 first
                     .writer_mut()
-                    .flush_current(&cx)
+                    .flush_shard(&cx, 0, LifecycleTrigger::ExplicitFlush)
                     .await
                     .expect("install segment without MANIFEST");
                 assert_eq!(first.snapshot().doc_count(), 0);

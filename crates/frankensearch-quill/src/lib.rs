@@ -49,8 +49,9 @@ pub use keeper::{
     GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter, LoadedManifest,
     MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC, Manifest,
     ManifestCodecError, ManifestFieldStats, ManifestSegment, ManifestSource, RecoveredSegment,
-    ResolvedCurrent, ResolvedDocumentId, TombstoneSet, WRITER_LOCK_FORMAT_VERSION,
-    WRITER_LOCK_MAGIC, WRITER_LOCK_RECORD_BYTES, load_manifest_pair, pack_engine_version,
+    ResolvedCurrent, ResolvedDocumentId, SegmentSizeTier, TierMergePlan, TierMergePolicy,
+    TierPolicyError, TombstoneSet, WRITER_LOCK_FORMAT_VERSION, WRITER_LOCK_MAGIC,
+    WRITER_LOCK_RECORD_BYTES, load_manifest_pair, pack_engine_version, plan_tier_merge,
     publish_current, resolve_current, unpack_engine_version,
 };
 pub use query::{
