@@ -6611,3 +6611,37 @@ exact release benchmark binary within the remote timeout. Retain the exact
 SWAR/scalar parity gates and 64-pass interleaving; require both A/A p5–p95 bands
 wholly inside 0.97–1.03, every shipping/candidate Criterion CV below 5%, short
 candidate/shipping <=0.97, and no decidable long-token regression before KEEP.
+
+## 2026-07-23 — KEEP: fragmented sub-10k Quill snapshots use segment-parallel scoring (`bd-quill-e7-integration-flip-d0tx.2`, RoseMaple)
+
+The fsfs 5,000-row watch contract retained one 5,000-document seed segment
+while 100 immutable 50-row replacement leaves accumulated. A temporary
+same-worker component profile isolated the miss: planning was 0.018 ms p95,
+flush/publication 7.620 ms, and explicit commit 0.005 ms, while the required
+post-publication visibility query cost 32.261 ms p95. The existing ranked
+query fan-out remained serial because its only gate was 10,000 live documents,
+even though the snapshot had enough independent leaves to amortize Rayon.
+
+One lever extends the already bit-exact `sealed_segment_fanout` decision:
+snapshots with at least eight sealed segments now fan out even below 10,000
+live documents. The two-segment below-gate control stays serial. The collector,
+scoring, merge, ordering, and materialization paths are unchanged.
+
+Exact strict-remote same-worker ovh-a release-perf contract results:
+
+| state | initial docs/s | watch updates/s | update-to-searchable p95 |
+|---|---:|---:|---:|
+| baseline `e663dff4` | 73,713 | 2,716 | 32.766 ms |
+| eight-segment fan-out | 69,279 | **5,462** | **13.017 ms** |
+
+The candidate clears the full 20k/5k/25ms contract while doubling watch
+throughput and cutting p95 by about 60%. The lower initial number remains more
+than 3.4x above its gate and is unaffected by this query-only predicate.
+Correctness proof: the full Quill library suite passed 473 tests with zero
+failures and two intentional ignores, including the seeded bit-exact
+serial-versus-fanned ranked and doc-id parity matrices; strict Quill
+library/test Clippy passed with `-D warnings`.
+
+**Decision: KEEP.** Fragmentation is now an independent fan-out signal; the
+document-count threshold still protects genuinely small, unfragmented
+snapshots.

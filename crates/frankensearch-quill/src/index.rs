@@ -4428,12 +4428,20 @@ fn validate_config(config: &QuillConfig) -> Result<(), QuillIndexError> {
 /// the same 10k floor. Below the gate, per-task scorer and collector setup
 /// costs more than the fan-out returns.
 const SEGMENT_FANOUT_THRESHOLD: u64 = 10_000;
+/// A fragmented snapshot has enough independent scorer setup and posting work
+/// to amortize rayon even below the document-count gate. The 2-segment
+/// below-gate control remains serial; watch-mode replacement batches cross
+/// this threshold as immutable leaves accumulate.
+const SEGMENT_COUNT_FANOUT_THRESHOLD: usize = 8;
 
 /// Decide whether sealed-segment scoring fans across rayon. Single-segment
-/// snapshots never fan out (there is nothing to overlap), and neither do
-/// small corpora below [`SEGMENT_FANOUT_THRESHOLD`] total sealed documents.
+/// snapshots never fan out (there is nothing to overlap). Larger corpora use
+/// the document-count gate, while sufficiently fragmented smaller snapshots
+/// use the segment-count gate.
 const fn sealed_segment_fanout(segment_count: usize, total_sealed_docs: u64) -> bool {
-    segment_count >= 2 && total_sealed_docs >= SEGMENT_FANOUT_THRESHOLD
+    segment_count >= 2
+        && (total_sealed_docs >= SEGMENT_FANOUT_THRESHOLD
+            || segment_count >= SEGMENT_COUNT_FANOUT_THRESHOLD)
 }
 
 fn check_cancel(cx: &Cx, phase: &'static str) -> Result<(), QuillIndexError> {
@@ -7550,9 +7558,17 @@ mod tests {
         );
         assert!(
             !sealed_segment_fanout(4, SEGMENT_FANOUT_THRESHOLD - 1),
-            "small corpora stay on the serial path",
+            "small unfragmented corpora stay on the serial path",
         );
         assert!(sealed_segment_fanout(2, SEGMENT_FANOUT_THRESHOLD));
+        assert!(sealed_segment_fanout(
+            SEGMENT_COUNT_FANOUT_THRESHOLD,
+            SEGMENT_FANOUT_THRESHOLD - 1,
+        ));
+        assert!(!sealed_segment_fanout(
+            SEGMENT_COUNT_FANOUT_THRESHOLD - 1,
+            SEGMENT_FANOUT_THRESHOLD - 1,
+        ));
         assert!(sealed_segment_fanout(16, u64::MAX));
     }
 
