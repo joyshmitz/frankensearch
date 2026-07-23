@@ -1088,6 +1088,18 @@ pub struct QuillIndex {
     directory: Option<PathBuf>,
 }
 
+/// Read-only Quill handle for consumers that must coexist with another
+/// process holding the durable writer lease.
+///
+/// Opening this handle pins the currently published MANIFEST without creating
+/// or acquiring `LOCK`. A fresh handle therefore observes the latest
+/// cross-process publication while a live watcher remains the sole writer.
+#[derive(Clone)]
+pub struct QuillSearchIndex {
+    reader: QuillReader,
+    directory: PathBuf,
+}
+
 /// Scalar Quill writer state guarded by [`QuillIndex::writer`].
 struct QuillWriterState {
     reader: QuillReader,
@@ -2012,6 +2024,14 @@ impl QuillWriterState {
         cx: &Cx,
         document_id: &str,
     ) -> Result<bool, QuillIndexError> {
+        Ok(self.delete_documents(cx, &[document_id]).await? != 0)
+    }
+
+    async fn delete_documents(
+        &mut self,
+        cx: &Cx,
+        document_ids: &[&str],
+    ) -> Result<usize, QuillIndexError> {
         check_cancel(cx, "delete document")?;
         if self.has_uncommitted_changes() {
             return Err(invalid_state(
@@ -2025,12 +2045,19 @@ impl QuillWriterState {
         }
         let mut manifest = self.backend.snapshot().next_manifest()?;
         manifest.last_publish_unix_s = 0;
-        if !self
-            .backend
-            .snapshot()
-            .delete_document(&mut manifest, document_id)?
-        {
-            return Ok(false);
+        let mut deleted = 0_usize;
+        for &document_id in document_ids {
+            check_cancel(cx, "delete document batch")?;
+            if self
+                .backend
+                .snapshot()
+                .delete_document(&mut manifest, document_id)?
+            {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+        if deleted == 0 {
+            return Ok(0);
         }
         let prepared = self
             .published_snapshot
@@ -2046,7 +2073,7 @@ impl QuillWriterState {
         }
         self.published_snapshot
             .install_prepared_sealed(Arc::new(self.backend.snapshot().clone()), prepared);
-        Ok(true)
+        Ok(deleted)
     }
 
     async fn delete_all(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
@@ -3008,6 +3035,231 @@ impl QuillReader {
         );
         Ok(docids)
     }
+
+    fn search_doc_ids(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<QuillHit>, QuillIndexError> {
+        Ok(self.search_paginated(cx, query, limit, 0, false)?.hits)
+    }
+
+    fn search_with_snippets(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        snippet_config: &SnippetConfig,
+    ) -> Result<Vec<QuillSnippetHit>, QuillIndexError> {
+        let query_type = classify_query(query);
+        if query_type == QueryExplanation::Empty {
+            return Ok(Vec::new());
+        }
+        let snapshot = self.published_snapshot.load();
+        let search = self.search_paginated_on(cx, query, limit, 0, false, snapshot.as_ref())?;
+        let mut parsed = self.parser.parse_lenient(query);
+        let _canonicalization = canonicalize_query(&mut parsed.query);
+        let terms = compiled_snippet_terms(
+            &parsed.query,
+            snapshot.as_ref(),
+            self.schema,
+            self.config.glob_expansion_limit,
+        )?;
+        let analyzer = match self.schema.fields.get(usize::from(CONTENT_FIELD)) {
+            Some(field) => match field.kind {
+                FieldKind::Text { analyzer, .. } => analyzer,
+                _ => return Err(invalid_state("content field is not text")),
+            },
+            None => return Err(invalid_state("schema has no content field")),
+        };
+        let mut generator = SnippetGenerator::new(analyzer, terms, snippet_config.clone());
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(search.hits.len())
+            .map_err(|_| invalid_state("could not allocate enriched lexical results"))?;
+        for (rank, hit) in search.hits.into_iter().enumerate() {
+            let snippet = snapshot
+                .materialize_stored_value(CONTENT_FIELD, hit.global_docid)?
+                .map(|content| {
+                    String::from_utf8(content)
+                        .map_err(|_| invalid_state("stored content contains non-UTF-8 bytes"))
+                })
+                .transpose()?
+                .as_deref()
+                .and_then(|content| generator.snippet(content));
+            results.push(QuillSnippetHit {
+                document_id: hit.document_id,
+                score: hit.score,
+                rank,
+                snippet,
+                query_type,
+                metadata: snapshot.materialize_metadata(hit.global_docid)?,
+            });
+        }
+        Ok(results)
+    }
+
+    fn segment_stats(&self) -> SegmentStats {
+        let snapshot = self.published_snapshot.load();
+        let mut stats = snapshot.keeper_snapshot().segment_stats();
+        stats.delta_segments = snapshot.delta_count();
+        stats.live_docs = usize::try_from(snapshot.live_doc_count()).unwrap_or(usize::MAX);
+        stats.delta_memory_bytes = snapshot
+            .delta_snapshots()
+            .iter()
+            .fold(0_u64, |total, delta| {
+                total
+                    .saturating_add(u64::try_from(delta.segment().bytes_used()).unwrap_or(u64::MAX))
+            });
+        stats
+    }
+}
+
+impl QuillSearchIndex {
+    /// Open the latest published shipping-schema snapshot without acquiring the
+    /// durable writer lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, configuration, recovery, schema, or parser
+    /// failures.
+    pub async fn open(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        validate_config(&config)?;
+        check_cancel(cx, "read-only index open")?;
+        let directory = directory.into();
+        let open_directory = directory.clone();
+        let snapshot =
+            spawn_blocking(move || KeeperSnapshot::open(open_directory, DEFAULT_SCHEMA)).await?;
+        check_cancel(cx, "read-only index open")?;
+        let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
+        Ok(Self {
+            reader: QuillReader {
+                parser: DefaultQueryParser::new(DEFAULT_SCHEMA)?,
+                config,
+                schema: DEFAULT_SCHEMA,
+                published_snapshot,
+            },
+            directory,
+        })
+    }
+
+    /// Durable index directory bound to this published snapshot.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Number of live documents in this published snapshot.
+    #[must_use]
+    pub fn doc_count(&self) -> u64 {
+        self.reader.published_snapshot.load().live_doc_count()
+    }
+
+    /// Refresh this read-only handle to the latest durable MANIFEST.
+    ///
+    /// Queries that already loaded the prior snapshot remain pinned to it;
+    /// later queries observe the successor after the atomic publication swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, recovery, schema, or snapshot-transition
+    /// failures. A regressed durable generation is rejected.
+    pub async fn refresh(&self, cx: &Cx) -> Result<bool, QuillIndexError> {
+        check_cancel(cx, "read-only index refresh")?;
+        let directory = self.directory.clone();
+        let snapshot =
+            spawn_blocking(move || KeeperSnapshot::open(directory, DEFAULT_SCHEMA)).await?;
+        check_cancel(cx, "read-only index refresh")?;
+
+        let current_generation = self.reader.published_snapshot.load().keeper_generation();
+        let next_generation = snapshot.loaded_manifest().manifest.generation;
+        if next_generation == current_generation {
+            return Ok(false);
+        }
+        self.reader
+            .published_snapshot
+            .publish_complete(Arc::new(snapshot), Vec::new())?;
+        Ok(true)
+    }
+
+    /// Execute a paginated ranked query against the pinned publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, parsing, lowering, scoring, or collection
+    /// failures.
+    pub fn search_paginated(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        self.reader
+            .search_paginated(cx, query, limit, offset, exact_count)
+    }
+
+    /// Search for full lexical results with canonical stored metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, query execution, metadata, or allocation
+    /// failures.
+    pub fn search_results(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredResult>, QuillIndexError> {
+        self.reader.scored_results(cx, query, limit, true)
+    }
+
+    /// Search the identifier-only lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, parsing, scoring, or collection failures.
+    pub fn search_doc_ids(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<QuillHit>, QuillIndexError> {
+        self.reader.search_doc_ids(cx, query, limit)
+    }
+
+    /// Search the pinned publication and generate snippets from stored content.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, query execution, stored-content, snippet,
+    /// UTF-8, or allocation failures.
+    pub fn search_with_snippets(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        snippet_config: &SnippetConfig,
+    ) -> Result<Vec<QuillSnippetHit>, QuillIndexError> {
+        self.reader
+            .search_with_snippets(cx, query, limit, snippet_config)
+    }
+
+    /// Collect every matching global document id from the pinned publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, parsing, lowering, cursor, or allocation
+    /// failures.
+    pub fn collect_docids(&self, cx: &Cx, query: &str) -> Result<Vec<u32>, QuillIndexError> {
+        self.reader.collect_docids(cx, query)
+    }
 }
 
 impl QuillIndex {
@@ -3393,6 +3645,7 @@ impl QuillIndex {
         }
 
         let mut writer = self.lock_writer(cx, "upsert writer lock").await?;
+        let mut existing_ids = Vec::new();
         for document in documents {
             if writer
                 .backend
@@ -3400,8 +3653,11 @@ impl QuillIndex {
                 .resolve_document_id(&document.id)?
                 .is_some()
             {
-                writer.delete_document(cx, &document.id).await?;
+                existing_ids.push(document.id.as_str());
             }
+        }
+        if !existing_ids.is_empty() {
+            writer.delete_documents(cx, &existing_ids).await?;
         }
         writer.index_documents(cx, documents).await
     }
@@ -3451,10 +3707,7 @@ impl QuillIndex {
         query: &str,
         limit: usize,
     ) -> Result<Vec<QuillHit>, QuillIndexError> {
-        Ok(self
-            .reader
-            .search_paginated(cx, query, limit, 0, false)?
-            .hits)
+        self.reader.search_doc_ids(cx, query, limit)
     }
 
     /// Search with the incumbent enriched result shape.
@@ -3474,54 +3727,8 @@ impl QuillIndex {
         limit: usize,
         snippet_config: &SnippetConfig,
     ) -> Result<Vec<QuillSnippetHit>, QuillIndexError> {
-        let query_type = classify_query(query);
-        if query_type == QueryExplanation::Empty {
-            return Ok(Vec::new());
-        }
-        let snapshot = self.search_snapshot();
-        let search =
-            self.reader
-                .search_paginated_on(cx, query, limit, 0, false, snapshot.as_ref())?;
-        let mut parsed = self.reader.parser.parse_lenient(query);
-        let _canonicalization = canonicalize_query(&mut parsed.query);
-        let terms = compiled_snippet_terms(
-            &parsed.query,
-            snapshot.as_ref(),
-            self.reader.schema,
-            self.reader.config.glob_expansion_limit,
-        )?;
-        let analyzer = match self.reader.schema.fields.get(usize::from(CONTENT_FIELD)) {
-            Some(field) => match field.kind {
-                FieldKind::Text { analyzer, .. } => analyzer,
-                _ => return Err(invalid_state("content field is not text")),
-            },
-            None => return Err(invalid_state("schema has no content field")),
-        };
-        let mut generator = SnippetGenerator::new(analyzer, terms, snippet_config.clone());
-        let mut results = Vec::new();
-        results
-            .try_reserve_exact(search.hits.len())
-            .map_err(|_| invalid_state("could not allocate enriched lexical results"))?;
-        for (rank, hit) in search.hits.into_iter().enumerate() {
-            let snippet = snapshot
-                .materialize_stored_value(CONTENT_FIELD, hit.global_docid)?
-                .map(|content| {
-                    String::from_utf8(content)
-                        .map_err(|_| invalid_state("stored content contains non-UTF-8 bytes"))
-                })
-                .transpose()?
-                .as_deref()
-                .and_then(|content| generator.snippet(content));
-            results.push(QuillSnippetHit {
-                document_id: hit.document_id,
-                score: hit.score,
-                rank,
-                snippet,
-                query_type,
-                metadata: snapshot.materialize_metadata(hit.global_docid)?,
-            });
-        }
-        Ok(results)
+        self.reader
+            .search_with_snippets(cx, query, limit, snippet_config)
     }
 
     /// Collect the complete deterministic set of matching global document IDs.
@@ -3590,18 +3797,13 @@ impl QuillIndex {
 
 impl SegmentStatsProvider for QuillIndex {
     fn segment_stats(&self) -> SegmentStats {
-        let snapshot = self.search_snapshot();
-        let mut stats = snapshot.keeper_snapshot().segment_stats();
-        stats.delta_segments = snapshot.delta_count();
-        stats.live_docs = usize::try_from(snapshot.live_doc_count()).unwrap_or(usize::MAX);
-        stats.delta_memory_bytes = snapshot
-            .delta_snapshots()
-            .iter()
-            .fold(0_u64, |total, delta| {
-                total
-                    .saturating_add(u64::try_from(delta.segment().bytes_used()).unwrap_or(u64::MAX))
-            });
-        stats
+        self.reader.segment_stats()
+    }
+}
+
+impl SegmentStatsProvider for QuillSearchIndex {
+    fn segment_stats(&self) -> SegmentStats {
+        self.reader.segment_stats()
     }
 }
 
@@ -7015,6 +7217,141 @@ mod tests {
                 Err(SearchError::Cancelled { .. })
             ));
             assert_eq!(index.doc_count(), 0);
+        });
+    }
+
+    #[test]
+    fn lexical_trait_batch_upsert_publishes_one_tombstone_generation() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            let original = [
+                IndexableDocument::new("first", "old alpha"),
+                IndexableDocument::new("second", "old beta"),
+                IndexableDocument::new("third", "old gamma"),
+            ];
+            LexicalSearch::index_documents(&index, &cx, &original)
+                .await
+                .expect("seed lexical documents");
+            LexicalSearch::commit(&index, &cx)
+                .await
+                .expect("publish seed generation");
+            let seed_generation = index.segment_stats().published_generation;
+
+            let replacements = [
+                IndexableDocument::new("first", "new alpha"),
+                IndexableDocument::new("second", "new beta"),
+                IndexableDocument::new("third", "new gamma"),
+            ];
+            LexicalSearch::index_documents(&index, &cx, &replacements)
+                .await
+                .expect("stage replacement batch");
+            assert_eq!(
+                index.segment_stats().published_generation,
+                seed_generation.saturating_add(1),
+                "one upsert batch must publish all replacement tombstones together"
+            );
+
+            LexicalSearch::commit(&index, &cx)
+                .await
+                .expect("publish replacement documents");
+            assert_eq!(
+                index.segment_stats().published_generation,
+                seed_generation.saturating_add(2)
+            );
+            assert_eq!(index.doc_count(), 3);
+        });
+    }
+
+    #[test]
+    fn lexical_trait_disjoint_batches_accumulate_before_commit() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            LexicalSearch::index_documents(
+                &index,
+                &cx,
+                &[
+                    IndexableDocument::new("first", "alpha"),
+                    IndexableDocument::new("second", "beta"),
+                ],
+            )
+            .await
+            .expect("stage first disjoint batch");
+            LexicalSearch::index_documents(
+                &index,
+                &cx,
+                &[
+                    IndexableDocument::new("third", "gamma"),
+                    IndexableDocument::new("fourth", "delta"),
+                ],
+            )
+            .await
+            .expect("stage second disjoint batch");
+
+            LexicalSearch::commit(&index, &cx)
+                .await
+                .expect("publish both disjoint batches");
+            assert_eq!(index.doc_count(), 4);
+        });
+    }
+
+    #[test]
+    fn read_only_search_handle_coexists_with_writer_and_pins_publication() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("index directory");
+            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable writer");
+            LexicalSearch::index_document(
+                &writer,
+                &cx,
+                &IndexableDocument::new("first", "published alpha"),
+            )
+            .await
+            .expect("stage first document");
+            LexicalSearch::commit(&writer, &cx)
+                .await
+                .expect("publish first document");
+
+            let pinned = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open read-only handle while writer lease is live");
+            assert_eq!(pinned.doc_count(), 1);
+            assert_eq!(
+                pinned
+                    .search_doc_ids(&cx, "alpha", 10)
+                    .expect("search pinned publication")[0]
+                    .document_id,
+                "first"
+            );
+
+            LexicalSearch::index_document(
+                &writer,
+                &cx,
+                &IndexableDocument::new("second", "published beta"),
+            )
+            .await
+            .expect("stage second document");
+            LexicalSearch::commit(&writer, &cx)
+                .await
+                .expect("publish second document");
+
+            assert!(
+                pinned
+                    .search_doc_ids(&cx, "beta", 10)
+                    .expect("old handle remains pinned")
+                    .is_empty()
+            );
+            assert!(pinned.refresh(&cx).await.expect("refresh publication"));
+            assert_eq!(pinned.doc_count(), 2);
+            assert_eq!(
+                pinned
+                    .search_doc_ids(&cx, "beta", 10)
+                    .expect("refreshed handle observes successor")[0]
+                    .document_id,
+                "second"
+            );
+            assert!(!pinned.refresh(&cx).await.expect("idempotent refresh"));
+            assert!(pinned.segment_stats().live_writer);
         });
     }
 

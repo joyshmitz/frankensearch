@@ -85,7 +85,7 @@ pub enum SubsystemId {
     EmbedFast,
     /// Quality-tier embedding worker.
     EmbedQuality,
-    /// Lexical (Tantivy) indexer.
+    /// Lexical indexer.
     LexicalIndexer,
     /// Query server (search requests).
     QueryServer,
@@ -204,7 +204,7 @@ pub struct ResourceUsage {
     /// Vector index footprint (FSVI/WAL) in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_index_bytes: Option<u64>,
-    /// Lexical index footprint (Tantivy) in bytes.
+    /// Lexical index footprint in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexical_index_bytes: Option<u64>,
     /// Catalog/database footprint in bytes.
@@ -261,7 +261,7 @@ impl ResourceUsage {
 pub struct IndexStorageBreakdown {
     /// Vector index footprint (FSVI/WAL) in bytes.
     pub vector_index_bytes: u64,
-    /// Lexical index footprint (Tantivy) in bytes.
+    /// Lexical index footprint in bytes.
     pub lexical_index_bytes: u64,
     /// Catalog/database footprint in bytes.
     pub catalog_bytes: u64,
@@ -707,7 +707,7 @@ pub fn index_footprint_advisor_small_fixture() -> IndexFootprintAdvisorReport {
                 6 * 1024 * 1024,
                 0,
                 7,
-                "tantivy",
+                "lexical",
             ),
             footprint(
                 IndexFootprintDomain::Metadata,
@@ -753,7 +753,7 @@ pub fn index_footprint_advisor_fragmented_fixture() -> IndexFootprintAdvisorRepo
                 280 * 1024 * 1024,
                 72 * 1024 * 1024,
                 240,
-                "tantivy",
+                "lexical",
             ),
             footprint(
                 IndexFootprintDomain::Metadata,
@@ -799,7 +799,7 @@ pub fn index_footprint_advisor_oversized_fixture() -> IndexFootprintAdvisorRepor
                 240 * 1024 * 1024,
                 24 * 1024 * 1024,
                 90,
-                "tantivy",
+                "lexical",
             ),
             footprint(
                 IndexFootprintDomain::Metadata,

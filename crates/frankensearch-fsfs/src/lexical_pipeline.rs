@@ -6,10 +6,12 @@
 //! - explicit update/delete behavior on change and reclassification
 //! - measurable throughput/latency target contracts
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use asupersync::Cx;
 use compact_str::CompactString;
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{IndexableDocument, LexicalSearch, SearchError, SearchResult};
+use frankensearch_quill::QuillIndex;
 use tracing::debug;
 
 use crate::config::IngestionClass;
@@ -352,6 +354,8 @@ pub struct LexicalMutation {
     pub ingestion_class: IngestionClass,
     pub change: LexicalMutationKind,
     pub text: Option<String>,
+    pub title: Option<String>,
+    pub metadata: HashMap<String, String>,
     pub reason: String,
 }
 
@@ -370,6 +374,8 @@ impl LexicalMutation {
             ingestion_class,
             change: LexicalMutationKind::Upsert,
             text: Some(text.into()),
+            title: None,
+            metadata: std::collections::HashMap::new(),
             reason: reason.into(),
         }
     }
@@ -387,8 +393,22 @@ impl LexicalMutation {
             ingestion_class,
             change: LexicalMutationKind::Delete,
             text: None,
+            title: None,
+            metadata: HashMap::new(),
             reason: reason.into(),
         }
+    }
+
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
     }
 }
 
@@ -397,6 +417,9 @@ pub enum LexicalAction {
     Upsert {
         doc_id: String,
         revision: u64,
+        content: String,
+        title: Option<String>,
+        metadata: HashMap<String, String>,
         chunks: Vec<LexicalChunk>,
     },
     Delete {
@@ -418,7 +441,7 @@ pub trait LexicalIndexBackend {
     /// # Errors
     ///
     /// Returns backend-specific errors while persisting the lexical action.
-    fn apply(&mut self, action: &LexicalAction) -> SearchResult<()>;
+    fn apply(&mut self, action: LexicalAction) -> SearchResult<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,26 +479,96 @@ impl InMemoryLexicalBackend {
 }
 
 impl LexicalIndexBackend for InMemoryLexicalBackend {
-    fn apply(&mut self, action: &LexicalAction) -> SearchResult<()> {
+    fn apply(&mut self, action: LexicalAction) -> SearchResult<()> {
         match action {
             LexicalAction::Upsert {
                 doc_id,
                 revision,
                 chunks,
+                ..
             } => {
-                self.entries.insert(
-                    doc_id.clone(),
-                    InMemoryLexicalEntry {
-                        revision: *revision,
-                        chunks: chunks.clone(),
-                    },
-                );
+                self.entries
+                    .insert(doc_id, InMemoryLexicalEntry { revision, chunks });
             }
             LexicalAction::Delete { doc_id, .. } => {
-                self.entries.remove(doc_id);
+                self.entries.remove(&doc_id);
             }
             LexicalAction::Skip { .. } => {}
         }
+        Ok(())
+    }
+}
+
+/// Quill adapter for the deterministic lexical mutation planner.
+///
+/// Planning remains synchronous and backend-neutral. Actions are staged so a
+/// caller can flush one bounded batch through Quill's async API while
+/// preserving planner order across upsert and delete barriers.
+pub struct QuillLexicalBackend<'a> {
+    index: &'a QuillIndex,
+    pending: Vec<LexicalAction>,
+}
+
+impl<'a> QuillLexicalBackend<'a> {
+    #[must_use]
+    pub const fn new(index: &'a QuillIndex) -> Self {
+        Self {
+            index,
+            pending: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Flush every planned action in order through Quill.
+    ///
+    /// Contiguous upserts share one `index_documents` call. Deletes form
+    /// ordering barriers so repeated document ids retain planner order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed Quill failure converted to the workspace search error.
+    pub async fn flush(&mut self, cx: &Cx) -> SearchResult<()> {
+        let actions = std::mem::take(&mut self.pending);
+        let mut documents = Vec::new();
+
+        for action in actions {
+            match action {
+                LexicalAction::Upsert {
+                    doc_id,
+                    content,
+                    title,
+                    metadata,
+                    ..
+                } => {
+                    let mut document = IndexableDocument::new(doc_id, content);
+                    document.title = title;
+                    document.metadata = metadata;
+                    documents.push(document);
+                }
+                LexicalAction::Delete { doc_id, .. } => {
+                    if !documents.is_empty() {
+                        LexicalSearch::index_documents(self.index, cx, &documents).await?;
+                        documents.clear();
+                    }
+                    let _deleted = self.index.delete_document(cx, &doc_id).await?;
+                }
+                LexicalAction::Skip { .. } => {}
+            }
+        }
+        if !documents.is_empty() {
+            LexicalSearch::index_documents(self.index, cx, &documents).await?;
+        }
+        Ok(())
+    }
+}
+
+impl LexicalIndexBackend for QuillLexicalBackend<'_> {
+    fn apply(&mut self, action: LexicalAction) -> SearchResult<()> {
+        self.pending.push(action);
         Ok(())
     }
 }
@@ -617,13 +710,8 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
             });
         }
 
-        let body = mutation
-            .text
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .to_owned();
-        if body.is_empty() {
+        let body = mutation.text.as_deref().unwrap_or_default();
+        if body.trim().is_empty() {
             return Ok(LexicalAction::Delete {
                 doc_id: mutation.doc_id.clone(),
                 revision: mutation.revision,
@@ -643,6 +731,9 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
         Ok(LexicalAction::Upsert {
             doc_id: mutation.doc_id.clone(),
             revision: mutation.revision,
+            content: body.to_owned(),
+            title: mutation.title.clone(),
+            metadata: mutation.metadata.clone(),
             chunks,
         })
     }
@@ -652,7 +743,6 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
 
         for mutation in updates {
             let action = self.plan_action(mutation)?;
-            self.backend.apply(&action)?;
             stats.record_action(&action);
 
             match &action {
@@ -660,6 +750,7 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
                     doc_id,
                     revision,
                     chunks,
+                    ..
                 } => {
                     debug!(
                         target: "frankensearch.fsfs.lexical",
@@ -697,6 +788,8 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
                     );
                 }
             }
+
+            self.backend.apply(action)?;
         }
 
         Ok(stats)
@@ -716,10 +809,16 @@ fn ensure_doc_id(doc_id: &str) -> SearchResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use asupersync::test_utils::run_test_with_cx;
+    use frankensearch_quill::{QuillConfig, QuillIndex, SegmentStatsProvider};
+
     use super::{
         InMemoryLexicalBackend, LexicalAction, LexicalChunkPolicy, LexicalMutation,
-        LexicalPerformanceTargets, LexicalPipeline, TARGET_INCREMENTAL_P95_LATENCY_MS,
-        TARGET_INCREMENTAL_UPDATES_PER_SECOND, TARGET_INITIAL_DOCS_PER_SECOND, tokenize_lexical,
+        LexicalPerformanceTargets, LexicalPipeline, QuillLexicalBackend,
+        TARGET_INCREMENTAL_P95_LATENCY_MS, TARGET_INCREMENTAL_UPDATES_PER_SECOND,
+        TARGET_INITIAL_DOCS_PER_SECOND, tokenize_lexical,
     };
     use crate::config::IngestionClass;
 
@@ -810,6 +909,271 @@ mod tests {
             .expect("incremental delete");
         assert_eq!(delete_stats.deleted, 1);
         assert!(!pipeline.backend().contains("doc-a"));
+    }
+
+    #[test]
+    fn quill_backend_flushes_planned_upserts_and_deletes() {
+        run_test_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig {
+                max_ingest_shards: 1,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            })
+            .expect("create in-memory Quill index");
+            let backend = QuillLexicalBackend::new(&index);
+            let mut pipeline = LexicalPipeline::new(backend);
+            let mutations = [
+                LexicalMutation::upsert(
+                    "doc-a",
+                    1,
+                    IngestionClass::FullSemanticLexical,
+                    "alpha lexical body",
+                    "initial",
+                )
+                .with_title("Alpha")
+                .with_metadata("source", "test"),
+                LexicalMutation::upsert(
+                    "doc-b",
+                    1,
+                    IngestionClass::LexicalOnly,
+                    "beta lexical body",
+                    "initial",
+                ),
+            ];
+            let stats = pipeline
+                .apply_initial(&mutations)
+                .expect("plan Quill batch");
+            assert_eq!(stats.upserted, 2);
+            assert_eq!(pipeline.backend().pending_len(), 2);
+            pipeline
+                .backend_mut()
+                .flush(&cx)
+                .await
+                .expect("flush Quill batch");
+            index.commit(&cx).await.expect("commit Quill batch");
+            assert_eq!(index.segment_stats().live_docs, 2);
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "alpha", 10)
+                    .expect("query Quill")
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>(),
+                vec!["doc-a"]
+            );
+
+            let update = [LexicalMutation::upsert(
+                "doc-a",
+                2,
+                IngestionClass::FullSemanticLexical,
+                "gamma replacement body",
+                "changed",
+            )];
+            pipeline
+                .apply_incremental(&update)
+                .expect("plan Quill update");
+            pipeline
+                .backend_mut()
+                .flush(&cx)
+                .await
+                .expect("flush Quill update");
+            index.commit(&cx).await.expect("commit Quill update");
+            assert!(
+                index
+                    .search_doc_ids(&cx, "alpha", 10)
+                    .expect("query replaced Quill text")
+                    .is_empty()
+            );
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "gamma", 10)
+                    .expect("query updated Quill text")
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>(),
+                vec!["doc-a"]
+            );
+
+            let delete = [LexicalMutation::delete(
+                "doc-a",
+                3,
+                IngestionClass::FullSemanticLexical,
+                "removed",
+            )];
+            let stats = pipeline
+                .apply_incremental(&delete)
+                .expect("plan Quill delete");
+            assert_eq!(stats.deleted, 1);
+            pipeline
+                .backend_mut()
+                .flush(&cx)
+                .await
+                .expect("flush Quill delete");
+            index.commit(&cx).await.expect("commit Quill delete");
+            assert!(
+                index
+                    .search_doc_ids(&cx, "alpha", 10)
+                    .expect("query deleted Quill document")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "release-perf contract gate; run explicitly on an isolated RCH worker"]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn quill_backend_meets_fsfs_throughput_contract() {
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            run_test_with_cx(|cx| async move {
+                const INITIAL_DOCS: usize = 20_000;
+                const UPDATE_DOCS: usize = 5_000;
+                const UPDATE_BATCH: usize = 50;
+
+                let initial_mutations = (0..INITIAL_DOCS)
+                    .map(|ordinal| {
+                        LexicalMutation::upsert(
+                            format!("bulk-{ordinal:05}"),
+                            1,
+                            IngestionClass::FullSemanticLexical,
+                            format!("bulk contract document {ordinal:05} sharedterm"),
+                            "contract_initial",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let contract_root = tempfile::tempdir().expect("create contract index root");
+                let bulk_index = QuillIndex::create(
+                    &cx,
+                    contract_root.path().join("bulk"),
+                    QuillConfig::default(),
+                )
+                .await
+                .expect("create bulk contract index");
+                let mut bulk_pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&bulk_index));
+                let initial_start = Instant::now();
+                bulk_pipeline
+                    .apply_initial(&initial_mutations)
+                    .expect("plan initial contract batch");
+                bulk_pipeline
+                    .backend_mut()
+                    .flush(&cx)
+                    .await
+                    .expect("flush initial contract batch");
+                bulk_index
+                    .commit(&cx)
+                    .await
+                    .expect("commit initial contract batch");
+                let initial_elapsed = initial_start.elapsed();
+                assert_eq!(bulk_index.segment_stats().live_docs, INITIAL_DOCS);
+
+                let watch_index = QuillIndex::create(
+                    &cx,
+                    contract_root.path().join("watch"),
+                    QuillConfig {
+                        max_ingest_shards: 1,
+                        deterministic_ingest: true,
+                        ..QuillConfig::default()
+                    },
+                )
+                .await
+                .expect("create watch contract index");
+                let mut watch_pipeline =
+                    LexicalPipeline::new(QuillLexicalBackend::new(&watch_index));
+                let seed = (0..UPDATE_DOCS)
+                    .map(|ordinal| {
+                        LexicalMutation::upsert(
+                            format!("watch-{ordinal:05}"),
+                            1,
+                            IngestionClass::FullSemanticLexical,
+                            format!("watch seed document {ordinal:05}"),
+                            "contract_seed",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                watch_pipeline
+                    .apply_initial(&seed)
+                    .expect("plan watch seed");
+                watch_pipeline
+                    .backend_mut()
+                    .flush(&cx)
+                    .await
+                    .expect("flush watch seed");
+                watch_index.commit(&cx).await.expect("commit watch seed");
+
+                let updates = (0..UPDATE_DOCS)
+                    .map(|ordinal| {
+                        LexicalMutation::upsert(
+                            format!("watch-{ordinal:05}"),
+                            2,
+                            IngestionClass::FullSemanticLexical,
+                            format!("watch updated document {ordinal:05} searchabletoken"),
+                            "contract_update",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut batch_latencies = Vec::with_capacity(UPDATE_DOCS / UPDATE_BATCH);
+                let update_start = Instant::now();
+                for batch in updates.chunks(UPDATE_BATCH) {
+                    let batch_start = Instant::now();
+                    watch_pipeline
+                        .apply_incremental(batch)
+                        .expect("plan watch contract batch");
+                    watch_pipeline
+                        .backend_mut()
+                        .flush(&cx)
+                        .await
+                        .expect("flush watch contract batch");
+                    watch_index
+                        .commit(&cx)
+                        .await
+                        .expect("commit watch contract batch");
+                    assert!(
+                        !watch_index
+                            .search_doc_ids(&cx, "searchabletoken", 1)
+                            .expect("probe update visibility")
+                            .is_empty()
+                    );
+                    batch_latencies.push(batch_start.elapsed());
+                }
+                let update_elapsed = update_start.elapsed();
+
+                batch_latencies.sort_unstable();
+                let p95_index = batch_latencies
+                    .len()
+                    .saturating_mul(95)
+                    .div_ceil(100)
+                    .saturating_sub(1);
+                let p95_latency = batch_latencies
+                    .get(p95_index)
+                    .copied()
+                    .expect("contract run records update batches");
+                // Every document in a watch batch becomes searchable only after the
+                // batch publication barrier, so the full batch latency is the honest
+                // update-to-searchable latency for each member of that batch.
+                let p95_update_to_searchable_ms = p95_latency.as_secs_f64() * 1_000.0;
+                let initial_rate = INITIAL_DOCS as f64 / initial_elapsed.as_secs_f64();
+                let update_rate = UPDATE_DOCS as f64 / update_elapsed.as_secs_f64();
+                let observed_initial = initial_rate.floor().clamp(0.0, f64::from(u32::MAX)) as u32;
+                let observed_updates = update_rate.floor().clamp(0.0, f64::from(u32::MAX)) as u32;
+                let observed_p95 = p95_update_to_searchable_ms
+                    .ceil()
+                    .clamp(0.0, f64::from(u32::MAX)) as u32;
+                eprintln!(
+                    "Quill fsfs contract: initial={observed_initial} docs/s updates={observed_updates} updates/s update-to-searchable-p95={p95_update_to_searchable_ms:.3} ms"
+                );
+                assert!(
+                    LexicalPerformanceTargets::default().meets_contract(
+                        observed_initial,
+                        observed_updates,
+                        observed_p95,
+                    ),
+                    "Quill adapter missed the 20k/5k/25ms fsfs contract"
+                );
+            });
+        });
     }
 
     #[test]
@@ -1017,6 +1381,8 @@ mod tests {
             ingestion_class: IngestionClass::FullSemanticLexical,
             change: super::LexicalMutationKind::Upsert,
             text: None,
+            title: None,
+            metadata: std::collections::HashMap::new(),
             reason: "test".to_owned(),
         };
         let action = pipeline.plan_action(&mutation).expect("plan");

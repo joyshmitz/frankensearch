@@ -136,7 +136,7 @@ fn lock_order_full_chain_concurrent() {
                     let _g2 = LockOrderGuard::acquire(LockLevel::EmbeddingQueue);
                     let _g3 = LockOrderGuard::acquire(LockLevel::IndexCache);
                     let _g4 = LockOrderGuard::acquire(LockLevel::FsviSegment);
-                    let _g5 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+                    let _g5 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
                     let _g6 = LockOrderGuard::acquire(LockLevel::AdaptiveState);
                 }
             })
@@ -181,10 +181,10 @@ fn lock_order_partial_chains_interleaved() {
                             let _g2 = LockOrderGuard::acquire(LockLevel::IndexCache);
                         }
                         _ => {
-                            // compaction pattern: Catalog → FsviSegment → TantivyWriter
+                            // compaction pattern: Catalog → FsviSegment → LexicalWriter
                             let _g1 = LockOrderGuard::acquire(LockLevel::Catalog);
                             let _g2 = LockOrderGuard::acquire(LockLevel::FsviSegment);
-                            let _g3 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+                            let _g3 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
                         }
                     }
                 }
@@ -205,7 +205,7 @@ fn lock_order_partial_chains_interleaved() {
 fn lock_order_violation_detected_in_debug() {
     // Attempt descending lock acquisition should panic in debug builds.
     let result = std::panic::catch_unwind(|| {
-        let _g1 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+        let _g1 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
         let _g2 = LockOrderGuard::acquire(LockLevel::Catalog); // violation: 5 → 1
     });
 
@@ -416,7 +416,7 @@ fn resource_token_concurrent_creation() {
                 let resource = match i % 5 {
                     0 => ResourceId::Catalog(format!("/tmp/cat_{i}").into()),
                     1 => ResourceId::FsviSegment(format!("/tmp/fsvi_{i}").into()),
-                    2 => ResourceId::TantivyIndex(format!("/tmp/tantivy_{i}").into()),
+                    2 => ResourceId::LexicalIndex(format!("/tmp/lexical_{i}").into()),
                     3 => ResourceId::EmbeddingQueue,
                     _ => ResourceId::IndexCache,
                 };
@@ -887,7 +887,7 @@ fn pipeline_access_serve_queries_is_read_only() {
 
     assert_eq!(serve.catalog, AccessMode::ReadOnly);
     assert_eq!(serve.fsvi, AccessMode::ReadOnly);
-    assert_eq!(serve.tantivy, AccessMode::ReadOnly);
+    assert_eq!(serve.lexical, AccessMode::ReadOnly);
     assert_eq!(serve.cache, AccessMode::ReadOnly);
     assert_eq!(serve.queue, AccessMode::None);
 }
@@ -901,7 +901,7 @@ fn pipeline_access_no_stage_writes_all_resources() {
             stage.catalog,
             stage.queue,
             stage.fsvi,
-            stage.tantivy,
+            stage.lexical,
             stage.cache,
         ]
         .iter()
@@ -957,9 +957,9 @@ fn pipeline_patterns_maintain_lock_ordering_concurrent() {
                             let _g3 = LockOrderGuard::acquire(LockLevel::FsviSegment);
                         }
                         4 => {
-                            // lexical_index: Catalog(1) + TantivyWriter(5)
+                            // lexical_index: Catalog(1) + LexicalWriter(5)
                             let _g1 = LockOrderGuard::acquire(LockLevel::Catalog);
-                            let _g2 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+                            let _g2 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
                         }
                         5 => {
                             // serve_queries: Catalog(1) + IndexCache(3) (R/O pattern)
@@ -973,12 +973,12 @@ fn pipeline_patterns_maintain_lock_ordering_concurrent() {
                             let _g3 = LockOrderGuard::acquire(LockLevel::FsviSegment);
                         }
                         _ => {
-                            // compaction: Catalog(1) + FSVI(4) + Tantivy(5) + Cache(3)
+                            // compaction: Catalog(1) + FSVI(4) + lexical(5) + Cache(3)
                             // Correct ascending order: 1, 3, 4, 5
                             let _g1 = LockOrderGuard::acquire(LockLevel::Catalog);
                             let _g2 = LockOrderGuard::acquire(LockLevel::IndexCache);
                             let _g3 = LockOrderGuard::acquire(LockLevel::FsviSegment);
-                            let _g4 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+                            let _g4 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
                         }
                     }
                 }
@@ -1097,13 +1097,13 @@ fn soak_lock_ordering_extended() {
                         }
                         2 => {
                             let _g1 = LockOrderGuard::acquire(LockLevel::Catalog);
-                            let _g2 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+                            let _g2 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
                         }
                         _ => {
                             let _g1 = LockOrderGuard::acquire(LockLevel::Catalog);
                             let _g2 = LockOrderGuard::acquire(LockLevel::IndexCache);
                             let _g3 = LockOrderGuard::acquire(LockLevel::FsviSegment);
-                            let _g4 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+                            let _g4 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
                             let _g5 = LockOrderGuard::acquire(LockLevel::AdaptiveState);
                         }
                     }
@@ -1196,14 +1196,14 @@ fn run_lock_ordering_stress_phase(
                         2 => {
                             let _g1 = LockOrderGuard::acquire(LockLevel::EmbeddingQueue);
                             let _g2 = LockOrderGuard::acquire(LockLevel::FsviSegment);
-                            let _g3 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+                            let _g3 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
                             metrics.record_acquisition(false);
                         }
                         _ => {
                             let _g1 = LockOrderGuard::acquire(LockLevel::Catalog);
                             let _g2 = LockOrderGuard::acquire(LockLevel::IndexCache);
                             let _g3 = LockOrderGuard::acquire(LockLevel::FsviSegment);
-                            let _g4 = LockOrderGuard::acquire(LockLevel::TantivyWriter);
+                            let _g4 = LockOrderGuard::acquire(LockLevel::LexicalWriter);
                             let _g5 = LockOrderGuard::acquire(LockLevel::AdaptiveState);
                             metrics.record_acquisition(true);
                         }
