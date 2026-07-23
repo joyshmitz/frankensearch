@@ -8,13 +8,23 @@
 
 mod bitpack {
     use thiserror::Error;
-    #[cfg(any(test, feature = "bench-internals"))]
     use wide::u32x8;
 
-    // The validated reader deliberately uses the scalar reservoir below. A
-    // same-binary A/B rejected a single wide-for-all production policy on
-    // 2026-07-17; the portable kernel remains here for differential fixtures
-    // and for a future independently measured per-width dispatcher.
+    // Production decoding routes per width through `unpack_dispatch_into`: the
+    // scalar reservoir for narrow widths (<= WIDE_UNPACK_MIN_WIDTH - 1) and the
+    // portable eight-lane `wide::u32x8` kernel for wider widths. A same-binary
+    // A/B rejected a single wide-for-all policy on 2026-07-17 (narrow widths
+    // regress); the 2026-07-23 per-width gate (bd-bz7q) confirmed the crossover
+    // with valid A/A null controls and sanctioned this dispatcher.
+
+    /// Smallest bit width for which the eight-lane `wide::u32x8` unpacker beats
+    /// the scalar reservoir. Widths below this decode with the scalar path.
+    ///
+    /// The boundary is measured, not assumed: the `postings_decode_ab` per-width
+    /// gate (`QUILL_POSTINGS_AB_INNER=512`) showed widths 1-2 as decidable
+    /// regressions and width 3 inside the directional null floor, while every
+    /// width >= 4 is a decidable win with a valid A/A null control.
+    pub const WIDE_UNPACK_MIN_WIDTH: u8 = 4;
 
     /// Typed failures for the canonical FSLX bitpacked-value stream.
     #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -198,7 +208,6 @@ mod bitpack {
     /// Eight `WIDTH`-bit values occupy exactly `WIDTH` bytes. We gather the
     /// possibly crossing little-endian words per lane, then perform the actual
     /// variable shifts, merge, and mask in one `wide::u32x8` kernel.
-    #[cfg(any(test, feature = "bench-internals"))]
     #[allow(clippy::cast_possible_truncation)]
     fn unpack_eight<const WIDTH: usize>(input: &[u8]) -> [u32; 8] {
         debug_assert!((1..=32).contains(&WIDTH));
@@ -234,7 +243,6 @@ mod bitpack {
         .to_array()
     }
 
-    #[cfg(any(test, feature = "bench-internals"))]
     macro_rules! dispatch_eight {
         ($width:expr, $input:expr) => {
             match $width {
@@ -276,7 +284,6 @@ mod bitpack {
     }
 
     /// Decode the canonical stream eight lanes at a time with `wide::u32x8`.
-    #[cfg(any(test, feature = "bench-internals"))]
     pub fn unpack_wide_into(
         input: &[u8],
         width: u8,
@@ -329,6 +336,31 @@ mod bitpack {
             unpack_scalar_into(source, width, destination)?;
         }
         Ok(())
+    }
+
+    /// Decode a canonical bitpacked stream, routing per width to whichever
+    /// kernel the measured gate proved faster (bd-bz7q).
+    ///
+    /// Narrow widths (`< WIDE_UNPACK_MIN_WIDTH`) use the scalar reservoir; wider
+    /// widths use the eight-lane `wide::u32x8` kernel. Both decode the identical
+    /// canonical stream to identical values — the choice is purely throughput —
+    /// so the dispatcher is behaviorally transparent to callers and to the
+    /// differential fixtures that pin scalar/wide equality across widths 0..=32.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed width/padding/length failures as the underlying
+    /// scalar and wide unpackers.
+    pub fn unpack_dispatch_into(
+        input: &[u8],
+        width: u8,
+        output: &mut [u32],
+    ) -> Result<(), BitpackError> {
+        if width < WIDE_UNPACK_MIN_WIDTH {
+            unpack_scalar_into(input, width, output)
+        } else {
+            unpack_wide_into(input, width, output)
+        }
     }
 }
 
@@ -2738,7 +2770,7 @@ fn decode_frequencies(
             let mut stored = [0_u32; POSTINGS_PER_BLOCK];
             map_bitpack(
                 reader.block_offset,
-                bitpack::unpack_scalar_into(bytes, width, &mut stored[..count]),
+                bitpack::unpack_dispatch_into(bytes, width, &mut stored[..count]),
             )?;
             let required = stored[..count]
                 .iter()
@@ -2854,7 +2886,7 @@ fn decode_for_payload(
     let mut stored_deltas = [0_u32; POSTINGS_PER_BLOCK - 1];
     map_bitpack(
         block_offset,
-        bitpack::unpack_scalar_into(packed_docs, doc_width, &mut stored_deltas),
+        bitpack::unpack_dispatch_into(packed_docs, doc_width, &mut stored_deltas),
     )?;
     let required_width = stored_deltas
         .iter()
