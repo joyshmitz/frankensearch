@@ -4217,7 +4217,64 @@ pub struct TopDocsCollector {
     retained: usize,
     exact_count: bool,
     total_count: u64,
-    heap: BinaryHeap<HeapEntry>,
+    /// Bounded max-heap of packed selection keys (`bd-y1ab`). Each key folds
+    /// the entry's score and docid so the whole heap comparison is one native
+    /// `u64` compare instead of an f32 `total_cmp` plus a conditional docid
+    /// tiebreak: high 32 bits = `!sortable(score)` (worst score = greatest key
+    /// = heap top, evicted first), low 32 bits = the global docid (higher docid
+    /// = greater = evicted first on a score tie, so the lower docid is
+    /// retained). Order-identical to the former per-entry `total_cmp` heap; see
+    /// [`packed_selection_key`].
+    heap: BinaryHeap<u64>,
+}
+
+/// Monotonic f32 -> u32 bijection: ascending `u32` order equals ascending f32
+/// order for every finite value (and both signed zeros). Collector scores are
+/// [`finite_score`]-guaranteed finite, so the round-trip through
+/// [`score_from_sortable`] is exact.
+#[inline]
+fn score_to_sortable(score: f32) -> u32 {
+    let bits = score.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+}
+
+/// Inverse of [`score_to_sortable`].
+#[inline]
+fn score_from_sortable(sortable: u32) -> f32 {
+    if sortable & 0x8000_0000 != 0 {
+        f32::from_bits(sortable & 0x7fff_ffff)
+    } else {
+        f32::from_bits(!sortable)
+    }
+}
+
+/// Badness-ordered packed key: greatest for the worst entry (lowest score;
+/// highest docid on a score tie), so a max-heap retains the best entries.
+#[inline]
+fn packed_selection_key(global_docid: u32, score: f32) -> u64 {
+    (u64::from(!score_to_sortable(score)) << 32) | u64::from(global_docid)
+}
+
+/// Reconstruct the winner encoded by a packed selection key.
+#[inline]
+fn scored_doc_from_key(key: u64) -> ScoredDoc {
+    let global_docid = (key & 0xffff_ffff) as u32;
+    let score = score_from_sortable(!((key >> 32) as u32));
+    ScoredDoc {
+        global_docid,
+        score,
+    }
+}
+
+/// Score of the packed key currently at the heap top (the worst retained
+/// entry), used as the competitive pruning cutoff.
+#[inline]
+fn cutoff_score_from_key(key: u64) -> f32 {
+    score_from_sortable(!((key >> 32) as u32))
 }
 
 impl TopDocsCollector {
@@ -4280,10 +4337,11 @@ impl TopDocsCollector {
 
     /// Fold another collector's retained state into this one.
     ///
-    /// [`HeapEntry`]'s total order (score via `total_cmp`, then ascending
-    /// docid) makes the retained top-`retained` set unique regardless of
-    /// insertion order, so folding per-segment partials in any order yields
-    /// exactly the set a single serial collector retains.
+    /// The packed selection key's total order (score via the monotonic
+    /// [`score_to_sortable`] transform, then ascending docid) makes the
+    /// retained top-`retained` set unique regardless of insertion order, so
+    /// folding per-segment partials in any order yields exactly the set a
+    /// single serial collector retains.
     ///
     /// # Errors
     ///
@@ -4304,12 +4362,12 @@ impl TopDocsCollector {
                 .checked_add(other.total_count)
                 .ok_or(ArgusError::MatchCountOverflow)?;
         }
-        for entry in other.heap {
+        for key in other.heap {
             if self.heap.len() < self.retained {
-                self.heap.push(entry);
-            } else if self.heap.peek().is_some_and(|cutoff| entry < *cutoff) {
+                self.heap.push(key);
+            } else if self.heap.peek().is_some_and(|&cutoff| key < cutoff) {
                 let _ = self.heap.pop();
-                self.heap.push(entry);
+                self.heap.push(key);
             }
         }
         Ok(())
@@ -4348,22 +4406,19 @@ impl TopDocsCollector {
         let score = score.ok_or(ArgusError::CursorInvariant(
             "top-k collector did not score a retained match",
         ))?;
-        let entry = HeapEntry {
-            global_docid,
-            score,
-        };
+        let key = packed_selection_key(global_docid, score);
         if self.heap.len() < self.retained {
-            self.heap.push(entry);
-        } else if self.heap.peek().is_some_and(|cutoff| entry < *cutoff) {
+            self.heap.push(key);
+        } else if self.heap.peek().is_some_and(|&cutoff| key < cutoff) {
             let _ = self.heap.pop();
-            self.heap.push(entry);
+            self.heap.push(key);
         }
         Ok(())
     }
 
     fn competitive_cutoff_score(&self) -> Option<f32> {
         if self.retained != 0 && self.heap.len() == self.retained {
-            self.heap.peek().map(|entry| entry.score)
+            self.heap.peek().map(|&key| cutoff_score_from_key(key))
         } else {
             None
         }
@@ -4383,7 +4438,7 @@ impl TopDocsCollector {
                 resource: "top-k winners",
                 count: winner_count,
             })?;
-        hits.extend(self.heap.into_iter().map(ScoredDoc::from));
+        hits.extend(self.heap.into_iter().map(scored_doc_from_key));
         hits.sort_unstable_by(|left, right| compare_scored_best_first(*left, *right));
         let start = self.offset.min(hits.len());
         let end = start.saturating_add(self.limit).min(hits.len());
@@ -4510,45 +4565,6 @@ pub fn materialize_doc_ids(
         });
     }
     Ok(hits)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HeapEntry {
-    global_docid: u32,
-    score: f32,
-}
-
-impl From<HeapEntry> for ScoredDoc {
-    fn from(entry: HeapEntry) -> Self {
-        Self {
-            global_docid: entry.global_docid,
-            score: entry.score,
-        }
-    }
-}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.global_docid == other.global_docid && self.score.to_bits() == other.score.to_bits()
-    }
-}
-
-impl Eq for HeapEntry {}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.score.total_cmp(&other.score) {
-            Ordering::Less => Ordering::Greater,
-            Ordering::Greater => Ordering::Less,
-            Ordering::Equal => self.global_docid.cmp(&other.global_docid),
-        }
-    }
 }
 
 fn compare_scored_best_first(left: ScoredDoc, right: ScoredDoc) -> Ordering {

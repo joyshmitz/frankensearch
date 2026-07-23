@@ -89,5 +89,10 @@ name = "segment_fanout_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "collector_packed_key_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true

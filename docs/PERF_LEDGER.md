@@ -1,5 +1,51 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-23 — KEEP: Quill `TopDocsCollector` packed-u64 selection key — 2–4.4× on the isolated heap op (`bd-y1ab`, cc)
+
+Sibling of the KEPT FSVI int8 pass-1 packed-selection-key win (`bd-b5wl`, PERF_LEDGER 2026-07-10).
+The quill top-k collector's bounded heap held a `HeapEntry { global_docid: u32, score: f32 }` and
+compared with an f32 `total_cmp` plus a conditional docid tiebreak on every `record_live` (per
+matched live doc — the query collection hot path). Replaced it with a `BinaryHeap<u64>` of packed
+selection keys so the whole comparison is one native integer compare: high 32 bits =
+`!score_to_sortable(score)` (worst score = greatest key = heap top, evicted first), low 32 bits =
+the global docid (higher docid = greater = evicted first on a score tie, so the lower docid is
+retained). Same 8-byte footprint — no struct fattening (contrast the REJECTED rrf sort-key
+fattening, 2026-… ledger).
+
+`score_to_sortable` is the standard monotonic f32→u32 bijection, exact for every finite value and
+both signed zeros. Scores are `finite_score`-guaranteed finite; boosts are validated `is_finite()`
+only (NOT non-negative — the programmatic/CASS AST path can build a negative boost), so the
+transform's sign path is load-bearing and is exercised by the bench's signed-boost shape. Order
+is provably identical to the former `HeapEntry` `Ord`, and `finish` reconstructs `ScoredDoc`s from
+keys and keeps the unchanged `compare_scored_best_first` comparator, so the emitted page (docid +
+raw score bits) and exact-count total are byte-identical. Pinned by the collector's existing
+exhaustive tests (page/offset/count/materialize-only-winners, the fanned parallel==serial parity
+property, and the merge-permutation-over-rotations test). 473/473 quill-lib tests green; scoped
+clippy `-D warnings` clean.
+
+MEASURED (`collector_packed_key_ab`, new same-binary A/B asserting identical top-k output before
+timing; `paired_median_ratio` + A/A null, 41 rounds inner=64; ratio packed/current, `<1` wins;
+null bands ~1.00 ± 0.02):
+
+| shape | n / retained | packed/current | decidable |
+|---|---|---|---|
+| high_df_k10 | 50k / 10 | **0.369 (~2.7×)** | yes |
+| high_df_k100 | 50k / 100 | **0.382 (~2.6×)** | yes |
+| tie_heavy_k10 | 50k / 10 | **0.229 (~4.4×)** | yes |
+| signed_k10 (neg boosts) | 50k / 10 | **0.394 (~2.5×)** | yes |
+| wide_k1000 | 100k / 1000 | **0.487 (~2.05×)** | yes |
+
+Tie-heavy wins most (4.4×): the former path pays the full `total_cmp` plus the docid tiebreak on
+every tie, versus one integer compare. **Honest scope:** the microbench isolates the heap
+operation over a pre-scored stream. In a full scored query, `record_live` is interleaved with the
+BM25 `score()` compute per doc, so the end-to-end fraction scales with each query's collection
+weight — the isolated win is diluted by the shared score cost. But the change is byte-identical,
+same-size, and strictly cheaper per heap op with **no downside**, so it is a pure win wherever the
+collection phase matters (and applies undiluted to count-only accumulation).
+
+**Decision: KEEP.** Route next: the same packed-key idea could fold into the union
+MaxScore/BMW pruning cutoff comparisons; not pursued here (one lever).
+
 ## 2026-07-23 — KEEP: WAL `decode_vector` f16 SIMD-widen — closes the last scalar consumer of the `vector_at_f32` route-next (`bd-y3hf`, cc)
 
 The 2026-07-16 `vector_at_f32` SIMD-widen KEEP (BlackThrush) explicitly deferred one consumer:
