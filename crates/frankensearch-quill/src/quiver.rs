@@ -11,20 +11,30 @@ mod bitpack {
     use wide::u32x8;
 
     // Production decoding routes per width through `unpack_dispatch_into`: the
-    // scalar reservoir for narrow widths (<= WIDE_UNPACK_MIN_WIDTH - 1) and the
-    // portable eight-lane `wide::u32x8` kernel for wider widths. A same-binary
-    // A/B rejected a single wide-for-all policy on 2026-07-17 (narrow widths
-    // regress); the 2026-07-23 per-width gate (bd-bz7q) confirmed the crossover
-    // with valid A/A null controls and sanctioned this dispatcher.
+    // portable eight-lane `wide::u32x8` kernel only inside the measured winning
+    // band [WIDE_UNPACK_MIN_WIDTH, WIDE_UNPACK_MAX_WIDTH], and the scalar
+    // reservoir everywhere else. A same-binary A/B rejected a single
+    // wide-for-all policy on 2026-07-17 (narrow widths regress); the 2026-07-23
+    // per-width gate (bd-bz7q) confirmed a TWO-SIDED crossover with valid A/A
+    // null controls and sanctioned this banded dispatcher.
 
     /// Smallest bit width for which the eight-lane `wide::u32x8` unpacker beats
     /// the scalar reservoir. Widths below this decode with the scalar path.
     ///
     /// The boundary is measured, not assumed: the `postings_decode_ab` per-width
-    /// gate (`QUILL_POSTINGS_AB_INNER=512`) showed widths 1-2 as decidable
-    /// regressions and width 3 inside the directional null floor, while every
-    /// width >= 4 is a decidable win with a valid A/A null control.
+    /// gate (`QUILL_POSTINGS_AB_INNER=512`, 256 nonzero cells, zero invalid A/A
+    /// nulls) showed widths 1-2 as decidable regressions (mean wide/scalar
+    /// 1.29-1.98) and width 3 inside the directional null floor at 1.19, while
+    /// widths 4-28 win with valid null controls (mean ratios 0.47-0.89).
     pub const WIDE_UNPACK_MIN_WIDTH: u8 = 4;
+
+    /// Largest bit width routed to the `wide::u32x8` unpacker. The same gate
+    /// found the SIMD advantage inverts at very wide encodings: widths 29-31
+    /// have zero wins and mean wide/scalar ratios 1.09-1.12 (a decidable
+    /// regression at w30/o31), and width 32 is a directional-floor wash. The
+    /// scalar reservoir is at least as fast once each value spans nearly a full
+    /// `u32`, so wide routing stops at 28 to avoid shipping the tail regression.
+    pub const WIDE_UNPACK_MAX_WIDTH: u8 = 28;
 
     /// Typed failures for the canonical FSLX bitpacked-value stream.
     #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -341,11 +351,14 @@ mod bitpack {
     /// Decode a canonical bitpacked stream, routing per width to whichever
     /// kernel the measured gate proved faster (bd-bz7q).
     ///
-    /// Narrow widths (`< WIDE_UNPACK_MIN_WIDTH`) use the scalar reservoir; wider
-    /// widths use the eight-lane `wide::u32x8` kernel. Both decode the identical
-    /// canonical stream to identical values — the choice is purely throughput —
-    /// so the dispatcher is behaviorally transparent to callers and to the
-    /// differential fixtures that pin scalar/wide equality across widths 0..=32.
+    /// The eight-lane `wide::u32x8` kernel runs only inside the measured
+    /// winning band `[WIDE_UNPACK_MIN_WIDTH, WIDE_UNPACK_MAX_WIDTH]`; narrower
+    /// and wider widths use the scalar reservoir, which the per-width gate
+    /// proved at least as fast at both extremes. Both kernels decode the
+    /// identical canonical stream to identical values — the choice is purely
+    /// throughput — so the dispatcher is behaviorally transparent to callers
+    /// and to the differential fixtures that pin scalar/wide equality across
+    /// widths 0..=32.
     ///
     /// # Errors
     ///
@@ -356,10 +369,10 @@ mod bitpack {
         width: u8,
         output: &mut [u32],
     ) -> Result<(), BitpackError> {
-        if width < WIDE_UNPACK_MIN_WIDTH {
-            unpack_scalar_into(input, width, output)
-        } else {
+        if (WIDE_UNPACK_MIN_WIDTH..=WIDE_UNPACK_MAX_WIDTH).contains(&width) {
             unpack_wide_into(input, width, output)
+        } else {
+            unpack_scalar_into(input, width, output)
         }
     }
 }

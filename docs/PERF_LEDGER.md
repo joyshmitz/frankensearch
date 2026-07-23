@@ -1,5 +1,46 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-23 — KEEP: Quill per-width posting-unpack dispatcher — banded SIMD for widths 4-28 (`bd-bz7q`, cc)
+
+Sanctioned follow-up to the 2026-07-17 global-wide-unpack REJECT
+(`bd-quill-e2-grimoire-quiver-accg.2`), whose retry predicate required a per-width dispatcher in
+which every routed width clears a valid same-binary A/A null control. The portable eight-lane
+`wide::u32x8` posting-unpacker (`unpack_wide_into`/`unpack_eight`/`dispatch_eight!`) was promoted
+out of its bench-only `cfg` gate into production; the new `unpack_dispatch_into` routes by width,
+and both production decode sites (`decode_frequencies`, `decode_for_payload` in `quiver.rs`) call it.
+
+The crossover is MEASURED and TWO-SIDED, not assumed. `postings_decode_ab` per-width gate at
+`QUILL_POSTINGS_AB_INNER=512` (paired `paired_median_ratio` + A/A null, 41 rounds, widths 0..=32 ×
+counts {127,128} × offsets {0,1,15,31} = 260 cells, **zero invalid A/A nulls** — the high inner
+count fixed the noise that had invalidated 85/256 cells in the 2026-07-17 run). Mean wide/scalar
+ratio per width (`<1` = wide wins):
+
+| width band | mean wide/scalar | routed to | verdict |
+|---|---|---|---|
+| w1-w2 | 1.98, 1.29 | scalar | decidable regression (wide loses) |
+| w3 | 1.19 | scalar | inside directional null floor (no win) |
+| **w4-w28** | **0.47-0.89** | **wide (SIMD)** | decidable wins / holds, **zero regressions** |
+| w29-w31 | 1.09, 1.10, 1.12 | scalar | zero wins; decidable regression at w30/o31 |
+| w32 | 0.94 | scalar | directional-floor wash (no decisive win) |
+
+So `WIDE_UNPACK_MIN_WIDTH = 4` and `WIDE_UNPACK_MAX_WIDTH = 28`: the SIMD kernel runs only inside
+the band where it decisively wins and never regresses. Below w4 (few source bytes per 8-lane
+group, scalar reservoir already optimal) and above w28 (each value spans nearly a full `u32`, the
+lane gather/shift cost overtakes the scalar shift-reservoir) the scalar path is at least as fast,
+so those widths stay scalar and the tail regression is never shipped.
+
+Behaviorally transparent: the dispatcher decodes the identical canonical stream to identical
+values — pinned by the `quiver-postings-bitpack-scalar-wide-v1` differential fixture asserting
+scalar == wide == dispatch across widths 0..=32, truncated/non-canonical inputs, and FOR/BITMAP
+payloads. 473/473 quill-lib tests green; scoped clippy `-D warnings` clean. Realistic effect:
+posting doc-delta and frequency blocks in the common 4-28 bit width range (typical for 128-doc
+FOR blocks) decode ~1.1-2.1× faster on the query hot path; narrow and full-width blocks are
+unchanged.
+
+**Decision: KEEP.** The banded dispatcher ships. Route next: the width-32 wash and the w29-31
+inversion suggest a possible AVX2-specific kernel for full-`u32` widths, but that needs its own
+gate; not pursued here (one lever).
+
 ## 2026-07-16 — `InMemoryVectorIndex::vector_at_f32` decodes f16 via SIMD widen (the in-memory twin) (BlackThrush)
 
 - **Negative-ledger-first route and profile:** grepping for the remaining scalar `f16::to_f32` decode loops (the "grep ALL consumers of a SIMD'd scalar op" lead from the FSVI `vector_at_f32` win, `38f471a9`) surfaced the direct twin I had missed: `InMemoryVectorIndex::vector_at_f32` (the fully-resident index used to materialize vectors for HNSW graph build / fingerprinting) still decoded its `&[f16]` slice with `stored.iter().map(|v| v.to_f32()).collect()` — scalar — while the f16 dot kernels already widen 8 f16 per block via `simd::widen8_f16_slice`.
