@@ -2489,6 +2489,120 @@ impl QuillIndex {
         Ok(())
     }
 
+    /// Walk every sealed segment through the unscored id-set path, serially
+    /// or fanned across rayon (bd-quill-e4-argus-3ycz.9 sibling lever).
+    ///
+    /// Determinism is free here: [`DocSetCollector::finish`] sorts and
+    /// dedups, so any partial fold order produces the identical final id
+    /// set. Delta snapshots stay on the caller's serial path.
+    fn collect_docids_sealed(
+        &self,
+        cx: &Cx,
+        collector: &mut DocSetCollector,
+        query: &Query,
+        snapshot: &QuillSearchSnapshot,
+        fan_out: bool,
+    ) -> Result<(), QuillIndexError> {
+        let keeper = snapshot.keeper_snapshot();
+        if fan_out {
+            check_cancel(cx, "collect_docids")?;
+            let schema = self.schema;
+            let glob_expansion_limit = self.config.glob_expansion_limit;
+            let partials = keeper
+                .segments()
+                .par_iter()
+                .map(|segment| {
+                    let mut local = DocSetCollector::new();
+                    let score_span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        crate::tracing_conventions::ARGUS_SCORE,
+                        phase = "score",
+                        collector = "docset",
+                        segment_id = segment.manifest().segment_id,
+                        doc_count = segment.doc_count(),
+                        plan = "unscored",
+                        segments_touched = 1_u64,
+                        pruning_windows = 0_u64,
+                        blocks_skipped = 0_u64,
+                        candidate_docs = 0_u64,
+                        duration_us = tracing::field::Empty,
+                    );
+                    let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
+                    let _score_entered = score_span.enter();
+                    let mut scorer = lower_query_unscored(
+                        query,
+                        1.0,
+                        QueryLeaf::Sealed(segment),
+                        snapshot,
+                        schema,
+                        glob_expansion_limit,
+                    )?;
+                    local.collect(&mut scorer, segment)?;
+                    Ok(local)
+                })
+                .collect::<Result<Vec<_>, QuillIndexError>>()?;
+            check_cancel(cx, "collect_docids")?;
+            for partial in partials {
+                collector.merge(partial)?;
+            }
+        } else {
+            for segment in keeper.segments() {
+                check_cancel(cx, "collect_docids")?;
+                let score_span = tracing::info_span!(
+                    target: crate::tracing_conventions::TARGET,
+                    crate::tracing_conventions::ARGUS_SCORE,
+                    phase = "score",
+                    collector = "docset",
+                    segment_id = segment.manifest().segment_id,
+                    doc_count = segment.doc_count(),
+                    plan = "unscored",
+                    segments_touched = 1_u64,
+                    pruning_windows = 0_u64,
+                    blocks_skipped = 0_u64,
+                    candidate_docs = 0_u64,
+                    duration_us = tracing::field::Empty,
+                );
+                let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
+                let _score_entered = score_span.enter();
+                let mut scorer = lower_query_unscored(
+                    query,
+                    1.0,
+                    QueryLeaf::Sealed(segment),
+                    snapshot,
+                    self.schema,
+                    self.config.glob_expansion_limit,
+                )?;
+                collector.collect(&mut scorer, segment)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bench-only: run one unscored id-set collection over the sealed
+    /// segments with the fan-out decision forced (bd-quill-e4-argus-3ycz.9
+    /// sibling A/B). Delta snapshots are intentionally excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed parsing, lowering, collection, and cancellation
+    /// failures as [`Self::collect_docids`].
+    #[cfg(feature = "bench-internals")]
+    pub fn bench_collect_docids_forced(
+        &self,
+        cx: &Cx,
+        query: &str,
+        fan_out: bool,
+    ) -> Result<Vec<u32>, QuillIndexError> {
+        let mut parsed = self.parser.parse_lenient(query);
+        let _canonicalization = canonicalize_query(&mut parsed.query);
+        validate_query_lowering(&parsed.query, 1.0, self.schema)?;
+        let published = self.published_snapshot.load();
+        let snapshot = published.as_ref();
+        let mut collector = DocSetCollector::new();
+        self.collect_docids_sealed(cx, &mut collector, &parsed.query, snapshot, fan_out)?;
+        Ok(collector.finish())
+    }
+
     fn execute_docid_query(
         &self,
         cx: &Cx,
@@ -2502,34 +2616,13 @@ impl QuillIndex {
             .len()
             .saturating_add(snapshot.delta_count());
         let mut collector = DocSetCollector::new();
-        for segment in keeper.segments() {
-            check_cancel(cx, "collect_docids")?;
-            let score_span = tracing::info_span!(
-                target: crate::tracing_conventions::TARGET,
-                crate::tracing_conventions::ARGUS_SCORE,
-                phase = "score",
-                collector = "docset",
-                segment_id = segment.manifest().segment_id,
-                doc_count = segment.doc_count(),
-                plan = "unscored",
-                segments_touched = 1_u64,
-                pruning_windows = 0_u64,
-                blocks_skipped = 0_u64,
-                candidate_docs = 0_u64,
-                duration_us = tracing::field::Empty,
-            );
-            let _score_timer = crate::tracing_conventions::StageTimer::new(&score_span);
-            let _score_entered = score_span.enter();
-            let mut scorer = lower_query_unscored(
-                query,
-                1.0,
-                QueryLeaf::Sealed(segment),
-                snapshot,
-                self.schema,
-                self.config.glob_expansion_limit,
-            )?;
-            collector.collect(&mut scorer, segment)?;
-        }
+        let sealed_docs: u64 = keeper
+            .segments()
+            .iter()
+            .map(|segment| u64::from(segment.doc_count()))
+            .sum();
+        let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs);
+        self.collect_docids_sealed(cx, &mut collector, query, snapshot, fan_out)?;
         for delta in snapshot.delta_snapshots() {
             check_cancel(cx, "collect_docids")?;
             let score_span = tracing::info_span!(
@@ -5441,6 +5534,42 @@ mod tests {
         }
         assert_eq!(index.snapshot().segments().len(), segments);
         index
+    }
+
+    /// Run the sealed-segment unscored id-set stage on one explicit path.
+    fn collect_docid_set(index: &QuillIndex, cx: &Cx, query_text: &str, fan_out: bool) -> Vec<u32> {
+        let mut parsed = index.parser.parse_lenient(query_text);
+        let _ = canonicalize_query(&mut parsed.query);
+        let snapshot = index.search_snapshot();
+        let mut collector = DocSetCollector::new();
+        index
+            .collect_docids_sealed(cx, &mut collector, &parsed.query, &snapshot, fan_out)
+            .expect("sealed docid collection");
+        collector.finish()
+    }
+
+    #[test]
+    fn fanned_docid_collection_matches_serial_exactly() {
+        run_with_cx(|cx| async move {
+            let concat = concat_merge_fixture_index(&cx).await;
+            let seeded = segment_fanout_fixture_index(&cx, 5, 64, 0x0d0c_1d5e_7c01_1ec7).await;
+            let fixtures = [
+                (&concat, CONCAT_MERGE_QUERIES.as_slice()),
+                (&seeded, SEGMENT_FANOUT_QUERIES.as_slice()),
+            ];
+            for (index, queries) in fixtures {
+                for query in queries {
+                    let serial = collect_docid_set(index, &cx, query, false);
+                    for round in 0..3 {
+                        assert_eq!(
+                            collect_docid_set(index, &cx, query, true),
+                            serial,
+                            "docid fan-out diverged from serial: query={query} round={round}",
+                        );
+                    }
+                }
+            }
+        });
     }
 
     #[test]

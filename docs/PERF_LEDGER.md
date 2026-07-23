@@ -6193,6 +6193,38 @@ benchmark correction, but do not close E3.5: normalized max/min spread is
 problem is now at two-source fan-in; closure evidence is recorded in
 `docs/NEGATIVE_EVIDENCE.md`.
 
+## 2026-07-22 — KEEP: Quill segment-parallel docid-set collection, ~2.7–3.5x on 4 rayon threads (`bd-quill-e4-argus-3ycz.9` sibling, cc)
+
+`QuillIndex::execute_docid_query` — the exhaustive unscored id-set path behind `collect_docids`
+(every gauntlet differential case's parity workhorse and the CASS structured-filter path) — now
+fans sealed-segment walks across rayon under the same `sealed_segment_fanout` gate as the ranked
+lever (>= 2 sealed segments AND >= 10k sealed docs). Per-segment `DocSetCollector` partials fold
+through the new `DocSetCollector::merge` (raw extend); determinism is free because `finish()`
+sorts and dedups, so ANY fold order yields the identical id set. Delta snapshots stay serial.
+Pinned by `fanned_docid_collection_matches_serial_exactly` (both fixtures x all queries x 3
+fanned repeats); 454/454 quill-lib tests green; scoped clippy `-D warnings` clean.
+
+MEASURED (`segment_fanout_ab` new `[docid-cell]` lane, `paired_median_ratio` + A/A null,
+rounds=41 inner=4, `RAYON_NUM_THREADS=4`, worker vmi1227854, LTO release, ratio =
+fanned/serial, `<1` wins; bit-exact id-set parity asserted before timing):
+
+| shape | query | null [p5, p95] | lever [p5, p95] | serial -> fanned | decidable |
+|---|---|---|---|---|---|
+| gate8x2500 (20k docs) | high_df_term | 0.994 [0.826, 1.349] | **0.359** [0.279, 0.430] | 21.0ms -> 6.4ms | YES |
+| gate8x2500 | mid_df_term | 1.003 [0.857, 1.200] | **0.365** [0.275, 0.510] | 19.1ms -> 6.6ms | YES |
+| gate8x2500 | union3 | 1.019 [0.882, 1.156] | **0.298** [0.261, 0.377] | 61.5ms -> 20.3ms | YES |
+| gate8x2500 | phrase | 1.010 [0.917, 1.097] | **0.286** [0.267, 0.309] | 502.2ms -> 142.8ms | YES |
+
+The same run reconfirmed the ranked-lever cells (0.284-0.353, all decidable). Disclosure: the
+harness stream cut at the gate4x12500 serial-arm phrase null (a ~13-minute cell — serial phrase
+at 50k is ~1.2s/call and the serial-vs-serial null runs 328 timed calls of it), so 50k and
+below-gate docid cells were not captured; the four 20k cells are complete, independently
+decidable, and structurally identical to the KEEP'd ranked lever. Harness note for future runs:
+order the slowest serial cells first or budget per-cell rounds.
+
+**Decision: KEEP.** Same gate, same fan-out rails, near-identical ratios to the ranked lever;
+this directly accelerates the E6 oracle-campaign lane's per-case docid parity sweeps.
+
 ## 2026-07-22 — KEEP: Quill segment-parallel query fan-out, ~2.8–3.6x on 4 rayon threads above the 10k gate (`bd-quill-e4-argus-3ycz.9`, cc)
 
 `QuillIndex::execute_ranked_query` now fans sealed-segment scoring across rayon when the snapshot

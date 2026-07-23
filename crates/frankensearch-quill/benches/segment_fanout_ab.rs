@@ -222,6 +222,88 @@ fn run_shape(cx: &Cx, shape: &Shape, rounds: usize, limit: usize, index: &QuillI
             lever.decidable_against(&null),
         );
     }
+
+    // Unscored id-set lane (bd-quill-e4-argus-3ycz.9 sibling): the exhaustive
+    // docid path behind `collect_docids` — the gauntlet differential
+    // campaigns' per-case parity workhorse and the CASS structured-filter
+    // path. Same fan-out gate, trivially deterministic (finish sorts+dedups).
+    for (query_name, query) in QUERIES {
+        let serial_ids = index
+            .bench_collect_docids_forced(cx, query, false)
+            .expect("serial docid set");
+        let fanned_ids = index
+            .bench_collect_docids_forced(cx, query, true)
+            .expect("fanned docid set");
+        assert_eq!(
+            serial_ids, fanned_ids,
+            "{}: docid fan-out diverged from serial before timing ({query_name})",
+            shape.name,
+        );
+
+        let null = paired_median_ratio(
+            rounds,
+            4,
+            || {
+                black_box(
+                    index
+                        .bench_collect_docids_forced(cx, black_box(query), false)
+                        .expect("docid null arm a"),
+                );
+            },
+            || {
+                black_box(
+                    index
+                        .bench_collect_docids_forced(cx, black_box(query), false)
+                        .expect("docid null arm b"),
+                );
+            },
+        );
+        let lever = paired_median_ratio(
+            rounds,
+            4,
+            || {
+                black_box(
+                    index
+                        .bench_collect_docids_forced(cx, black_box(query), false)
+                        .expect("docid serial arm"),
+                );
+            },
+            || {
+                black_box(
+                    index
+                        .bench_collect_docids_forced(cx, black_box(query), true)
+                        .expect("docid fanned arm"),
+                );
+            },
+        );
+        let serial_us = absolute_us(16, || {
+            black_box(
+                index
+                    .bench_collect_docids_forced(cx, black_box(query), false)
+                    .expect("docid serial absolute"),
+            );
+        });
+        let fanned_us = absolute_us(16, || {
+            black_box(
+                index
+                    .bench_collect_docids_forced(cx, black_box(query), true)
+                    .expect("docid fanned absolute"),
+            );
+        });
+        eprintln!(
+            "[docid-cell] shape={} query={query_name} \
+             null={:.4} [{:.4}, {:.4}] lever(fanned/serial)={:.4} [{:.4}, {:.4}] \
+             decidable={} serial_us={serial_us:.1} fanned_us={fanned_us:.1}",
+            shape.name,
+            null.median,
+            null.p5,
+            null.p95,
+            lever.median,
+            lever.p5,
+            lever.p95,
+            lever.decidable_against(&null),
+        );
+    }
 }
 
 fn main() {

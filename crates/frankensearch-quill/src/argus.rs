@@ -4442,6 +4442,25 @@ impl DocSetCollector {
         Ok(())
     }
 
+    /// Fold another collector's raw matches into this one.
+    ///
+    /// Order does not matter: [`Self::finish`] sorts and dedups, so folding
+    /// per-segment partials in any order yields the identical final set.
+    ///
+    /// # Errors
+    ///
+    /// Rejects allocation failure while growing the match vector.
+    pub fn merge(&mut self, other: Self) -> Result<(), ArgusError> {
+        self.docs
+            .try_reserve(other.docs.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "doc-set matches",
+                count: self.docs.len().saturating_add(other.docs.len()),
+            })?;
+        self.docs.extend(other.docs);
+        Ok(())
+    }
+
     /// Return deterministic sorted unique global docids.
     #[must_use]
     pub fn finish(mut self) -> Vec<u32> {
