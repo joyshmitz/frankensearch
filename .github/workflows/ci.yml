@@ -96,6 +96,24 @@ jobs:
       - name: cargo check (fsfs lite -- no embedded models)
         run: cargo check -p frankensearch-fsfs --no-default-features
 
+      - name: Pre-flip lexical feature graph guard (bd-quill-e7.4)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          default_tree="$(cargo tree -p frankensearch --edges normal --prefix none)"
+          if grep -Eq '^frankensearch-(lexical|quill) v' <<< "${default_tree}"; then
+            echo "Default facade graph unexpectedly contains a lexical engine:" >&2
+            grep -E '^frankensearch-(lexical|quill) v' <<< "${default_tree}" >&2
+            exit 1
+          fi
+
+          cargo check -p frankensearch --lib --no-default-features --features quill
+          cargo check -p frankensearch --lib --no-default-features --features lexical-tantivy
+          cargo check -p frankensearch --lib --no-default-features --features cass-compat
+          cargo check -p frankensearch --all-targets --all-features
+          cargo check -p frankensearch-fusion --all-targets --all-features
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --exclude optimize-params -- -D warnings
 
@@ -110,7 +128,7 @@ jobs:
         timeout-minutes: 30
         run: cargo test --profile release -p frankensearch-quill-gauntlet generator::tests::nightly_xlarge_stream_hash_integrity -- --ignored --exact --nocapture
 
-      - name: Quill oracle campaign PR fast lane (bd-quill-e6.9)
+      - name: Quill/lexical/fusion PR fast lane (bd-quill-e6.9, bd-quill-e7.4)
         if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 20
         env:

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-lexical = ["dep:frankensearch-lexical"]
+tantivy-bench = ["dep:frankensearch-lexical"]
 quill = ["dep:frankensearch-quill"]
 rerank = ["dep:frankensearch-rerank"]
 graph = []
@@ -257,7 +257,7 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "real_hybrid_knownitem"
 harness = false
-required-features = ["lexical"]
+required-features = ["tantivy-bench"]
 
 [[bench]]
 name = "nqc_cv_cost_ab"

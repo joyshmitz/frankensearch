@@ -438,6 +438,7 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
 Notes:
 - For production semantic quality, use `model2vec` + `fastembed` (or `EmbedderStack::auto_detect_with`).
 - Enable `quill` for the native bulk-built lexical index; use `lexical-tantivy` only for the explicit Tantivy oracle/comparator lane during migration.
+- Enable `cass-compat` only when interoperating with an external CASS Tantivy-format index.
 - Use `search_collect_with_text` or full `search(...)` when you need negation filtering (`-term`) and rerank text access.
 - Keep `TwoTierConfig` explicit in code for reproducible behavior across environments.
 

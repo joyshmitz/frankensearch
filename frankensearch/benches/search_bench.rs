@@ -11,41 +11,41 @@
 //! 6. Vector index I/O (write/open)
 //! 7. Explicit Tantivy-oracle comparator vs frankensearch hybrid
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use std::collections::hash_map::DefaultHasher;
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use std::fs::File;
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use std::hash::{Hash, Hasher};
 use std::hint::black_box;
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use std::io::{BufWriter, Write};
 use std::path::Path;
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use std::path::PathBuf;
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use std::sync::{Arc, OnceLock};
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use frankensearch_core::query_class::QueryClass;
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use frankensearch_core::traits::LexicalSearch;
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use frankensearch_core::types::IndexableDocument;
 use frankensearch_core::types::{ScoreSource, ScoredResult, VectorHit};
 use frankensearch_embed::hash_embedder::{HashAlgorithm, HashEmbedder};
 use frankensearch_fusion::normalize::{min_max_normalize, z_score_normalize};
 use frankensearch_fusion::rrf::{RrfConfig, rrf_fuse};
 use frankensearch_index::{VectorIndex, dot_product_f32_f32};
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 use frankensearch_lexical::TantivyIndex;
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 static BOLD_VERIFY_SUMMARY_ONCE: OnceLock<()> = OnceLock::new();
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ fn build_corpus(n: usize, dim: usize) -> Vec<(String, Vec<f32>)> {
         .collect()
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 #[derive(Clone, Copy)]
 struct BoldVerifyQuery {
     class: &'static str,
@@ -81,7 +81,7 @@ struct BoldVerifyQuery {
     limit: usize,
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 struct BoldVerifyFixture {
     doc_count: usize,
     corpus_hash: String,
@@ -91,7 +91,7 @@ struct BoldVerifyFixture {
     _vector_dir: TempDir,
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 #[derive(Clone, Copy)]
 struct LatencyStats {
     p50: u128,
@@ -99,7 +99,7 @@ struct LatencyStats {
     p99: u128,
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 const BOLD_VERIFY_TOP10_QUERIES: &[BoldVerifyQuery] = &[
     BoldVerifyQuery {
         class: "exact_identifier",
@@ -133,14 +133,14 @@ const BOLD_VERIFY_TOP10_QUERIES: &[BoldVerifyQuery] = &[
     },
 ];
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 const BOLD_VERIFY_LIMIT_ALL_QUERY: BoldVerifyQuery = BoldVerifyQuery {
     class: "limit_all",
     text: "search",
     limit: usize::MAX,
 };
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn bold_verify_content(i: usize) -> String {
     let theme = match i % 6 {
         0 => "Rust ownership borrowing lifetimes Result error handling async future executor",
@@ -159,7 +159,7 @@ fn bold_verify_content(i: usize) -> String {
     )
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn build_bold_verify_docs(doc_count: usize) -> Vec<IndexableDocument> {
     (0..doc_count)
         .map(|i| {
@@ -170,7 +170,7 @@ fn build_bold_verify_docs(doc_count: usize) -> Vec<IndexableDocument> {
         .collect()
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn corpus_hash(docs: &[IndexableDocument]) -> String {
     let mut hasher = DefaultHasher::new();
     for doc in docs {
@@ -181,7 +181,7 @@ fn corpus_hash(docs: &[IndexableDocument]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn build_bold_verify_fixture(doc_count: usize) -> BoldVerifyFixture {
     let docs = build_bold_verify_docs(doc_count);
     let hash = corpus_hash(&docs);
@@ -261,7 +261,7 @@ fn make_semantic_hits(n: usize) -> Vec<VectorHit> {
         .collect()
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn lexical_doc_ids_as_scored(results: &[frankensearch_lexical::LexicalIdHit]) -> Vec<ScoredResult> {
     results
         .iter()
@@ -280,7 +280,7 @@ fn lexical_doc_ids_as_scored(results: &[frankensearch_lexical::LexicalIdHit]) ->
         .collect()
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn bold_verify_lexical_short_circuit(
     query: &BoldVerifyQuery,
     lexical_count: usize,
@@ -295,7 +295,7 @@ fn bold_verify_lexical_short_circuit(
             ))
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn bold_verify_lexical_prefetch_limit(
     query: &BoldVerifyQuery,
     limit: usize,
@@ -308,7 +308,7 @@ fn bold_verify_lexical_prefetch_limit(
     .min(candidate_limit)
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn tantivy_only_search(fixture: &BoldVerifyFixture, cx: &asupersync::Cx, query: &BoldVerifyQuery) {
     let limit = query.limit.min(fixture.doc_count);
     black_box(
@@ -319,7 +319,7 @@ fn tantivy_only_search(fixture: &BoldVerifyFixture, cx: &asupersync::Cx, query: 
     );
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn frankensearch_hash_hybrid_search(
     fixture: &BoldVerifyFixture,
     cx: &asupersync::Cx,
@@ -351,7 +351,7 @@ fn frankensearch_hash_hybrid_search(
     ));
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn frankensearch_hash_lexical_guard_search(
     fixture: &BoldVerifyFixture,
     cx: &asupersync::Cx,
@@ -365,14 +365,14 @@ fn frankensearch_hash_lexical_guard_search(
     black_box(lexical_doc_ids_as_scored(&lexical_hits));
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn percentile(sorted: &[u128], pct: usize) -> u128 {
     let len = sorted.len();
     let index = len.saturating_mul(pct).div_ceil(100).saturating_sub(1);
     sorted[index.min(len.saturating_sub(1))]
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn measure_latency_us(mut f: impl FnMut(), samples: usize) -> LatencyStats {
     for _ in 0..5 {
         f();
@@ -391,14 +391,14 @@ fn measure_latency_us(mut f: impl FnMut(), samples: usize) -> LatencyStats {
     }
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn current_rss_bytes() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     Some(pages.saturating_mul(4096))
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn git_sha() -> String {
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -409,14 +409,14 @@ fn git_sha() -> String {
         .map_or_else(|| "unknown".to_owned(), |sha| sha.trim().to_owned())
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn worker_id() -> String {
     std::env::var("RCH_WORKER")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn bold_verify_output_dir() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("FRANKENSEARCH_BOLD_VERIFY_OUT") {
         return Some(PathBuf::from(path));
@@ -428,7 +428,7 @@ fn bold_verify_output_dir() -> Option<PathBuf> {
     Some(PathBuf::from("target").join("criterion/bold_verify"))
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 #[allow(clippy::too_many_arguments)]
 fn write_bold_verify_row(
     jsonl: &mut BufWriter<File>,
@@ -499,7 +499,7 @@ fn write_bold_verify_row(
     );
 }
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
     let Some(out_dir) = bold_verify_output_dir() else {
         return;
@@ -660,7 +660,7 @@ fn bench_vector_search(c: &mut Criterion) {
 /// use the same generated documents and query stream. The incumbent side is
 /// Tantivy BM25 identifiers only; the frankensearch side is hash embedding +
 /// FSVI vector search + Tantivy candidates + RRF fusion.
-#[cfg(feature = "lexical")]
+#[cfg(feature = "lexical-tantivy")]
 fn bench_tantivy_oracle_comparator(c: &mut Criterion) {
     let mut group = c.benchmark_group("tantivy_oracle_comparator");
     group.sample_size(10);
@@ -734,10 +734,10 @@ fn bench_tantivy_oracle_comparator(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "lexical"))]
+#[cfg(not(feature = "lexical-tantivy"))]
 fn bench_tantivy_oracle_comparator(c: &mut Criterion) {
     let mut group = c.benchmark_group("tantivy_oracle_comparator");
-    group.bench_function("enable_lexical_feature", |b| {
+    group.bench_function("enable_lexical_tantivy_feature", |b| {
         b.iter(|| black_box("run with --features lexical-tantivy"));
     });
     group.finish();

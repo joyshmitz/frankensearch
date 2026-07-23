@@ -47,6 +47,7 @@ Consumers receive results progressively via `SearchPhase` callbacks, so UIs can 
 | `lexical` | Pre-flip Tantivy BM25 compatibility lane |
 | `quill` | Native Quill lexical engine and `IndexBuilder` integration |
 | `lexical-tantivy` | Explicit Tantivy facade/oracle and comparator lane |
+| `cass-compat` | External CASS Tantivy-format interoperability |
 | `rerank` | FlashRank cross-encoder reranking |
 | `ann` | HNSW approximate nearest-neighbor index |
 | `download` | Model auto-download from HuggingFace |

@@ -12,12 +12,12 @@
 //! ```bash
 //! FS_CORPUS_TXT=corpus.txt FS_CORPUS_SLAB=real.bin FS_QUERY_TXT=queries.txt \
 //! FS_QUERY_SLAB=queries.bin FS_QUERY_IDS=query_srcids.txt FS_DIM=256 \
-//!   cargo bench -p frankensearch-fusion --features lexical --bench real_hybrid_knownitem
+//!   cargo bench -p frankensearch-fusion --features tantivy-bench --bench real_hybrid_knownitem
 //! ```
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-#[cfg(feature = "lexical")]
+#[cfg(feature = "tantivy-bench")]
 fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     use std::hint::black_box;
 
@@ -327,9 +327,9 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     g.finish();
 }
 
-#[cfg(not(feature = "lexical"))]
+#[cfg(not(feature = "tantivy-bench"))]
 fn bench_real_hybrid_knownitem(_c: &mut Criterion) {
-    // Lexical (Tantivy) lives behind the `lexical` feature; build with `--features lexical`.
+    // Tantivy lives behind a bench-only feature; build with `--features tantivy-bench`.
 }
 
 criterion_group!(benches, bench_real_hybrid_knownitem);
