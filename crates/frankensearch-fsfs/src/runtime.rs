@@ -369,10 +369,12 @@ const FSFS_TUI_SEARCH_RENDER_MIN_INTERVAL_MS: u64 = 16;
 const FSFS_TUI_SEARCH_RENDER_IDLE_HEARTBEAT_MS: u64 = 180;
 const FSFS_TUI_STATUS_REFRESH_MS: u64 = 15_000;
 const FSFS_TUI_STATUS_REFRESH_ACTIVE_GRACE_MS: u64 = 2_500;
-const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 6;
+/// Shipping lexical search debounce before the first adaptive recomputation.
+pub const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 6;
 const FSFS_TUI_SEMANTIC_DEBOUNCE_MS: u64 = 36;
 const FSFS_TUI_QUALITY_DEBOUNCE_MS: u64 = 160;
-const FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS: u64 = 3;
+/// Minimum lexical debounce admitted by the adaptive search policy.
+pub const FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS: u64 = 3;
 const FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS: u64 = 20;
 const FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS: u64 = 6;
 const FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS: u64 = 24;
@@ -403,6 +405,27 @@ const FSFS_TUI_FAST_STAGE_SNIPPET_MAX_CHARS: usize = 120;
 const FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION: usize = 384;
 const FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD: usize = 5;
 const FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER: usize = 1;
+
+/// Compute the lexical debounce installed after a query edit.
+///
+/// The helper is shared with the deterministic pressure harness so debounce
+/// retune evidence exercises the shipping policy instead of duplicating it.
+#[must_use]
+pub fn adaptive_lexical_debounce_ms(typing_cadence_ms: u64, query_char_count: usize) -> u64 {
+    let cadence_ms = typing_cadence_ms.clamp(
+        FSFS_TUI_TYPING_INTERVAL_MIN_MS,
+        FSFS_TUI_TYPING_INTERVAL_MAX_MS,
+    );
+    let lexical = cadence_ms.div_ceil(10).clamp(
+        FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
+    );
+    if query_char_count <= FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD {
+        lexical.min(FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS)
+    } else {
+        lexical
+    }
+}
 const FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER: usize = 2;
 const FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL: usize = usize::MAX;
 // This controls fast-phase head breadth, not final output cardinality.
@@ -932,13 +955,8 @@ impl SearchDashboardState {
                 FSFS_TUI_TYPING_INTERVAL_MIN_MS,
                 FSFS_TUI_TYPING_INTERVAL_MAX_MS,
             );
-        let mut lexical = cadence_ms.div_ceil(10).clamp(
-            FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
-            FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
-        );
-        if self.query_input.value().chars().count() <= FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD {
-            lexical = lexical.min(FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS);
-        }
+        let lexical =
+            adaptive_lexical_debounce_ms(cadence_ms, self.query_input.value().chars().count());
         let mut semantic = lexical.saturating_mul(4).saturating_add(8).clamp(
             FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
             FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,

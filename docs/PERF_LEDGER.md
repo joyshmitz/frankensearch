@@ -6645,3 +6645,32 @@ library/test Clippy passed with `-D warnings`.
 **Decision: KEEP.** Fragmentation is now an independent fan-out signal; the
 document-count threshold still protects genuinely small, unfragmented
 snapshots.
+
+## 2026-07-23 — REJECT: fsfs lexical debounce floor retune is an update-to-searchable p95 wash (`bd-quill-e7-integration-flip-d0tx.2`, RoseMaple)
+
+The final E7.2 acceptance gate compared the shipping 6 ms lexical debounce
+base with the admitted 3 ms floor in the deterministic fsfs pressure harness.
+The harness now calls the production adaptive-debounce helper rather than
+copying its formula. A query edit recomputes the window before scheduling a
+refresh, so the simulated 64 ms typing cadence and 12-character query install
+the same 7 ms adaptive window in both arms. Each observation then adds the
+measured Quill watch-query p95 anchor of 13.017 ms and the scenario's
+deterministic pressure penalty.
+
+Strict-remote ovh-a results:
+
+| pressure scenario | shipping 6 ms base p95 | candidate 3 ms base p95 | shipping/candidate invocations |
+|---|---:|---:|---:|
+| gradual ramp-up | 36.017 ms | 36.017 ms | 40 / 40 |
+| spike and recovery | 36.017 ms | 36.017 ms | 25 / 25 |
+| hysteresis oscillation | 24.017 ms | 24.017 ms | 30 / 30 |
+| long-run soak fault injection | 20.017 ms | 20.017 ms | 180 / 180 |
+
+The full pressure harness passed all 15 tests and all 35 oracles. The scoped
+fsfs Clippy command reached the crate but remained blocked by 48 pre-existing
+crate-wide `-D warnings` findings; none named the changed pressure harness.
+
+**Decision: REJECT the 3 ms retune and retain the shipping 6 ms base.** It
+cannot improve steady query-edit latency because production adaptive
+recomputation replaces it before search scheduling, and the pressure evidence
+shows neither a p95 nor invocation-count benefit.
