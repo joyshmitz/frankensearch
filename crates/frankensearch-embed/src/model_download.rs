@@ -27,6 +27,17 @@ use crate::model_manifest::{ModelFile, ModelLifecycle, ModelManifest};
 
 static STAGING_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Default per-artifact response body cap for model downloads.
+///
+/// The underlying HTTP codec defaults to a 16 MiB body limit, which is smaller
+/// than several production-ready model artifacts in the built-in catalog (e.g.
+/// the default Potion tokenizer is ~17.8 MiB and its model weights ~489 MiB).
+/// Files are streamed to disk with bounded memory and verified against the
+/// manifest's declared size and SHA-256, so this cap serves only as a finite
+/// resource guard. 2 GiB comfortably covers the current catalog while keeping a
+/// bounded ceiling; callers may override it via [`DownloadConfig`].
+pub const DEFAULT_MAX_MODEL_ARTIFACT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 /// Configuration for model downloads.
@@ -40,6 +51,14 @@ pub struct DownloadConfig {
     pub user_agent: String,
     /// Maximum redirects to follow.
     pub max_redirects: u32,
+    /// Maximum size, in bytes, of a single downloaded model artifact.
+    ///
+    /// Forwarded to the HTTP client's body-size limit. The codec default of
+    /// 16 MiB is too small for real model artifacts, so this defaults to
+    /// [`DEFAULT_MAX_MODEL_ARTIFACT_BYTES`]. Downloads are streamed to disk and
+    /// verified against the manifest's declared size and SHA-256, so this bound
+    /// only guards against an unexpectedly large response.
+    pub max_response_bytes: usize,
 }
 
 impl Default for DownloadConfig {
@@ -49,6 +68,7 @@ impl Default for DownloadConfig {
             retry_base_delay: Duration::from_secs(1),
             user_agent: format!("frankensearch/{}", env!("CARGO_PKG_VERSION")),
             max_redirects: 5,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         }
     }
 }
@@ -121,6 +141,9 @@ impl ModelDownloader {
         let mut client_config = HttpClientConfig::default();
         client_config.redirect_policy = RedirectPolicy::Limited(config.max_redirects);
         client_config.user_agent = Some(config.user_agent.clone());
+        // Lift the codec's 16 MiB default body cap; model artifacts routinely
+        // exceed it. Streaming-to-disk keeps memory bounded regardless.
+        client_config.max_body_size = Some(config.max_response_bytes);
         Self {
             config,
             client: HttpClient::with_config(client_config),
@@ -171,6 +194,24 @@ impl ModelDownloader {
             lifecycle.fail_verification(reason.clone());
             return Err(SearchError::InvalidConfig {
                 field: "manifest".to_owned(),
+                value: manifest.id.clone(),
+                reason,
+            });
+        }
+
+        // Fail fast with an actionable error if any declared artifact exceeds the
+        // configured response cap, rather than failing cryptically mid-stream with
+        // a `BodyTooLarge` codec error after exhausting all retries.
+        let cap = self.config.max_response_bytes as u64;
+        if let Some(oversized) = manifest.files.iter().find(|file| file.size > cap) {
+            let reason = format!(
+                "model artifact '{}' declares {} bytes, which exceeds the configured \
+                 download response cap of {cap} bytes; raise DownloadConfig.max_response_bytes",
+                oversized.name, oversized.size
+            );
+            lifecycle.fail_verification(reason.clone());
+            return Err(SearchError::InvalidConfig {
+                field: "download.max_response_bytes".to_owned(),
                 value: manifest.id.clone(),
                 reason,
             });
@@ -705,6 +746,8 @@ mod tests {
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.retry_base_delay, Duration::from_secs(1));
         assert_eq!(config.max_redirects, 5);
+        assert_eq!(config.max_response_bytes, DEFAULT_MAX_MODEL_ARTIFACT_BYTES);
+        assert!(config.max_response_bytes > 16 * 1024 * 1024);
         assert!(config.user_agent.starts_with("frankensearch/"));
     }
 
@@ -777,6 +820,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -801,6 +845,89 @@ mod tests {
         assert_eq!(last.bytes_downloaded, expected_size);
         assert_eq!(last.total_bytes, Some(expected_size));
         drop(events);
+    }
+
+    #[test]
+    fn download_single_file_succeeds_beyond_legacy_16mib_codec_cap() {
+        // Regression for #27: the default HTTP codec caps response bodies at
+        // 16 MiB, which rejected production model artifacts (the default Potion
+        // tokenizer is ~17.8 MiB). A body just over the legacy cap must now
+        // stream to disk and verify.
+        let body = vec![0x41_u8; 16 * 1024 * 1024 + 4096];
+        let file = ModelFile {
+            name: "big.onnx".to_owned(),
+            sha256: sha256_hex(&body),
+            size: u64::try_from(body.len()).unwrap(),
+            url: None,
+        };
+
+        let (base_url, served, handle) = spawn_test_http_server(vec![TestHttpResponse {
+            status: 200,
+            reason: "OK",
+            body: body.clone(),
+        }]);
+        let url = format!("{base_url}/big.onnx");
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("big.onnx");
+        let dest_for_task = dest.clone();
+        // Default config carries the 2 GiB cap.
+        let downloader = ModelDownloader::with_defaults();
+
+        run_test_with_cx(|cx| async move {
+            downloader
+                .download_single_file(&cx, &url, &dest_for_task, &file, 0, 1, &|_| {})
+                .await
+                .unwrap();
+        });
+
+        handle.join().unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(dest).unwrap().len(), body.len());
+    }
+
+    #[test]
+    fn download_model_rejects_artifact_larger_than_response_cap() {
+        // A manifest whose declared artifact exceeds the configured cap must
+        // fail fast with an actionable InvalidConfig error, not a cryptic
+        // mid-stream BodyTooLarge after retries.
+        let mut manifest = ModelManifest::minilm_v2();
+        let oversized = u64::try_from(manifest_cap_test_bytes()).unwrap() + 1;
+        manifest.files[0].size = oversized;
+        // Skip the sum-of-sizes cross-check so the oversized size reaches the cap guard.
+        manifest.download_size_bytes = 0;
+        let consent = crate::model_manifest::DownloadConsent::granted(
+            crate::model_manifest::ConsentSource::Environment,
+        );
+        let mut lifecycle = ModelLifecycle::new(manifest.clone(), consent);
+        let dest = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+            max_response_bytes: manifest_cap_test_bytes(),
+        });
+
+        run_test_with_cx(|cx| async move {
+            let err = downloader
+                .download_model(&cx, &manifest, dest.path(), &mut lifecycle, |_| {})
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "download.max_response_bytes"
+            ));
+            assert!(err.to_string().contains("max_response_bytes"));
+            assert!(matches!(
+                lifecycle.state(),
+                crate::model_manifest::ModelState::VerificationFailed { .. }
+            ));
+        });
+    }
+
+    const fn manifest_cap_test_bytes() -> usize {
+        4 * 1024
     }
 
     #[test]
@@ -834,6 +961,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -878,6 +1006,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -918,6 +1047,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -965,6 +1095,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -1210,6 +1341,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
@@ -1240,6 +1372,7 @@ mod tests {
             retry_base_delay: Duration::from_millis(1),
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
         });
 
         run_test_with_cx(|cx| async move {
