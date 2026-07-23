@@ -75,6 +75,7 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
+frankensearch-lexical = { workspace = true }
 proptest = { workspace = true }
 jsonschema = "0.46"
 criterion = { workspace = true }

@@ -30,8 +30,10 @@ use frankensearch_embed::{
 };
 use frankensearch_index::VectorIndex;
 use frankensearch_quill::{
-    DEFAULT_SCHEMA, KeeperError, KeeperSnapshot, QuillConfig, QuillIndex, QuillIndexError,
-    QuillSearchIndex, SegmentStats, SegmentStatsProvider, SnippetConfig,
+    BlueGreenEngine, CURRENT_FILE_NAME, CurrentPointer, DEFAULT_SCHEMA, FSLX_FORMAT_VERSION,
+    KeeperError, KeeperSnapshot, QuillConfig, QuillIndex, QuillIndexError, QuillSearchIndex,
+    ResolvedCurrent, SegmentStats, SegmentStatsProvider, SnippetConfig, publish_current,
+    resolve_current,
 };
 use frankensearch_storage::{
     EmbeddingVectorSink, IngestAction, IngestRequest, IngestResult, JobQueueConfig,
@@ -347,6 +349,7 @@ const TOMBSTONE_CLEANUP_MIN_INTERVAL_MS: u64 = 60_000;
 const FSFS_SENTINEL_FILE: &str = "index_sentinel.json";
 const FSFS_VECTOR_MANIFEST_FILE: &str = "vector/index_manifest.json";
 const FSFS_LEXICAL_MANIFEST_FILE: &str = "lexical/index_manifest.json";
+const FSFS_INDEX_MANIFEST_FILE_NAME: &str = "index_manifest.json";
 const FSFS_VECTOR_INDEX_FILE: &str = "vector/index.fsvi";
 const FSFS_EXPLAIN_SESSION_FILE: &str = "explain/last_search_session.json";
 const FSFS_FLUSH_REQUEST_FILE: &str = ".fsfs-flush-request.json";
@@ -1153,6 +1156,60 @@ struct IndexSentinel {
     reason_codes: Vec<String>,
     total_canonical_bytes: u64,
     source_hash_hex: String,
+}
+
+const FSFS_QUILL_ENGINE_DIR: &str = "quill-v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LexicalEngineLayout {
+    Missing {
+        lexical_root: PathBuf,
+    },
+    LegacyDirect {
+        lexical_root: PathBuf,
+        engine: BlueGreenEngine,
+        engine_dir: PathBuf,
+    },
+    BlueGreen {
+        lexical_root: PathBuf,
+        pointer: CurrentPointer,
+    },
+}
+
+impl LexicalEngineLayout {
+    const fn engine(&self) -> Option<BlueGreenEngine> {
+        match self {
+            Self::Missing { .. } => None,
+            Self::LegacyDirect { engine, .. } => Some(*engine),
+            Self::BlueGreen { pointer, .. } => Some(pointer.engine()),
+        }
+    }
+
+    fn engine_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::Missing { .. } => None,
+            Self::LegacyDirect { engine_dir, .. } => Some(engine_dir.clone()),
+            Self::BlueGreen {
+                lexical_root,
+                pointer,
+            } => Some(pointer.engine_dir(lexical_root)),
+        }
+    }
+
+    fn lexical_root(&self) -> &Path {
+        match self {
+            Self::Missing { lexical_root } | Self::BlueGreen { lexical_root, .. } => lexical_root,
+            Self::LegacyDirect { lexical_root, .. } => lexical_root,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LexicalBuildPlan {
+    lexical_root: PathBuf,
+    engine_dir: PathBuf,
+    publish_pointer: Option<CurrentPointer>,
+    previous_engine: Option<(BlueGreenEngine, PathBuf)>,
 }
 
 const fn completed_generation_default() -> bool {
@@ -7500,10 +7557,17 @@ impl FsfsRuntime {
 
     async fn run_flush_command(&self, cx: &Cx) -> SearchResult<()> {
         let index_root = self.resolve_status_index_root()?;
-        let lexical_path = index_root.join("lexical");
-        if !lexical_path.exists() {
-            return Err(SearchError::IndexNotFound { path: lexical_path });
-        }
+        self.rebuild_tantivy_lexical_index_if_needed(cx, &index_root)
+            .await?;
+        let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
+        let lexical_path = match (lexical_layout.engine(), lexical_layout.engine_dir()) {
+            (Some(BlueGreenEngine::Quill), Some(path)) => path,
+            _ => {
+                return Err(SearchError::IndexNotFound {
+                    path: index_root.join("lexical"),
+                });
+            }
+        };
 
         let index_freshness =
             match QuillIndex::open(cx, &lexical_path, QuillConfig::default()).await {
@@ -8001,6 +8065,8 @@ impl FsfsRuntime {
             });
         }
 
+        checks.push(Self::collect_lexical_engine_doctor_check(&index_root)?);
+
         // 5. Index directory writable
         if index_root.exists() {
             let probe = index_root.join(".fsfs_doctor_probe");
@@ -8105,6 +8171,221 @@ impl FsfsRuntime {
             fail_count,
             overall,
         })
+    }
+
+    fn collect_lexical_engine_doctor_check(index_root: &Path) -> SearchResult<DoctorCheck> {
+        let layout = Self::resolve_lexical_engine(index_root)?;
+        let lexical_root = layout.lexical_root();
+        if layout.engine().is_none() {
+            return Ok(DoctorCheck {
+                name: "lexical_engine".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: format!("no lexical engine found under {}", lexical_root.display()),
+                suggestion: Some("run `fsfs index <dir>` to build the lexical index".to_owned()),
+            });
+        }
+
+        let active_dir = layout
+            .engine_dir()
+            .expect("a resolved lexical engine always has a directory");
+        let active_engine = layout
+            .engine()
+            .expect("a resolved lexical engine always has a kind");
+        let pointer_target = match &layout {
+            LexicalEngineLayout::BlueGreen { pointer, .. } => pointer.dir_name().to_owned(),
+            LexicalEngineLayout::LegacyDirect { .. } => "<legacy-direct>".to_owned(),
+            LexicalEngineLayout::Missing { .. } => unreachable!("handled above"),
+        };
+        let format_version = match &layout {
+            LexicalEngineLayout::BlueGreen { pointer, .. } => pointer.index_format_version(),
+            LexicalEngineLayout::LegacyDirect {
+                engine: BlueGreenEngine::Quill,
+                ..
+            } => FSLX_FORMAT_VERSION,
+            LexicalEngineLayout::LegacyDirect {
+                engine: BlueGreenEngine::Tantivy,
+                ..
+            } => 0,
+            LexicalEngineLayout::Missing { .. } => unreachable!("handled above"),
+        };
+
+        let mut engine_dirs = Vec::<(BlueGreenEngine, PathBuf)>::new();
+        if lexical_root.join("MANIFEST").is_file() {
+            engine_dirs.push((BlueGreenEngine::Quill, lexical_root.to_path_buf()));
+        } else if lexical_root.join("meta.json").is_file() {
+            engine_dirs.push((BlueGreenEngine::Tantivy, lexical_root.to_path_buf()));
+        }
+        if lexical_root.is_dir() {
+            for entry in fs::read_dir(lexical_root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let path = entry.path();
+                let engine = if path.join("MANIFEST").is_file() {
+                    Some(BlueGreenEngine::Quill)
+                } else if path.join("meta.json").is_file() {
+                    Some(BlueGreenEngine::Tantivy)
+                } else {
+                    None
+                };
+                if let Some(engine) = engine {
+                    engine_dirs.push((engine, path));
+                }
+            }
+        }
+        engine_dirs.sort_by(|left, right| left.1.cmp(&right.1));
+
+        let transient_double_disk_bytes =
+            engine_dirs.iter().try_fold(0_u64, |total, (_, path)| {
+                Ok::<u64, SearchError>(total.saturating_add(Self::path_bytes(path)?))
+            })?;
+        let directories = engine_dirs
+            .iter()
+            .map(|(engine, path)| {
+                let active = if *path == active_dir {
+                    "active"
+                } else {
+                    "retained"
+                };
+                format!("{}:{}:{}", engine.label(), path.display(), active)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let stats = if active_engine == BlueGreenEngine::Quill {
+            let snapshot = KeeperSnapshot::open(&active_dir, DEFAULT_SCHEMA)?;
+            let stats = snapshot.segment_stats();
+            let (fec_protected, fec_artifacts) = Self::quill_fec_coverage(&active_dir)?;
+            format!(
+                "segments={} (sealed={}, delta={}), live_docs={}, tombstones={}, fec={fec_protected}/{fec_artifacts}",
+                stats.sealed_segments.saturating_add(stats.delta_segments),
+                stats.sealed_segments,
+                stats.delta_segments,
+                stats.live_docs,
+                stats.tombstones,
+            )
+        } else {
+            "segments=tantivy-managed, tombstones=tantivy-managed, fec=tantivy-managed".to_owned()
+        };
+
+        let retained = engine_dirs
+            .iter()
+            .filter(|(_, path)| *path != active_dir)
+            .collect::<Vec<_>>();
+        let suggestion = if active_engine == BlueGreenEngine::Tantivy {
+            Some("open the index with `fsfs search` or run `fsfs index <source-dir>` to rebuild into a fresh Quill sibling".to_owned())
+        } else if retained.is_empty() {
+            None
+        } else {
+            let commands = retained
+                .iter()
+                .map(|(engine, path)| Self::lexical_reclaim_command(*engine, path, &active_dir))
+                .collect::<SearchResult<Vec<_>>>()?
+                .join("; ");
+            Some(format!(
+                "rollback data retained; after confirming it is no longer needed, reclaim with: {commands}"
+            ))
+        };
+        let verdict = if active_engine == BlueGreenEngine::Quill && retained.is_empty() {
+            DoctorVerdict::Pass
+        } else {
+            DoctorVerdict::Warn
+        };
+
+        Ok(DoctorCheck {
+            name: "lexical_engine".to_owned(),
+            verdict,
+            detail: format!(
+                "active={}, format_version={}, CURRENT={}, directories=[{}], transient_double_disk_bytes={}; {}",
+                active_engine.label(),
+                format_version,
+                pointer_target,
+                directories,
+                transient_double_disk_bytes,
+                stats,
+            ),
+            suggestion,
+        })
+    }
+
+    fn lexical_reclaim_command(
+        engine: BlueGreenEngine,
+        retained_dir: &Path,
+        active_dir: &Path,
+    ) -> SearchResult<String> {
+        if !active_dir.starts_with(retained_dir) {
+            return Ok(format!("rm -r -- {}", shell_quote(retained_dir)));
+        }
+        if engine != BlueGreenEngine::Tantivy {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: retained_dir.display().to_string(),
+                reason: "retained engine overlaps the active engine; refusing to print an unsafe reclaim command".to_owned(),
+            });
+        }
+
+        let managed_path = retained_dir.join(".managed.json");
+        let managed_raw = fs::read_to_string(&managed_path)?;
+        let managed = serde_json::from_str::<Vec<String>>(&managed_raw).map_err(|source| {
+            SearchError::SubsystemError {
+                subsystem: "fsfs.doctor.lexical_engine",
+                source: Box::new(source),
+            }
+        })?;
+        let mut reclaim_paths = BTreeSet::from([
+            managed_path,
+            retained_dir.join(".tantivy-meta.lock"),
+            retained_dir.join(".tantivy-writer.lock"),
+        ]);
+        for name in managed {
+            let candidate = Path::new(&name);
+            if candidate.components().count() != 1
+                || !matches!(candidate.components().next(), Some(Component::Normal(_)))
+            {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.index_dir".to_owned(),
+                    value: retained_dir.display().to_string(),
+                    reason: format!(
+                        "Tantivy managed-file entry {name:?} is path-unsafe; refusing to print a reclaim command"
+                    ),
+                });
+            }
+            reclaim_paths.insert(retained_dir.join(candidate));
+        }
+        Ok(format!(
+            "rm -r -- {}",
+            reclaim_paths
+                .iter()
+                .map(|path| shell_quote(path))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ))
+    }
+
+    fn quill_fec_coverage(engine_dir: &Path) -> SearchResult<(usize, usize)> {
+        let mut protected = 0_usize;
+        let mut artifacts = 0_usize;
+        for entry in fs::read_dir(engine_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !matches!(name, "MANIFEST" | "MANIFEST.prev")
+                && !(name.starts_with("seg-") && name.ends_with(".fslx"))
+            {
+                continue;
+            }
+            artifacts = artifacts.saturating_add(1);
+            if engine_dir.join(format!("{name}.fec")).is_file() {
+                protected = protected.saturating_add(1);
+            }
+        }
+        Ok((protected, artifacts))
     }
 
     fn resolve_download_model_root(&self) -> SearchResult<PathBuf> {
@@ -8282,6 +8563,157 @@ impl FsfsRuntime {
         self.collect_status_payload_with_lexical_stats(None)
     }
 
+    fn resolve_lexical_engine(index_root: &Path) -> SearchResult<LexicalEngineLayout> {
+        if index_root.join(CURRENT_FILE_NAME).is_file() {
+            return Self::resolve_blue_green_lexical_root(index_root);
+        }
+
+        let lexical_root = index_root.join("lexical");
+        if !lexical_root.is_dir() {
+            return Ok(LexicalEngineLayout::Missing { lexical_root });
+        }
+
+        if lexical_root.join(CURRENT_FILE_NAME).is_file() {
+            return Self::resolve_blue_green_lexical_root(&lexical_root);
+        }
+
+        if lexical_root.join("MANIFEST").is_file() {
+            return Ok(LexicalEngineLayout::LegacyDirect {
+                lexical_root: index_root.to_path_buf(),
+                engine: BlueGreenEngine::Quill,
+                engine_dir: lexical_root,
+            });
+        }
+        if lexical_root.join("meta.json").is_file() {
+            return Ok(LexicalEngineLayout::LegacyDirect {
+                lexical_root: index_root.to_path_buf(),
+                engine: BlueGreenEngine::Tantivy,
+                engine_dir: lexical_root,
+            });
+        }
+
+        Self::resolve_blue_green_lexical_root(&lexical_root)
+    }
+
+    fn resolve_blue_green_lexical_root(lexical_root: &Path) -> SearchResult<LexicalEngineLayout> {
+        match resolve_current(lexical_root).map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.lexical.current",
+            source: Box::new(source),
+        })? {
+            ResolvedCurrent::Pointer(pointer) | ResolvedCurrent::Adopted(pointer) => {
+                Ok(LexicalEngineLayout::BlueGreen {
+                    lexical_root: lexical_root.to_path_buf(),
+                    pointer,
+                })
+            }
+            ResolvedCurrent::Empty => Ok(LexicalEngineLayout::Missing {
+                lexical_root: lexical_root.to_path_buf(),
+            }),
+        }
+    }
+
+    fn next_quill_engine_dir(lexical_root: &Path) -> SearchResult<(String, PathBuf)> {
+        let canonical = lexical_root.join(FSFS_QUILL_ENGINE_DIR);
+        if !canonical.exists() {
+            return Ok((FSFS_QUILL_ENGINE_DIR.to_owned(), canonical));
+        }
+
+        let timestamp = pressure_timestamp_ms();
+        for attempt in 0_u16..=u16::MAX {
+            let name = format!("{FSFS_QUILL_ENGINE_DIR}-rebuild-{timestamp}-{attempt}");
+            let candidate = lexical_root.join(&name);
+            if !candidate.exists() {
+                return Ok((name, candidate));
+            }
+        }
+
+        Err(SearchError::InvalidConfig {
+            field: "cli.index_dir".to_owned(),
+            value: lexical_root.display().to_string(),
+            reason: "unable to allocate a fresh Quill engine sibling; run `fsfs doctor`".to_owned(),
+        })
+    }
+
+    fn plan_lexical_build(index_root: &Path) -> SearchResult<LexicalBuildPlan> {
+        let layout = Self::resolve_lexical_engine(index_root)?;
+        match layout {
+            LexicalEngineLayout::LegacyDirect {
+                lexical_root,
+                engine: BlueGreenEngine::Quill,
+                engine_dir,
+            } => Ok(LexicalBuildPlan {
+                lexical_root,
+                engine_dir,
+                publish_pointer: None,
+                previous_engine: None,
+            }),
+            LexicalEngineLayout::BlueGreen {
+                lexical_root,
+                pointer,
+            } if pointer.engine() == BlueGreenEngine::Quill => Ok(LexicalBuildPlan {
+                lexical_root: lexical_root.clone(),
+                engine_dir: pointer.engine_dir(&lexical_root),
+                publish_pointer: None,
+                previous_engine: None,
+            }),
+            LexicalEngineLayout::Missing { lexical_root } => {
+                fs::create_dir_all(&lexical_root)?;
+                let (dir_name, engine_dir) = Self::next_quill_engine_dir(&lexical_root)?;
+                let pointer =
+                    CurrentPointer::new(BlueGreenEngine::Quill, dir_name, FSLX_FORMAT_VERSION)
+                        .map_err(|source| SearchError::SubsystemError {
+                            subsystem: "fsfs.lexical.current",
+                            source: Box::new(source),
+                        })?;
+                Ok(LexicalBuildPlan {
+                    lexical_root,
+                    engine_dir,
+                    publish_pointer: Some(pointer),
+                    previous_engine: None,
+                })
+            }
+            LexicalEngineLayout::LegacyDirect {
+                lexical_root,
+                engine: BlueGreenEngine::Tantivy,
+                engine_dir: previous_dir,
+            } => {
+                let (dir_name, engine_dir) = Self::next_quill_engine_dir(&lexical_root)?;
+                let pointer =
+                    CurrentPointer::new(BlueGreenEngine::Quill, dir_name, FSLX_FORMAT_VERSION)
+                        .map_err(|source| SearchError::SubsystemError {
+                            subsystem: "fsfs.lexical.current",
+                            source: Box::new(source),
+                        })?;
+                Ok(LexicalBuildPlan {
+                    lexical_root,
+                    engine_dir,
+                    publish_pointer: Some(pointer),
+                    previous_engine: Some((BlueGreenEngine::Tantivy, previous_dir)),
+                })
+            }
+            LexicalEngineLayout::BlueGreen {
+                lexical_root,
+                pointer,
+            } => {
+                let previous_dir = pointer.engine_dir(&lexical_root);
+                let previous_engine = pointer.engine();
+                let (dir_name, engine_dir) = Self::next_quill_engine_dir(&lexical_root)?;
+                let replacement =
+                    CurrentPointer::new(BlueGreenEngine::Quill, dir_name, FSLX_FORMAT_VERSION)
+                        .map_err(|source| SearchError::SubsystemError {
+                            subsystem: "fsfs.lexical.current",
+                            source: Box::new(source),
+                        })?;
+                Ok(LexicalBuildPlan {
+                    lexical_root,
+                    engine_dir,
+                    publish_pointer: Some(replacement),
+                    previous_engine: Some((previous_engine, previous_dir)),
+                })
+            }
+        }
+    }
+
     const fn index_freshness_payload(stats: SegmentStats) -> IndexFreshnessPayload {
         IndexFreshnessPayload {
             published_generation: stats.published_generation,
@@ -8305,12 +8737,15 @@ impl FsfsRuntime {
             embedding_cache_roots: vec![index_root.join("cache")],
         };
         let mut usage = self.collect_index_storage_usage(&storage_paths)?;
-        let lexical_path = index_root.join("lexical");
-        let lexical_stats = if lexical_stats.is_some() || !lexical_path.exists() {
-            lexical_stats
-        } else {
-            Some(KeeperSnapshot::open(&lexical_path, DEFAULT_SCHEMA)?.segment_stats())
-        };
+        let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
+        let lexical_stats =
+            if lexical_stats.is_some() || lexical_layout.engine() != Some(BlueGreenEngine::Quill) {
+                lexical_stats
+            } else if let Some(engine_dir) = lexical_layout.engine_dir() {
+                Some(KeeperSnapshot::open(&engine_dir, DEFAULT_SCHEMA)?.segment_stats())
+            } else {
+                None
+            };
         if let Some(stats) = lexical_stats {
             usage.lexical_index_bytes = stats.managed_disk_bytes;
         }
@@ -8429,7 +8864,10 @@ impl FsfsRuntime {
         index_root: &Path,
         file_name: &str,
     ) -> SearchResult<Option<Vec<IndexManifestEntry>>> {
-        let path = index_root.join(file_name);
+        Self::read_index_manifest_path(&index_root.join(file_name))
+    }
+
+    fn read_index_manifest_path(path: &Path) -> SearchResult<Option<Vec<IndexManifestEntry>>> {
         let raw = match fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -8452,9 +8890,16 @@ impl FsfsRuntime {
         else {
             return Ok(None);
         };
-        let Some(lexical_manifest) =
-            Self::read_index_manifest_file(index_root, FSFS_LEXICAL_MANIFEST_FILE)?
-        else {
+        let lexical_layout = Self::resolve_lexical_engine(index_root)?;
+        let lexical_manifest_path = if lexical_layout.lexical_root() == index_root {
+            lexical_layout
+                .engine_dir()
+                .map(|path| path.join(FSFS_INDEX_MANIFEST_FILE_NAME))
+                .unwrap_or_else(|| index_root.join(FSFS_LEXICAL_MANIFEST_FILE))
+        } else {
+            index_root.join(FSFS_LEXICAL_MANIFEST_FILE)
+        };
+        let Some(lexical_manifest) = Self::read_index_manifest_path(&lexical_manifest_path)? else {
             return Ok(None);
         };
         if vector_manifest != lexical_manifest {
@@ -8659,7 +9104,22 @@ impl FsfsRuntime {
         &self,
         cx: &Cx,
         command: CliCommand,
+        on_progress: F,
+    ) -> SearchResult<()>
+    where
+        F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
+    {
+        self.run_one_shot_index_scaffold_internal(cx, command, on_progress, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_one_shot_index_scaffold_internal<F>(
+        &self,
+        cx: &Cx,
+        command: CliCommand,
         mut on_progress: F,
+        emit_user_output: bool,
     ) -> SearchResult<()>
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
@@ -8693,12 +9153,14 @@ impl FsfsRuntime {
             elapsed_ms = discovery_elapsed_ms,
             "fsfs file discovery completed"
         );
-        println!(
-            "Discovered {} file(s) under {} ({} skipped by policy)",
-            stats.discovered_files,
-            target_root.display(),
-            stats.skipped_files
-        );
+        if emit_user_output {
+            println!(
+                "Discovered {} file(s) under {} ({} skipped by policy)",
+                stats.discovered_files,
+                target_root.display(),
+                stats.skipped_files
+            );
+        }
 
         // Resilience tracking state
         let mut embedding_retries = 0_usize;
@@ -8992,7 +9454,25 @@ impl FsfsRuntime {
             HashSet::new()
         };
 
-        let lexical_path = index_root.join("lexical");
+        let lexical_plan = Self::plan_lexical_build(&index_root)?;
+        let lexical_path = lexical_plan.engine_dir.clone();
+        let lexical_manifest_path = if lexical_plan.lexical_root == index_root {
+            lexical_path.join(FSFS_INDEX_MANIFEST_FILE_NAME)
+        } else {
+            index_root.join(FSFS_LEXICAL_MANIFEST_FILE)
+        };
+        if let Some((previous_engine, previous_dir)) = lexical_plan.previous_engine.as_ref() {
+            info!(
+                event = "fsfs.lexical_engine_migration",
+                from_engine = previous_engine.label(),
+                from_dir = %previous_dir.display(),
+                to_engine = BlueGreenEngine::Quill.label(),
+                to_dir = %lexical_path.display(),
+                strategy = "rebuild",
+                old_dir_retained = true,
+                "fsfs detected a legacy lexical engine; rebuilding into a fresh sibling"
+            );
+        }
         // One-shot construction uses Quill's routed shard set and suppresses
         // ordinary tier merges until the final bulk concat. Watch sessions use
         // the deterministic singleton policy in `build_live_ingest_pipeline`.
@@ -9510,7 +9990,11 @@ impl FsfsRuntime {
                 checkpoint.skipped_files = stats
                     .discovered_files
                     .saturating_sub(published_manifests.len());
-                self.write_index_artifacts(&index_root, &published_manifests)?;
+                self.write_index_artifacts(
+                    &index_root,
+                    &lexical_manifest_path,
+                    &published_manifests,
+                )?;
                 let partial_total_canonical_bytes =
                     published_manifests.iter().fold(0_u64, |total, entry| {
                         total.saturating_add(entry.canonical_bytes)
@@ -9967,7 +10451,7 @@ impl FsfsRuntime {
         });
         let reason_codes = observed_reason_codes.into_iter().collect::<Vec<_>>();
 
-        self.write_index_artifacts(&index_root, &manifests)?;
+        self.write_index_artifacts(&index_root, &lexical_manifest_path, &manifests)?;
         let sentinel = IndexSentinel {
             schema_version: 1,
             generation_complete: true,
@@ -10036,6 +10520,23 @@ impl FsfsRuntime {
             &recent_warnings,
         ))?;
 
+        if let Some(pointer) = lexical_plan.publish_pointer.as_ref() {
+            publish_current(&lexical_plan.lexical_root, pointer).map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.lexical.current",
+                    source: Box::new(source),
+                }
+            })?;
+            info!(
+                event = "fsfs.lexical_current_published",
+                engine = pointer.engine().label(),
+                engine_dir = pointer.dir_name(),
+                index_format_version = pointer.index_format_version(),
+                old_dir_retained = lexical_plan.previous_engine.is_some(),
+                "fsfs published the rebuilt lexical engine"
+            );
+        }
+
         info!(
             command = ?command,
             target_root = %target_root.display(),
@@ -10060,19 +10561,21 @@ impl FsfsRuntime {
             "fsfs index pipeline completed"
         );
 
-        println!(
-            "Indexed {} file(s) (discovered {}, skipped {}) into {} in {} ms (index size {} bytes)",
-            indexed_files,
-            stats.discovered_files,
-            skipped_files,
-            index_root.display(),
-            elapsed_ms,
-            storage_usage.total_bytes()
-        );
-        if embedder_degraded {
+        if emit_user_output {
             println!(
-                "WARNING: Completed with hash embeddings (degraded). Semantic embeddings will be upgraded on next run."
+                "Indexed {} file(s) (discovered {}, skipped {}) into {} in {} ms (index size {} bytes)",
+                indexed_files,
+                stats.discovered_files,
+                skipped_files,
+                index_root.display(),
+                elapsed_ms,
+                storage_usage.total_bytes()
             );
+            if embedder_degraded {
+                println!(
+                    "WARNING: Completed with hash embeddings (degraded). Semantic embeddings will be upgraded on next run."
+                );
+            }
         }
 
         Ok(())
@@ -10145,6 +10648,92 @@ impl FsfsRuntime {
         absolutize_path(Path::new(raw))
     }
 
+    async fn rebuild_tantivy_lexical_index_if_needed(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+    ) -> SearchResult<()> {
+        let layout = Self::resolve_lexical_engine(index_root)?;
+        if layout.engine() != Some(BlueGreenEngine::Tantivy) {
+            return Ok(());
+        }
+
+        let previous_dir = layout
+            .engine_dir()
+            .expect("Tantivy layout always has an engine directory");
+        let sentinel =
+            Self::read_index_sentinel(index_root)?.ok_or_else(|| SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "Tantivy lexical index detected, but its canonical source root is unknown; run `fsfs index <source-dir>` to rebuild with Quill".to_owned(),
+            })?;
+        if !sentinel.generation_complete {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "Tantivy lexical index detected beside an incomplete generation; resume `fsfs index` before searching".to_owned(),
+            });
+        }
+
+        let target_root = PathBuf::from(&sentinel.target_root);
+        if !target_root.is_dir() {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index.target".to_owned(),
+                value: target_root.display().to_string(),
+                reason: "Tantivy lexical index requires rebuild, but the canonical source root is unavailable".to_owned(),
+            });
+        }
+
+        let retained_bytes = Self::path_bytes(&previous_dir)?;
+        warn!(
+            event = "fsfs.lexical_engine_migration",
+            from_engine = BlueGreenEngine::Tantivy.label(),
+            from_dir = %previous_dir.display(),
+            to_engine = BlueGreenEngine::Quill.label(),
+            strategy = "rebuild_from_canonical_storage",
+            retained_bytes,
+            old_dir_retained = true,
+            "fsfs detected a Tantivy lexical index at open; starting blue-green rebuild"
+        );
+
+        let mut migration_input = self.cli_input.clone();
+        migration_input.command = CliCommand::Index;
+        migration_input.target_path = Some(target_root);
+        migration_input.index_dir = Some(index_root.to_path_buf());
+        migration_input.watch = false;
+        migration_input.quiet = true;
+        let migration_runtime = Self::new(self.config.clone()).with_cli_input(migration_input);
+        migration_runtime
+            .run_one_shot_index_scaffold_internal(cx, CliCommand::Index, |_| Ok(()), false)
+            .await?;
+
+        let migrated = Self::resolve_lexical_engine(index_root)?;
+        if migrated.engine() != Some(BlueGreenEngine::Quill) {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "lexical rebuild completed without publishing a Quill CURRENT pointer"
+                    .to_owned(),
+            });
+        }
+        let active_dir = migrated
+            .engine_dir()
+            .expect("Quill layout always has an engine directory");
+        let active_bytes = Self::path_bytes(&active_dir)?;
+        info!(
+            event = "fsfs.lexical_engine_migration_completed",
+            active_engine = BlueGreenEngine::Quill.label(),
+            active_dir = %active_dir.display(),
+            retained_dir = %previous_dir.display(),
+            retained_bytes,
+            active_bytes,
+            transient_double_disk_bytes = retained_bytes.saturating_add(active_bytes),
+            rollback = "publish CURRENT to the retained Tantivy directory",
+            "fsfs blue-green lexical rebuild completed; retained directory remains available"
+        );
+        Ok(())
+    }
+
     fn resolve_fast_embedder(&self) -> SearchResult<Arc<dyn Embedder>> {
         if cfg!(test) {
             return Ok(Arc::new(HashEmbedder::default_256()));
@@ -10187,6 +10776,8 @@ impl FsfsRuntime {
         mode: SearchExecutionMode,
     ) -> SearchResult<SearchExecutionResources> {
         let index_root = self.resolve_status_index_root()?;
+        self.rebuild_tantivy_lexical_index_if_needed(cx, &index_root)
+            .await?;
         if let Some(checkpoint) = read_indexing_checkpoint(&index_root)?
             && (checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
                 || !checkpoint.artifacts_durable)
@@ -10198,13 +10789,15 @@ impl FsfsRuntime {
                     .to_owned(),
             });
         }
-        let lexical_path = index_root.join("lexical");
+        let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
+        let lexical_path = lexical_layout.engine_dir();
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
-        let lexical_index = if lexical_path.exists() {
-            Some(QuillSearchIndex::open(cx, &lexical_path, QuillConfig::default()).await?)
-        } else {
-            None
+        let lexical_index = match (lexical_layout.engine(), lexical_path.as_deref()) {
+            (Some(BlueGreenEngine::Quill), Some(path)) => {
+                Some(QuillSearchIndex::open(cx, path, QuillConfig::default()).await?)
+            }
+            _ => None,
         };
         let lexical_available = lexical_index.is_some();
 
@@ -10404,7 +10997,15 @@ impl FsfsRuntime {
             fs::create_dir_all(parent)?;
         }
 
-        let lexical_path = index_root.join("lexical");
+        let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
+        let lexical_path = match (lexical_layout.engine(), lexical_layout.engine_dir()) {
+            (Some(BlueGreenEngine::Quill), Some(path)) => path,
+            _ => {
+                return Err(SearchError::IndexNotFound {
+                    path: index_root.join("lexical"),
+                });
+            }
+        };
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
         let lexical_index = QuillIndex::create(
@@ -10547,6 +11148,7 @@ impl FsfsRuntime {
     fn write_index_artifacts(
         &self,
         index_root: &Path,
+        lexical_manifest_path: &Path,
         manifests: &[IndexManifestEntry],
     ) -> SearchResult<()> {
         let vector_manifest = serde_json::to_string_pretty(manifests).map_err(|error| {
@@ -10563,10 +11165,7 @@ impl FsfsRuntime {
                 source: Box::new(error),
             }
         })?;
-        write_durable(
-            index_root.join(FSFS_LEXICAL_MANIFEST_FILE),
-            lexical_manifest,
-        )?;
+        write_durable(lexical_manifest_path, lexical_manifest)?;
 
         Ok(())
     }
@@ -15900,6 +16499,10 @@ fn render_doctor_table(payload: &FsfsDoctorPayload, no_color: bool) -> String {
     out
 }
 
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
 fn humanize_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut unit_index = 0_usize;
@@ -16398,7 +17001,7 @@ fn emit_lite_build_model_hint(model_root: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::future::{Future, poll_fn};
     use std::io::Write as _;
@@ -16417,9 +17020,11 @@ mod tests {
     };
     use frankensearch_embed::{HashEmbedder, ModelManifest};
     use frankensearch_index::VectorIndex;
+    use frankensearch_lexical::TantivyIndex;
     use frankensearch_quill::{
-        DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillIndex, QuillSearchIndex,
-        SegmentStatsProvider,
+        BlueGreenEngine, CURRENT_FILE_NAME, CurrentPointer, DEFAULT_SCHEMA, KeeperSnapshot,
+        QuillConfig, QuillIndex, QuillSearchIndex, SegmentStatsProvider, publish_current,
+        resolve_current,
     };
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
@@ -16480,9 +17085,63 @@ mod tests {
     }
 
     async fn open_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
-        QuillIndex::open(cx, path, QuillConfig::default())
+        let engine_path = if path.join("MANIFEST").is_file() {
+            path.to_path_buf()
+        } else if let Ok(bytes) = fs::read(path.join(CURRENT_FILE_NAME)) {
+            CurrentPointer::decode(&bytes)
+                .expect("decode test CURRENT pointer")
+                .engine_dir(path)
+        } else {
+            fs::read_dir(path)
+                .expect("scan test lexical root")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|candidate| candidate.join("MANIFEST").is_file())
+                .expect("find test Quill engine directory")
+        };
+        QuillIndex::open(cx, &engine_path, QuillConfig::default())
             .await
             .expect("open Quill index")
+    }
+
+    fn snapshot_directory(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let mut entries = fs::read_dir(current)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry"))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let entry_path = entry.path();
+                if entry.file_type().expect("read snapshot file type").is_dir() {
+                    visit(root, &entry_path, files);
+                } else {
+                    let relative = entry_path
+                        .strip_prefix(root)
+                        .expect("snapshot entry below root")
+                        .to_path_buf();
+                    files.insert(relative, fs::read(&entry_path).expect("read snapshot file"));
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        visit(path, path, &mut files);
+        files
+    }
+
+    fn copy_tantivy_mini_fixture(destination: &Path) {
+        fs::create_dir_all(destination).expect("create Tantivy fixture destination");
+        fs::write(
+            destination.join(".managed.json"),
+            include_bytes!("../tests/fixtures/tantivy-mini/.managed.json"),
+        )
+        .expect("copy Tantivy managed-file fixture");
+        fs::write(
+            destination.join("meta.json"),
+            include_bytes!("../tests/fixtures/tantivy-mini/meta.json"),
+        )
+        .expect("copy Tantivy metadata fixture");
     }
 
     #[test]
@@ -19214,7 +19873,11 @@ mod tests {
                 }
             }
             runtime
-                .write_index_artifacts(&index_root, &legacy_manifest)
+                .write_index_artifacts(
+                    &index_root,
+                    &index_root.join(super::FSFS_LEXICAL_MANIFEST_FILE),
+                    &legacy_manifest,
+                )
                 .expect("write legacy-format manifests");
             fs::write(
                 project.join("src/stale.rs"),
@@ -21045,6 +21708,188 @@ mod tests {
                 .any(|entry| { entry.target == "index_dir" && entry.status == "removed" })
         );
         assert!(!index_root.exists(), "index dir should be removed");
+    }
+
+    #[test]
+    fn tantivy_open_rebuilds_blue_green_and_retains_rollback_directory() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            let index_root = project.join(".frankensearch");
+            let lexical_root = index_root.clone();
+            let tantivy_dir = index_root.join("lexical");
+            fs::create_dir_all(&project).expect("create canonical source root");
+            fs::write(
+                project.join("migration.md"),
+                "canonical quill migration witness",
+            )
+            .expect("write canonical source");
+
+            copy_tantivy_mini_fixture(&tantivy_dir);
+            let retained_before = snapshot_directory(&tantivy_dir);
+            let old_pointer = CurrentPointer::new(BlueGreenEngine::Tantivy, "lexical", 0)
+                .expect("build Tantivy pointer");
+            let sentinel = super::IndexSentinel {
+                schema_version: 1,
+                generation_complete: true,
+                generated_at_ms: super::pressure_timestamp_ms(),
+                command: "index".to_owned(),
+                target_root: project.display().to_string(),
+                index_root: index_root.display().to_string(),
+                discovered_files: 1,
+                indexed_files: 1,
+                skipped_files: 0,
+                reason_codes: vec!["test.tantivy_migration".to_owned()],
+                total_canonical_bytes: 33,
+                source_hash_hex: "tantivy-generation".to_owned(),
+            };
+            fs::create_dir_all(&index_root).expect("create index root");
+            fs::write(
+                index_root.join(super::FSFS_SENTINEL_FILE),
+                serde_json::to_vec_pretty(&sentinel).expect("serialize sentinel"),
+            )
+            .expect("write sentinel");
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("migration witness".to_owned()),
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let resources = runtime
+                .prepare_search_execution_resources(&cx, super::SearchExecutionMode::LexicalOnly)
+                .await
+                .expect("open should rebuild Tantivy into Quill");
+            let active = resolve_current(&lexical_root)
+                .expect("resolve migrated CURRENT")
+                .pointer()
+                .expect("migrated pointer")
+                .clone();
+            assert_eq!(active.engine(), BlueGreenEngine::Quill);
+            assert_ne!(active.dir_name(), old_pointer.dir_name());
+            assert_eq!(
+                snapshot_directory(&tantivy_dir),
+                retained_before,
+                "Rule 1: retained Tantivy directory must remain byte-for-byte untouched"
+            );
+            drop(
+                TantivyIndex::open(&tantivy_dir).expect("previous binary can reopen retained dir"),
+            );
+
+            let lexical = resources
+                .lexical_index
+                .as_ref()
+                .expect("rebuilt Quill search index");
+            let hits = lexical
+                .search_doc_ids(&cx, "migration witness", 10)
+                .expect("search rebuilt Quill index");
+            assert_eq!(hits[0].document_id, "migration.md");
+
+            publish_current(&lexical_root, &old_pointer)
+                .expect("rollback is one CURRENT pointer swap");
+            assert_eq!(
+                resolve_current(&lexical_root)
+                    .expect("resolve rollback pointer")
+                    .pointer()
+                    .expect("rollback pointer")
+                    .engine(),
+                BlueGreenEngine::Tantivy
+            );
+            publish_current(&lexical_root, &active).expect("restore migrated pointer");
+
+            let doctor = runtime
+                .collect_doctor_payload()
+                .expect("collect doctor payload");
+            let lexical_check = doctor
+                .checks
+                .iter()
+                .find(|check| check.name == "lexical_engine")
+                .expect("lexical engine doctor check");
+            assert_eq!(lexical_check.verdict, super::DoctorVerdict::Warn);
+            assert!(lexical_check.detail.contains("active=quill"));
+            assert!(lexical_check.detail.contains("format_version=1"));
+            assert!(lexical_check.detail.contains("tantivy:"));
+            assert!(
+                lexical_check
+                    .detail
+                    .contains(&tantivy_dir.display().to_string())
+            );
+            assert!(lexical_check.detail.contains(active.dir_name()));
+            assert!(
+                lexical_check
+                    .detail
+                    .contains("transient_double_disk_bytes=")
+            );
+            assert!(lexical_check.detail.contains("tombstones="));
+            assert!(lexical_check.detail.contains("fec="));
+            let suggestion = lexical_check
+                .suggestion
+                .as_deref()
+                .expect("doctor prints explicit retained-dir reclaim command");
+            assert!(suggestion.contains("rm -r --"));
+            assert!(suggestion.contains(&tantivy_dir.display().to_string()));
+
+            let table = super::render_doctor_table(&doctor, true);
+            assert!(
+                table.contains(
+                    "[!!] lexical_engine: active=quill, format_version=1, CURRENT=quill-v1"
+                )
+            );
+            assert!(table.contains("rollback data retained"));
+        });
+    }
+
+    #[test]
+    fn failed_tantivy_rebuild_never_flips_current_or_removes_old_directory() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            let lexical_root = index_root.clone();
+            let tantivy_dir = index_root.join("lexical");
+            copy_tantivy_mini_fixture(&tantivy_dir);
+            let retained_before = snapshot_directory(&tantivy_dir);
+            let sentinel = super::IndexSentinel {
+                schema_version: 1,
+                generation_complete: true,
+                generated_at_ms: 1,
+                command: "index".to_owned(),
+                target_root: temp.path().join("missing-source").display().to_string(),
+                index_root: index_root.display().to_string(),
+                discovered_files: 0,
+                indexed_files: 0,
+                skipped_files: 0,
+                reason_codes: Vec::new(),
+                total_canonical_bytes: 0,
+                source_hash_hex: "old".to_owned(),
+            };
+            fs::write(
+                index_root.join(super::FSFS_SENTINEL_FILE),
+                serde_json::to_vec_pretty(&sentinel).expect("serialize sentinel"),
+            )
+            .expect("write sentinel");
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("anything".to_owned()),
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+            assert!(
+                runtime
+                    .prepare_search_execution_resources(
+                        &cx,
+                        super::SearchExecutionMode::LexicalOnly
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !lexical_root.join(CURRENT_FILE_NAME).exists(),
+                "failed rebuild must not publish CURRENT"
+            );
+            assert_eq!(snapshot_directory(&tantivy_dir), retained_before);
+            drop(TantivyIndex::open(&tantivy_dir).expect("old index remains openable"));
+        });
     }
 
     #[test]
