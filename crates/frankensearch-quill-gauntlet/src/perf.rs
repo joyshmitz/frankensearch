@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::GauntletError;
 
 /// Version of the JSON emitted by the QG matrix harness.
-pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v1";
+pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v2";
 /// Minimum independent samples required by the standing statistical law.
 pub const PERF_MIN_RUNS: usize = 10;
 /// Maximum coefficient of variation admitted by an activated gate.
@@ -288,6 +288,15 @@ impl PerfMatrixSpec {
         single.positions = Some(PositionMode::On);
         cells.push(single);
 
+        let mut initial =
+            PerfCellSpec::new(PerfGate::Qg3, "watch/medium/initial", "docs_per_second");
+        initial.corpus = Some(PerfCorpus::Medium);
+        initial.document_count = Some(PerfCorpus::Medium.document_count());
+        initial.threads = Some(1);
+        initial.writer_heap_bytes = Some(perf_writer_heap_bytes(1));
+        initial.positions = Some(PositionMode::On);
+        cells.push(initial);
+
         for topology in [PerfTopology::InProcess, PerfTopology::FreshProcess] {
             for metric in ["updates_per_second", "update_to_searchable_ms"] {
                 let mut cell = PerfCellSpec::new(
@@ -515,6 +524,10 @@ pub struct PerfGateArtifact {
     pub gate: PerfGate,
     pub machine_fingerprint: String,
     pub git_rev: String,
+    /// Shared identifier for the bounded candidate/rerun measurement window.
+    pub run_window: String,
+    /// Unique identifier for one pass inside the measurement window.
+    pub run_id: String,
     pub corpus_manifest_hash: String,
     pub manifest_sha256: String,
     pub cells: Vec<PerfCellResult>,
@@ -679,7 +692,7 @@ mod tests {
             4 * 4 * 2
         );
         assert_eq!(matrix.for_gate(PerfGate::Qg1).len(), 4 * 4 * 2 + 2);
-        assert_eq!(matrix.for_gate(PerfGate::Qg3).len(), 4);
+        assert_eq!(matrix.for_gate(PerfGate::Qg3).len(), 5);
         assert_eq!(matrix.for_gate(PerfGate::Qg5).len(), 3);
         assert_eq!(matrix.for_gate(PerfGate::Qg6).len(), 5 * 2 * 2);
         assert_eq!(matrix.for_gate(PerfGate::Qg8).len(), 6);
@@ -709,6 +722,8 @@ mod tests {
             gate: PerfGate::Qg1,
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             git_rev: "0123456789abcdef".to_owned(),
+            run_window: "test-window".to_owned(),
+            run_id: "candidate".to_owned(),
             corpus_manifest_hash: "a".repeat(64),
             manifest_sha256: "b".repeat(64),
             cells: vec![PerfCellResult {
@@ -723,10 +738,14 @@ mod tests {
         let json = artifact.to_json_pretty().expect("artifact JSON");
         let value: serde_json::Value = serde_json::from_str(&json).expect("decode artifact");
         for key in [
+            "schema_version",
             "gate",
             "machine_fingerprint",
             "git_rev",
+            "run_window",
+            "run_id",
             "corpus_manifest_hash",
+            "manifest_sha256",
             "cells",
             "laws_attested",
         ] {

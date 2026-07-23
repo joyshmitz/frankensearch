@@ -799,6 +799,7 @@ fn measure_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -
             tokenize_metric(context, spec)
         }
         PerfGate::Qg1 | PerfGate::Qg2 | PerfGate::Qg8 => bulk_metric(context, spec, arm),
+        PerfGate::Qg3 if spec.metric == "docs_per_second" => bulk_metric(context, spec, arm),
         PerfGate::Qg3 => watch_metric(context, spec, arm),
         PerfGate::Qg4 => commit_metric(context, spec, arm),
         PerfGate::Qg5 => compaction_metric(context, spec, arm),
@@ -1064,6 +1065,10 @@ fn bench_matrix(c: &mut Criterion) {
 
     let output_dir = output_dir();
     let revision = git_revision(scale);
+    let run_window = std::env::var("QUILL_PERF_RUN_WINDOW")
+        .unwrap_or_else(|_| format!("manual-window-{}", std::process::id()));
+    let run_id = std::env::var("QUILL_PERF_RUN_ID")
+        .unwrap_or_else(|_| format!("manual-pass-{}", std::process::id()));
     let manifest_hash = manifest_sha256();
     let corpus_hash = corpus_manifest_hash(&context, &selected);
     for (gate, cells) in by_gate {
@@ -1072,6 +1077,8 @@ fn bench_matrix(c: &mut Criterion) {
             gate,
             machine_fingerprint: machine_fingerprint(),
             git_rev: revision.clone(),
+            run_window: run_window.clone(),
+            run_id: run_id.clone(),
             corpus_manifest_hash: corpus_hash.clone(),
             manifest_sha256: manifest_hash.clone(),
             cells,

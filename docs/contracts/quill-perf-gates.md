@@ -20,13 +20,48 @@ Every gate ships `activated = false` until ALL of its pins are real: fixture com
 ```
 .bench-history/
   QG-<n>.<machine-class>.latest.json     # committed; the ratchet baseline
-  QG-<n>.<machine-class>.<date>.json     # rolling window (last 30 kept)
+  QG-<n>.<machine-class>.<date>.json     # retained run window
+  QG-<n>.unmeasured.latest.json          # explicit bootstrap quarantine
 ```
-Schema per file: `{gate, machine_fingerprint, git_rev, corpus_manifest_hash, cells: [{fixture, metric, value, cv_pct, runs}], laws_attested: bool}`. The ratchet script (quill-e8.2) refuses cells with `cv_pct >= 5` and refuses comparisons across differing `corpus_manifest_hash`.
+Schema per file: `{schema_version, gate, machine_fingerprint, git_rev,
+run_window, run_id, corpus_manifest_hash, manifest_sha256, cells: [{fixture,
+metric, engine, unit, value, p50, p95, p99, mad, cv_pct, runs}],
+laws_attested}`. Candidate and rerun share `run_window` but must have distinct
+`run_id` values. The ratchet script (quill-e8.2) refuses cells with
+`cv_pct >= 5` and refuses comparisons across differing
+`corpus_manifest_hash`.
+
+The bootstrap files contain no measurements. They make the absence of a real
+machine-class baseline visible without fabricating a number and force PR alarms
+to `Quarantine`. After a gate is activated, an otherwise-allowable full
+candidate/rerun pair may establish its first measured baseline.
+`quill-perf-ratchet` evaluates later candidates against that committed baseline
+with a directional 5% pass-over-pass threshold and a median+MAD robust z-score.
+A movement beyond 5% with robust z >= 3 is `Block`; a movement beyond 5% still
+inside the MAD band is `Quarantine`, never a silent keep. Promotion also
+requires a second artifact from the same git revision, machine fingerprint,
+corpus hash, and run window, with a distinct run ID and medians reproducing
+within 5%. Oracle drift, a null control that does not bracket 1.0, fewer than 10
+runs, `cv_pct >= 5`, incomplete cells, or an inactive gate all quarantine.
+
+Every decision JSON names and SHA-256 hashes the manifest, baseline, candidate,
+and rerun. `Allow` may update the machine-class `latest.json` and write a dated
+sibling; `Block` and `Quarantine` never change history. Older evidence is
+retained rather than automatically deleted under repository Rule 1.
+
+CI uses the same binary in two lanes:
+
+- PRs run the QG-2 smoke slice twice and raise a regression alarm against the
+  committed Ubuntu baseline.
+- The scheduled/workflow-dispatch matrix runs each QG gate in full
+  `release-perf`, measures candidate and rerun from one checkout/host/target,
+  evaluates promotion, and uploads measurements, decision, and any history
+  candidate. Since CI has read-only repository permission, an allowed history
+  update remains a reviewable artifact until committed deliberately.
 
 ## Topology honesty (QG-3/QG-4)
 
-Update→searchable and visibility claims carry topology labels per the cross-process visibility contract (`bd-quill-duel-visibility-contract`): **in-process** (delta-visible once e5.x lands) vs **fresh-process** (published-generation freshness). G1a (scalar checkpoint) has no delta: QG-4's visibility-lead clause is N/A until bet Q3 lands as a lever — the manifests encode this so nobody quotes a visibility number the architecture doesn't yet earn.
+Update→searchable and visibility claims carry topology labels per the cross-process visibility contract (`bd-quill-duel-visibility-contract`): **in-process** (delta-visible once e5.x lands) vs **fresh-process** (published-generation freshness). QG-3 also records the required initial-index throughput row; omitting that row makes the gate incomplete. G1a (scalar checkpoint) has no delta: QG-4's visibility-lead clause is N/A until bet Q3 lands as a lever — the manifests encode this so nobody quotes a visibility number the architecture doesn't yet earn.
 
 ## Cross-references
 

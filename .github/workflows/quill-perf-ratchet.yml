@@ -1,0 +1,164 @@
+name: Quill performance ratchet
+
+on:
+  pull_request:
+    paths:
+      - ".bench-history/**"
+      - ".github/workflows/quill-perf-ratchet.yml"
+      - "crates/frankensearch-lexical/**"
+      - "crates/frankensearch-quill/**"
+      - "crates/frankensearch-quill-gauntlet/**"
+      - "docs/contracts/quill-perf-gates.*"
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: quill-perf-ratchet-${{ github.event_name }}-${{ github.ref }}-${{ matrix.gate }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ratchet:
+    name: Ratchet ${{ matrix.gate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: ${{ fromJSON(github.event_name == 'pull_request' && '["QG-2"]' || '["QG-1","QG-2","QG-3","QG-4","QG-5","QG-6","QG-7","QG-8","QG-9","QG-10"]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Prepare pinned sibling dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "${GITHUB_WORKSPACE}/.." && pwd)"
+
+          clone_at() {
+            local url="$1"
+            local destination="$2"
+            local revision="$3"
+            git clone --no-checkout "${url}" "${destination}"
+            git -C "${destination}" fetch --depth 1 origin "${revision}"
+            git -C "${destination}" checkout --detach FETCH_HEAD
+          }
+
+          clone_at \
+            "https://github.com/Dicklesworthstone/asupersync.git" \
+            "${deps_dir}/asupersync" \
+            "15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          clone_at \
+            "https://github.com/Dicklesworthstone/frankensqlite.git" \
+            "${deps_dir}/frankensqlite" \
+            "5c99eeb93d789c1309d5c46a540289369ff39535"
+          clone_at \
+            "https://github.com/Dicklesworthstone/fast_cmaes.git" \
+            "${deps_dir}/fast_cmaes" \
+            "17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          find "${GITHUB_WORKSPACE}" -name Cargo.toml -exec \
+            sed -i -e "s|/data/projects/|${deps_dir}/|g" {} +
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quill-perf-ratchet-${{ matrix.gate }}
+          cache-targets: true
+
+      - name: Measure candidate and same-revision rerun
+        shell: bash
+        env:
+          QUILL_PERF_GATE: ${{ matrix.gate }}
+          QUILL_PERF_GIT_REV: ${{ github.sha }}
+          QUILL_PERF_RUNS: "10"
+          QUILL_PERF_SCALE: ${{ github.event_name == 'pull_request' && 'smoke' || 'full' }}
+          QUILL_PERF_RUN_WINDOW: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.gate }}
+        run: |
+          set -euo pipefail
+          for pass in candidate rerun; do
+            export QUILL_PERF_RUN_ID="${pass}"
+            export QUILL_PERF_OUTPUT_DIR="${GITHUB_WORKSPACE}/ci_artifacts/quill-perf/${pass}"
+            cargo bench \
+              --profile release-perf \
+              -p frankensearch-quill-gauntlet \
+              --bench perf_matrix \
+              --features perf-harness \
+              -- \
+              --noplot
+          done
+
+      - name: Evaluate committed pass-over-pass ratchet
+        id: ratchet
+        shell: bash
+        env:
+          QG_GATE: ${{ matrix.gate }}
+          QG_MODE: ${{ github.event_name == 'pull_request' && 'regression-alarm' || 'promotion' }}
+        run: |
+          set -euo pipefail
+          history=".bench-history/${QG_GATE}.github-ubuntu.latest.json"
+          if [[ ! -f "${history}" ]]; then
+            history=".bench-history/${QG_GATE}.unmeasured.latest.json"
+          fi
+
+          args=(
+            --manifest docs/contracts/quill-perf-gates.toml
+            --baseline "${history}"
+            --candidate "ci_artifacts/quill-perf/candidate/${QG_GATE}.json"
+            --rerun "ci_artifacts/quill-perf/rerun/${QG_GATE}.json"
+            --output "ci_artifacts/quill-perf/${QG_GATE}.ratchet.json"
+            --mode "${QG_MODE}"
+          )
+          if [[ "${QG_MODE}" == "promotion" ]]; then
+            args+=(
+              --promote-dir .bench-history
+              --machine-class github-ubuntu
+              --date "$(date -u +%F)"
+            )
+          fi
+
+          set +e
+          cargo run \
+            --profile release-perf \
+            -p frankensearch-quill-gauntlet \
+            --bin quill-perf-ratchet \
+            -- \
+            "${args[@]}"
+          status=$?
+          set -e
+
+          case "${status}" in
+            0)
+              echo "decision=allow" >> "${GITHUB_OUTPUT}"
+              ;;
+            1)
+              echo "decision=block" >> "${GITHUB_OUTPUT}"
+              exit 1
+              ;;
+            2)
+              echo "decision=quarantine" >> "${GITHUB_OUTPUT}"
+              echo "::warning::${QG_GATE} evidence quarantined; inspect the ratchet artifact"
+              ;;
+            *)
+              echo "ratchet invocation failed with status ${status}" >&2
+              exit "${status}"
+              ;;
+          esac
+
+      - name: Upload QG measurements, decision, and history candidate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quill-perf-${{ matrix.gate }}-${{ steps.ratchet.outputs.decision || 'error' }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ci_artifacts/quill-perf/
+            .bench-history/${{ matrix.gate }}.*.json

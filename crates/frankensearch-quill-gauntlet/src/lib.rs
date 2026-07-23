@@ -14,6 +14,7 @@ mod comparator;
 mod engine;
 mod generator;
 mod perf;
+mod perf_ratchet;
 mod runner;
 mod version_contract;
 
@@ -55,6 +56,12 @@ pub use perf::{
     PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES, PerfCellResult, PerfCellSpec,
     PerfCorpus, PerfGate, PerfGateArtifact, PerfMatrixSpec, PerfQueryClass, PerfTopology,
     PositionMode, machine_fingerprint, peak_rss_bytes, perf_writer_heap_bytes, validate_matrix,
+};
+pub use perf_ratchet::{
+    PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,
+    PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
+    PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
+    evaluate_perf_ratchet,
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CampaignCaseResult, CampaignConfig, CampaignDisposition,
