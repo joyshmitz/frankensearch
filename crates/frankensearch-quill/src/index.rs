@@ -1151,6 +1151,7 @@ struct QuillWriterState {
     pending_owned_segments: Vec<EncodedSegment>,
     pending_field_stats: BTreeMap<u16, (u64, u32)>,
     pending_manifest: Option<Manifest>,
+    pending_replacement_manifest: Option<Manifest>,
     pending_delta_seal: Option<PendingDeltaSeal>,
     unpublished_since: Option<Instant>,
 }
@@ -1443,6 +1444,7 @@ impl QuillWriterState {
             pending_owned_segments: Vec::new(),
             pending_field_stats: BTreeMap::new(),
             pending_manifest: None,
+            pending_replacement_manifest: None,
             pending_delta_seal: None,
             unpublished_since: None,
         })
@@ -1705,6 +1707,7 @@ impl QuillWriterState {
             || self.staged_flush.is_some()
             || !self.pending_segments.is_empty()
             || self.pending_manifest.is_some()
+            || self.pending_replacement_manifest.is_some()
             || self.pending_delta_seal.is_some()
     }
 
@@ -1727,6 +1730,18 @@ impl QuillWriterState {
         &mut self,
         cx: &Cx,
         documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        let replacement_ids = BTreeSet::new();
+        self.index_documents_with_replacements(cx, documents, &replacement_ids, true)
+            .await
+    }
+
+    async fn index_documents_with_replacements(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        replacement_ids: &BTreeSet<&str>,
+        allow_automatic_publication: bool,
     ) -> Result<(), QuillIndexError> {
         let ingest_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
@@ -1755,6 +1770,7 @@ impl QuillWriterState {
             if self.staged_flush.is_some()
                 || !self.pending_segments.is_empty()
                 || self.pending_manifest.is_some()
+                || (self.pending_replacement_manifest.is_some() && replacement_ids.is_empty())
             {
                 return Err(invalid_state(
                     "installed segments await MANIFEST publication; retry commit before indexing",
@@ -1806,6 +1822,7 @@ impl QuillWriterState {
                             .snapshot()
                             .resolve_document_id(&document.id)?
                             .is_some()
+                            && !replacement_ids.contains(document.id.as_str())
                     {
                         return Err(invalid_state(format!(
                             "duplicate live document id {:?}",
@@ -1860,20 +1877,24 @@ impl QuillWriterState {
                         self.flush_shard(cx, shard_id, LifecycleTrigger::ArenaBudget)
                             .await?;
                         self.shards[shard_id].current_lease_base = Some(span.lease_base);
-                        self.publish_bulk_cadence_if_due(cx).await?;
+                        if allow_automatic_publication {
+                            self.publish_bulk_cadence_if_due(cx).await?;
+                        }
                     }
                 }
                 if span_index + 1 < allocated.spans().len() {
                     self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
                         .await?;
-                    self.publish_bulk_cadence_if_due(cx).await?;
+                    if allow_automatic_publication {
+                        self.publish_bulk_cadence_if_due(cx).await?;
+                    }
                 }
             }
             debug_assert_eq!(document_index, documents.len());
             let visibility_due = self.unpublished_since.is_some_and(|started| {
                 started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
             });
-            if visibility_due {
+            if allow_automatic_publication && visibility_due {
                 self.commit_with_trigger(cx, LifecycleTrigger::VisibilityLag)
                     .await?;
             }
@@ -1949,7 +1970,10 @@ impl QuillWriterState {
         trigger: LifecycleTrigger,
     ) -> Result<(), QuillIndexError> {
         check_cancel(cx, "commit publish")?;
-        if self.pending_segments.is_empty() {
+        if self.pending_segments.is_empty()
+            && self.pending_replacement_manifest.is_none()
+            && self.pending_manifest.is_none()
+        {
             return Ok(());
         }
 
@@ -2020,6 +2044,7 @@ impl QuillWriterState {
         self.pending_owned_segments.clear();
         self.pending_field_stats.clear();
         self.pending_manifest = None;
+        self.pending_replacement_manifest = None;
         self.uncommitted_ids.clear();
         for shard in &self.shards {
             self.uncommitted_ids.extend(
@@ -2311,6 +2336,57 @@ impl QuillWriterState {
         Ok(report)
     }
 
+    async fn upsert_documents(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        check_cancel(cx, "upsert documents")?;
+        let mut manifest = self.backend.snapshot().next_manifest()?;
+        let mut replacement_ids = BTreeSet::new();
+        for document in documents {
+            check_cancel(cx, "upsert document batch")?;
+            if self
+                .backend
+                .snapshot()
+                .delete_document(&mut manifest, &document.id)?
+            {
+                replacement_ids.insert(document.id.as_str());
+            }
+        }
+        if replacement_ids.is_empty() {
+            return self.index_documents(cx, documents).await;
+        }
+        if self.has_uncommitted_changes() {
+            let message = if self.pending_replacement_manifest.is_some() {
+                "a retained replacement MANIFEST awaits commit retry"
+            } else {
+                "uncommitted changes must be committed before replacing live documents"
+            };
+            return Err(invalid_state(message));
+        }
+        if self.has_active_deltas() {
+            return Err(invalid_state(
+                "upsert documents cannot mutate a frozen process-local Delta epoch",
+            ));
+        }
+
+        self.pending_replacement_manifest = Some(manifest);
+        self.index_documents_with_replacements(cx, documents, &replacement_ids, false)
+            .await?;
+        for shard in 0..self.shards.len() {
+            self.flush_shard(cx, shard, LifecycleTrigger::ExplicitFlush)
+                .await?;
+        }
+        self.prepare_pending_manifest()?;
+        self.publish_pending_segments(cx, LifecycleTrigger::ExplicitFlush)
+            .await?;
+        if !self.config.bulk_load_mode {
+            self.apply_tier_policy(cx).await?;
+        }
+        Ok(())
+    }
+
     async fn delete_document(
         &mut self,
         cx: &Cx,
@@ -2404,7 +2480,23 @@ impl QuillWriterState {
         if self.pending_manifest.is_some() {
             return Ok(());
         }
-        let mut manifest = self.backend.snapshot().next_manifest()?;
+        let manifest = if let Some(manifest) = &self.pending_replacement_manifest {
+            manifest.clone()
+        } else {
+            self.backend.snapshot().next_manifest()?
+        };
+        self.prepare_pending_manifest_from(manifest)?;
+        self.pending_replacement_manifest = None;
+        Ok(())
+    }
+
+    fn prepare_pending_manifest_from(
+        &mut self,
+        mut manifest: Manifest,
+    ) -> Result<(), QuillIndexError> {
+        if self.pending_manifest.is_some() {
+            return Ok(());
+        }
         manifest
             .segments
             .extend(self.pending_segments.iter().cloned());
@@ -4033,21 +4125,7 @@ impl QuillIndex {
         }
 
         let mut writer = self.lock_writer(cx, "upsert writer lock").await?;
-        let mut existing_ids = Vec::new();
-        for document in documents {
-            if writer
-                .backend
-                .snapshot()
-                .resolve_document_id(&document.id)?
-                .is_some()
-            {
-                existing_ids.push(document.id.as_str());
-            }
-        }
-        if !existing_ids.is_empty() {
-            writer.delete_documents(cx, &existing_ids).await?;
-        }
-        writer.index_documents(cx, documents).await
+        writer.upsert_documents(cx, documents).await
     }
 
     /// Parse and exhaustively execute one query over the published snapshot.
@@ -7622,9 +7700,22 @@ mod tests {
             LexicalSearch::index_document(&index, &cx, &replacement)
                 .await
                 .expect("upsert replacement through lexical trait");
+            assert!(
+                LexicalSearch::search(&index, &cx, "ownership", 10)
+                    .await
+                    .expect("search removed content before explicit commit")
+                    .is_empty()
+            );
+            assert_eq!(
+                LexicalSearch::search(&index, &cx, "replacement", 10)
+                    .await
+                    .expect("search replacement before explicit commit")
+                    .len(),
+                1
+            );
             LexicalSearch::commit(&index, &cx)
                 .await
-                .expect("commit replacement");
+                .expect("no-op commit after atomic replacement");
             assert!(
                 LexicalSearch::search(&index, &cx, "ownership", 10)
                     .await
@@ -7691,7 +7782,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_trait_batch_upsert_publishes_one_tombstone_generation() {
+    fn lexical_trait_batch_upsert_publishes_one_atomic_generation() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
             let original = [
@@ -7714,19 +7805,27 @@ mod tests {
             ];
             LexicalSearch::index_documents(&index, &cx, &replacements)
                 .await
-                .expect("stage replacement batch");
+                .expect("publish replacement batch");
             assert_eq!(
                 index.segment_stats().published_generation,
                 seed_generation.saturating_add(1),
-                "one upsert batch must publish all replacement tombstones together"
+                "one upsert batch must publish tombstones and replacements together"
+            );
+            assert!(!index.has_uncommitted_changes());
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "new", 10)
+                    .expect("replacement batch is immediately searchable")
+                    .len(),
+                3
             );
 
             LexicalSearch::commit(&index, &cx)
                 .await
-                .expect("publish replacement documents");
+                .expect("commit after replacement is a no-op");
             assert_eq!(
                 index.segment_stats().published_generation,
-                seed_generation.saturating_add(2)
+                seed_generation.saturating_add(1)
             );
             assert_eq!(index.doc_count(), 3);
         });
