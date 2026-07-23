@@ -9,6 +9,13 @@
 //! ```
 
 #![allow(unsafe_code)]
+#![allow(
+    clippy::cast_ptr_alignment,
+    clippy::doc_markdown,
+    clippy::many_single_char_names,
+    clippy::semicolon_if_nothing_returned,
+    clippy::significant_drop_tightening
+)]
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};

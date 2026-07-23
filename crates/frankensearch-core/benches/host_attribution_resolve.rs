@@ -76,6 +76,8 @@ const QUERY_WORKLOADS: &[(&str, &str)] = &[
     ("unicode_edges", "\u{2003}\u{2003}search café 東京\u{2003}"),
 ];
 
+// Mirrors the shipped by-value signature — the owned-String pass is part of the A/B.
+#[allow(clippy::needless_pass_by_value)]
 fn current_sanitize_query_text(query_text: String) -> String {
     let trimmed = query_text.trim();
     if trimmed.is_empty() {

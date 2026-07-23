@@ -1,5 +1,5 @@
 //! Validates that a REOPENED on-disk index realizes the fast id-materialization
-//! path via its persisted ordinal→doc_id sidecar (written on commit, loaded on
+//! path via its persisted `ordinal→doc_id` sidecar (written on commit, loaded on
 //! open). Builds an on-disk index, commits (persists the sidecar), drops it, and
 //! reopens from the same directory — then A/Bs, on that reopened handle:
 //!

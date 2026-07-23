@@ -25,6 +25,8 @@
 //!      If rotation lifts 4-bit recall to plain-int8 levels, that is a 2×
 //!      recall-per-byte win on the bandwidth-bound flat scan.
 
+#![allow(clippy::cast_lossless, clippy::cast_possible_truncation)]
+
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -178,14 +180,11 @@ fn report_anisotropy(vectors: &[Vec<f32>], dim: usize, label: &str) {
 }
 
 fn bench_real_embed_quant(c: &mut Criterion) {
-    let slab = match std::env::var("FS_REAL_SLAB") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!(
-                "[real_embed_quant] FS_REAL_SLAB unset — skipping (generate with the potion_embed_corpus example)."
-            );
-            return;
-        }
+    let Ok(slab) = std::env::var("FS_REAL_SLAB") else {
+        eprintln!(
+            "[real_embed_quant] FS_REAL_SLAB unset — skipping (generate with the potion_embed_corpus example)."
+        );
+        return;
     };
     let dim: usize = std::env::var("FS_REAL_DIM")
         .ok()

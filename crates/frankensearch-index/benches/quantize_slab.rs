@@ -13,6 +13,8 @@
 //!   rch exec -- cargo bench -p frankensearch-index --bench quantize_slab
 //! ```
 
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::significant_drop_tightening)]
+
 use std::hint::black_box;
 use std::io::Write;
 

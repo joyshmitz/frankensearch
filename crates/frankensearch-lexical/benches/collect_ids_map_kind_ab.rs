@@ -38,8 +38,24 @@ fn xorshift(state: &mut u64) -> u64 {
 }
 
 const VOCAB: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "search", "engine",
-    "vector", "lexical", "ranking", "relevance", "document", "query", "hybrid", "fusion",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "search",
+    "engine",
+    "vector",
+    "lexical",
+    "ranking",
+    "relevance",
+    "document",
+    "query",
+    "hybrid",
+    "fusion",
 ];
 
 struct Fixture {

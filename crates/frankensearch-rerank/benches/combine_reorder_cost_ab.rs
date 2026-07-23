@@ -178,10 +178,10 @@ fn mapping_checksum(mapping: &PreparedMapping) -> usize {
 }
 
 fn resolved_indices(mapping: &PreparedMapping) -> Vec<usize> {
-    match &mapping.indices {
-        Some(indices) => indices.clone(),
-        None => (0..mapping.included_count).collect(),
-    }
+    mapping
+        .indices
+        .as_ref()
+        .map_or_else(|| (0..mapping.included_count).collect(), Clone::clone)
 }
 
 fn run_mapping(
@@ -214,7 +214,7 @@ fn bench_mapping(c: &mut Criterion) {
     group.sample_size(10);
     group.bench_with_input(BenchmarkId::new("allocating_a", 32), &all_text, |b, win| {
         b.iter(|| {
-                    black_box(run_mapping(black_box(win), prepare_mapping_allocating));
+            black_box(run_mapping(black_box(win), prepare_mapping_allocating));
         });
     });
     group.bench_with_input(BenchmarkId::new("lazy", 32), &all_text, |b, win| {
@@ -224,7 +224,7 @@ fn bench_mapping(c: &mut Criterion) {
     });
     group.bench_with_input(BenchmarkId::new("allocating_b", 32), &all_text, |b, win| {
         b.iter(|| {
-                    black_box(run_mapping(black_box(win), prepare_mapping_allocating));
+            black_box(run_mapping(black_box(win), prepare_mapping_allocating));
         });
     });
     group.finish();

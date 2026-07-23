@@ -20,10 +20,17 @@
 //!     --bench residual_mask_scan
 //! ```
 
+#![allow(
+    clippy::cast_lossless,
+    clippy::doc_markdown,
+    clippy::needless_range_loop,
+    clippy::range_plus_one
+)]
+
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use wide::{CmpLe, f32x8};
+use wide::f32x8;
 
 const N: usize = 50_000;
 const DIM: usize = 384;

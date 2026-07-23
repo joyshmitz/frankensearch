@@ -1679,6 +1679,8 @@ pub fn cass_build_preview(content: &str, max_chars: usize) -> String {
     // Byte offset just past the `max_chars`-th char, or `content.len()` if there are fewer.
     let mut cut = content.len();
     let mut count = 0usize;
+    // Pinned-oracle scan kept in its shipped shape (single `char_indices` walk).
+    #[allow(clippy::explicit_counter_loop)]
     for (byte_idx, _) in content.char_indices() {
         if count == max_chars {
             cut = byte_idx;
@@ -1728,7 +1730,7 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
 
 /// The largest char-boundary prefix of `content` that is `≤ max_bytes` bytes.
 ///
-/// The original walked `char_indices` forward from byte 0 — O(max_bytes) char decodes just to locate
+/// The original walked `char_indices` forward from byte 0 — `O(max_bytes)` char decodes just to locate
 /// the boundary near `max_bytes`. Since UTF-8 chars are ≤ 4 bytes, the largest boundary `≤ max_bytes`
 /// is at most 3 bytes below `max_bytes`, so a backward `is_char_boundary` walk finds it in **≤ 4
 /// steps** — O(1). Byte-for-byte identical result (`cass_prefix_source_matches_slow`).
@@ -2919,7 +2921,7 @@ mod cass_query_tests {
         assert_eq!(cass_build_preview("éclair", 3), "écl…");
     }
 
-    /// PARITY GATE: the ASCII-fast `cass_generate_edge_ngrams` must equal the char_indices original
+    /// PARITY GATE: the ASCII-fast `cass_generate_edge_ngrams` must equal the `char_indices` original
     /// for ASCII words (fast path), non-ASCII words (fallback), and mixed text — including the
     /// 20-char cap, short words (<3 chars → nothing), and words straddling the ASCII/Unicode split.
     #[test]
@@ -2944,7 +2946,7 @@ mod cass_query_tests {
     }
 
     /// PARITY GATE: the O(1) `cass_prefix_source` must return the byte-identical prefix as the
-    /// forward-scan original for every content/max_bytes combination — including cuts that land
+    /// forward-scan original for every `content/max_bytes` combination — including cuts that land
     /// mid-multibyte-char (must round down to the boundary), at a boundary, at 0, and past the end.
     #[test]
     fn cass_prefix_source_matches_slow() {

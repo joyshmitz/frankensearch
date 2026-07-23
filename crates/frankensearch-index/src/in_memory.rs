@@ -70,7 +70,7 @@ pub struct InMemoryVectorIndex {
     /// space as `BitsetFilter`). Lets a *selective* filtered search gather the
     /// allow-set's positions directly — `O(|allow-set|)` exact dots instead of one
     /// filter probe per corpus document (`scan_gather` vs `scan_range`). Stored as
-    /// `Option`: `None` means two doc_ids collide to the same hash, so the map is
+    /// `Option`: `None` means two `doc_ids` collide to the same hash, so the map is
     /// not a bijection and the gather fast-path is disabled (the per-document scan
     /// stays correct). Built on first selective-filter search; other callers pay
     /// neither the build nor its footprint.
@@ -110,7 +110,7 @@ fn quantize_i8_query(query: &[f32]) -> Vec<i8> {
 #[allow(clippy::cast_possible_truncation)] // round()+clamp() bounds the cast
 fn nibble_of(value: f32, scale: f32) -> u8 {
     let q = (value * scale).round().clamp(-7.0, 7.0) as i8;
-    (q as u8) & 0x0F
+    q.cast_unsigned() & 0x0F
 }
 
 /// Pack an f32 query into signed 4-bit nibbles, 2 dims/byte (low = even dim, high =
@@ -369,6 +369,10 @@ impl InMemoryVectorIndex {
     /// the exact scan uses), so **filtered** large-N searches get the int8 speedup
     /// instead of falling back to the exact scan. The result matches the exact
     /// filtered top-k whenever pass-1 retains the true filtered top-k.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` when `query.len() != dimension`.
     pub fn search_top_k_int8_two_pass_filtered(
         &self,
         query: &[f32],
@@ -436,12 +440,9 @@ impl InMemoryVectorIndex {
                 let mut cutoff = f32::NEG_INFINITY;
                 for index in start..end {
                     if let Some(f) = filter {
-                        let passed = match doc_id_hashes
+                        let passed = doc_id_hashes
                             .and_then(|h| f.matches_doc_id_hash(h[index], None))
-                        {
-                            Some(decided) => decided,
-                            None => f.matches(&self.doc_ids[index], None),
-                        };
+                            .unwrap_or_else(|| f.matches(&self.doc_ids[index], None));
                         if !passed {
                             continue;
                         }
@@ -484,6 +485,10 @@ impl InMemoryVectorIndex {
     /// `dot_packed_4bit` kernel keeps the top `k·mult`, then an exact f16 rescore
     /// selects the final top-k. 16 levels are lossless at mult≈5 on realistic
     /// clustered data; the result matches the exact top-k whenever pass-1 retains it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` when `query.len() != dimension`.
     pub fn search_top_k_4bit_two_pass(
         &self,
         query: &[f32],
@@ -497,6 +502,10 @@ impl InMemoryVectorIndex {
     /// vector by its precomputed `doc_id` hash (the same path the int8 two-pass and
     /// exact scan use), so **filtered** searches keep the 4-bit speedup. Result
     /// matches the exact filtered top-k whenever pass-1 retains the true filtered top-k.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` when `query.len() != dimension`.
     pub fn search_top_k_4bit_two_pass_filtered(
         &self,
         query: &[f32],
@@ -551,12 +560,9 @@ impl InMemoryVectorIndex {
                 let mut cutoff = f32::NEG_INFINITY;
                 for index in start..end {
                     if let Some(f) = filter {
-                        let passed = match doc_id_hashes
+                        let passed = doc_id_hashes
                             .and_then(|h| f.matches_doc_id_hash(h[index], None))
-                        {
-                            Some(decided) => decided,
-                            None => f.matches(&self.doc_ids[index], None),
-                        };
+                            .unwrap_or_else(|| f.matches(&self.doc_ids[index], None));
                         if !passed {
                             continue;
                         }
@@ -631,7 +637,7 @@ impl InMemoryVectorIndex {
     }
 
     /// Lazily-built `doc_id_hash → position` map for the selective-filter gather
-    /// fast-path. Returns `None` when two doc_ids hash to the same value (the map
+    /// fast-path. Returns `None` when two `doc_ids` hash to the same value (the map
     /// would not be a bijection, so a gather could miss a colliding position the
     /// per-document scan would visit) — callers then fall back to the full scan,
     /// preserving exact results. Built once on first selective-filter search.
@@ -825,11 +831,9 @@ impl InMemoryVectorIndex {
 
         for index in start..end {
             if let Some(f) = filter {
-                let passed = match doc_id_hashes.and_then(|h| f.matches_doc_id_hash(h[index], None))
-                {
-                    Some(decided) => decided,
-                    None => f.matches(&self.doc_ids[index], None),
-                };
+                let passed = doc_id_hashes
+                    .and_then(|h| f.matches_doc_id_hash(h[index], None))
+                    .unwrap_or_else(|| f.matches(&self.doc_ids[index], None));
                 if !passed {
                     continue;
                 }
@@ -908,12 +912,11 @@ impl InMemoryVectorIndex {
         // the f16 dot kernels use — bit-identical to the scalar `f16::to_f32`), then a
         // scalar tail for the last < 8. Mirrors the FSVI `VectorIndex::vector_at_f32`.
         let mut out = Vec::with_capacity(stored.len());
-        let mut blocks = stored.chunks_exact(8);
-        for block in &mut blocks {
-            let arr: &[f16; 8] = block.try_into().expect("chunks_exact(8) yields 8 f16");
+        let (blocks, remainder) = stored.as_chunks::<8>();
+        for arr in blocks {
             out.extend_from_slice(&crate::simd::widen8_f16_slice(arr).to_array());
         }
-        for v in blocks.remainder() {
+        for v in remainder {
             out.push(v.to_f32());
         }
         Ok(out)
@@ -1154,7 +1157,7 @@ const fn score_key(score: f32) -> f32 {
     }
 }
 
-/// Winners-count threshold above which the limit_all final sort uses a parallel
+/// Winners-count threshold above which the `limit_all` final sort uses a parallel
 /// `par_sort_unstable_by` (mirrors `search::PAR_SORT_THRESHOLD`). Below it, rayon's
 /// spawn/merge overhead is not amortized for the cheap `compare_best_first`.
 const PAR_SORT_THRESHOLD: usize = 16_384;

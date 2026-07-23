@@ -20,6 +20,12 @@
 //!   rch exec -- cargo bench -p frankensearch-index --profile release --bench f16_slab_quantize
 //! ```
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::chunks_exact_to_as_chunks,
+    clippy::inline_always
+)]
+
 use std::hint::black_box;
 use std::time::Duration;
 

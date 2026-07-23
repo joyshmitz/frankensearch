@@ -26,6 +26,14 @@
 //!     --bench adsampling_transposed_scan
 //! ```
 
+#![allow(
+    clippy::cast_lossless,
+    clippy::doc_markdown,
+    clippy::float_cmp,
+    clippy::needless_range_loop,
+    clippy::range_plus_one
+)]
+
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};

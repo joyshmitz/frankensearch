@@ -157,6 +157,7 @@ pub fn dot_product_f32_f32(a: &[f32], b: &[f32]) -> SearchResult<f32> {
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::many_single_char_names)] // a/b lane/pointer names are idiomatic kernel style
 unsafe fn dot_product_f32_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::{
         _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
@@ -250,6 +251,7 @@ pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
 #[target_feature(enable = "avx2,f16c")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_product_f16_f32_avx2(stored: &[f16], query: &[f32]) -> f32 {
     use core::arch::x86_64::{
         __m128i, _mm_loadu_si128, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps,
@@ -392,6 +394,7 @@ pub fn dot_product_f16_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
 #[target_feature(enable = "avx2,f16c")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_product_f16_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> f32 {
     use core::arch::x86_64::{
         __m128i, _mm_loadu_si128, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps,
@@ -455,6 +458,7 @@ unsafe fn dot_product_f16_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> 
 #[target_feature(enable = "avx2,f16c,fma")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_product_f16_bytes_f32_fma_avx2(stored_bytes: &[u8], query: &[f32]) -> f32 {
     use core::arch::x86_64::{
         __m128i, _mm_loadu_si128, _mm256_add_ps, _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
@@ -608,6 +612,7 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_product_f32_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> f32 {
     use core::arch::x86_64::{
         _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
@@ -820,6 +825,7 @@ fn dot_i8x4_i8_generic(stored_rows: &[i8], query: &[i8]) -> [i32; 4] {
 #[target_feature(enable = "avx2")]
 #[inline(never)]
 #[allow(unsafe_code)]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_i8x4_i8_avx2(stored_rows: &[i8], query: &[i8]) -> [i32; 4] {
     use core::arch::x86_64::{
         __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
@@ -906,6 +912,7 @@ unsafe fn dot_i8x4_i8_avx2(stored_rows: &[i8], query: &[i8]) -> [i32; 4] {
 #[target_feature(enable = "avx2")]
 #[inline(never)]
 #[allow(unsafe_code)]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_i8x4_i8_avx2_maddubs(stored_rows: &[i8], query: &[i8], q_bias128: i32) -> [i32; 4] {
     use core::arch::x86_64::{
         __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
@@ -932,7 +939,7 @@ unsafe fn dot_i8x4_i8_avx2_maddubs(stored_rows: &[i8], query: &[i8], q_bias128: 
     // are within the four-row slice. Scalar tail accumulates in the u8 domain (see single-row).
     unsafe {
         let ones = _mm256_set1_epi16(1);
-        let flip = _mm256_set1_epi8(0x80_u8 as i8);
+        let flip = _mm256_set1_epi8(0x80_u8.cast_signed());
         let query_ptr = query.as_ptr();
         let stored_ptr = stored_rows.as_ptr();
         let mut acc0 = _mm256_setzero_si256();
@@ -1015,6 +1022,7 @@ pub fn dot_i8x4_i8_maddubs(stored_rows: &[i8], query: &[i8], q_bias128: i32) -> 
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_i8_i8_avx2(stored: &[i8], query: &[i8]) -> i32 {
     use core::arch::x86_64::{
         __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
@@ -1057,7 +1065,7 @@ unsafe fn dot_i8_i8_avx2(stored: &[i8], query: &[i8]) -> i32 {
     }
 }
 
-/// Fixed-shape AVX2 i8 dot for the production MiniLM dimension. Expanding the
+/// Fixed-shape AVX2 i8 dot for the production `MiniLM` dimension. Expanding the
 /// twelve 32-byte blocks removes the dynamic length, loop control, and scalar
 /// tail from every corpus-vector score while retaining the shipped two-lane
 /// accumulation and exact integer reduction tree.
@@ -1069,6 +1077,7 @@ unsafe fn dot_i8_i8_avx2(stored: &[i8], query: &[i8]) -> i32 {
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_i8_i8_avx2_384(stored: &[i8], query: &[i8]) -> i32 {
     use core::arch::x86_64::{
         __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
@@ -1142,6 +1151,8 @@ unsafe fn dot_i8_i8_avx2_384(stored: &[i8], query: &[i8]) -> i32 {
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
+#[allow(clippy::many_single_char_names)] // s/q/u lane names are idiomatic kernel style
 unsafe fn dot_i8_i8_avx2_maddubs(stored: &[i8], query: &[i8], q_bias128: i32) -> i32 {
     use core::arch::x86_64::{
         __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
@@ -1154,7 +1165,7 @@ unsafe fn dot_i8_i8_avx2_maddubs(stored: &[i8], query: &[i8], q_bias128: i32) ->
     // scalar tail covers `n % 32`. `q_bias128 = 128·Σ q_i` is supplied over the same `n`.
     unsafe {
         let ones = _mm256_set1_epi16(1);
-        let flip = _mm256_set1_epi8(0x80_u8 as i8);
+        let flip = _mm256_set1_epi8(0x80_u8.cast_signed());
         let mut acc0 = _mm256_setzero_si256();
         let mut acc1 = _mm256_setzero_si256();
         let mut i = 0_usize;
@@ -1251,11 +1262,9 @@ pub fn dot_i8_i8_generic(stored: &[i8], query: &[i8]) -> i32 {
     let mut acc2 = i32x8::splat(0);
     let mut acc3 = i32x8::splat(0);
 
-    let mut s32 = stored.chunks_exact(32);
-    let mut q32 = query.chunks_exact(32);
-    for (sc, qc) in s32.by_ref().zip(q32.by_ref()) {
-        let s: &[i8; 32] = sc.try_into().expect("chunks_exact(32)");
-        let q: &[i8; 32] = qc.try_into().expect("chunks_exact(32)");
+    let (s32, s_rem32) = stored.as_chunks::<32>();
+    let (q32, q_rem32) = query.as_chunks::<32>();
+    for (s, q) in s32.iter().zip(q32) {
         acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
         acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
         acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
@@ -1264,15 +1273,13 @@ pub fn dot_i8_i8_generic(stored: &[i8], query: &[i8]) -> i32 {
     let mut sum = (acc0 + acc1) + (acc2 + acc3);
 
     // Tail: remaining full 8-chunks, then a scalar remainder.
-    let mut s8 = s32.remainder().chunks_exact(8);
-    let mut q8 = q32.remainder().chunks_exact(8);
-    for (sc, qc) in s8.by_ref().zip(q8.by_ref()) {
-        let s: &[i8; 8] = sc.try_into().expect("chunks_exact(8)");
-        let q: &[i8; 8] = qc.try_into().expect("chunks_exact(8)");
+    let (s8, s_rem) = s_rem32.as_chunks::<8>();
+    let (q8, q_rem) = q_rem32.as_chunks::<8>();
+    for (s, q) in s8.iter().zip(q8) {
         sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
     }
     let mut result = sum.reduce_add();
-    for (s, q) in s8.remainder().iter().zip(q8.remainder()) {
+    for (s, q) in s_rem.iter().zip(q_rem) {
         result += i32::from(*s) * i32::from(*q);
     }
     result
@@ -1281,17 +1288,19 @@ pub fn dot_i8_i8_generic(stored: &[i8], query: &[i8]) -> i32 {
 /// Sign-extend the low nibble of a packed byte (4-bit two's complement → i8).
 #[inline(always)]
 fn nibble_lo(b: u8) -> i32 {
-    i32::from((((b & 0x0F) ^ 0x08) as i8) - 8)
+    i32::from(((b & 0x0F) ^ 0x08).cast_signed() - 8)
 }
 
 /// Sign-extend the high nibble of a packed byte (4-bit two's complement → i8).
 #[inline(always)]
 fn nibble_hi(b: u8) -> i32 {
-    i32::from((((b >> 4) ^ 0x08) as i8) - 8)
+    i32::from(((b >> 4) ^ 0x08).cast_signed() - 8)
 }
 
 /// A query pre-unpacked into per-16-byte-chunk sign-extended low/high nibble lanes
-/// (+ a scalar tail), so the query nibbles are decoded **once** rather than for
+/// (+ a scalar tail).
+///
+/// The query nibbles are decoded **once** rather than for
 /// every stored vector in a scan. See [`prepare_4bit_query`] / [`dot_4bit_prepared`].
 pub struct PreparedQuery4bit {
     low: Vec<i16x16>,
@@ -1302,21 +1311,22 @@ pub struct PreparedQuery4bit {
 const FOUR_BIT_DIM384_BYTES: usize = 384 / 2;
 const FOUR_BIT_DIM384_CHUNKS: usize = FOUR_BIT_DIM384_BYTES / 16;
 
-/// Pre-unpack a packed 4-bit query (the loop-invariant operand of a scan). For each
+/// Pre-unpack a packed 4-bit query (the loop-invariant operand of a scan).
+///
+/// For each
 /// 16-byte chunk, store the sign-extended low/high nibble lanes (`i16x16`); the
 /// remainder bytes go to a scalar `(low, high)` tail.
+#[must_use]
 pub fn prepare_4bit_query(query: &[u8]) -> PreparedQuery4bit {
-    let mut chunks = query.chunks_exact(16);
+    let (chunks, remainder) = query.as_chunks::<16>();
     let mut low = Vec::with_capacity(query.len() / 16);
     let mut high = Vec::with_capacity(query.len() / 16);
-    for qc in chunks.by_ref() {
-        let qa: [u8; 16] = qc.try_into().expect("chunks_exact(16)");
-        let q = i16x16::from_i8x16(i8x16::from(qa.map(|b| b as i8)));
+    for qa in chunks {
+        let q = i16x16::from_i8x16(i8x16::from(qa.map(u8::cast_signed)));
         low.push((q << 12_i32) >> 12_i32);
         high.push((q << 8_i32) >> 12_i32);
     }
-    let tail = chunks
-        .remainder()
+    let tail = remainder
         .iter()
         .map(|&b| (nibble_lo(b), nibble_hi(b)))
         .collect();
@@ -1324,12 +1334,14 @@ pub fn prepare_4bit_query(query: &[u8]) -> PreparedQuery4bit {
 }
 
 /// Dot product of a packed 4-bit `stored` vector against a [`PreparedQuery4bit`].
+///
 /// The stored nibbles are decoded per call; the query was decoded once. Result is
 /// exact (per-dim products ≤ 49). Identical to `dot_packed_4bit(stored, query)`.
 ///
 /// SIMD: load 16 packed bytes → `i16x16`, extract nibbles via arithmetic
 /// `(x<<12)>>12` / `(x<<8)>>12`, multiply by the prepared query lanes, and
 /// accumulate vertically (flushing before any `i16` lane can overflow).
+#[must_use]
 pub fn dot_4bit_prepared(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1381,6 +1393,7 @@ pub fn dot_4bit_prepared_dynamic(stored: &[u8], query: &PreparedQuery4bit) -> i3
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_4bit_prepared_avx2(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     use core::arch::x86_64::{
         __m128i, __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
@@ -1433,7 +1446,7 @@ unsafe fn dot_4bit_prepared_avx2(stored: &[u8], query: &PreparedQuery4bit) -> i3
     sum
 }
 
-/// Fixed-shape AVX2 prepared 4-bit dot for the production MiniLM dimension.
+/// Fixed-shape AVX2 prepared 4-bit dot for the production `MiniLM` dimension.
 /// Twelve expanded packed chunks fit in one vertical `i16` accumulator, so the
 /// dynamic loop/flush/tail machinery disappears while the reduction tree stays
 /// identical to [`dot_4bit_prepared_avx2`].
@@ -1445,6 +1458,7 @@ unsafe fn dot_4bit_prepared_avx2(stored: &[u8], query: &PreparedQuery4bit) -> i3
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 #[must_use]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn dot_4bit_prepared_avx2_384(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     use core::arch::x86_64::{
         __m128i, __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
@@ -1504,10 +1518,9 @@ pub fn dot_4bit_prepared_generic(stored: &[u8], query: &PreparedQuery4bit) -> i3
     let mut sum = 0_i32;
     let mut acc = i16x16::splat(0);
     let mut pending = 0_usize;
-    let mut s16 = stored.chunks_exact(16);
-    for (sc, (q_low, q_high)) in s16.by_ref().zip(query.low.iter().zip(&query.high)) {
-        let sa: [u8; 16] = sc.try_into().expect("chunks_exact(16)");
-        let s = i16x16::from_i8x16(i8x16::from(sa.map(|b| b as i8)));
+    let (s16, s_rem) = stored.as_chunks::<16>();
+    for (sa, (q_low, q_high)) in s16.iter().zip(query.low.iter().zip(&query.high)) {
+        let s = i16x16::from_i8x16(i8x16::from(sa.map(u8::cast_signed)));
         let s_low = (s << 12_i32) >> 12_i32;
         let s_high = (s << 8_i32) >> 12_i32;
         acc += s_low * *q_low + s_high * *q_high;
@@ -1519,17 +1532,20 @@ pub fn dot_4bit_prepared_generic(stored: &[u8], query: &PreparedQuery4bit) -> i3
         }
     }
     sum += i32::from(acc.reduce_add());
-    for (sb, &(qlo, qhi)) in s16.remainder().iter().zip(&query.tail) {
+    for (sb, &(qlo, qhi)) in s_rem.iter().zip(&query.tail) {
         sum += nibble_lo(*sb) * qlo + nibble_hi(*sb) * qhi;
     }
     sum
 }
 
-/// Dot product of two vectors stored as packed signed 4-bit nibbles: 2 dims per
+/// Dot product of two vectors stored as packed signed 4-bit nibbles.
+///
+/// Layout: 2 dims per
 /// byte, low nibble = even dim, high nibble = odd dim, each a 4-bit two's
 /// complement in `[-7, 7]`. `stored` and `query` must have equal packed length.
 /// Result is exact (per-dim products ≤ 49). For a scan over many stored vectors,
 /// prefer [`prepare_4bit_query`] + [`dot_4bit_prepared`] to decode the query once.
+#[must_use]
 pub fn dot_packed_4bit(stored: &[u8], query: &[u8]) -> i32 {
     dot_4bit_prepared(stored, &prepare_4bit_query(query))
 }
@@ -1544,11 +1560,9 @@ pub fn dot_product_f32_f32_generic(a: &[f32], b: &[f32]) -> f32 {
     let mut acc2 = f32x8::splat(0.0);
     let mut acc3 = f32x8::splat(0.0);
 
-    let mut a32 = a.chunks_exact(32);
-    let mut b32 = b.chunks_exact(32);
-    for (a_chunk, b_chunk) in a32.by_ref().zip(b32.by_ref()) {
-        let a_block: &[f32; 32] = a_chunk.try_into().expect("chunks_exact(32)");
-        let b_block: &[f32; 32] = b_chunk.try_into().expect("chunks_exact(32)");
+    let (a32, a_rem32) = a.as_chunks::<32>();
+    let (b32, b_rem32) = b.as_chunks::<32>();
+    for (a_block, b_block) in a32.iter().zip(b32) {
         acc0 += load8_f32::<0>(a_block) * load8_f32::<0>(b_block);
         acc1 += load8_f32::<8>(a_block) * load8_f32::<8>(b_block);
         acc2 += load8_f32::<16>(a_block) * load8_f32::<16>(b_block);
@@ -1556,17 +1570,15 @@ pub fn dot_product_f32_f32_generic(a: &[f32], b: &[f32]) -> f32 {
     }
 
     let mut sum = (acc0 + acc1) + (acc2 + acc3);
-    let mut a8 = a32.remainder().chunks_exact(8);
-    let mut b8 = b32.remainder().chunks_exact(8);
+    let (a8, a_rem) = a_rem32.as_chunks::<8>();
+    let (b8, b_rem) = b_rem32.as_chunks::<8>();
 
-    for (a_chunk, b_chunk) in a8.by_ref().zip(b8.by_ref()) {
-        let a_block: &[f32; 8] = a_chunk.try_into().expect("chunks_exact(8)");
-        let b_block: &[f32; 8] = b_chunk.try_into().expect("chunks_exact(8)");
+    for (a_block, b_block) in a8.iter().zip(b8) {
         sum += f32x8::from(*a_block) * f32x8::from(*b_block);
     }
 
     let mut result = sum.reduce_add();
-    for (x, y) in a8.remainder().iter().zip(b8.remainder()) {
+    for (x, y) in a_rem.iter().zip(b_rem) {
         result += x * y;
     }
     result
@@ -1580,7 +1592,9 @@ const fn ensure_same_len(expected: usize, found: usize) -> SearchResult<()> {
 }
 
 /// Quantize an f16 slab to int8 with one corpus-wide max-abs scale (the lazy int8
-/// ADC slab build). Runtime-dispatches to an AVX2+F16C kernel when available: the
+/// ADC slab build).
+///
+/// Runtime-dispatches to an AVX2+F16C kernel when available: the
 /// build is **decode-bound** (`f16::to_f32` is software, run twice — once for
 /// max-abs, once to quantize) and `round` is a per-element scalar op, both of which
 /// `vcvtph2ps` + vector round crush. Falls back to the portable scalar kernel.
@@ -1848,8 +1862,8 @@ pub fn quantize_f16_slab_to_i8_generic(vectors_f16: &[f16]) -> Vec<i8> {
 #[must_use]
 pub fn quantize_f16_le_bytes_to_i8_generic(bytes: &[u8]) -> Vec<i8> {
     let mut max_abs = 0.0_f32;
-    for chunk in bytes.chunks_exact(2) {
-        let value = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32().abs();
+    for chunk in bytes.as_chunks::<2>().0 {
+        let value = f16::from_le_bytes(*chunk).to_f32().abs();
         max_abs = max_abs.max(value);
     }
     if max_abs <= 0.0 {
@@ -1857,10 +1871,12 @@ pub fn quantize_f16_le_bytes_to_i8_generic(bytes: &[u8]) -> Vec<i8> {
     }
     let scale = 127.0 / max_abs;
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             #[allow(clippy::cast_possible_truncation)]
-            let q = (f16::from_le_bytes([chunk[0], chunk[1]]).to_f32() * scale)
+            let q = (f16::from_le_bytes(*chunk).to_f32() * scale)
                 .round()
                 .clamp(-127.0, 127.0) as i8;
             q
@@ -1874,7 +1890,7 @@ pub fn quantize_f16_le_bytes_to_i8_generic(bytes: &[u8]) -> Vec<i8> {
 fn nibble_of_4bit(value: f32, scale: f32) -> u8 {
     #[allow(clippy::cast_possible_truncation)]
     let q = (value * scale).round().clamp(-7.0, 7.0) as i8;
-    (q as u8) & 0x0F
+    q.cast_unsigned() & 0x0F
 }
 
 /// Pack a contiguous little-endian f16 byte slab into signed 4-bit nibbles with
@@ -1930,7 +1946,9 @@ pub fn pack_f16_le_bytes_to_4bit_explicit_round(bytes: &[u8], dim: usize) -> Vec
 }
 
 /// Pack a contiguous f16 slab (`count·dim`) into signed 4-bit nibbles (2 dims/byte,
-/// `dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale — the lazy
+/// `dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale.
+///
+/// This is the lazy
 /// 4-bit ADC slab build (the **wired-default** two-pass pass-1 storage). Like the
 /// int8 slab, it is decode-bound; runtime-dispatches to AVX2+F16C when available.
 #[must_use]
@@ -2218,7 +2236,9 @@ pub fn pack_f16_slab_to_4bit_generic(vectors_f16: &[f16], dim: usize) -> Vec<u8>
 
 /// Encode an f32 slice to f16, appending to `dst` — the per-element `f32→f16`
 /// conversion at the heart of every index build (`InMemoryVectorIndex::from_vectors`,
-/// FSVI writes). Runtime-dispatches to F16C `vcvtps2ph` (8 f16/instruction) when
+/// FSVI writes).
+///
+/// Runtime-dispatches to F16C `vcvtps2ph` (8 f16/instruction) when
 /// available; the software `half::f16::from_f32` is the fallback.
 pub fn encode_f32_to_f16_extend(src: &[f32], dst: &mut Vec<f16>) {
     #[cfg(target_arch = "x86_64")]
@@ -2245,6 +2265,7 @@ pub fn encode_f32_to_f16_extend(src: &[f32], dst: &mut Vec<f16>) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
 #[allow(unsafe_code)]
+#[allow(clippy::cast_ptr_alignment)] // unaligned loadu/storeu intrinsics
 unsafe fn encode_f32_to_f16_extend_avx2(src: &[f32], dst: &mut Vec<f16>) {
     use core::arch::x86_64::{
         __m128i, _MM_FROUND_TO_NEAREST_INT, _mm_storeu_si128, _mm256_cvtps_ph, _mm256_loadu_ps,
@@ -2266,8 +2287,8 @@ unsafe fn encode_f32_to_f16_extend_avx2(src: &[f32], dst: &mut Vec<f16>) {
             let h = _mm256_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT }>(x);
             _mm_storeu_si128(out.add(c * 8).cast::<__m128i>(), h);
         }
-        for i in (chunks * 8)..n {
-            *out.add(i) = f16::from_f32(src[i]).to_bits();
+        for (i, &v) in src.iter().enumerate().skip(chunks * 8) {
+            *out.add(i) = f16::from_f32(v).to_bits();
         }
         dst.set_len(base + n);
     }
@@ -2775,10 +2796,10 @@ mod tests {
     #[test]
     fn dot_packed_4bit_matches_scalar() {
         fn lo(b: u8) -> i32 {
-            i32::from((((b & 0x0F) ^ 0x08) as i8) - 8)
+            i32::from(((b & 0x0F) ^ 0x08).cast_signed() - 8)
         }
         fn hi(b: u8) -> i32 {
-            i32::from((((b >> 4) ^ 0x08) as i8) - 8)
+            i32::from(((b >> 4) ^ 0x08).cast_signed() - 8)
         }
         fn scalar(s: &[u8], q: &[u8]) -> i32 {
             s.iter()
@@ -2788,8 +2809,12 @@ mod tests {
         }
         // Lengths exercising the 16-wide loop, a partial tail, and extremes.
         for len in [0_usize, 1, 5, 15, 16, 17, 32, 33, 192, 193] {
-            let s: Vec<u8> = (0..len).map(|i| ((i * 37 + 11) % 256) as u8).collect();
-            let q: Vec<u8> = (0..len).map(|i| ((i * 53 + 7) % 256) as u8).collect();
+            let s: Vec<u8> = (0..len)
+                .map(|i| u8::try_from((i * 37 + 11) % 256).expect("bounded by % 256"))
+                .collect();
+            let q: Vec<u8> = (0..len)
+                .map(|i| u8::try_from((i * 53 + 7) % 256).expect("bounded by % 256"))
+                .collect();
             assert_eq!(dot_packed_4bit(&s, &q), scalar(&s, &q), "len={len}");
             let prepared = prepare_4bit_query(&q);
             assert_eq!(
@@ -3219,6 +3244,7 @@ mod tests {
     // ── vpmaddubs approximate int8 dot (bd-b5wl) ────────────────────────────
 
     /// Deterministic int8 vectors with a bounded magnitude (no RNG in tests).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // bounded xorshift fixture
     fn i8_vec(n: usize, seed: u64, bound: i32) -> Vec<i8> {
         let mut s = seed | 1;
         (0..n)
@@ -3303,10 +3329,10 @@ mod tests {
     /// realistic f16 corpus.
     #[test]
     fn fma_f16_dot_is_ulp_close_and_order_preserving() {
-        let dim = 384;
+        let dim = 384_u64;
         let query: Vec<f32> = {
             let mut v: Vec<f32> = (0..dim)
-                .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 40) as f32 / 1e6 - 0.5)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 40) as f32 / 1e6 - 0.5)
                 .collect();
             let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
             for x in &mut v {
@@ -3367,9 +3393,9 @@ mod tests {
             let query = i8_vec(dim, 0xCAFE, 40);
             let bias = maddubs_query_bias(&query, dim);
             let mut rows = Vec::with_capacity(dim * 4);
-            let singles: Vec<i32> = (0..4)
+            let singles: Vec<i32> = (0..4_u64)
                 .map(|r| {
-                    let row = i8_vec(dim, 0x3000 + r as u64, 40);
+                    let row = i8_vec(dim, 0x3000 + r, 40);
                     let s = dot_i8_i8_maddubs(&row, &query, bias);
                     rows.extend_from_slice(&row);
                     s
@@ -3381,6 +3407,7 @@ mod tests {
     }
 
     /// A deterministic pseudo-normalized f32 vector (models an embedding). No RNG.
+    #[allow(clippy::cast_possible_truncation)] // intended f64→f32 rounding of a unit sample
     fn norm_f32(dim: usize, seed: u64) -> Vec<f32> {
         let mut s = seed | 1;
         let mut v: Vec<f32> = (0..dim)

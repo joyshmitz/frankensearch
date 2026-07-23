@@ -118,6 +118,8 @@ fn former_cached_index_filtered<'a>(
         .collect()
 }
 
+// Criterion groups intentionally own their reporting state across all registrations.
+#[allow(clippy::significant_drop_tightening)]
 fn bench_palette_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("palette_filter");
     group.warm_up_time(Duration::from_millis(100));

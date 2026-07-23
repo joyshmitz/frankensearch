@@ -27,6 +27,12 @@
 //!     --bench cluster_ordered_scan
 //! ```
 
+#![allow(
+    clippy::cast_lossless,
+    clippy::needless_range_loop,
+    clippy::range_plus_one
+)]
+
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};

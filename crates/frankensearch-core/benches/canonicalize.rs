@@ -64,6 +64,8 @@ fn filter_new(text: &str) -> bool {
 }
 
 /// Old `strip_markdown_line` inline chain: 4 allocating no-op passes per line.
+// Mirrors the shipped chain pass-for-pass; collapsing would change the measured work.
+#[allow(clippy::collapsible_str_replace)]
 fn md_old(line: &str) -> String {
     line.replace("**", "")
         .replace("__", "")
@@ -72,6 +74,8 @@ fn md_old(line: &str) -> String {
 }
 
 /// New: skip the chain entirely when the line has no inline-markdown chars.
+// Mirrors the shipped chain pass-for-pass; collapsing would change the measured work.
+#[allow(clippy::collapsible_str_replace)]
 fn md_new(line: &str) -> String {
     if line.bytes().any(|b| matches!(b, b'*' | b'_' | b'`' | b'[')) {
         line.replace("**", "")
@@ -83,6 +87,8 @@ fn md_new(line: &str) -> String {
     }
 }
 
+// Criterion groups intentionally own their reporting state across all registrations.
+#[allow(clippy::significant_drop_tightening)]
 fn bench_nfc(c: &mut Criterion) {
     #[cfg(feature = "bench-internals")]
     {
@@ -348,7 +354,7 @@ fn bench_nfc(c: &mut Criterion) {
         line.replace("__", "") // only the `_`-triggered replace runs
     }
     let snake_lines = "let retry_count = compute_value(self_ref, max_retries_allowed);"
-        .repeat(1)
+        .to_string()
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();

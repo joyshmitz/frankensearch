@@ -338,11 +338,21 @@ Ordinary Q1 concat re-emits entries in posting-block order. It preserves
 term POSTINGS byte lengths to `block_offset`. It never synthesizes a seam entry
 or recomputes a bound. Fresh seal derives POSTINGS and BLOCKMAX from the same
 source-block pass before the written POSTINGS self-validation; deep compaction
-is the re-encoding path.
+is not required for ordinary merging. Tombstone-folding compaction is the
+current re-encoding path; survivor renumbering remains reserved as described
+below.
 
 ### 5.5 DOCLEN
 
 Per field with `Text`/`Keyword` indexing: `doc_count_span = docid_hi - docid_lo` fieldnorm bytes, direct-indexed by `docid - docid_lo`. **Holes:** positions for docids absent from the segment (burned/tombstone-folded) hold canonical byte `0x00`. Every u8, including `0x00` and `0xFF`, is a valid fieldnorm for a present document, so readers must derive presence from IDMAP/postings membership and never from the DOCLEN byte. Cursors only score present docids. Post-compaction segments keep positional indexing with holes; space overhead is bounded by the compaction-density threshold.
+
+Ordinary tombstone-folding compaction preserves the source segment's
+`[docid_lo, docid_hi)` range and every surviving global docid; it only turns
+deleted rows into canonical holes. Renumbering survivors is reserved solely as
+a future u32-docid-exhaustion escape hatch. No current writer, reader, or public
+compaction policy implements that deep-compaction operation; introducing it
+requires an explicit format/version decision rather than silently extending
+ordinary compaction.
 
 Field order: ascending `field_ord`; each field's array is 64-aligned within the section; a small directory (`field_count × {field_ord: u16, offset: u32}`) heads the section.
 

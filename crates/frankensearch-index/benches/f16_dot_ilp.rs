@@ -20,6 +20,11 @@
 //! ```
 
 #![allow(unsafe_code)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_ptr_alignment,
+    clippy::unreadable_literal
+)]
 
 use std::hint::black_box;
 use std::time::Duration;

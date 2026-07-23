@@ -2294,7 +2294,7 @@ mod tests {
         assert_eq!(result.chars().count(), 2);
     }
 
-    /// BYTE-IDENTITY GATE: the O(max_chars) `truncate_chars` must equal the former
+    /// BYTE-IDENTITY GATE: the `O(max_chars)` `truncate_chars` must equal the former
     /// `chars().count()`+`take` implementation for every input — within/at/over the limit, ASCII,
     /// multibyte, combining marks, empty, and `max_chars == 0`.
     #[test]

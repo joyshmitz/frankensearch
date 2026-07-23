@@ -102,7 +102,9 @@ pub fn mean_recall_lower_bound(recalls: &[f64], delta: f64) -> f64 {
 }
 
 /// Empirical-**Bernstein** lower confidence bound on the mean recall (Maurer &
-/// Pontil, 2009). Like [`mean_recall_lower_bound`] it certifies `E[recall] ≥ L`
+/// Pontil, 2009).
+///
+/// Like [`mean_recall_lower_bound`] it certifies `E[recall] ≥ L`
 /// w.p. `≥ 1 − delta` for bounded `[0,1]` variables with no distributional
 /// assumptions — but it uses the *sample variance*, so it is substantially tighter
 /// than Hoeffding when the per-query recall variance is small (the usual case:
@@ -154,7 +156,7 @@ pub struct CertifiedEf {
 ///
 /// `calibration` pairs each candidate `ef_search` with its measured per-query
 /// recall sample. Returns the smallest `ef` for which
-/// [`conformal_recall_lower_bound`]`(recalls, alpha) ≥ target` (cheapest ANN that
+/// <code>[conformal_recall_lower_bound](recalls, alpha) ≥ target</code> (cheapest ANN that
 /// is *certified* to hit the budget). If none qualifies, returns the candidate with
 /// the highest certified bound and `meets_target = false`, so the caller always
 /// learns the best certifiable option instead of silently trusting a guess. Returns
@@ -180,10 +182,7 @@ pub fn certified_min_ef(
             return Some(candidate);
         }
         // Track the best-certifiable fallback (highest bound).
-        let better = match best {
-            Some(b) => bound > b.certified_recall,
-            None => true,
-        };
+        let better = best.is_none_or(|b| bound > b.certified_recall);
         if better {
             best = Some(candidate);
         }
@@ -191,7 +190,9 @@ pub fn certified_min_ef(
     best
 }
 
-/// Mean-recall variant of [`certified_min_ef`]: the cheapest `ef` whose certified
+/// Mean-recall variant of [`certified_min_ef`].
+///
+/// Selects the cheapest `ef` whose certified
 /// **mean** recall (empirical-Bernstein lower bound, [`mean_recall_lower_bound_bernstein`])
 /// meets `target` at confidence `1 − delta`.
 ///
@@ -220,10 +221,7 @@ pub fn certified_min_ef_mean(
         if candidate.meets_target {
             return Some(candidate);
         }
-        let better = match best {
-            Some(b) => bound > b.certified_recall,
-            None => true,
-        };
+        let better = best.is_none_or(|b| bound > b.certified_recall);
         if better {
             best = Some(candidate);
         }
@@ -285,10 +283,7 @@ pub fn calibrate_certified_ef(
                 sweep,
             });
         }
-        let better = match best {
-            Some(b) => bound > b.certified_recall,
-            None => true,
-        };
+        let better = best.is_none_or(|b| bound > b.certified_recall);
         if better {
             best = Some(candidate);
         }
@@ -318,6 +313,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // exact 0.0 sentinel returns are intended
     fn conformal_bound_is_trivial_when_sample_too_small() {
         // alpha=0.05, n=10 -> floor(0.05*11)=0 -> cannot certify > 0.
         let recalls = vec![0.9; 10];
@@ -377,7 +373,7 @@ mod tests {
             }
         }
         #[allow(clippy::cast_precision_loss)]
-        let miss_rate = misses as f64 / trials as f64;
+        let miss_rate = misses as f64 / f64::from(trials);
         // Finite-sample guarantee: miss rate <= alpha in expectation. Allow a small
         // Monte-Carlo slack (3 s.e. ~ 0.014 at these sizes).
         assert!(
@@ -402,7 +398,7 @@ mod tests {
         let delta = 0.05;
         let n = 300;
         let trials = 3000;
-        let mut lcg = Lcg(0xc0ffee);
+        let mut lcg = Lcg(0x00c0_ffee);
         let true_mean = 0.9;
         let mut misses = 0usize;
         for _ in 0..trials {
@@ -415,7 +411,7 @@ mod tests {
             }
         }
         #[allow(clippy::cast_precision_loss)]
-        let miss_rate = misses as f64 / trials as f64;
+        let miss_rate = misses as f64 / f64::from(trials);
         assert!(
             miss_rate <= delta,
             "mean LCB coverage violated: {miss_rate:.4} > {delta}"
@@ -429,7 +425,7 @@ mod tests {
         let delta = 0.05;
         let n = 300;
         let trials = 3000;
-        let mut lcg = Lcg(0xb0bb1e);
+        let mut lcg = Lcg(0x00b0_bb1e);
         let true_mean = 0.97;
         let mut misses = 0usize;
         for _ in 0..trials {
@@ -442,7 +438,7 @@ mod tests {
             }
         }
         #[allow(clippy::cast_precision_loss)]
-        let miss_rate = misses as f64 / trials as f64;
+        let miss_rate = misses as f64 / f64::from(trials);
         assert!(
             miss_rate <= delta,
             "Bernstein LCB coverage violated: {miss_rate:.4} > {delta}"

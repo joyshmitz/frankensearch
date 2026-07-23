@@ -1,4 +1,4 @@
-//! SimHash vote-accumulation A/B: L1 table-lookup vs tableless AVX2 bit-expansion.
+//! `SimHash` vote-accumulation A/B: L1 table-lookup vs tableless AVX2 bit-expansion.
 //!
 //! `fingerprint::apply_hash_votes` accumulates 64 ±1 votes per shingle window into
 //! `[i32;64]` bit-weights. The shipped form does 8 `VOTE_TABLE[byte]` L1 loads per
@@ -91,9 +91,13 @@ unsafe fn apply_votes_simd_avx2(hash: u64, bit_weights: &mut [i32; 64]) {
         let m = _mm256_cmpeq_epi32(_mm256_and_si256(b, bitsel), bitsel); // -1 set, 0 clear
         // vote = -(2*m + 1): set -> +1, clear -> -1
         let vote = _mm256_sub_epi32(zero, _mm256_add_epi32(_mm256_add_epi32(m, m), ones));
-        let dst = ptr.add(8 * j).cast();
-        let cur = _mm256_loadu_si256(dst);
-        _mm256_storeu_si256(dst, _mm256_add_epi32(cur, vote));
+        // SAFETY: avx2 by contract; `8*j + 8 <= 64` bounds the pointer, and
+        // loadu/storeu tolerate any alignment.
+        unsafe {
+            let dst = ptr.add(8 * j).cast();
+            let cur = _mm256_loadu_si256(dst);
+            _mm256_storeu_si256(dst, _mm256_add_epi32(cur, vote));
+        }
     }
 }
 
@@ -148,6 +152,8 @@ fn simhash(text: &str, simd: bool) -> u64 {
     hash_from_weights(&bw)
 }
 
+// xorshift word picker — truncating the u64 to a table index is the point.
+#[allow(clippy::cast_possible_truncation)]
 fn doc(tokens: usize) -> String {
     let words = [
         "retry",
@@ -195,6 +201,8 @@ fn apply_all(hashes: &[u64], simd: bool) -> u64 {
     hash_from_weights(&bw)
 }
 
+// Criterion groups intentionally own their reporting state across all registrations.
+#[allow(clippy::significant_drop_tightening)]
 fn bench(c: &mut Criterion) {
     // Full simhash (real impact — includes the FNV window hashing, shared by both arms).
     let mut group = c.benchmark_group("simhash_vote_simd");

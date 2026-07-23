@@ -18,6 +18,10 @@
 
 // Benchmark-only quantization rounds f32 -> i8 (a deliberate, bounded truncation).
 #![allow(clippy::cast_possible_truncation)]
+// The `*_baseline` kernels are byte-faithful replicas of the pre-optimization
+// implementations; rewriting their `chunks_exact` iteration to `as_chunks`
+// would change the measured baseline shape.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 use std::hint::black_box;
 use std::time::Duration;
@@ -94,11 +98,11 @@ fn dot_i8_i8_baseline(stored: &[i8], query: &[i8]) -> i32 {
 }
 
 fn nibble_lo(b: u8) -> i32 {
-    i32::from(((b << 4) as i8) >> 4)
+    i32::from((b << 4).cast_signed() >> 4)
 }
 
 fn nibble_hi(b: u8) -> i32 {
-    i32::from((((b >> 4) ^ 0x08) as i8) - 8)
+    i32::from(((b >> 4) ^ 0x08).cast_signed() - 8)
 }
 
 /// The pre-query-prep 4-bit dot: decode stored and query nibbles for every vector.
@@ -111,8 +115,8 @@ fn dot_packed_4bit_baseline(stored: &[u8], query: &[u8]) -> i32 {
     for (sc, qc) in s16.by_ref().zip(q16.by_ref()) {
         let sa: [u8; 16] = sc.try_into().expect("chunks_exact(16)");
         let qa: [u8; 16] = qc.try_into().expect("chunks_exact(16)");
-        let s = i16x16::from_i8x16(i8x16::from(sa.map(|b| b as i8)));
-        let q = i16x16::from_i8x16(i8x16::from(qa.map(|b| b as i8)));
+        let s = i16x16::from_i8x16(i8x16::from(sa.map(u8::cast_signed)));
+        let q = i16x16::from_i8x16(i8x16::from(qa.map(u8::cast_signed)));
         let s_low = (s << 12_i32) >> 12_i32;
         let s_high = (s << 8_i32) >> 12_i32;
         let q_low = (q << 12_i32) >> 12_i32;
@@ -250,7 +254,7 @@ fn topk_int8_two_pass(
         .map(|(i, v)| (dot_i8_i8(v, q_i8), i as u32))
         .collect();
     let cand = (k * mult).min(p1.len());
-    p1.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    p1.sort_unstable_by_key(|&(score, _)| std::cmp::Reverse(score));
     // Pass 2: exact f16 rescore of the candidates, keep top k.
     let mut p2: Vec<(f32, u32)> = p1[..cand]
         .iter()
@@ -316,10 +320,10 @@ fn quantize_4bit(x: f32) -> i8 {
 fn pack_4bit_vector(v: &[f32]) -> Vec<u8> {
     v.chunks(2)
         .map(|pair| {
-            let lo = quantize_4bit(pair[0]) as u8 & 0x0f;
+            let lo = quantize_4bit(pair[0]).cast_unsigned() & 0x0f;
             let hi = pair
                 .get(1)
-                .map_or(0, |x| (quantize_4bit(*x) as u8 & 0x0f) << 4);
+                .map_or(0, |x| (quantize_4bit(*x).cast_unsigned() & 0x0f) << 4);
             lo | hi
         })
         .collect()

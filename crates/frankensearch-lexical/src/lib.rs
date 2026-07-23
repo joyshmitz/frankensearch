@@ -953,8 +953,7 @@ impl TantivyIndex {
         let final_path = dir.join("ord_table.json");
         let write = std::fs::File::create(&tmp).and_then(|file| {
             let mut writer = std::io::BufWriter::new(file);
-            serde_json::to_writer(&mut writer, &*table)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            serde_json::to_writer(&mut writer, &*table).map_err(std::io::Error::other)?;
             std::io::Write::flush(&mut writer)
         });
         match write {
@@ -1421,6 +1420,9 @@ impl TantivyIndex {
     /// per-hit to [`Self::docstore_id`] for any ordinal the table cannot resolve
     /// (documents written before `ord` existed, a reopened-but-not-rebuilt
     /// table, or a poisoned lock), so results are identical either way.
+    // The `ord_table` read guard is intentionally held across the whole hit
+    // loop — it is the once-per-call snapshot every hit resolves against.
+    #[allow(clippy::significant_drop_tightening)]
     fn collect_id_hits(
         &self,
         searcher: &Searcher,

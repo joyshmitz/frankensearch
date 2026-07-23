@@ -15983,3 +15983,78 @@ graph already warm, or when the exact binary links within ten minutes. Require
 top-k's 32-query recall/order proof, A/A inside 0.97–1.03, and both arm CVs
 below 5%; for RRF require full `FusedHit` equality, map/map A/A, and every
 compared arm CV below 5%.
+### 2026-07-22 — REJECT throughput win against an already-fed canonical rebuild; KEEP E3.6 compaction correctness (`bd-quill-e3-keeper-ndtk.6`)
+
+The production tombstone-fold path passed its Q1-OB4 correctness bundle before
+timing: surviving global docids and sparse lease spans remain unchanged,
+deleted rows become canonical holes, exact retained posting frequencies
+rederive manifest token totals without lossy fieldnorm recovery, query results
+match the tombstone-paired source, the trigger is strict at the policy boundary,
+the successor is idempotent, fully deleted segments disappear, and a crash after
+temporary output but before the single MANIFEST publish leaves the old segment
+authoritative. Focused strict-remote correctness job `j-29943190916169730`
+passed 6/6 tests on `ovh-a`; isolated all-target Quill clippy job
+`j-29943190916169753` passed with `-D warnings`.
+
+The retained full-scale harness then compared the shipped verified
+decode/filter/re-encode path with a canonical Scribe rebuild already supplied
+with the live document strings and their original sparse global docids. It
+forbids the invalid 0%-tombstone fixture, uses 20,000 documents at 5/20/50%,
+requires whole-file byte identity before timing, and interleaves nine paired
+rounds with a rebuild/rebuild A/A null in every cell. Strict-remote release-LTO
+job `j-29943190916169758` ran on `ovh-a` and exited 0:
+
+| tombstones | A/A rebuild ratio median [p5, p95] | compaction/rebuild median [p5, p95] | source bytes | output bytes | decision |
+|---:|---:|---:|---:|---:|---|
+| 5% | 1.0033 [0.9443, 1.0486] | 20.6247 [18.6324, 35.2091] | 4,480,182 | 4,311,862 | REJECT |
+| 20% | 1.0054 [0.6739, 1.1341] | 24.2195 [16.6948, 29.0388] | 4,480,182 | 3,803,702 | REJECT |
+| 50% | 0.9764 [0.6592, 1.5674] | 37.5974 [35.5539, 48.7946] | 4,480,182 | 2,595,766 | REJECT |
+
+Every null interval brackets 1.0 and every output is byte-identical to the
+canonical rebuild, so the negative timing result is admissible. The comparison
+does not include canonical storage reads or token acquisition on the rebuild
+side, while compaction deliberately validates and decodes the durable source
+before re-encoding it; therefore no throughput win is claimed.
+
+**Decision: REJECT the throughput lever, KEEP the E3.6 correctness feature.**
+The feature supplies the required atomic, Q1-preserving tombstone fold and
+honestly clears its realistic-density evidence requirement. Retry performance
+only after profiling the verified decode/re-encode stages, or against a full
+end-to-end canonical-storage rebuild with symmetric input acquisition, using
+the same null-controlled 5/20/50% matrix and never a 0% fixture.
+
+### 2026-07-22 — BLOCKED / NO ADMISSIBLE VERDICT: short-token ASCII boundary selection mask (`bd-l5x3`, IndigoOtter)
+
+The mandatory ledger and recent-log pass left the short-token tokenizer gap
+open while closing cached SWAR-window reuse, dot-product measurement noise,
+and the cold-link top-k/RRF retry. Alien-graveyard §8.2 supplied a different
+primitive: classify one eight-byte ASCII word, derive a selection mask for all
+token-run transitions, and enumerate those transitions rather than ping-pong
+between separate separator and token scans. Unicode-containing words retained
+the scalar char path. Exact proof passed before timing: 4,000 randomized mixed
+Unicode inputs, the existing lane-edge corpus, and every length 1–129 produced
+the same token text, lowercasing, offsets, positions, position lengths, and
+order as both the retained shipping SWAR implementation and scalar reference.
+
+Strict-remote release job `j-29943190916169794` completed on `vmi1227854` but
+overlapped the segment-fanout benchmark. Short candidate/shipping was 0.8190
+[0.7589, 0.9014] paired and 137.626/183.557 us = 0.7498 by Criterion means;
+long was 1.0129 [0.9028, 1.0641] paired and 77.577/77.627 us = 0.9994. Those
+directions are not admissible evidence because the short A/A was 0.9868
+[0.8642, 1.0672], long A/A was 0.9969 [0.9118, 1.0651], and the short shipping,
+short candidate, and long candidate raw CVs were respectively 5.694%, 10.128%,
+and 6.800% (long shipping alone passed at 3.891%).
+
+A symmetric 64-pass paired retry then sought full-worker isolation. Requested
+idle `vmi1152480`, `hz2`, and `vmi1293453` all failed closed before execution
+with `RCH-I004 alias_wrong_target`. Job `j-29943190916169821` successfully
+reserved all 3/3 slots on idle `vmi1156319`, reached final release linking, but
+never executed the benchmark: RCH returned `RCH-E104` when SSH hit its
+1,800-second timeout. No null or Criterion sample exists from the isolated run.
+
+**Decision: BLOCKED / NO ADMISSIBLE VERDICT, not REJECT.** All candidate source
+and benchmark edits were manually removed; shipping SWAR remains unchanged.
+Retry only when a fully reserved requested worker can link or reuse the exact
+release binary within the remote timeout. Require exact SWAR/scalar parity,
+64-pass A/A p5–p95 wholly within 0.97–1.03 for both corpora, every decisive-arm
+CV below 5%, short candidate/shipping <=0.97, and no decidable long regression.

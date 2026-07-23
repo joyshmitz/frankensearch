@@ -34,24 +34,24 @@ fn main() {
     let emb = Model2VecEmbedder::load(model_dir).expect("load model2vec model");
 
     // ── Smoke check: related pair should out-score an unrelated pair. ──
-    let a = emb
+    let cat = emb
         .embed_sync("the cat sat on the warm windowsill in the sun")
         .unwrap();
-    let b = emb
+    let kitten = emb
         .embed_sync("a kitten rested on the sunny window ledge")
         .unwrap();
-    let c = emb
+    let revenue = emb
         .embed_sync("quarterly revenue exceeded analyst expectations")
         .unwrap();
     eprintln!(
         "[smoke] dim={} cos(related)={:.3} cos(unrelated)={:.3}",
-        a.len(),
-        cosine(&a, &b),
-        cosine(&a, &c)
+        cat.len(),
+        cosine(&cat, &kitten),
+        cosine(&cat, &revenue)
     );
 
     let reader = BufReader::new(File::open(corpus_path).expect("open corpus"));
-    let mut w = BufWriter::new(File::create(out_path).expect("create out"));
+    let mut writer = BufWriter::new(File::create(out_path).expect("create out"));
     let mut n = 0usize;
     let mut dim = 0usize;
     for line in reader.lines() {
@@ -69,14 +69,14 @@ fn main() {
             dim = v.len();
         }
         for x in &v {
-            w.write_all(&x.to_le_bytes()).unwrap();
+            writer.write_all(&x.to_le_bytes()).unwrap();
         }
         n += 1;
         if n % 5000 == 0 {
             eprintln!("[embed] {n} …");
         }
     }
-    w.flush().unwrap();
+    writer.flush().unwrap();
 
     let sidecar = format!("{out_path}.meta.json");
     std::fs::write(&sidecar, format!("{{\"n\":{n},\"dim\":{dim}}}\n")).unwrap();

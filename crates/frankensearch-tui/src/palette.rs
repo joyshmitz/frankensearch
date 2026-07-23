@@ -226,6 +226,7 @@ impl CommandPalette {
     ///
     /// The actions are yielded in registration order without allocating an
     /// intermediate reference vector.
+    #[must_use]
     pub fn iter_filtered(&self) -> impl ExactSizeIterator<Item = &Action> {
         self.matching_indices
             .iter()

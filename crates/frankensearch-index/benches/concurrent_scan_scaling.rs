@@ -15,6 +15,8 @@
 //! Run: `rch exec -- cargo bench -p frankensearch-index --profile release
 //!   --bench concurrent_scan_scaling`
 
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+
 use std::hint::black_box;
 use std::time::Instant;
 

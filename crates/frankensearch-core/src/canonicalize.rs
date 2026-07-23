@@ -874,7 +874,7 @@ mod tests {
     /// ASCII, every ASCII whitespace byte (incl. the tricky U+000B vertical tab), Unicode whitespace
     /// (NBSP U+00A0, NEL U+0085, ideographic space U+3000, en/em spaces), runs, leading/trailing, and
     /// mixed ASCII/Unicode text.
-    /// PARITY GATE: the ASCII-fast `truncate_to_chars` must equal the char_indices original — for
+    /// PARITY GATE: the ASCII-fast `truncate_to_chars` must equal the `char_indices` original — for
     /// content shorter/equal/longer than the cap, ASCII and multibyte, and cuts landing on an ASCII
     /// boundary, before a multibyte char, and mid-multibyte (must round down to the char boundary).
     #[test]
@@ -913,13 +913,13 @@ mod tests {
         let shapes: &[(&[&str], usize, usize)] = &[
             (&[], 20, 10),
             (&["only one line"], 20, 10),
-            (&body[..5], 20, 10),   // short (< head+tail): full keep
-            (&body[..30], 20, 10),  // exactly head+tail: full keep
-            (&body[..31], 20, 10),  // one over: collapse
-            (&body[..], 20, 10),    // large collapse
-            (&body[..], 0, 5),      // head=0
-            (&body[..], 5, 0),      // tail=0
-            (&body[..], 0, 0),      // both zero -> collapse, no kept lines
+            (&body[..5], 20, 10),  // short (< head+tail): full keep
+            (&body[..30], 20, 10), // exactly head+tail: full keep
+            (&body[..31], 20, 10), // one over: collapse
+            (&body[..], 20, 10),   // large collapse
+            (&body[..], 0, 5),     // head=0
+            (&body[..], 5, 0),     // tail=0
+            (&body[..], 0, 0),     // both zero -> collapse, no kept lines
         ];
         for lang in langs {
             for &(lines, head, tail) in shapes {

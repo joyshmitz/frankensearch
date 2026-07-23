@@ -22,6 +22,8 @@
 //!   rch exec -- cargo bench -p frankensearch-index --bench batched_query_scan
 //! ```
 
+#![allow(clippy::cast_possible_truncation)]
+
 use std::hint::black_box;
 use std::time::Duration;
 

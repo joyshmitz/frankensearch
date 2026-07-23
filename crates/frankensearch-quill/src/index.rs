@@ -36,8 +36,8 @@ use crate::grimoire::{
     validate_bound_term, validate_query_term,
 };
 use crate::keeper::{
-    CURRENT_ENGINE_VERSION, KeeperError, KeeperSnapshot, KeeperWriter, Manifest,
-    ManifestFieldStats, ManifestSegment, RecoveredSegment, TombstoneSet,
+    CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, KeeperError, KeeperSnapshot,
+    KeeperWriter, Manifest, ManifestFieldStats, ManifestSegment, RecoveredSegment, TombstoneSet,
     validate_manifest_successor,
 };
 use crate::query::{
@@ -1790,6 +1790,82 @@ impl QuillIndex {
         );
         self.next_seal_seq = next_seal_seq;
         Ok(self.backend.snapshot())
+    }
+
+    /// Fold tombstones into immutable positional holes for eligible segments.
+    ///
+    /// Every surviving global document id is preserved. The complete set of
+    /// replacement files is built and synced before one successor MANIFEST is
+    /// published, so interruption before that boundary leaves the old snapshot
+    /// authoritative. A policy-boundary equality is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Rejects uncommitted scalar or Delta state, invalid policy values,
+    /// cancellation, source/codec failures, and durable publication failures.
+    pub async fn compact(
+        &mut self,
+        cx: &Cx,
+        policy: CompactionPolicy,
+    ) -> Result<CompactionReport, QuillIndexError> {
+        check_cancel(cx, "compaction")?;
+        if self.has_uncommitted_changes() {
+            return Err(invalid_state(
+                "compaction requires a fully committed scalar index",
+            ));
+        }
+        let created_unix_s = self.created_unix_s()?;
+        let compact_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::KEEPER_COMPACT,
+            phase = "compact",
+            durability = matches!(&self.backend, IndexBackend::Durable(_)),
+            generation = self.snapshot().loaded_manifest().manifest.generation,
+            segment_count = self.snapshot().segments().len(),
+            result_count = tracing::field::Empty,
+            output_bytes = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _compact_timer = crate::tracing_conventions::StageTimer::new(&compact_span);
+        let instrumented = compact_span.clone();
+        let report = async {
+            match &mut self.backend {
+                IndexBackend::Durable(writer) => Ok::<CompactionReport, QuillIndexError>(
+                    writer.compact(cx, policy, created_unix_s).await?,
+                ),
+                IndexBackend::Memory(snapshot) => {
+                    let source = snapshot.clone();
+                    let (successor, report) =
+                        spawn_blocking(move || source.compact_owned(policy, created_unix_s))
+                            .await?;
+                    check_cancel(cx, "compaction")?;
+                    *snapshot = successor;
+                    Ok(report)
+                }
+            }
+        }
+        .instrument(instrumented)
+        .await?;
+        compact_span.record("result_count", report.compacted_segments);
+        compact_span.record("output_bytes", report.output_bytes);
+        if report.changed() {
+            let prepared_publication = self.published_snapshot.prepare_sealed_manifest(
+                self.schema,
+                &self.backend.snapshot().loaded_manifest().manifest,
+            )?;
+            self.published_snapshot.install_prepared_sealed(
+                Arc::new(self.backend.snapshot().clone()),
+                prepared_publication,
+            );
+            self.next_seal_seq = self
+                .snapshot()
+                .segments()
+                .iter()
+                .map(|segment| segment.manifest().seal_seq)
+                .max()
+                .unwrap_or(0);
+        }
+        Ok(report)
     }
 
     fn prepare_pending_manifest(&mut self) -> Result<(), QuillIndexError> {
@@ -4709,7 +4785,7 @@ mod tests {
     use crate::delta::{
         DeltaFieldNorm, DeltaNumericValue, DeltaSegment, DeltaStoredValue, DeltaTermPosting,
     };
-    use crate::keeper::ConcatMergeError;
+    use crate::keeper::{CompactionError, ConcatMergeError};
     #[cfg(feature = "bench-internals")]
     use crate::query::{BooleanClause, QueryField};
     use crate::quiver::{
@@ -4726,6 +4802,13 @@ mod tests {
         "right",
         "left OR right",
         "\"shared left\"",
+    ];
+    const Q1_OB4_QUERIES: [&str; 5] = [
+        "shared",
+        "left",
+        "shared AND left",
+        "\"shared left\"",
+        "ord:[0 TO 39]",
     ];
     const KNOWN_SECTION_KINDS: [SectionKind; 10] = [
         SectionKind::TERMDICT,
@@ -5388,6 +5471,62 @@ mod tests {
                     .collect_docids(cx, query)
                     .expect("Q1-OB2a scoreless query");
                 (ranked, docids)
+            })
+            .collect()
+    }
+
+    fn q1_ob4_tombstoned_index(document_count: usize, deleted: &[u32]) -> QuillIndex {
+        let documents = q1_ob2a_documents();
+        let documents = documents
+            .get(..document_count)
+            .expect("Q1-OB4 fixture document count");
+        let sealed = seal_q1_ob2a_documents(documents, 0, 0x0b40_0001);
+        let field_stats =
+            merge_field_stats(&[], &sealed.field_stats).expect("Q1-OB4 segment statistics");
+        let committed = q1_ob2a_owned_index(vec![sealed.encoded], field_stats);
+        let mut manifest = committed
+            .snapshot()
+            .next_manifest()
+            .expect("Q1-OB4 tombstone MANIFEST");
+        for &global_docid in deleted {
+            assert!(
+                committed
+                    .snapshot()
+                    .delete_document(&mut manifest, &format!("q1-ob2a-{global_docid:03}"),)
+                    .expect("stage Q1-OB4 tombstone"),
+                "Q1-OB4 document {global_docid} must be live before deletion",
+            );
+        }
+        let tombstoned = committed
+            .snapshot()
+            .publish_owned_segments(&manifest, Vec::new())
+            .expect("publish Q1-OB4 tombstone generation");
+        QuillIndex::from_backend(
+            IndexBackend::Memory(tombstoned),
+            DEFAULT_SCHEMA,
+            deterministic_config(),
+        )
+        .expect("bind Q1-OB4 fixture index")
+    }
+
+    type Q1Ob4QueryEvidence = (Vec<(String, u32)>, Option<u64>, u64, Vec<u32>);
+
+    fn q1_ob4_query_evidence(index: &QuillIndex, cx: &Cx) -> Vec<Q1Ob4QueryEvidence> {
+        Q1_OB4_QUERIES
+            .iter()
+            .map(|query| {
+                let ranked = index
+                    .search_paginated(cx, query, 500, 0, true)
+                    .expect("Q1-OB4 ranked query");
+                let hits = ranked
+                    .hits
+                    .into_iter()
+                    .map(|hit| (hit.document_id, hit.global_docid))
+                    .collect();
+                let docids = index
+                    .collect_docids(cx, query)
+                    .expect("Q1-OB4 scoreless query");
+                (hits, ranked.total_count, ranked.doc_count, docids)
             })
             .collect()
     }
@@ -8560,6 +8699,351 @@ mod tests {
                 .search_paginated(&cx, "ord: IN [0 1]", 10, 0, true)
                 .expect_err("fast-only set remains unsupported with sealed leaves");
             assert_eq!(populated_set_error.to_string(), empty_set_error.to_string());
+        });
+    }
+
+    #[test]
+    fn compaction_preserves_q1_docids_and_live_query_identity() {
+        run_with_blocking_cx(|cx| async move {
+            let deleted = [1_u32, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23];
+            let mut index = q1_ob4_tombstoned_index(40, &deleted);
+            let source = index.snapshot().clone();
+            let source_manifest = source.loaded_manifest().manifest.clone();
+            let source_segment = &source.segments()[0];
+            let source_segment_id = source_segment.manifest().segment_id;
+            let query_before = q1_ob4_query_evidence(&index, &cx);
+            let live_docids_before = index
+                .collect_docids(&cx, "shared")
+                .expect("Q1-OB4 live docids before compaction");
+            assert_eq!(source_segment.manifest().tombstones.cardinality(), 12);
+            assert_eq!(source_segment.manifest().doc_count, 40);
+
+            let report = index
+                .compact(&cx, CompactionPolicy::default())
+                .await
+                .expect("Q1-OB4 in-memory compaction");
+            assert_eq!(report.generation_before, source_manifest.generation);
+            assert_eq!(report.generation_after, source_manifest.generation + 1);
+            assert_eq!(report.examined_segments, 1);
+            assert_eq!(report.compacted_segments, 1);
+            assert_eq!(report.removed_segments, 0);
+            assert_eq!(report.dropped_documents, 12);
+            assert_eq!(report.input_bytes, source_segment.manifest().file_len);
+            assert!(report.output_bytes > 0);
+
+            let replacement = &index.snapshot().segments()[0];
+            assert_ne!(replacement.manifest().segment_id, source_segment_id);
+            assert_eq!(replacement.manifest().docid_lo, 0);
+            assert_eq!(replacement.manifest().docid_hi, 40);
+            assert_eq!(replacement.manifest().doc_count, 28);
+            assert_eq!(replacement.manifest().tombstones.cardinality(), 0);
+            replacement.verify().expect("verify compacted Q1-OB4 FSLX");
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "shared")
+                    .expect("Q1-OB4 live docids after compaction"),
+                live_docids_before,
+                "surviving global docids must not be renumbered",
+            );
+            assert_eq!(
+                q1_ob4_query_evidence(&index, &cx),
+                query_before,
+                "ranked identities, order, global docids, counts, phrase matches, and fast-column ranges must be query-identical",
+            );
+            for global_docid in 0_u32..40 {
+                let should_live = !deleted.contains(&global_docid);
+                assert_eq!(index.snapshot().is_live(global_docid), should_live);
+                assert_eq!(
+                    index
+                        .snapshot()
+                        .materialize_document_id(global_docid)
+                        .is_some(),
+                    should_live,
+                    "IDMAP/IDHASH hole mismatch at global docid {global_docid}",
+                );
+            }
+            for kind in KNOWN_SECTION_KINDS {
+                assert_eq!(
+                    source_segment
+                        .section(kind)
+                        .expect("read Q1-OB4 source section")
+                        .is_some(),
+                    replacement
+                        .section(kind)
+                        .expect("read Q1-OB4 replacement section")
+                        .is_some(),
+                    "compaction changed section presence for kind {}",
+                    kind.raw(),
+                );
+            }
+            assert!(
+                index
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats
+                    .iter()
+                    .all(|row| row.doc_count == 28),
+                "post-compaction statistics must be re-derived over retained documents",
+            );
+        });
+    }
+
+    #[test]
+    fn compaction_rederives_exact_token_totals_from_retained_postings() {
+        run_with_blocking_cx(|cx| async move {
+            let retained_content = std::iter::repeat_n("retained", 4_096)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let deleted_content = std::iter::repeat_n("deleted", 3_001)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let documents = vec![
+                IndexableDocument::new("long-retained", retained_content),
+                IndexableDocument::new("long-deleted", deleted_content),
+            ];
+            let sealed = seal_q1_ob2a_documents(&documents, 0, 0x0b40_1001);
+            let field_stats =
+                merge_field_stats(&[], &sealed.field_stats).expect("long source statistics");
+            let committed = q1_ob2a_owned_index(vec![sealed.encoded], field_stats);
+            let mut tombstoned = committed
+                .snapshot()
+                .next_manifest()
+                .expect("long tombstone MANIFEST");
+            assert!(
+                committed
+                    .snapshot()
+                    .delete_document(&mut tombstoned, "long-deleted")
+                    .expect("delete long document")
+            );
+            let tombstoned = committed
+                .snapshot()
+                .publish_owned_segments(&tombstoned, Vec::new())
+                .expect("publish long tombstones");
+            let mut compacted = QuillIndex::from_backend(
+                IndexBackend::Memory(tombstoned),
+                DEFAULT_SCHEMA,
+                deterministic_config(),
+            )
+            .expect("bind long compaction fixture");
+
+            let canonical = seal_q1_ob2a_documents(&documents[..1], 0, 0x0b40_1002);
+            let canonical_stats = canonical.field_stats;
+            let report = compacted
+                .compact(&cx, CompactionPolicy::default())
+                .await
+                .expect("compact long fieldnorm fixture");
+            assert!(report.changed());
+            assert_eq!(
+                compacted
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats
+                    .iter()
+                    .map(|row| (row.field_ord, (row.total_tokens, row.doc_count)))
+                    .collect::<BTreeMap<_, _>>(),
+                canonical_stats,
+                "STATS must use exact retained posting frequencies, not quantized fieldnorm lengths",
+            );
+        });
+    }
+
+    #[test]
+    fn compaction_density_boundary_is_strict_and_successor_is_idempotent() {
+        run_with_blocking_cx(|cx| async move {
+            let boundary_deleted = [0_u32, 1, 2, 3];
+            let mut boundary = q1_ob4_tombstoned_index(20, &boundary_deleted);
+            let boundary_generation = boundary.snapshot().loaded_manifest().manifest.generation;
+            let boundary_segment_id = boundary.snapshot().segments()[0].manifest().segment_id;
+            let report = boundary
+                .compact(&cx, CompactionPolicy::default())
+                .await
+                .expect("20-percent boundary pass");
+            assert!(!report.changed(), "density equality must not compact");
+            assert_eq!(report.generation_after, boundary_generation);
+            assert_eq!(
+                boundary.snapshot().segments()[0].manifest().segment_id,
+                boundary_segment_id,
+            );
+
+            let eligible_deleted = [0_u32, 1, 2, 3, 4];
+            let mut eligible = q1_ob4_tombstoned_index(20, &eligible_deleted);
+            let first = eligible
+                .compact(&cx, CompactionPolicy::default())
+                .await
+                .expect("25-percent compaction");
+            assert!(first.changed());
+            let compacted_generation = first.generation_after;
+            let compacted_segment_id = eligible.snapshot().segments()[0].manifest().segment_id;
+            let second = eligible
+                .compact(&cx, CompactionPolicy::default())
+                .await
+                .expect("idempotent successor pass");
+            assert!(!second.changed());
+            assert_eq!(second.generation_before, compacted_generation);
+            assert_eq!(second.generation_after, compacted_generation);
+            assert_eq!(
+                eligible.snapshot().segments()[0].manifest().segment_id,
+                compacted_segment_id,
+                "a tombstone-free replacement must not thrash",
+            );
+        });
+    }
+
+    #[test]
+    fn compaction_removes_fully_deleted_segments_and_rejects_invalid_policy() {
+        run_with_blocking_cx(|cx| async move {
+            let deleted = (0_u32..20).collect::<Vec<_>>();
+            let mut index = q1_ob4_tombstoned_index(20, &deleted);
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let report = index
+                .compact(&cx, CompactionPolicy::default())
+                .await
+                .expect("fully deleted compaction");
+            assert_eq!(report.generation_after, generation + 1);
+            assert_eq!(report.compacted_segments, 1);
+            assert_eq!(report.removed_segments, 1);
+            assert_eq!(report.dropped_documents, 20);
+            assert_eq!(report.output_bytes, 0);
+            assert!(index.snapshot().segments().is_empty());
+            assert_eq!(index.snapshot().doc_count(), 0);
+            assert!(
+                index
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .field_stats
+                    .iter()
+                    .all(|row| row.doc_count == 0 && row.total_tokens == 0),
+            );
+
+            for density in [0.0, -0.1, 1.1, f64::INFINITY, f64::NAN] {
+                let Err(error) = index
+                    .snapshot()
+                    .compact_owned(CompactionPolicy::new(density), 0)
+                else {
+                    panic!("invalid density {density:?} unexpectedly compacted");
+                };
+                assert!(matches!(
+                    error,
+                    KeeperError::Compaction {
+                        source: CompactionError::InvalidDensity { .. }
+                    }
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn durable_compaction_crash_boundary_keeps_old_manifest_authoritative() {
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary Q1-OB4 Keeper directory");
+            let documents = q1_ob2a_documents();
+            let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable Q1-OB4 index");
+            index
+                .index_documents(&cx, &documents[..20])
+                .await
+                .expect("accumulate durable Q1-OB4 documents");
+            index
+                .commit(&cx)
+                .await
+                .expect("commit durable Q1-OB4 segment");
+            let source_segment_id = index.snapshot().segments()[0].manifest().segment_id;
+            let source_path = directory
+                .path()
+                .join(format!("seg-{source_segment_id:016x}.fslx"));
+            let mut tombstoned = index
+                .snapshot()
+                .next_manifest()
+                .expect("durable Q1-OB4 tombstone MANIFEST");
+            for global_docid in 0_u32..5 {
+                assert!(
+                    index
+                        .snapshot()
+                        .delete_document(&mut tombstoned, &format!("q1-ob2a-{global_docid:03}"),)
+                        .expect("stage durable Q1-OB4 tombstone"),
+                );
+            }
+            match &mut index.backend {
+                IndexBackend::Durable(writer) => {
+                    writer
+                        .publish(&cx, &tombstoned)
+                        .await
+                        .expect("publish durable Q1-OB4 tombstones");
+                }
+                IndexBackend::Memory(_) => panic!("durable fixture must own KeeperWriter"),
+            }
+            drop(index);
+            let mut index = QuillIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("reopen durable tombstone generation");
+            let old_manifest = index.snapshot().loaded_manifest().manifest.clone();
+            let query_before = q1_ob4_query_evidence(&index, &cx);
+            let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
+                directory.path(),
+                crate::keeper::PublishCheckpoint::TempWritten,
+            );
+            let mut compact = Box::pin(index.compact(&cx, CompactionPolicy::default()));
+            std::future::poll_fn(|task_cx| {
+                if pause.is_reached() {
+                    return Poll::Ready(());
+                }
+                match compact.as_mut().poll(task_cx) {
+                    Poll::Pending => {
+                        task_cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Poll::Ready(_) => panic!("compaction completed before crash checkpoint"),
+                }
+            })
+            .await;
+
+            let on_disk = Manifest::from_bytes(
+                &std::fs::read(directory.path().join("MANIFEST"))
+                    .expect("read authoritative pre-compaction MANIFEST"),
+            )
+            .expect("decode authoritative pre-compaction MANIFEST");
+            assert_eq!(on_disk, old_manifest);
+            assert!(
+                source_path.exists(),
+                "old immutable segment must remain intact"
+            );
+            let installed_segment_count = std::fs::read_dir(directory.path())
+                .expect("inspect compaction crash directory")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("seg-") && name.ends_with(".fslx")
+                })
+                .count();
+            assert_eq!(
+                installed_segment_count, 2,
+                "replacement output must be installed but still unreferenced",
+            );
+            let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                .expect("reopen the old authoritative crash-boundary snapshot");
+            assert_eq!(reopened.loaded_manifest().manifest, old_manifest);
+            assert_eq!(
+                reopened.segments()[0].manifest().segment_id,
+                source_segment_id
+            );
+            assert_eq!(
+                reopened.segments()[0].manifest().tombstones.cardinality(),
+                5
+            );
+
+            pause.release();
+            let report = compact.await.expect("finish released durable compaction");
+            assert!(report.changed());
+            assert_eq!(q1_ob4_query_evidence(&index, &cx), query_before);
+            assert!(
+                source_path.exists(),
+                "compaction does not delete old files inline"
+            );
         });
     }
 

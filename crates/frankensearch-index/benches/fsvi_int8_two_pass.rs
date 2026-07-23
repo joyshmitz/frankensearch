@@ -15,6 +15,13 @@
 //!   fsvi_int8_two_pass_ab --sample-size 50 --warm-up-time 2 --measurement-time 10 --noplot
 //! ```
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::significant_drop_tightening,
+    clippy::similar_names
+)]
+
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

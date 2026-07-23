@@ -12,7 +12,11 @@
 //!
 //! Run: `rch exec -- cargo bench -p frankensearch-rerank --profile release
 //!   --bench token_id_truncate_ab`
-#![allow(clippy::doc_markdown, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -81,7 +85,9 @@ fn ids_to_truncated_i64_legacy(ids: &[u32], max_length: usize) -> Vec<i64> {
 }
 
 fn make_ids(len: usize) -> Vec<u32> {
-    (0..len).map(|i| (i as u32).wrapping_mul(2_654_435_761) % 30_000).collect()
+    (0..len)
+        .map(|i| (i as u32).wrapping_mul(2_654_435_761) % 30_000)
+        .collect()
 }
 
 fn run_arm(ids: &[u32], arm: Arm) -> usize {
@@ -107,7 +113,10 @@ fn paired_ratio(ids: &[u32], a: Arm, b: Arm) -> RatioDistribution {
         let bb = time_arm(ids, b);
         let ba = time_arm(ids, a);
         if record {
-            Some(((ab.as_secs_f64() / aa.as_secs_f64()) * (bb.as_secs_f64() / ba.as_secs_f64())).sqrt())
+            Some(
+                ((ab.as_secs_f64() / aa.as_secs_f64()) * (bb.as_secs_f64() / ba.as_secs_f64()))
+                    .sqrt(),
+            )
         } else {
             black_box((aa, ab, bb, ba));
             None
@@ -133,7 +142,9 @@ fn median_ns(ids: &[u32], arm: Arm) -> f64 {
 }
 
 fn main() {
-    eprintln!("[profile-config] max_length={MAX_LENGTH} token_lengths={TOKEN_LENGTHS:?} profile_rounds={PROFILE_ROUNDS} paired_round_pairs={PAIRED_ROUND_PAIRS}");
+    eprintln!(
+        "[profile-config] max_length={MAX_LENGTH} token_lengths={TOKEN_LENGTHS:?} profile_rounds={PROFILE_ROUNDS} paired_round_pairs={PAIRED_ROUND_PAIRS}"
+    );
     let mut any_clears = false;
     for &len in TOKEN_LENGTHS {
         let ids = make_ids(len);
@@ -147,12 +158,20 @@ fn main() {
 
         let legacy_ns = median_ns(&ids, Arm::Legacy);
         let fast_ns = median_ns(&ids, Arm::Fast);
-        eprintln!("[profile] tokens={len} legacy_median_ns={legacy_ns:.2} fast_median_ns={fast_ns:.2}");
+        eprintln!(
+            "[profile] tokens={len} legacy_median_ns={legacy_ns:.2} fast_median_ns={fast_ns:.2}"
+        );
 
         let null = paired_ratio(&ids, Arm::Legacy, Arm::Legacy);
         let lever = paired_ratio(&ids, Arm::Legacy, Arm::Fast);
-        eprintln!("[paired] tokens={len} comparison=null_legacy_legacy median={:.6} p5={:.6} p95={:.6}", null.median, null.p5, null.p95);
-        eprintln!("[paired] tokens={len} comparison=fast_vs_legacy median={:.6} p5={:.6} p95={:.6}", lever.median, lever.p5, lever.p95);
+        eprintln!(
+            "[paired] tokens={len} comparison=null_legacy_legacy median={:.6} p5={:.6} p95={:.6}",
+            null.median, null.p5, null.p95
+        );
+        eprintln!(
+            "[paired] tokens={len} comparison=fast_vs_legacy median={:.6} p5={:.6} p95={:.6}",
+            lever.median, lever.p5, lever.p95
+        );
         let gate_pass = null.null_contains_one() && lever.median < null.p5;
         any_clears |= gate_pass;
         eprintln!(
@@ -161,5 +180,8 @@ fn main() {
             1.0 / lever.median
         );
     }
-    eprintln!("[gate-summary] decision={} any_shape_clears_null_floor={any_clears}", if any_clears { "KEEP" } else { "HOLD" });
+    eprintln!(
+        "[gate-summary] decision={} any_shape_clears_null_floor={any_clears}",
+        if any_clears { "KEEP" } else { "HOLD" }
+    );
 }

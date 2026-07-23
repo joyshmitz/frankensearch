@@ -430,14 +430,14 @@ impl TwoTierIndex {
 
         let mut scores = Vec::with_capacity(hits.len());
         for hit in hits {
-            let mut found_score = None;
-
-            if let Some(&i) = wal_latest.get(hit.doc_id.as_str()) {
-                found_score = Some(dot_product_f32_f32(
+            let mut found_score = if let Some(&i) = wal_latest.get(hit.doc_id.as_str()) {
+                Some(dot_product_f32_f32(
                     &quality_index.wal_entries[i].embedding,
                     query_vec,
-                )?);
-            }
+                )?)
+            } else {
+                None
+            };
 
             if found_score.is_none() {
                 let fast_idx = if hit.index == u32::MAX {

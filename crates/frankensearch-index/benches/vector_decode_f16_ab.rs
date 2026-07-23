@@ -20,6 +20,8 @@
 //!   rch exec -- cargo bench -p frankensearch-index --bench vector_decode_f16_ab
 //! ```
 
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::inline_always)]
+
 use std::hint::black_box;
 
 use bytemuck::cast;
