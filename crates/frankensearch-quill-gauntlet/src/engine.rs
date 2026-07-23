@@ -2013,7 +2013,7 @@ mod tests {
 
     async fn e55_index_with_live_history(cx: &Cx) -> (QuillIndex, usize, u32) {
         let config = e55_config();
-        let mut index = QuillIndex::in_memory_with_schema(E55_SCHEMA, config)
+        let index = QuillIndex::in_memory_with_schema(E55_SCHEMA, config)
             .expect("construct historical E5.5 index");
         let generation = index.search_snapshot().keeper_generation();
         let mut historical = E55DeltaBuilder::new(0);
@@ -2866,7 +2866,7 @@ mod tests {
         let (index, baseline_dead_segments, historical_docid) =
             e55_index_with_live_history(cx).await;
         let mut corpus = e55_build_live_corpus(&index, seed, extras_per_delta, historical_docid);
-        let mut index = e55_tombstone_sealed_upsert_source(&index, historical_docid);
+        let index = e55_tombstone_sealed_upsert_source(&index, historical_docid);
         let successor_generation = index.search_snapshot().keeper_generation();
         corpus.first = Arc::new(corpus.first.rebind_keeper_generation(successor_generation));
         corpus.second = Arc::new(corpus.second.rebind_keeper_generation(successor_generation));

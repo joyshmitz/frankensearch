@@ -3558,6 +3558,22 @@ impl QuillIndex {
         self.reader.collect_preparsed_docids(cx, query)
     }
 
+    /// Bench-only forced sealed fan-out path for scoreless id-set collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed parsing, lowering, collection, and cancellation
+    /// failures as [`Self::collect_docids`].
+    #[cfg(feature = "bench-internals")]
+    pub fn bench_collect_docids_forced(
+        &self,
+        cx: &Cx,
+        query: &str,
+        fan_out: bool,
+    ) -> Result<Vec<u32>, QuillIndexError> {
+        self.reader.bench_collect_docids_forced(cx, query, fan_out)
+    }
+
     /// Bench-only forced sealed fan-out path.
     #[cfg(feature = "bench-internals")]
     pub fn bench_search_sealed_forced(

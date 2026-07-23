@@ -285,7 +285,7 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
         ConcatMergeError, KeeperError, QuillConfig, QuillIndex, QuillIndexError, SectionKind,
     };
 
-    let mut index = QuillIndex::in_memory(QuillConfig {
+    let index = QuillIndex::in_memory(QuillConfig {
         deterministic_ingest: true,
         ..QuillConfig::default()
     })
@@ -347,7 +347,8 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             .map_err(|error| q1_merge_error("verify source segment", error))?;
     }
 
-    let before_manifest = &index.snapshot().loaded_manifest().manifest;
+    let before_snapshot = index.snapshot();
+    let before_manifest = &before_snapshot.loaded_manifest().manifest;
     let before_generation = before_manifest.generation;
     let before_watermark = before_manifest.docid_high_watermark;
     let before_field_stats = before_manifest.field_stats.clone();
