@@ -417,7 +417,6 @@ pub enum LexicalAction {
     Upsert {
         doc_id: String,
         revision: u64,
-        content: String,
         title: Option<String>,
         metadata: HashMap<String, String>,
         chunks: Vec<LexicalChunk>,
@@ -539,11 +538,12 @@ impl<'a> QuillLexicalBackend<'a> {
             match action {
                 LexicalAction::Upsert {
                     doc_id,
-                    content,
                     title,
                     metadata,
+                    chunks,
                     ..
                 } => {
+                    let content = chunks_into_index_content(chunks);
                     let mut document = IndexableDocument::new(doc_id, content);
                     document.title = title;
                     document.metadata = metadata;
@@ -564,6 +564,19 @@ impl<'a> QuillLexicalBackend<'a> {
         }
         Ok(())
     }
+}
+
+fn chunks_into_index_content(chunks: Vec<LexicalChunk>) -> String {
+    let mut chunks = chunks.into_iter();
+    let Some(first) = chunks.next() else {
+        return String::new();
+    };
+    let mut content = first.text;
+    for chunk in chunks {
+        content.push('\n');
+        content.push_str(&chunk.text);
+    }
+    content
 }
 
 impl LexicalIndexBackend for QuillLexicalBackend<'_> {
@@ -731,7 +744,6 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
         Ok(LexicalAction::Upsert {
             doc_id: mutation.doc_id.clone(),
             revision: mutation.revision,
-            content: body.to_owned(),
             title: mutation.title.clone(),
             metadata: mutation.metadata.clone(),
             chunks,
@@ -818,7 +830,7 @@ mod tests {
         InMemoryLexicalBackend, LexicalAction, LexicalChunkPolicy, LexicalMutation,
         LexicalPerformanceTargets, LexicalPipeline, QuillLexicalBackend,
         TARGET_INCREMENTAL_P95_LATENCY_MS, TARGET_INCREMENTAL_UPDATES_PER_SECOND,
-        TARGET_INITIAL_DOCS_PER_SECOND, tokenize_lexical,
+        TARGET_INITIAL_DOCS_PER_SECOND, chunks_into_index_content, tokenize_lexical,
     };
     use crate::config::IngestionClass;
 
@@ -844,6 +856,20 @@ mod tests {
         assert_eq!(chunks[0].byte_end, 10);
         assert_eq!(chunks[1].byte_start, 7);
         assert_eq!(chunks[1].byte_end, 17);
+    }
+
+    #[test]
+    fn quill_content_is_projected_from_planned_chunks() {
+        let chunks = LexicalChunkPolicy {
+            max_chars: 10,
+            overlap_chars: 3,
+        }
+        .chunk_text("abcdefghijklmnopqrstuvwxyz");
+
+        assert_eq!(
+            chunks_into_index_content(chunks),
+            "abcdefghij\nhijklmnopq\nopqrstuvwx\nvwxyz"
+        );
     }
 
     #[test]
