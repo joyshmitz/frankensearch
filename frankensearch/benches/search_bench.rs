@@ -9,7 +9,7 @@
 //! 4. RRF fusion (various result counts)
 //! 5. Score normalization (various sizes)
 //! 6. Vector index I/O (write/open)
-//! 7. BOLD-VERIFY Tantivy-class incumbent vs frankensearch hybrid
+//! 7. Explicit Tantivy-oracle comparator vs frankensearch hybrid
 
 #[cfg(feature = "lexical")]
 use std::collections::hash_map::DefaultHasher;
@@ -524,7 +524,7 @@ fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
     let sha = git_sha();
     let worker = worker_id();
     let command = std::env::var("FRANKENSEARCH_BOLD_VERIFY_COMMAND").unwrap_or_else(|_| {
-        "CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 3".to_owned()
+        "CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical-tantivy --profile release --bench search_bench tantivy_oracle_comparator -- --sample-size 10 --warm-up-time 1 --measurement-time 3".to_owned()
     });
 
     for fixture in fixtures {
@@ -652,7 +652,7 @@ fn bench_vector_search(c: &mut Criterion) {
     group.finish();
 }
 
-// ─── 3d. BOLD-VERIFY Tantivy-Class Comparator ──────────────────────────────
+// ─── 3d. Explicit Tantivy Oracle Comparator ─────────────────────────────────
 
 /// Warm-query head-to-head against a Tantivy/Lucene-class incumbent.
 ///
@@ -661,8 +661,8 @@ fn bench_vector_search(c: &mut Criterion) {
 /// Tantivy BM25 identifiers only; the frankensearch side is hash embedding +
 /// FSVI vector search + Tantivy candidates + RRF fusion.
 #[cfg(feature = "lexical")]
-fn bench_tantivy_class_comparator(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bold_verify_tantivy_class");
+fn bench_tantivy_oracle_comparator(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tantivy_oracle_comparator");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(3));
 
@@ -735,10 +735,10 @@ fn bench_tantivy_class_comparator(c: &mut Criterion) {
 }
 
 #[cfg(not(feature = "lexical"))]
-fn bench_tantivy_class_comparator(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bold_verify_tantivy_class");
+fn bench_tantivy_oracle_comparator(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tantivy_oracle_comparator");
     group.bench_function("enable_lexical_feature", |b| {
-        b.iter(|| black_box("run with --features lexical"));
+        b.iter(|| black_box("run with --features lexical-tantivy"));
     });
     group.finish();
 }
@@ -922,7 +922,7 @@ criterion_group!(
     bench_vector_search,
     bench_vector_search_tombstone_overhead,
     bench_vector_vacuum_time,
-    bench_tantivy_class_comparator,
+    bench_tantivy_oracle_comparator,
     bench_rrf_fusion,
     bench_normalization,
     bench_index_io,

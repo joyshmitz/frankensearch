@@ -4,7 +4,7 @@ Two-tier hybrid search for Rust: sub-millisecond initial results, quality-refine
 
 ## Overview
 
-`frankensearch` is the main library crate that re-exports and unifies all workspace sub-crates into a single, ergonomic API. It combines lexical (Tantivy BM25) and semantic (vector cosine similarity) search via Reciprocal Rank Fusion (RRF), with a two-tier progressive embedding model that delivers results in two phases:
+`frankensearch` is the main library crate that re-exports and unifies all workspace sub-crates into a single, ergonomic API. It combines lexical (native Quill or the explicit Tantivy oracle) and semantic (vector cosine similarity) search via Reciprocal Rank Fusion (RRF), with a two-tier progressive embedding model that delivers results in two phases:
 
 1. **Phase 1 (Initial):** Fast embedder (potion-128M, 256d, ~0.57ms) produces results immediately via brute-force vector search + optional BM25 fusion.
 2. **Phase 2 (Refined):** Quality embedder (MiniLM-L6-v2, 384d, ~128ms) re-scores the top candidates for higher relevance.
@@ -14,7 +14,7 @@ Consumers receive results progressively via `SearchPhase` callbacks, so UIs can 
 ```text
  Query --+-> Fast Embed (256d) -> Vector Search --+-> RRF Fusion -> Phase 1
          |                                        |
-         +-> Tantivy BM25 (optional) -------------+
+         +-> Quill / Tantivy-oracle BM25 ---------+
                                                         |
                                               Quality Embed (384d)
                                                         |
@@ -44,7 +44,9 @@ Consumers receive results progressively via `SearchPhase` callbacks, so UIs can 
 | `hash` (default) | FNV-1a hash embedder, zero dependencies |
 | `model2vec` | potion-128M static embedder (fast tier) |
 | `fastembed` | MiniLM-L6-v2 ONNX embedder (quality tier) |
-| `lexical` | Tantivy BM25 full-text search |
+| `lexical` | Pre-flip Tantivy BM25 compatibility lane |
+| `quill` | Native Quill lexical engine and `IndexBuilder` integration |
+| `lexical-tantivy` | Explicit Tantivy facade/oracle and comparator lane |
 | `rerank` | FlashRank cross-encoder reranking |
 | `ann` | HNSW approximate nearest-neighbor index |
 | `download` | Model auto-download from HuggingFace |
@@ -68,7 +70,7 @@ Consumers receive results progressively via `SearchPhase` callbacks, so UIs can 
 
 ## Usage
 
-```rust
+```rust,no_run
 use std::sync::Arc;
 use frankensearch::prelude::*;
 use frankensearch::{EmbedderStack, HashEmbedder, IndexBuilder, TwoTierIndex};
@@ -91,7 +93,7 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
     // Search
     let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
     let index = Arc::new(
-        TwoTierIndex::open("./my_index", TwoTierConfig::default()).unwrap()
+        TwoTierIndex::open(std::path::Path::new("./my_index"), TwoTierConfig::default()).unwrap()
     );
     let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
     let (results, metrics) = searcher
@@ -101,6 +103,21 @@ asupersync::test_utils::run_test_with_cx(|cx| async move {
 
     for result in &results {
         println!("{}: {:.4}", result.doc_id, result.score);
+    }
+
+    #[cfg(feature = "quill")]
+    {
+        let lexical = frankensearch::QuillIndex::open(
+            &cx,
+            "./my_index/lexical",
+            frankensearch::QuillConfig::default(),
+        )
+        .await
+        .expect("open Quill lexical index");
+        let lexical_hits = lexical
+            .search_results(&cx, "ownership", 10)
+            .expect("search Quill lexical index");
+        assert!(!lexical_hits.is_empty());
     }
 });
 ```
@@ -132,6 +149,7 @@ frankensearch-embed      (always)
 frankensearch-index      (always)
 frankensearch-fusion     (always)
 frankensearch-lexical    (feature: lexical)
+frankensearch-quill      (feature: quill)
 frankensearch-rerank     (feature: rerank)
 frankensearch-storage    (feature: storage)
 frankensearch-durability (feature: durability)
