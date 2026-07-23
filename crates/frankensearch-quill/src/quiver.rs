@@ -2536,7 +2536,23 @@ impl<'a> PayloadReader<'a> {
         Ok(u32::from_le_bytes(little_endian))
     }
 
+    // Profile-directed inline+cold split (bd-b6tc): the 1-byte case is inlined
+    // into callers to skip the non-inlined-call prologue; the rare multi-byte
+    // loop is out-of-line and `#[cold]`. Byte-identical.
+    #[inline]
     fn read_vint(&mut self) -> Result<u32, PostingCodecError> {
+        if let Some(&byte) = self.bytes.get(self.position)
+            && byte & 0x80 == 0
+        {
+            self.position += 1;
+            return Ok(u32::from(byte));
+        }
+        self.read_vint_multibyte()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_vint_multibyte(&mut self) -> Result<u32, PostingCodecError> {
         let start = self.absolute_position();
         let mut value = 0_u32;
         for byte_index in 0..5 {
@@ -4505,7 +4521,26 @@ impl<'a> PositionByteReader<'a> {
         Ok(byte)
     }
 
+    // Profile-directed (bd-b6tc): `read_u32_vint` was 11% of query self-time,
+    // paying a non-inlined call's prologue on every gap-encoded position. The
+    // 1-byte case (value < 128) dominates positions and is always canonical, so
+    // it is inlined into callers while the rare multi-byte loop is out-of-line
+    // and `#[cold]`. Byte-identical to the former single function.
+    #[inline]
     fn read_u32_vint(&mut self) -> Result<u32, PositionCodecError> {
+        if self.cursor < self.end
+            && let Some(&byte) = self.bytes.get(self.cursor)
+            && byte & 0x80 == 0
+        {
+            self.cursor += 1;
+            return Ok(u32::from(byte));
+        }
+        self.read_u32_vint_multibyte()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_u32_vint_multibyte(&mut self) -> Result<u32, PositionCodecError> {
         let start = self.cursor;
         let mut value = 0_u32;
         for byte_index in 0..5 {
@@ -4534,7 +4569,23 @@ impl<'a> PositionByteReader<'a> {
         })
     }
 
+    // Profile-directed inline+cold split (bd-b6tc): 1-byte fast path inlined,
+    // multi-byte loop out-of-line `#[cold]`. Byte-identical.
+    #[inline]
     fn read_u64_vint(&mut self) -> Result<u64, PositionCodecError> {
+        if self.cursor < self.end
+            && let Some(&byte) = self.bytes.get(self.cursor)
+            && byte & 0x80 == 0
+        {
+            self.cursor += 1;
+            return Ok(u64::from(byte));
+        }
+        self.read_u64_vint_multibyte()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_u64_vint_multibyte(&mut self) -> Result<u64, PositionCodecError> {
         let start = self.cursor;
         let mut value = 0_u64;
         for byte_index in 0..10 {

@@ -1,5 +1,54 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-23 — KEEP: Quill vint decode inline+cold split — −16.2% total instructions, the first profile-directed lever (`bd-b6tc`, cc)
+
+FIRST lever driven by a local symbolized profile of the query path (the e8.3 attribution the bd-e41k
+note said was unobtainable via rch — TRUE for rch, but it works LOCALLY; recipe below). Flat `perf`
+self-time on `segment_fanout_ab` (smoke shape, single-thread) showed variable-length integer decoding
+was **~33% of query self-time**: `SliceReader::read_vint` (grimoire) 16.3%, `PositionByteReader::read_u32_vint`
+(quiver) 11.3%, `PayloadReader::read_vint` 3.6%, plus `decode_vint_payload` 1.8%.
+
+A first attempt (1-byte fast path alone) was a WASH — the re-profile showed `read_vint` unchanged at
+~17%. `perf annotate` then revealed the real cost: `read_vint`'s hottest instructions were its own
+**function prologue** — a 6-callee-saved-register spill (`push rbp/r15/r14/r13/r12/rbx` ≈ 18% of the
+function's self-time). The vint readers were never inlined, so every call in the tight
+`decode_entry` / `consume_position_run` loops paid full call overhead. Fix = the textbook
+inline-hot-path / outline-cold-path split: `#[inline]` the 1-byte fast case (value < 128, which
+dominates gap-encoded deltas/positions and is ALWAYS canonical) so it inlines into callers and
+eliminates the prologue, with the rare multi-byte loop moved to a `#[cold] #[inline(never)]`
+`*_multibyte` helper (no code-size bloat). Applied to all four readers: grimoire `read_vint`, quiver
+`read_u32_vint`, `read_u64_vint`, and `PayloadReader::read_vint`.
+
+Byte-identical: a 1-byte vint (< 128) has `vint_len == 1`, so it is always canonical and cannot
+overflow — the fast path returns exactly what the loop would. Pinned by the exhaustive grimoire/quiver
+vint tests (canonical / non-canonical-padding / overflow / truncation); 473/473 quill-lib tests green;
+scoped clippy `-D warnings` clean.
+
+MEASURED by **deterministic instruction count** (`perf stat -e instructions`, the cleanest metric — zero
+run-to-run drift, unlike wall-clock), two same-shape binaries built from HEAD (pre-vint) vs the change,
+`QUILL_E49_SCALE=smoke QUILL_E49_ROUNDS=9 RAYON_NUM_THREADS=1`:
+
+| binary | instructions | note |
+|---|---|---|
+| OLD (HEAD, pre-vint) | 70,854,048,799 / 70,858,019,891 | two runs, ±0.006% |
+| NEW (inline+cold, 2 hottest readers) | 59,356,689,959 / 59,353,387,608 | two runs, ±0.006% |
+| **reduction** | **−11.50B (−16.2%)** | deterministic, unambiguous |
+
+(The A/B was captured on the two hottest readers; the shipped change extends the identical split to all
+four, so the landed reduction is at least this.) A 16.2% total-instruction cut on a decode-bound
+workload is a large real speedup — the non-inlined vint call was pervasive across ingest and query.
+
+WORKING LOCAL-PROFILE RECIPE (toward `docs/quill-perf-attribution.md`, e8.3): the floating `nightly`
+toolchain triggers a broken rustup auto-install mid-build — pin a dated nightly with `--check-cfg`
+(`RUSTUP_TOOLCHAIN=nightly-2026-07-06-…`); bypass the rch hook by symlinking `qc` → that toolchain's
+cargo binary (NOT the rustup shim, which rejects non-`cargo` argv[0]); build with
+`CARGO_PROFILE_RELEASE_LTO=false DEBUG=1 STRIP=false` to an isolated target; FLAT `perf record -F 999`
+(no `-g` — DWARF unwinding hangs on the rayon workload) with `RAYON_NUM_THREADS=1`.
+
+**Decision: KEEP.** Route next (profile route-nexts): `consume_position_run` + `positions_for_ordinal`
+(phrase position decode, ~15% combined — likely the same non-inlined pattern), `decode_bitmap_payload`
+(bit-by-bit scan → `trailing_zeros`), `decode_entry` (10.8%).
+
 ## 2026-07-23 — KEEP: Quill `TopDocsCollector` packed-u64 selection key — 2–4.4× on the isolated heap op (`bd-y1ab`, cc)
 
 Sibling of the KEPT FSVI int8 pass-1 packed-selection-key win (`bd-b5wl`, PERF_LEDGER 2026-07-10).

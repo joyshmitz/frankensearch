@@ -2754,7 +2754,28 @@ impl<'a> SliceReader<'a> {
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    // Profile-directed (bd-b6tc): `read_vint` was 16% of query self-time and
+    // its hot instructions were the *function prologue* — it was never inlined,
+    // so every call in the tight `decode_entry` loops paid a full 6-register
+    // spill. The 1-byte case (value < 128) dominates gap-encoded
+    // lengths/offsets and is always canonical, so it is inlined into callers
+    // here while the rare multi-byte loop is kept out-of-line and `#[cold]` to
+    // avoid code-size bloat. Byte-identical to the former single function.
+    #[inline]
     fn read_vint(&mut self) -> Result<u64, TermDictionaryError> {
+        if self.position < self.end
+            && let Some(&byte) = self.bytes.get(self.position)
+            && byte & 0x80 == 0
+        {
+            self.position += 1;
+            return Ok(u64::from(byte));
+        }
+        self.read_vint_multibyte()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_vint_multibyte(&mut self) -> Result<u64, TermDictionaryError> {
         let start = self.position;
         let mut value = 0_u64;
         for byte_index in 0..10 {
