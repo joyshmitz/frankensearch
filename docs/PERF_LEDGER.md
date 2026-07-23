@@ -1,5 +1,26 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-23 — KEEP: Quill `decode_bitmap_payload` `trailing_zeros` bit-scan — −4.86% total instructions (`bd-udz8`, cc)
+
+Profile-directed follow-on to the vint lever: the post-vint hotspot map put `decode_bitmap_payload`
+at 6.8% of query self-time. A BITMAP posting block packs exactly 128 set bits across a 128..512-bit
+span (64 bytes), so for larger spans the bitmap is sparse (span 512 → 25% set). The inner decode
+scanned all 512 bit positions (`for bit_index in 0..8 { if byte & (1<<bit)==0 { continue } }`),
+wasting up to 384 zero-bit tests per block. Replaced with a set-bits-only walk:
+`while bits != 0 { let bit = bits.trailing_zeros(); bits &= bits - 1; … }` — visits exactly the set
+bits in ascending order, so the emitted docids, span/cardinality checks, and errors are byte-identical
+(pinned by the existing BITMAP decode tests: first/last-set invariant, zero-beyond-span, exactly-128
+cardinality, docid overflow). 473/473 quill-lib tests green; scoped clippy `-D warnings` clean.
+
+MEASURED by deterministic instruction count (`perf stat -e instructions`, HEAD-vs-change binaries,
+`smoke`/`ROUNDS=9`/1-thread): OLD 56,509,326,088 / 56,518,668,541 → NEW 53,764,802,472 /
+53,773,904,176 = **−2.745B (−4.86%)**, both runs ±0.02% (130× the run-to-run noise — decidable).
+The smoke corpus's high-df terms produce sparse bitmap blocks, so the skipped zero-bit tests are real
+work removed.
+
+**Decision: KEEP.** (Note: the win scales with bitmap sparsity; a corpus of only span-128 fully-dense
+blocks would be a wash — but that regresses to the same iteration count, never slower.)
+
 ## 2026-07-23 — KEEP: Quill vint decode inline+cold split — −16.2% total instructions, the first profile-directed lever (`bd-b6tc`, cc)
 
 FIRST lever driven by a local symbolized profile of the query path (the e8.3 attribution the bd-e41k

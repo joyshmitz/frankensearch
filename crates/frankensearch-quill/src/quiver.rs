@@ -2990,10 +2990,15 @@ fn decode_bitmap_payload(
     let mut docs = [0_u32; POSTINGS_PER_BLOCK];
     let mut cardinality = 0_usize;
     for (byte_index, &byte) in bitmap.iter().enumerate() {
-        for bit_index in 0..8 {
-            if byte & (1_u8 << bit_index) == 0 {
-                continue;
-            }
+        // Iterate only the set bits (ascending) via `trailing_zeros` instead of
+        // testing all 8 positions: the bitmap holds 128 set bits across a
+        // 128..512 span, so larger (sparser) spans skip up to 384 zero bits
+        // (profile-directed, bd-udz8). Byte-identical — same relative values in
+        // the same order, same span/cardinality checks.
+        let mut bits = byte;
+        while bits != 0 {
+            let bit_index = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
             let relative = byte_index * 8 + bit_index;
             if relative >= usize::from(span) {
                 return Err(PostingCodecError::InvalidBitmap {
