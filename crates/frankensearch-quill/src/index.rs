@@ -6740,11 +6740,12 @@ mod tests {
 
     /// Run the sealed-segment unscored id-set stage on one explicit path.
     fn collect_docid_set(index: &QuillIndex, cx: &Cx, query_text: &str, fan_out: bool) -> Vec<u32> {
-        let mut parsed = index.parser.parse_lenient(query_text);
+        let mut parsed = index.reader.parser.parse_lenient(query_text);
         let _ = canonicalize_query(&mut parsed.query);
         let snapshot = index.search_snapshot();
         let mut collector = DocSetCollector::new();
         index
+            .reader
             .collect_docids_sealed(cx, &mut collector, &parsed.query, &snapshot, fan_out)
             .expect("sealed docid collection");
         collector.finish()
