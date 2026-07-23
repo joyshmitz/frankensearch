@@ -3730,6 +3730,11 @@ impl QuillIndex {
     }
 
     /// Open an existing shipping-schema index with FEC repair enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, admission, recovery, schema, or durability
+    /// failures.
     #[cfg(feature = "durability")]
     pub async fn open_durable(
         cx: &Cx,
@@ -3743,6 +3748,11 @@ impl QuillIndex {
     }
 
     /// Create or open a shipping-schema index with FEC repair enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, admission, recovery, schema, creation, or
+    /// durability failures.
     #[cfg(feature = "durability")]
     pub async fn create_durable(
         cx: &Cx,
@@ -6442,7 +6452,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
     use asupersync::runtime::yield_now;
@@ -6575,6 +6585,64 @@ mod tests {
             deterministic_ingest: true,
             ..QuillConfig::default()
         }
+    }
+
+    const E3_9_PINNED_SEEDS: [u64; 4] = [
+        0xe3_9000_0000_0001,
+        0xe3_9000_0000_001d,
+        0xe3_9000_0000_0101,
+        0xe3_9000_0000_1009,
+    ];
+    const E3_9_RANDOM_SEED_COUNT_ENV: &str = "QUILL_E3_9_RANDOM_SEEDS";
+
+    fn e3_9_seed_corpus() -> Vec<u64> {
+        let random_seed_count = match std::env::var(E3_9_RANDOM_SEED_COUNT_ENV) {
+            Ok(value) => value.parse::<usize>().unwrap_or_else(|error| {
+                panic!("{E3_9_RANDOM_SEED_COUNT_ENV}={value:?} is not a seed count: {error}")
+            }),
+            Err(std::env::VarError::NotPresent) => 0,
+            Err(error) => panic!("failed to read {E3_9_RANDOM_SEED_COUNT_ENV}: {error}"),
+        };
+        let mut seeds = Vec::from(E3_9_PINNED_SEEDS);
+        if random_seed_count == 0 {
+            return seeds;
+        }
+
+        let epoch_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("nightly seed clock predates the Unix epoch")
+            .as_nanos();
+        let mut state = u64::try_from(epoch_nanos & u128::from(u64::MAX))
+            .expect("masked epoch nanoseconds fit u64")
+            ^ 0xe3_9000_9e37_79b9;
+        for _ in 0..random_seed_count {
+            // SplitMix64 gives the scheduled campaign a fresh, well-spread
+            // corpus while every assertion still prints the exact replay seed.
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut seed = state;
+            seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            seeds.push(seed ^ (seed >> 31));
+        }
+        seeds
+    }
+
+    fn assert_e3_9_lab_report(scenario: &str, seed: u64, report: &asupersync::lab::LabRunReport) {
+        let replay = format!(
+            "{scenario}: seed={seed:#018x} fingerprint={:#018x}",
+            report.trace_fingerprint
+        );
+        assert!(report.quiescent, "{replay}: LabRuntime did not quiesce");
+        assert!(
+            report.oracle_report.all_passed(),
+            "{replay}: LabRuntime oracle failure: {:?}",
+            report.oracle_report
+        );
+        assert!(
+            report.invariant_violations.is_empty(),
+            "{replay}: LabRuntime invariant failures: {:?}",
+            report.invariant_violations
+        );
     }
 
     fn assert_pairwise_disjoint_manifest(segments: &[ManifestSegment]) {
@@ -9255,6 +9323,388 @@ mod tests {
     }
 
     #[test]
+    fn e3_9_labruntime_pinned_commit_delete_interleavings_are_atomic() {
+        run_with_cx(|cx| async move {
+            for seed in e3_9_seed_corpus() {
+                let index =
+                    Arc::new(QuillIndex::in_memory(deterministic_config()).expect("memory index"));
+                let alpha = IndexableDocument::new("alpha", "alpha committed");
+                index
+                    .index_document(&cx, &alpha)
+                    .await
+                    .expect("accumulate alpha");
+                index.commit(&cx).await.expect("publish alpha");
+                let beta = IndexableDocument::new("beta", "beta pending");
+                index
+                    .index_document(&cx, &beta)
+                    .await
+                    .expect("accumulate beta");
+
+                let writer = Arc::clone(&index.writer);
+                let commit_succeeded = Arc::new(AtomicBool::new(false));
+                // 1 = delete followed the commit and succeeded; 2 = delete
+                // serialized first and correctly rejected the pending commit.
+                let delete_outcome = Arc::new(AtomicU8::new(0));
+                let mut lab = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+                let region = lab.state.create_root_region(Budget::INFINITE);
+
+                let holder_writer = Arc::clone(&writer);
+                let (holder, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let holder_cx = Cx::for_testing();
+                        let guard = OwnedMutexGuard::lock(Arc::clone(&holder_writer), &holder_cx)
+                            .await
+                            .expect("acquire interleaving gate");
+                        while holder_writer.waiters() < 2 {
+                            yield_now().await;
+                        }
+                        drop(guard);
+                    })
+                    .expect("create interleaving gate");
+
+                let commit_index = Arc::clone(&index);
+                let commit_result = Arc::clone(&commit_succeeded);
+                let (commit_task, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let task_cx = Cx::for_testing();
+                        commit_index.commit(&task_cx).await.unwrap_or_else(|error| {
+                            panic!("seed={seed:#018x}: commit failed: {error}")
+                        });
+                        commit_result.store(true, Ordering::SeqCst);
+                    })
+                    .expect("create commit task");
+
+                let delete_index = Arc::clone(&index);
+                let delete_result = Arc::clone(&delete_outcome);
+                let (delete_task, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let task_cx = Cx::for_testing();
+                        let outcome = match delete_index.delete_document(&task_cx, "alpha").await {
+                            Ok(true) => 1,
+                            Err(QuillIndexError::InvalidState { detail })
+                                if detail.contains("fully committed") =>
+                            {
+                                2
+                            }
+                            Ok(false) => {
+                                panic!("seed={seed:#018x}: live alpha was not deleted")
+                            }
+                            Err(error) => {
+                                panic!("seed={seed:#018x}: unexpected delete result: {error}")
+                            }
+                        };
+                        delete_result.store(outcome, Ordering::SeqCst);
+                    })
+                    .expect("create delete task");
+
+                lab.scheduler.lock().schedule(holder, 0);
+                lab.step_for_test();
+                lab.scheduler.lock().schedule(commit_task, 0);
+                lab.scheduler.lock().schedule(delete_task, 0);
+                let report = lab.run_until_quiescent_with_report();
+                assert_e3_9_lab_report("commit-delete", seed, &report);
+
+                assert!(
+                    commit_succeeded.load(Ordering::SeqCst),
+                    "seed={seed:#018x}: commit did not complete"
+                );
+                let outcome = delete_outcome.load(Ordering::SeqCst);
+                assert_ne!(
+                    outcome, 0,
+                    "seed={seed:#018x}: delete task did not complete"
+                );
+                let snapshot = index.snapshot();
+                assert!(
+                    snapshot
+                        .resolve_document_id("beta")
+                        .expect("resolve beta")
+                        .is_some(),
+                    "seed={seed:#018x}: committed beta was lost"
+                );
+                let alpha_is_live = snapshot
+                    .resolve_document_id("alpha")
+                    .expect("resolve alpha")
+                    .is_some();
+                if outcome == 1 {
+                    assert!(
+                        !alpha_is_live,
+                        "seed={seed:#018x}: successful delete left alpha live"
+                    );
+                    assert_eq!(snapshot.doc_count(), 1);
+                } else {
+                    assert!(
+                        alpha_is_live,
+                        "seed={seed:#018x}: rejected delete changed alpha visibility"
+                    );
+                    assert_eq!(snapshot.doc_count(), 2);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn e3_9_labruntime_cancelled_ingest_and_merge_waiters_leave_no_partial_state() {
+        run_with_cx(|cx| async move {
+            for seed in e3_9_seed_corpus() {
+                let ingest =
+                    Arc::new(QuillIndex::in_memory(deterministic_config()).expect("memory index"));
+                let before = ingest.search_snapshot();
+                let writer = Arc::clone(&ingest.writer);
+                let operation_cx = Arc::new(Cx::for_testing());
+                let holder_release = Arc::new(AtomicBool::new(false));
+                let operation_cancelled = Arc::new(AtomicBool::new(false));
+                let mut lab = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+                let region = lab.state.create_root_region(Budget::INFINITE);
+
+                let holder_writer = Arc::clone(&writer);
+                let release = Arc::clone(&holder_release);
+                let (holder, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let holder_cx = Cx::for_testing();
+                        let guard = OwnedMutexGuard::lock(Arc::clone(&holder_writer), &holder_cx)
+                            .await
+                            .expect("acquire ingest cancellation gate");
+                        while !release.load(Ordering::SeqCst) {
+                            yield_now().await;
+                        }
+                        drop(guard);
+                    })
+                    .expect("create ingest cancellation gate");
+
+                let ingest_index = Arc::clone(&ingest);
+                let ingest_cx = Arc::clone(&operation_cx);
+                let cancel_observed = Arc::clone(&operation_cancelled);
+                let (ingest_task, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let document = IndexableDocument::new("cancelled", "never published");
+                        match ingest_index.index_document(&ingest_cx, &document).await {
+                            Err(QuillIndexError::Cancelled {
+                                phase: "index writer lock",
+                            }) => {
+                                cancel_observed.store(true, Ordering::SeqCst);
+                            }
+                            result => {
+                                panic!(
+                                    "seed={seed:#018x}: unexpected cancelled-ingest result: {result:?}"
+                                )
+                            }
+                        }
+                    })
+                    .expect("create cancelled ingest");
+
+                let cancel_writer = Arc::clone(&writer);
+                let cancel_cx = Arc::clone(&operation_cx);
+                let release = Arc::clone(&holder_release);
+                let (canceller, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        while cancel_writer.waiters() == 0 {
+                            yield_now().await;
+                        }
+                        cancel_cx.set_cancel_requested(true);
+                        release.store(true, Ordering::SeqCst);
+                    })
+                    .expect("create ingest canceller");
+
+                lab.scheduler.lock().schedule(holder, 0);
+                lab.step_for_test();
+                lab.scheduler.lock().schedule(ingest_task, 0);
+                lab.scheduler.lock().schedule(canceller, 0);
+                let report = lab.run_until_quiescent_with_report();
+                assert_e3_9_lab_report("cancel-ingest", seed, &report);
+                assert!(
+                    operation_cancelled.load(Ordering::SeqCst),
+                    "seed={seed:#018x}: ingest waiter did not observe cancellation"
+                );
+                assert!(Arc::ptr_eq(&before, &ingest.search_snapshot()));
+                assert!(!ingest.has_uncommitted_changes());
+                assert_eq!(ingest.doc_count(), 0);
+
+                let merge = Arc::new(concat_merge_fixture_index(&cx).await);
+                let before = merge.search_snapshot();
+                let before_evidence = q1_ob2a_query_evidence(&merge, &cx);
+                let source_ids = committed_segment_ids(&merge);
+                let output_segment_id = fresh_merge_segment_id(&merge, seed);
+                let writer = Arc::clone(&merge.writer);
+                let operation_cx = Arc::new(Cx::for_testing());
+                let holder_release = Arc::new(AtomicBool::new(false));
+                let operation_cancelled = Arc::new(AtomicBool::new(false));
+                let mut lab =
+                    LabRuntime::new(LabConfig::new(seed.rotate_left(17)).max_steps(100_000));
+                let region = lab.state.create_root_region(Budget::INFINITE);
+
+                let holder_writer = Arc::clone(&writer);
+                let release = Arc::clone(&holder_release);
+                let (holder, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let holder_cx = Cx::for_testing();
+                        let guard = OwnedMutexGuard::lock(Arc::clone(&holder_writer), &holder_cx)
+                            .await
+                            .expect("acquire merge cancellation gate");
+                        while !release.load(Ordering::SeqCst) {
+                            yield_now().await;
+                        }
+                        drop(guard);
+                    })
+                    .expect("create merge cancellation gate");
+
+                let merge_index = Arc::clone(&merge);
+                let merge_cx = Arc::clone(&operation_cx);
+                let cancel_observed = Arc::clone(&operation_cancelled);
+                let (merge_task, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        match merge_index
+                            .concat_merge(&merge_cx, &source_ids, output_segment_id, 1_700_000_000)
+                            .await
+                        {
+                            Err(QuillIndexError::Cancelled {
+                                phase: "concat merge writer lock",
+                            }) => {
+                                cancel_observed.store(true, Ordering::SeqCst);
+                            }
+                            Ok(_) => {
+                                panic!("seed={seed:#018x}: cancelled merge unexpectedly succeeded")
+                            }
+                            Err(error) => panic!(
+                                "seed={seed:#018x}: unexpected cancelled-merge error: {error}"
+                            ),
+                        }
+                    })
+                    .expect("create cancelled merge");
+
+                let cancel_writer = Arc::clone(&writer);
+                let cancel_cx = Arc::clone(&operation_cx);
+                let release = Arc::clone(&holder_release);
+                let (canceller, _) = lab
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        while cancel_writer.waiters() == 0 {
+                            yield_now().await;
+                        }
+                        cancel_cx.set_cancel_requested(true);
+                        release.store(true, Ordering::SeqCst);
+                    })
+                    .expect("create merge canceller");
+
+                lab.scheduler.lock().schedule(holder, 0);
+                lab.step_for_test();
+                lab.scheduler.lock().schedule(merge_task, 0);
+                lab.scheduler.lock().schedule(canceller, 0);
+                let report = lab.run_until_quiescent_with_report();
+                assert_e3_9_lab_report("cancel-merge", seed, &report);
+                assert!(
+                    operation_cancelled.load(Ordering::SeqCst),
+                    "seed={seed:#018x}: merge waiter did not observe cancellation"
+                );
+                assert!(Arc::ptr_eq(&before, &merge.search_snapshot()));
+                assert_eq!(q1_ob2a_query_evidence(&merge, &cx), before_evidence);
+            }
+        });
+    }
+
+    #[test]
+    fn e3_9_labruntime_compaction_racing_search_keeps_complete_held_snapshots() {
+        for seed in e3_9_seed_corpus() {
+            let index = Arc::new(q1_ob4_tombstoned_index(20, &[0, 1, 2, 3, 4]));
+            let query_cx = Cx::for_testing();
+            let expected = q1_ob4_query_evidence(&index, &query_cx);
+            let held = index.snapshot();
+            let held_generation = held.loaded_manifest().manifest.generation;
+            let weak = Arc::downgrade(&held);
+            let reader_started = Arc::new(AtomicBool::new(false));
+            let writer_done = Arc::new(AtomicBool::new(false));
+            let reader_passes = Arc::new(AtomicUsize::new(0));
+            let mut lab = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+            let region = lab.state.create_root_region(Budget::INFINITE);
+
+            let reader_index = Arc::clone(&index);
+            let reader_expected = expected.clone();
+            let reader_started_flag = Arc::clone(&reader_started);
+            let reader_done = Arc::clone(&writer_done);
+            let passes = Arc::clone(&reader_passes);
+            let (reader, _) = lab
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let cx = Cx::for_testing();
+                    reader_started_flag.store(true, Ordering::SeqCst);
+                    while !reader_done.load(Ordering::SeqCst) {
+                        assert_eq!(
+                            q1_ob4_query_evidence(&reader_index, &cx),
+                            reader_expected,
+                            "seed={seed:#018x}: reader observed torn compaction state"
+                        );
+                        passes.fetch_add(1, Ordering::SeqCst);
+                        yield_now().await;
+                    }
+                    assert_eq!(
+                        q1_ob4_query_evidence(&reader_index, &cx),
+                        reader_expected,
+                        "seed={seed:#018x}: post-compaction query drift"
+                    );
+                    passes.fetch_add(1, Ordering::SeqCst);
+                })
+                .expect("create compaction reader");
+
+            let writer_index = Arc::clone(&index);
+            let writer_started = Arc::clone(&reader_started);
+            let writer_finished = Arc::clone(&writer_done);
+            let (writer, _) = lab
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    while !writer_started.load(Ordering::SeqCst) {
+                        yield_now().await;
+                    }
+                    let cx = Cx::for_testing();
+                    let report = writer_index
+                        .compact(&cx, CompactionPolicy::default())
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("seed={seed:#018x}: compaction failed: {error}")
+                        });
+                    assert!(report.changed(), "seed={seed:#018x}: expected compaction");
+                    writer_finished.store(true, Ordering::SeqCst);
+                })
+                .expect("create compaction writer");
+
+            lab.scheduler.lock().schedule(reader, 0);
+            lab.step_for_test();
+            assert!(reader_started.load(Ordering::SeqCst));
+            lab.scheduler.lock().schedule(writer, 0);
+            let report = lab.run_until_quiescent_with_report();
+            assert_e3_9_lab_report("compaction-search", seed, &report);
+            assert!(
+                reader_passes.load(Ordering::SeqCst) >= 2,
+                "seed={seed:#018x}: reader did not span the publication"
+            );
+            assert_eq!(q1_ob4_query_evidence(&index, &query_cx), expected);
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                held_generation + 1
+            );
+            assert_eq!(held.loaded_manifest().manifest.generation, held_generation);
+            held.segments()[0]
+                .verify()
+                .unwrap_or_else(|error| panic!("seed={seed:#018x}: held segment failed: {error}"));
+            assert!(
+                weak.upgrade().is_some(),
+                "seed={seed:#018x}: held snapshot retired too early"
+            );
+            drop(held);
+            assert!(
+                weak.upgrade().is_none(),
+                "seed={seed:#018x}: old snapshot survived its last reader"
+            );
+        }
+    }
+
+    #[test]
     fn installed_delta_segment_without_manifest_is_not_durable_visibility() {
         run_with_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("temporary Keeper directory");
@@ -11850,7 +12300,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("durable index tempdir").keep();
         run_with_cx(|cx| async move {
             let protector = test_file_protector();
-            let mut index = QuillIndex::create_durable(
+            let index = QuillIndex::create_durable(
                 &cx,
                 &directory,
                 deterministic_config(),

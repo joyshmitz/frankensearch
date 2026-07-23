@@ -137,6 +137,8 @@ jobs:
 
       - name: Nightly full validation (all features)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        env:
+          QUILL_E3_9_RANDOM_SEEDS: "32"
         run: cargo test --workspace --all-features -- --nocapture
 
       - name: E2E contract smoke (fsfs)
