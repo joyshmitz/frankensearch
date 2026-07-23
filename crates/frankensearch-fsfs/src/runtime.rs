@@ -8975,10 +8975,18 @@ impl FsfsRuntime {
         };
 
         let lexical_path = index_root.join("lexical");
-        // Bulk construction retains Quill's default ingest policy. Watch
-        // sessions use the deterministic singleton policy in
-        // `build_live_ingest_pipeline` below.
-        let lexical_index = QuillIndex::create(cx, &lexical_path, QuillConfig::default()).await?;
+        // One-shot construction uses Quill's routed shard set and suppresses
+        // ordinary tier merges until the final bulk concat. Watch sessions use
+        // the deterministic singleton policy in `build_live_ingest_pipeline`.
+        let lexical_index = QuillIndex::create(
+            cx,
+            &lexical_path,
+            QuillConfig {
+                bulk_load_mode: true,
+                ..QuillConfig::default()
+            },
+        )
+        .await?;
         if discard_undurable_lexical_generation {
             lexical_index.delete_all(cx).await?;
         }
@@ -9923,7 +9931,7 @@ impl FsfsRuntime {
         checkpoint.updated_at_ms = pressure_timestamp_ms();
         write_indexing_checkpoint(&index_root, &checkpoint)?;
         let lexical_commit_start = Instant::now();
-        lexical_index.commit(cx).await?;
+        lexical_index.finish_bulk_load(cx).await?;
         lexical_elapsed_ms =
             lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 

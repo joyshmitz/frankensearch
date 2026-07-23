@@ -1056,6 +1056,7 @@ mod tests {
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
             run_test_with_cx(|cx| async move {
                 const INITIAL_DOCS: usize = 20_000;
+                const INITIAL_BATCH: usize = 256;
                 const UPDATE_DOCS: usize = 5_000;
                 const UPDATE_BATCH: usize = 50;
 
@@ -1074,24 +1075,29 @@ mod tests {
                 let bulk_index = QuillIndex::create(
                     &cx,
                     contract_root.path().join("bulk"),
-                    QuillConfig::default(),
+                    QuillConfig {
+                        bulk_load_mode: true,
+                        ..QuillConfig::default()
+                    },
                 )
                 .await
                 .expect("create bulk contract index");
                 let mut bulk_pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&bulk_index));
                 let initial_start = Instant::now();
-                bulk_pipeline
-                    .apply_initial(&initial_mutations)
-                    .expect("plan initial contract batch");
-                bulk_pipeline
-                    .backend_mut()
-                    .flush(&cx)
-                    .await
-                    .expect("flush initial contract batch");
+                for batch in initial_mutations.chunks(INITIAL_BATCH) {
+                    bulk_pipeline
+                        .apply_initial(batch)
+                        .expect("plan initial contract batch");
+                    bulk_pipeline
+                        .backend_mut()
+                        .flush(&cx)
+                        .await
+                        .expect("flush initial contract batch");
+                }
                 bulk_index
-                    .commit(&cx)
+                    .finish_bulk_load(&cx)
                     .await
-                    .expect("commit initial contract batch");
+                    .expect("finish bulk contract index");
                 let initial_elapsed = initial_start.elapsed();
                 assert_eq!(bulk_index.segment_stats().live_docs, INITIAL_DOCS);
 
