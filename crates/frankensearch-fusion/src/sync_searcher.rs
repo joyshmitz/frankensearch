@@ -79,40 +79,9 @@ impl QuillSyncLexicalSearch {
 #[cfg(feature = "quill")]
 impl SyncLexicalSearch for QuillSyncLexicalSearch {
     fn search_sync(&self, _query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
-        let result = self
-            .index
-            .search_paginated(&self.cx, &self.query, limit, 0, false)
-            .map_err(map_quill_search_error)?;
-        Ok(result
-            .hits
-            .into_iter()
-            .map(|hit| ScoredResult {
-                doc_id: hit.document_id.into(),
-                score: hit.score,
-                source: ScoreSource::Lexical,
-                index: None,
-                fast_score: None,
-                quality_score: None,
-                lexical_score: Some(hit.score),
-                rerank_score: None,
-                explanation: None,
-                metadata: None,
-            })
-            .collect())
-    }
-}
-
-#[cfg(feature = "quill")]
-fn map_quill_search_error(error: frankensearch_quill::QuillIndexError) -> SearchError {
-    match error {
-        frankensearch_quill::QuillIndexError::Cancelled { phase } => SearchError::Cancelled {
-            phase: phase.to_owned(),
-            reason: "Quill observed request cancellation".to_owned(),
-        },
-        source => SearchError::SubsystemError {
-            subsystem: "quill",
-            source: Box::new(source),
-        },
+        self.index
+            .search_results(&self.cx, &self.query, limit)
+            .map_err(SearchError::from)
     }
 }
 
@@ -1301,7 +1270,7 @@ mod tests {
             fn assert_send_sync<T: Send + Sync>() {}
             assert_send_sync::<QuillSyncLexicalSearch>();
 
-            let mut quill = QuillIndex::in_memory(QuillConfig {
+            let quill = QuillIndex::in_memory(QuillConfig {
                 deterministic_ingest: true,
                 ..QuillConfig::default()
             })

@@ -39,8 +39,8 @@ pub use grimoire::{
     TermScratch, TermSectionLengths,
 };
 pub use index::{
-    QuillHit, QuillIndex, QuillIndexError, QuillSearchResult, QuillSearchSnapshot, SnapshotError,
-    SnapshotPublisher,
+    QuillHit, QuillIndex, QuillIndexError, QuillSearchResult, QuillSearchSnapshot, QuillSnippetHit,
+    SnapshotError, SnapshotPublisher,
 };
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
