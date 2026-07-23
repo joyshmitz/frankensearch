@@ -11,7 +11,12 @@
 //! Within-process paired AB/BA. `limit = n/3` matches the default `rescore_top_k = 3·limit`.
 //!
 //! Run: `rch exec -- cargo bench -p frankensearch-index --profile release --bench mrl_topk_select_ab`
-#![allow(clippy::doc_markdown, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::trivially_copy_pass_by_ref
+)]
 
 use std::cmp::Ordering;
 use std::hint::black_box;
@@ -30,7 +35,9 @@ struct Entry {
 }
 
 fn cmp(a: &Entry, b: &Entry) -> Ordering {
-    b.score.total_cmp(&a.score).then_with(|| a.index.cmp(&b.index))
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| a.index.cmp(&b.index))
 }
 
 fn make_entries(n: usize) -> Vec<Entry> {
@@ -121,7 +128,10 @@ fn paired_ratio(base: &[Entry], limit: usize, a: Arm, b: Arm) -> RatioDistributi
         let bb = time_arm(base, limit, b);
         let ba = time_arm(base, limit, a);
         if record {
-            Some(((ab.as_secs_f64() / aa.as_secs_f64()) * (bb.as_secs_f64() / ba.as_secs_f64())).sqrt())
+            Some(
+                ((ab.as_secs_f64() / aa.as_secs_f64()) * (bb.as_secs_f64() / ba.as_secs_f64()))
+                    .sqrt(),
+            )
         } else {
             black_box((aa, ab, bb, ba));
             None
@@ -153,7 +163,9 @@ fn key(v: &[Entry]) -> Vec<(u32, u32)> {
 }
 
 fn main() {
-    eprintln!("[profile-config] select_nth_min={SELECT_NTH_MIN} shapes={SHAPES:?} profile_rounds={PROFILE_ROUNDS} paired_round_pairs={PAIRED_ROUND_PAIRS}");
+    eprintln!(
+        "[profile-config] select_nth_min={SELECT_NTH_MIN} shapes={SHAPES:?} profile_rounds={PROFILE_ROUNDS} paired_round_pairs={PAIRED_ROUND_PAIRS}"
+    );
     let mut any_clears = false;
     for &(n, limit) in SHAPES {
         let base = make_entries(n);
@@ -161,18 +173,30 @@ fn main() {
         let mut vs = base.clone();
         apply_legacy(&mut vl, limit);
         apply_select(&mut vs, limit);
-        assert_eq!(key(&vl), key(&vs), "select must equal legacy for n={n} limit={limit}");
+        assert_eq!(
+            key(&vl),
+            key(&vs),
+            "select must equal legacy for n={n} limit={limit}"
+        );
         let uses_select = limit < n && n >= SELECT_NTH_MIN;
         eprintln!("[parity] n={n} limit={limit} uses_select={uses_select} output_identical=true");
 
         let legacy_ns = median_ns(&base, limit, Arm::Legacy);
         let select_ns = median_ns(&base, limit, Arm::Select);
-        eprintln!("[profile] n={n} limit={limit} legacy_median_ns={legacy_ns:.1} select_median_ns={select_ns:.1}");
+        eprintln!(
+            "[profile] n={n} limit={limit} legacy_median_ns={legacy_ns:.1} select_median_ns={select_ns:.1}"
+        );
 
         let null = paired_ratio(&base, limit, Arm::Legacy, Arm::Legacy);
         let lever = paired_ratio(&base, limit, Arm::Legacy, Arm::Select);
-        eprintln!("[paired] n={n} comparison=null_legacy_legacy median={:.6} p5={:.6} p95={:.6}", null.median, null.p5, null.p95);
-        eprintln!("[paired] n={n} comparison=select_vs_legacy median={:.6} p5={:.6} p95={:.6}", lever.median, lever.p5, lever.p95);
+        eprintln!(
+            "[paired] n={n} comparison=null_legacy_legacy median={:.6} p5={:.6} p95={:.6}",
+            null.median, null.p5, null.p95
+        );
+        eprintln!(
+            "[paired] n={n} comparison=select_vs_legacy median={:.6} p5={:.6} p95={:.6}",
+            lever.median, lever.p5, lever.p95
+        );
         let gate_pass = null.null_contains_one() && lever.median < null.p5;
         any_clears |= gate_pass;
         eprintln!(
@@ -181,5 +205,8 @@ fn main() {
             1.0 / lever.median
         );
     }
-    eprintln!("[gate-summary] decision={} any_shape_clears_null_floor={any_clears}", if any_clears { "KEEP" } else { "HOLD" });
+    eprintln!(
+        "[gate-summary] decision={} any_shape_clears_null_floor={any_clears}",
+        if any_clears { "KEEP" } else { "HOLD" }
+    );
 }

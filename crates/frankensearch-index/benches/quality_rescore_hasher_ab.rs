@@ -23,6 +23,8 @@
 //!   rch exec -- cargo bench -p frankensearch-index --bench quality_rescore_hasher_ab
 //! ```
 
+#![allow(clippy::doc_markdown)]
+
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::hint::black_box;

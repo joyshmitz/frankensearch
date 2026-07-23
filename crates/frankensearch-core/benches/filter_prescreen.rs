@@ -1,9 +1,9 @@
-//! Filtered-scan prescreen: `matches()` (re-hash per doc_id) vs
+//! Filtered-scan prescreen: `matches()` (re-hash per `doc_id`) vs
 //! `matches_doc_id_hash()` (precomputed hash) — the per-vector cost the in-memory
 //! filtered scan pays for a `BitsetFilter`.
 //!
 //! The committed in-memory scan called `SearchFilter::matches(doc_id)`, which for
-//! `BitsetFilter` re-hashes the doc_id **string** every vector. The FSVI scan
+//! `BitsetFilter` re-hashes the `doc_id` **string** every vector. The FSVI scan
 //! already pre-screens with a precomputed hash via `matches_doc_id_hash`; this
 //! bench quantifies the per-vector saving (then in-memory was wired to match).
 //!

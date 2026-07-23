@@ -50,6 +50,16 @@ tokenizers = { workspace = true }
 criterion = { workspace = true }
 rayon = { workspace = true }
 
+# Real-corpus embedding generators (see each example's doc header for the run
+# command) — gated so default-feature `--all-targets` builds skip them.
+[[example]]
+name = "potion_embed_corpus"
+required-features = ["model2vec"]
+
+[[example]]
+name = "minilm_embed_corpus"
+required-features = ["fastembed"]
+
 [[bench]]
 name = "hash_embed"
 harness = false

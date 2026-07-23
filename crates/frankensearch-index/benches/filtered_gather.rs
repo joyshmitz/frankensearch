@@ -22,6 +22,8 @@
 //!   rch exec -- cargo bench -p frankensearch-index --bench filtered_gather
 //! ```
 
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::path::PathBuf;

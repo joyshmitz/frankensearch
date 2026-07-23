@@ -45,7 +45,7 @@ fn shared_prefix_depth_zip(path_a: &str, path_b: &str) -> usize {
         .count()
 }
 
-/// (query_path, candidate_path) pairs with varied shared-prefix depths, shaped
+/// (`query_path`, `candidate_path`) pairs with varied shared-prefix depths, shaped
 /// like a real source tree — the query origin plus a fanned-out candidate set.
 fn pairs() -> Vec<(&'static str, &'static str)> {
     let query = "crates/frankensearch-fsfs/src/ranking_priors.rs";
@@ -87,7 +87,7 @@ fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("shared_prefix_depth");
     for &n in &[8usize, 100, 500] {
         // Replicate the candidate set to a realistic per-query candidate count.
-        let batch: Vec<(&str, &str)> = ps.iter().cloned().cycle().take(n).collect();
+        let batch: Vec<(&str, &str)> = ps.iter().copied().cycle().take(n).collect();
         assert_eq!(run_alloc(&batch), run_zip(&batch), "batch parity (n={n})");
 
         group.bench_with_input(BenchmarkId::new("alloc", n), &batch, |b, batch| {

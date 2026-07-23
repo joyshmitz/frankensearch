@@ -1,11 +1,11 @@
 //! Hypothesis test for the ONE un-rejected lexical materialization lever
-//! (NEGATIVE_EVIDENCE.md route-next after the str-FAST-field reject):
+//! (`NEGATIVE_EVIDENCE.md` route-next after the str-FAST-field reject):
 //!
 //!   `search_doc_ids` materializes each hit's `doc_id` via `searcher.doc(addr)`,
 //!   which **decompresses the whole stored document** (id + content + title +
 //!   metadata) just to read `id`. The str-FAST-field variant was REJECTED
 //!   (2.65–18.3× slower) because `StrColumn::ord_to_str` does a dictionary
-//!   SSTable seek per hit. The route-next: a **numeric u64 fast field carrying a
+//!   `SSTable` seek per hit. The route-next: a **numeric u64 fast field carrying a
 //!   dense doc ordinal** (a flat packed column — NO dictionary) plus an external
 //!   `ordinal -> doc_id` table (`Vec<String>`, O(1) index). Materialization then
 //!   reads `ord = ff.first(local_doc)` (bit-unpack) and clones `table[ord]` once,
@@ -75,6 +75,8 @@ struct Fixture {
     table: Vec<String>,
 }
 
+// xorshift word picker — truncating the u64 to a vocab index is the point.
+#[allow(clippy::cast_possible_truncation)]
 fn build_fixture() -> Fixture {
     let mut sb = Schema::builder();
     let id_field = sb.add_text_field("id", STRING | STORED);
@@ -136,6 +138,8 @@ fn materialize_docstore(
     out
 }
 
+// The u64 ordinal is a dense in-range table index by construction.
+#[allow(clippy::cast_possible_truncation)]
 fn materialize_numeric_ff(
     searcher: &tantivy::Searcher,
     table: &[String],

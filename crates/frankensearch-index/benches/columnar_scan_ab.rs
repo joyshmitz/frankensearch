@@ -106,6 +106,7 @@ struct RatioDistribution {
     median: f64,
     p5: f64,
     p95: f64,
+    #[allow(dead_code)] // populated for symmetry with the paired-ratio report
     round_pairs: usize,
 }
 impl RatioDistribution {
@@ -183,7 +184,11 @@ fn paired_ratio(c: &Corpus, arm_a: Arm, arm_b: Arm) -> RatioDistribution {
     for _ in 0..3 {
         let _ = run(false);
     }
-    ratio_distribution((0..PAIRED_ROUND_PAIRS).map(|_| run(true).expect("pair")).collect())
+    ratio_distribution(
+        (0..PAIRED_ROUND_PAIRS)
+            .map(|_| run(true).expect("pair"))
+            .collect(),
+    )
 }
 
 fn median_ns_per_cand(c: &Corpus, arm: Arm) -> f64 {
@@ -191,19 +196,30 @@ fn median_ns_per_cand(c: &Corpus, arm: Arm) -> f64 {
     for _ in 0..3 {
         black_box(time_arm(c, arm, &mut out));
     }
-    let mut samples: Vec<Duration> = (0..PROFILE_ROUNDS).map(|_| time_arm(c, arm, &mut out)).collect();
+    let mut samples: Vec<Duration> = (0..PROFILE_ROUNDS)
+        .map(|_| time_arm(c, arm, &mut out))
+        .collect();
     samples.sort_unstable();
     percentile(&samples, 50).as_secs_f64() * 1e9 / c.n as f64
 }
 
 fn main() {
-    eprintln!("[config] shapes={} profile_rounds={PROFILE_ROUNDS}", SHAPES.len());
+    eprintln!(
+        "[config] shapes={} profile_rounds={PROFILE_ROUNDS}",
+        SHAPES.len()
+    );
     let mut all_faster = true;
     for &(n, dim) in SHAPES {
         let query = make_f32s(dim, 0xA5A5_1234);
         let rowmajor = make_f32s(n * dim, 0x1234_ABCD);
         let tiled = to_tiled(&rowmajor, n, dim);
-        let c = Corpus { query, rowmajor, tiled, n, dim };
+        let c = Corpus {
+            query,
+            rowmajor,
+            tiled,
+            n,
+            dim,
+        };
 
         // Parity: the two scans agree up to ULP reassociation.
         let mut a = vec![0.0_f32; n];
@@ -217,12 +233,17 @@ fn main() {
             .zip(&b)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0_f32, f32::max);
-        assert!(max_abs < 1e-2, "row/columnar disagree beyond ULP: max_abs={max_abs} (n={n} dim={dim})");
+        assert!(
+            max_abs < 1e-2,
+            "row/columnar disagree beyond ULP: max_abs={max_abs} (n={n} dim={dim})"
+        );
         eprintln!("[parity] n={n} dim={dim} max_abs_err={max_abs:.2e}");
 
         let row_ns = median_ns_per_cand(&c, Arm::Row);
         let col_ns = median_ns_per_cand(&c, Arm::Col);
-        eprintln!("[profile] n={n} dim={dim} rowmajor_ns/cand={row_ns:.3} columnar_ns/cand={col_ns:.3}");
+        eprintln!(
+            "[profile] n={n} dim={dim} rowmajor_ns/cand={row_ns:.3} columnar_ns/cand={col_ns:.3}"
+        );
 
         let null = paired_ratio(&c, Arm::Row, Arm::Row);
         let lever = paired_ratio(&c, Arm::Row, Arm::Col);
@@ -244,6 +265,10 @@ fn main() {
     }
     eprintln!(
         "[gate-summary] decision={}",
-        if all_faster { "columnar-faster-all-shapes" } else { "MIXED-or-floor" }
+        if all_faster {
+            "columnar-faster-all-shapes"
+        } else {
+            "MIXED-or-floor"
+        }
     );
 }

@@ -493,6 +493,7 @@ mod tests {
     /// loop for every digest, and `hash_hex(text)` must equal `to_hex(hash(text))` — so
     /// the pipeline's single-hash rewrite keeps `content_hash_hex` bit-for-bit identical.
     #[test]
+    #[allow(clippy::cast_possible_truncation)] // deterministic byte-fill wants the low 8 bits
     fn to_hex_matches_write_format() {
         use std::fmt::Write as _;
         fn write_hex(digest: &[u8; 32]) -> String {

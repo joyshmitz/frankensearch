@@ -113,7 +113,7 @@ type Int8HeapKey = u128;
 #[allow(clippy::inline_always)]
 #[inline(always)]
 const fn int8_heap_key(index: usize, score: i32) -> Int8HeapKey {
-    let ascending_score = (score as u32) ^ 0x8000_0000;
+    let ascending_score = score.cast_unsigned() ^ 0x8000_0000;
     let descending_score = !ascending_score;
     ((descending_score as u128) << usize::BITS) | index as u128
 }
@@ -126,7 +126,7 @@ fn int8_heap_key_from_f32(index: usize, score: i32) -> Int8HeapKey {
     let sign_mask = (bits >> 31).wrapping_neg() | 0x8000_0000;
     let ascending_score = bits ^ sign_mask;
     let descending_score = !ascending_score;
-    ((descending_score as u128) << usize::BITS) | index as u128
+    (u128::from(descending_score) << usize::BITS) | index as u128
 }
 
 const fn int8_heap_index(key: Int8HeapKey) -> usize {
@@ -344,8 +344,14 @@ impl VectorIndex {
     /// Covers the contiguous F16 main-vector region only; falls back to the exact
     /// [`VectorIndex::search_top_k`] when a WAL is present or quantization is not F16
     /// (so results are always correct, never silently degraded). Not wired into the
-    /// BOLD hybrid (that gap is not vector-bound — see docs/NEGATIVE_EVIDENCE.md);
+    /// BOLD hybrid (that gap is not vector-bound — see `docs/NEGATIVE_EVIDENCE.md`);
     /// this targets pure vector-search latency at large N.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` when `query.len()` does not
+    /// match index dimensionality, and `SearchError::IndexCorrupted` for
+    /// malformed slab data.
     pub fn search_top_k_int8_two_pass(
         &self,
         query: &[f32],
@@ -702,6 +708,12 @@ impl VectorIndex {
     /// `fsvi_4bit_two_pass` bench); recall rises with `candidate_multiplier`.
     /// Falls back to the exact `search_top_k` for WAL/non-F16 indexes. Not wired
     /// into the BOLD hybrid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` when `query.len()` does not
+    /// match index dimensionality, and `SearchError::IndexCorrupted` for
+    /// malformed slab data.
     pub fn search_top_k_4bit_two_pass(
         &self,
         query: &[f32],
@@ -1441,6 +1453,7 @@ impl VectorIndex {
 
 /// Quantize an f32 query to int8 using its own max-abs scale (a per-query constant
 /// that does not change the dot-product ranking).
+#[allow(clippy::cast_possible_truncation)] // round()+clamp() bounds the f32->i8 cast
 fn quantize_i8_query(query: &[f32]) -> Vec<i8> {
     let max_abs = query.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
     if max_abs <= 0.0 {
@@ -1456,9 +1469,10 @@ fn quantize_i8_query(query: &[f32]) -> Vec<i8> {
 /// Quantize one component to a signed 4-bit nibble (`[-7, 7]`, 4-bit two's
 /// complement in the low 4 bits) given a scale.
 #[inline]
+#[allow(clippy::cast_possible_truncation)] // round()+clamp() bounds the cast
 fn nibble_of(value: f32, scale: f32) -> u8 {
     let q = (value * scale).round().clamp(-7.0, 7.0) as i8;
-    (q as u8) & 0x0F
+    q.cast_unsigned() & 0x0F
 }
 
 /// Pack an f32 query into signed 4-bit nibbles, 2 dims/byte (low = even dim, high =
@@ -1638,6 +1652,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)] // deterministic non-negative fixture mixing
     fn int8_two_pass_keep_all_matches_exact() {
         // With a multiplier large enough to retain every record, pass-1 keeps all
         // main vectors, so the exact f16 rescore must reproduce `search_top_k`
@@ -1685,6 +1700,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)] // deterministic non-negative fixture mixing
     fn int8_row_block_matches_orig_with_tombstones_and_tail() {
         // Cross the parallel threshold and leave a three-row tail in the final
         // chunk. Tombstones in two different four-row blocks force the exact
@@ -1748,6 +1764,7 @@ mod tests {
     /// exactly. Asserts maddubs recall@10 ≥ orig recall@10 and both are perfect on a realistic
     /// (normalized, clustered) corpus that exercises the saturation.
     #[test]
+    #[allow(clippy::cast_sign_loss)] // deterministic non-negative fixture mixing
     fn int8_two_pass_maddubs_preserves_recall_vs_flat() {
         let path = temp_index_path("int8-maddubs-recall");
         let dim = 384;
@@ -1805,8 +1822,8 @@ mod tests {
             hit as f64 / exact.len().max(1) as f64
         };
 
-        for c in 0..4usize {
-            let query = normalize(centroids[c].clone());
+        for (c, centroid) in centroids.iter().take(4).enumerate() {
+            let query = normalize(centroid.clone());
             let exact = ids(index.search_top_k(&query, 10, None).expect("flat"));
             for mult in [3usize, 5] {
                 let orig = ids(index
@@ -1830,6 +1847,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)] // deterministic non-negative fixture mixing
     fn four_bit_two_pass_keep_all_matches_exact() {
         // With a multiplier large enough to retain every record, the exact f16
         // rescore must reproduce `search_top_k` bit-for-bit — verifying the nibble

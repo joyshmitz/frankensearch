@@ -256,6 +256,11 @@ impl Model2VecEmbedder {
     /// threads once the batch reaches [`PARALLEL_BATCH_MIN`]. Each document is
     /// independent CPU-bound work, so the result is **identical** to the serial loop
     /// (Rayon's indexed `collect` preserves input order); only the wall-clock differs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::EmbeddingFailed` if tokenization fails or
+    /// all tokens are out-of-vocabulary for any text in the batch.
     pub fn embed_batch_sync(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
         if texts.len() >= PARALLEL_BATCH_MIN {
             texts.par_iter().map(|text| self.embed_sync(text)).collect()
@@ -375,11 +380,9 @@ fn parse_f32_matrix(data: &[u8], vocab_size: usize, dimensions: usize) -> Result
     // Pre-allocate the exact size
     let mut matrix = Vec::with_capacity(expected_elements);
 
-    // Parse bytes in 4-byte chunks
-    for chunk in data.chunks_exact(4) {
-        let bytes: [u8; 4] = chunk
-            .try_into()
-            .map_err(|_| "byte slice conversion failed".to_string())?;
+    // Parse bytes in 4-byte chunks (length is validated above to be a
+    // multiple of 4, so `as_chunks` leaves no remainder)
+    for &bytes in data.as_chunks::<4>().0 {
         matrix.push(f32::from_le_bytes(bytes));
     }
 
@@ -588,7 +591,10 @@ mod tests {
 
             assert_eq!(batched.len(), serial.len(), "len at n={batch_size}");
             for (b, s) in batched.iter().zip(&serial) {
-                assert_eq!(b, s, "embed_batch_sync diverged from serial at n={batch_size}");
+                assert_eq!(
+                    b, s,
+                    "embed_batch_sync diverged from serial at n={batch_size}"
+                );
             }
         }
     }
@@ -809,7 +815,7 @@ mod tests {
 
         // Create safetensors with a non-standard tensor name
         let mut data = vec![0u8; 2 * 3 * 4]; // 2 rows × 3 dims × 4 bytes
-        for (i, chunk) in data.chunks_exact_mut(4).enumerate() {
+        for (i, chunk) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             let val = i as f32;
             chunk.copy_from_slice(&val.to_le_bytes());

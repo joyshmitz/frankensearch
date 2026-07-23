@@ -178,7 +178,10 @@ fn paired_ratio(base: &[ScoredResult], a: Arm, b: Arm) -> RatioDistribution {
         let bb = time_arm(base, b);
         let ba = time_arm(base, a);
         if record {
-            Some(((ab.as_secs_f64() / aa.as_secs_f64()) * (bb.as_secs_f64() / ba.as_secs_f64())).sqrt())
+            Some(
+                ((ab.as_secs_f64() / aa.as_secs_f64()) * (bb.as_secs_f64() / ba.as_secs_f64()))
+                    .sqrt(),
+            )
         } else {
             black_box((aa, ab, bb, ba));
             None
@@ -204,7 +207,9 @@ fn median_ns(base: &[ScoredResult], arm: Arm) -> f64 {
 }
 
 fn main() {
-    eprintln!("[profile-config] window_sizes={WINDOW_SIZES:?} profile_rounds={PROFILE_ROUNDS} paired_round_pairs={PAIRED_ROUND_PAIRS}");
+    eprintln!(
+        "[profile-config] window_sizes={WINDOW_SIZES:?} profile_rounds={PROFILE_ROUNDS} paired_round_pairs={PAIRED_ROUND_PAIRS}"
+    );
     let mut any_clears = false;
     for &n in WINDOW_SIZES {
         let base = window(n);
@@ -212,17 +217,29 @@ fn main() {
         let mut wm = base.clone();
         apply_legacy(&mut wl);
         apply_move(&mut wm);
-        assert_eq!(key(&wl), key(&wm), "move tail must equal clone_from_slice for n={n}");
+        assert_eq!(
+            key(&wl),
+            key(&wm),
+            "move tail must equal clone_from_slice for n={n}"
+        );
         eprintln!("[parity] window={n} output_identical=true");
 
         let legacy_ns = median_ns(&base, Arm::Legacy);
         let move_ns = median_ns(&base, Arm::Move);
-        eprintln!("[profile] window={n} legacy_median_ns={legacy_ns:.2} move_median_ns={move_ns:.2}");
+        eprintln!(
+            "[profile] window={n} legacy_median_ns={legacy_ns:.2} move_median_ns={move_ns:.2}"
+        );
 
         let null = paired_ratio(&base, Arm::Legacy, Arm::Legacy);
         let lever = paired_ratio(&base, Arm::Legacy, Arm::Move);
-        eprintln!("[paired] window={n} comparison=null_legacy_legacy median={:.6} p5={:.6} p95={:.6}", null.median, null.p5, null.p95);
-        eprintln!("[paired] window={n} comparison=move_vs_legacy median={:.6} p5={:.6} p95={:.6}", lever.median, lever.p5, lever.p95);
+        eprintln!(
+            "[paired] window={n} comparison=null_legacy_legacy median={:.6} p5={:.6} p95={:.6}",
+            null.median, null.p5, null.p95
+        );
+        eprintln!(
+            "[paired] window={n} comparison=move_vs_legacy median={:.6} p5={:.6} p95={:.6}",
+            lever.median, lever.p5, lever.p95
+        );
         let gate_pass = null.null_contains_one() && lever.median < null.p5;
         any_clears |= gate_pass;
         eprintln!(
@@ -231,5 +248,8 @@ fn main() {
             1.0 / lever.median
         );
     }
-    eprintln!("[gate-summary] decision={} any_shape_clears_null_floor={any_clears}", if any_clears { "KEEP" } else { "HOLD" });
+    eprintln!(
+        "[gate-summary] decision={} any_shape_clears_null_floor={any_clears}",
+        if any_clears { "KEEP" } else { "HOLD" }
+    );
 }

@@ -15,7 +15,11 @@
 //! AGENT_NAME=cc_fse CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
 //!   rch exec -- cargo bench -p frankensearch-index --profile release --bench ivf_crossover_ab
 //! ```
-#![allow(clippy::doc_markdown)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown
+)]
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -62,9 +66,9 @@ impl Xorshift {
 
 struct Corpus {
     query_v: Vec<f32x8>,
-    slab: Vec<f32>,          // n*DIM, row-major
-    centroids: Vec<f32>,     // c*DIM
-    lists: Vec<Vec<usize>>,  // cluster -> member indices
+    slab: Vec<f32>,         // n*DIM, row-major
+    centroids: Vec<f32>,    // c*DIM
+    lists: Vec<Vec<usize>>, // cluster -> member indices
     n: usize,
     c: usize,
 }
@@ -92,7 +96,14 @@ fn make_corpus(n: usize) -> Corpus {
         query[d] = centroids[d] + r.next_f32() * 0.3;
     }
     let query_v: Vec<f32x8> = (0..DIM / 8).map(|k| load8(&query[k * 8..])).collect();
-    Corpus { query_v, slab, centroids, lists, n, c }
+    Corpus {
+        query_v,
+        slab,
+        centroids,
+        lists,
+        n,
+        c,
+    }
 }
 
 fn retain(heap: &mut Vec<(f32, usize)>, score: f32, idx: usize, cutoff: &mut f32) {
@@ -158,7 +169,9 @@ fn median_ns(c: &Corpus, ivf: bool) -> f64 {
 }
 
 fn main() {
-    eprintln!("[config] dim={DIM} k={K} probe={PROBE} nlist=sqrt(N) profile_rounds={PROFILE_ROUNDS}");
+    eprintln!(
+        "[config] dim={DIM} k={K} probe={PROBE} nlist=sqrt(N) profile_rounds={PROFILE_ROUNDS}"
+    );
     let mut crossover = None;
     for &n in SHAPES {
         let c = make_corpus(n);
@@ -168,7 +181,11 @@ fn main() {
             .collect();
         let take = PROBE.min(c.c);
         cdist.select_nth_unstable_by(take - 1, |a, b| b.0.total_cmp(&a.0));
-        let scanned: usize = cdist.iter().take(take).map(|&(_, cl)| c.lists[cl].len()).sum();
+        let scanned: usize = cdist
+            .iter()
+            .take(take)
+            .map(|&(_, cl)| c.lists[cl].len())
+            .sum();
 
         let flat_ns = median_ns(&c, false);
         let ivf_ns = median_ns(&c, true);

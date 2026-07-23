@@ -15,7 +15,11 @@
 //! AGENT_NAME=cc_fse env -u CARGO_TARGET_DIR \
 //!   rch exec -- cargo bench -p frankensearch-index --profile release --bench ivf_recall_ab
 //! ```
-#![allow(clippy::doc_markdown)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::many_single_char_names
+)]
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -78,7 +82,10 @@ fn flat_topk(query: &[f32], slab: &[f32], n: usize) -> Vec<usize> {
         if best.len() < K {
             best.push((d, i));
             if best.len() == K {
-                cutoff = best.iter().map(|&(x, _)| x).fold(f32::NEG_INFINITY, f32::max);
+                cutoff = best
+                    .iter()
+                    .map(|&(x, _)| x)
+                    .fold(f32::NEG_INFINITY, f32::max);
             }
         } else if d < cutoff {
             let mut mi = 0;
@@ -88,7 +95,10 @@ fn flat_topk(query: &[f32], slab: &[f32], n: usize) -> Vec<usize> {
                 }
             }
             best[mi] = (d, i);
-            cutoff = best.iter().map(|&(x, _)| x).fold(f32::NEG_INFINITY, f32::max);
+            cutoff = best
+                .iter()
+                .map(|&(x, _)| x)
+                .fold(f32::NEG_INFINITY, f32::max);
         }
     }
     best.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -117,7 +127,10 @@ fn ivf_topk(
             if best.len() < K {
                 best.push((d, i));
                 if best.len() == K {
-                    cutoff = best.iter().map(|&(x, _)| x).fold(f32::NEG_INFINITY, f32::max);
+                    cutoff = best
+                        .iter()
+                        .map(|&(x, _)| x)
+                        .fold(f32::NEG_INFINITY, f32::max);
                 }
             } else if d < cutoff {
                 let mut mi = 0;
@@ -127,7 +140,10 @@ fn ivf_topk(
                     }
                 }
                 best[mi] = (d, i);
-                cutoff = best.iter().map(|&(x, _)| x).fold(f32::NEG_INFINITY, f32::max);
+                cutoff = best
+                    .iter()
+                    .map(|&(x, _)| x)
+                    .fold(f32::NEG_INFINITY, f32::max);
             }
         }
     }
@@ -183,7 +199,9 @@ fn kmeans(slab: &[f32], n: usize, r: &mut Xorshift) -> (Vec<f32>, Vec<Vec<u32>>)
 }
 
 fn main() {
-    eprintln!("[config] dim={DIM} n={N} nlist={NLIST} kmeans_iters={KMEANS_ITERS} k={K} nquery={NQUERY}");
+    eprintln!(
+        "[config] dim={DIM} n={N} nlist={NLIST} kmeans_iters={KMEANS_ITERS} k={K} nquery={NQUERY}"
+    );
     let mut r = Xorshift(0x9E37_79B9_7F4A_7C15);
     // Clustered corpus.
     let ntrue = 256;
@@ -199,7 +217,9 @@ fn main() {
     let queries: Vec<Vec<f32>> = (0..NQUERY)
         .map(|_| {
             let cl = r.next_usize(ntrue);
-            (0..DIM).map(|d| centers[cl * DIM + d] + r.next_f32() * 0.4).collect()
+            (0..DIM)
+                .map(|d| centers[cl * DIM + d] + r.next_f32() * 0.4)
+                .collect()
         })
         .collect();
 

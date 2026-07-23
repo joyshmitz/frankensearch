@@ -11,7 +11,11 @@
 //!
 //! Run: `rch exec -- cargo bench -p frankensearch-index --profile release
 //!   --bench concurrent_int8_vs_4bit`
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -45,7 +49,9 @@ fn pack_4bit_vector(v: &[f32]) -> Vec<u8> {
     v.chunks(2)
         .map(|pair| {
             let lo = quantize_4bit(pair[0]) as u8 & 0x0f;
-            let hi = pair.get(1).map_or(0, |x| (quantize_4bit(*x) as u8 & 0x0f) << 4);
+            let hi = pair
+                .get(1)
+                .map_or(0, |x| (quantize_4bit(*x) as u8 & 0x0f) << 4);
             lo | hi
         })
         .collect()
@@ -96,7 +102,10 @@ fn scan_i8(slab: &[i8], query: &[i8]) -> i64 {
 fn scan_4bit(slab: &[u8], q4: &PreparedQuery4bit, per: usize) -> i64 {
     let mut acc = 0i64;
     for v in 0..N {
-        acc = acc.wrapping_add(i64::from(dot_4bit_prepared(&slab[v * per..(v + 1) * per], q4)));
+        acc = acc.wrapping_add(i64::from(dot_4bit_prepared(
+            &slab[v * per..(v + 1) * per],
+            q4,
+        )));
     }
     acc
 }
@@ -142,7 +151,10 @@ fn main() {
 
     let i8_base = throughput(1, i8_round);
     let b4_base = throughput(1, b4_round);
-    eprintln!("[baseline] int8_scans_per_sec={i8_base:.1} fourbit_scans_per_sec={b4_base:.1} fourbit_over_int8_1thread={:.4}", b4_base / i8_base);
+    eprintln!(
+        "[baseline] int8_scans_per_sec={i8_base:.1} fourbit_scans_per_sec={b4_base:.1} fourbit_over_int8_1thread={:.4}",
+        b4_base / i8_base
+    );
 
     let counts: Vec<usize> = [2usize, 4, 8, cores]
         .into_iter()

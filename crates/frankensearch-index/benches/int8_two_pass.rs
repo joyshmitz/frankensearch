@@ -15,6 +15,8 @@
 //!   rch exec -- cargo bench -p frankensearch-index --bench int8_two_pass
 //! ```
 
+#![allow(clippy::significant_drop_tightening)]
+
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};

@@ -22,6 +22,8 @@
 //!   rch exec -- cargo bench -p frankensearch-index --bench quality_rescore_fused_dot_ab
 //! ```
 
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};

@@ -282,14 +282,18 @@ fn parse_batch(
 fn decode_vector(bytes: &[u8], dimension: usize, quantization: Quantization) -> Vec<f32> {
     let vec = match quantization {
         Quantization::F16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .take(dimension)
-            .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+            .map(|chunk| f16::from_le_bytes(*chunk).to_f32())
             .collect(),
         Quantization::F32 => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(dimension)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect(),
     };
     debug_assert_eq!(

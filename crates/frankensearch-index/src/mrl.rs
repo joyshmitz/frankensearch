@@ -42,6 +42,9 @@ use crate::{
     VectorIndex, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
 };
 
+/// Dot-product kernel over raw stored bytes for a given quantization.
+type PartialDotFn = fn(&[u8], &[f32]) -> SearchResult<f32>;
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -373,11 +376,10 @@ impl VectorIndex {
             crate::Quantization::F16 => self.dimension() * 2,
             crate::Quantization::F32 => self.dimension() * 4,
         };
-        let (partial_bytes, dot): (usize, fn(&[u8], &[f32]) -> SearchResult<f32>) =
-            match self.quantization() {
-                crate::Quantization::F16 => (search_dims * 2, dot_product_f16_bytes_f32),
-                crate::Quantization::F32 => (search_dims * 4, dot_product_f32_bytes_f32),
-            };
+        let (partial_bytes, dot): (usize, PartialDotFn) = match self.quantization() {
+            crate::Quantization::F16 => (search_dims * 2, dot_product_f16_bytes_f32),
+            crate::Quantization::F32 => (search_dims * 4, dot_product_f32_bytes_f32),
+        };
 
         // Below the parallel threshold, a single sequential chunk avoids rayon
         // overhead. Above it, scan disjoint record ranges in parallel — the same

@@ -82,7 +82,7 @@ fn bench_real_qlen_vector(_c: &mut Criterion) {
         for i in 0..q {
             let target = format!("doc-{:06}", srcids[i]);
             let hits = index.search_top_k(&qvecs[i], K, None).expect("search");
-            if let Some(rank) = hits.iter().position(|h| h.doc_id.to_string() == target) {
+            if let Some(rank) = hits.iter().position(|h| h.doc_id == target) {
                 recall += 1.0;
                 mrr += 1.0 / (rank as f64 + 1.0);
             }

@@ -48,8 +48,16 @@ fn topk_flat(q: &[f32], slab: &[f32]) -> Vec<usize> {
     v.into_iter().map(|(_, i)| i).collect()
 }
 
-fn topk_ivf(q: &[f32], slab: &[f32], cents: &[f32], lists: &[Vec<u32>], probe: usize) -> Vec<usize> {
-    let mut cd: Vec<(f32, usize)> = (0..NLIST).map(|c| (l2sq(q, &cents[c * DIM..]), c)).collect();
+fn topk_ivf(
+    q: &[f32],
+    slab: &[f32],
+    cents: &[f32],
+    lists: &[Vec<u32>],
+    probe: usize,
+) -> Vec<usize> {
+    let mut cd: Vec<(f32, usize)> = (0..NLIST)
+        .map(|c| (l2sq(q, &cents[c * DIM..]), c))
+        .collect();
     cd.select_nth_unstable_by(probe - 1, |a, b| a.0.total_cmp(&b.0));
     let mut best: Vec<(f32, usize)> = Vec::new();
     for &(_, c) in cd.iter().take(probe) {
@@ -80,7 +88,7 @@ fn kmeans(slab: &[f32], r: &mut Xs) -> (Vec<f32>, Vec<Vec<u32>>) {
                 let d = l2sq(v, &cents[c * DIM..]);
                 if d < bd {
                     bd = d;
-                    bc = c as u32;
+                    bc = u32::try_from(c).expect("NLIST fits in u32");
                 }
             }
             asg[i] = bc;
@@ -105,7 +113,7 @@ fn kmeans(slab: &[f32], r: &mut Xs) -> (Vec<f32>, Vec<Vec<u32>>) {
     }
     let mut lists = vec![Vec::new(); NLIST];
     for i in 0..N {
-        lists[asg[i] as usize].push(i as u32);
+        lists[asg[i] as usize].push(u32::try_from(i).expect("N fits in u32"));
     }
     (cents, lists)
 }
@@ -114,7 +122,7 @@ fn kmeans(slab: &[f32], r: &mut Xs) -> (Vec<f32>, Vec<Vec<u32>>) {
 /// well-separated (easy) and noise≈2.5 is heavily overlapping (a proxy for real-embedding
 /// difficulty, where the true top-k spans several clusters).
 fn pareto_at_noise(noise: f32) -> Vec<f64> {
-    let mut r = Xs(0x9E37_79B9_7F4A_7C15 ^ (noise.to_bits() as u64).wrapping_mul(0x1234_5)); // vary seed
+    let mut r = Xs(0x9E37_79B9_7F4A_7C15 ^ u64::from(noise.to_bits()).wrapping_mul(0x0001_2345)); // vary seed
     let centers: Vec<f32> = (0..NTRUE * DIM).map(|_| r.f() * 4.0).collect();
     let mut slab = vec![0.0f32; N * DIM];
     for i in 0..N {
@@ -126,7 +134,9 @@ fn pareto_at_noise(noise: f32) -> Vec<f64> {
     let queries: Vec<Vec<f32>> = (0..NQUERY)
         .map(|_| {
             let cl = r.u(NTRUE);
-            (0..DIM).map(|d| centers[cl * DIM + d] + r.f() * noise).collect()
+            (0..DIM)
+                .map(|d| centers[cl * DIM + d] + r.f() * noise)
+                .collect()
         })
         .collect();
     let (cents, lists) = kmeans(&slab, &mut r);
@@ -143,8 +153,9 @@ fn pareto_at_noise(noise: f32) -> Vec<f64> {
         }
         let recall = hit as f64 / (NQUERY * K) as f64;
         let scanned: usize = {
-            let mut cd: Vec<(f32, usize)> =
-                (0..NLIST).map(|c| (l2sq(&queries[0], &cents[c * DIM..]), c)).collect();
+            let mut cd: Vec<(f32, usize)> = (0..NLIST)
+                .map(|c| (l2sq(&queries[0], &cents[c * DIM..]), c))
+                .collect();
             cd.select_nth_unstable_by(p - 1, |a, b| a.0.total_cmp(&b.0));
             cd.iter().take(p).map(|&(_, c)| lists[c].len()).sum()
         };
@@ -168,9 +179,15 @@ fn ivf_recall_pareto() {
     let hard = pareto_at_noise(2.5);
     for recalls in [&easy, &moderate, &hard] {
         for w in recalls.windows(2) {
-            assert!(w[1] >= w[0] - 1e-9, "recall not monotone in probe: {recalls:?}");
+            assert!(
+                w[1] >= w[0] - 1e-9,
+                "recall not monotone in probe: {recalls:?}"
+            );
         }
     }
     // Even under heavy overlap, high probe must still recover most neighbours (else IVF is broken).
-    assert!(*hard.last().unwrap() >= 0.80, "hard-overlap probe=32 recall too low: {hard:?}");
+    assert!(
+        *hard.last().unwrap() >= 0.80,
+        "hard-overlap probe=32 recall too low: {hard:?}"
+    );
 }

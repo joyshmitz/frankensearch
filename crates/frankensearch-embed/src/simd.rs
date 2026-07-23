@@ -30,7 +30,7 @@ pub fn accumulate_f32_into(sum: &mut [f32], row: &[f32]) {
     }
 }
 
-/// Minimum token count for software-prefetching Model2Vec embedding rows.
+/// Minimum token count for software-prefetching `Model2Vec` embedding rows.
 ///
 /// Short query sequences keep their gathered rows resident and regress when the
 /// prefetch instructions are added. Long document sequences are the cache-cold
@@ -199,6 +199,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)] // VOCAB = 19 always fits in u32
     fn model2vec_prefetch_gate_matches_original_gather() {
         const VOCAB: usize = 19;
         for &dimensions in &[1_usize, 7, 8, 31, 128, 256, 257] {
