@@ -4722,21 +4722,25 @@ fn consume_position_run(
     posting_ordinal: u32,
     freq: u32,
 ) -> Result<(), PositionCodecError> {
-    let mut previous: Option<u32> = None;
-    for _ in 0..freq {
+    // Peel the first position out of the hot loop so the remaining iterations
+    // drop the per-position `Option` match and re-wrap that distinguished it
+    // (profile-directed, bd-2fha: this run was ~14% of query self-time). The
+    // first position is the raw delta with no predecessor; every later position
+    // is a checked prefix sum — byte-identical to the former `Option` form.
+    if freq == 0 {
+        return Ok(());
+    }
+    let mut previous = reader.read_u32_vint()?;
+    for _ in 1..freq {
         let encoded = reader.read_u32_vint()?;
-        let position = if let Some(previous) = previous {
+        previous =
             previous
                 .checked_add(encoded)
                 .ok_or(PositionCodecError::PositionOverflow {
                     posting_ordinal,
                     previous,
                     delta: encoded,
-                })?
-        } else {
-            encoded
-        };
-        previous = Some(position);
+                })?;
     }
     Ok(())
 }

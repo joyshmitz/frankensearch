@@ -1,5 +1,25 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-23 — KEEP: Quill `consume_position_run` peel-first-iteration — −0.81% total instructions (`bd-2fha`, cc)
+
+Small profile-directed cleanup: the post-bitmap map put `consume_position_run` at ~14% of query
+self-time (`perf report --sort srcline` pinned the per-position `read_u32_vint` + prefix-sum lines).
+The loop carried `let mut previous: Option<u32> = None;` and did an `if let Some(previous) = previous
+{ … } else { encoded }` match plus a `previous = Some(position)` rewrap on EVERY position, purely to
+distinguish the first delta (which has no predecessor). Peeled the first read out of the loop:
+`if freq == 0 { return } let mut previous = read_u32_vint()?; for _ in 1..freq { previous =
+previous.checked_add(read_u32_vint()?)? }`. Byte-identical — the first position is the raw delta with
+no overflow check (as before), every later position is the same checked prefix sum with the identical
+`PositionOverflow { previous, delta }` error — and it drops the branch + `Option` wrap per position.
+473/473 quill-lib tests green; scoped clippy `-D warnings` clean.
+
+MEASURED (deterministic instruction count, HEAD+bitmap vs +peel, `smoke`/`ROUNDS=9`/1-thread): OLD
+53,772,604,564 / 53,776,217,976 → NEW 53,336,727,330 / 53,337,755,179 = **−437M (−0.81%)**, both runs
+±0.007% (signal is ~145× the run-to-run noise — decidable). Modest but real, byte-identical, and
+simpler code with no downside.
+
+**Decision: KEEP.**
+
 ## 2026-07-23 — KEEP: Quill `decode_bitmap_payload` `trailing_zeros` bit-scan — −4.86% total instructions (`bd-udz8`, cc)
 
 Profile-directed follow-on to the vint lever: the post-vint hotspot map put `decode_bitmap_payload`
