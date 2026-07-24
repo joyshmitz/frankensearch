@@ -13,8 +13,8 @@ struct Scored {
 }
 #[derive(Clone)]
 struct VHit {
-    index: u32,
-    score: f32,
+    _index: u32,
+    _score: f32,
     doc_id: String,
 }
 
@@ -31,8 +31,8 @@ fn old_build(initial: &[Scored], refined: &[Scored]) -> usize {
         .iter()
         .enumerate()
         .map(|(i, h)| VHit {
-            index: h.index.unwrap_or(i as u32),
-            score: h.score,
+            _index: h.index.unwrap_or(i as u32),
+            _score: h.score,
             doc_id: h.doc_id.clone(),
         })
         .collect();
@@ -40,8 +40,8 @@ fn old_build(initial: &[Scored], refined: &[Scored]) -> usize {
         .iter()
         .enumerate()
         .map(|(i, h)| VHit {
-            index: h.index.unwrap_or(i as u32),
-            score: h.score,
+            _index: h.index.unwrap_or(i as u32),
+            _score: h.score,
             doc_id: h.doc_id.clone(),
         })
         .collect();
