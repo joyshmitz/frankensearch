@@ -654,9 +654,9 @@ mod tests {
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     #[cfg(feature = "durability")]
-    use frankensearch_durability::{
-        DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
-    };
+    use frankensearch_durability::FsviProtector;
+    #[cfg(all(feature = "durability", feature = "quill"))]
+    use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviVerifyResult};
     #[cfg(all(feature = "lexical", not(feature = "quill")))]
     use frankensearch_lexical::TantivyIndex;
 

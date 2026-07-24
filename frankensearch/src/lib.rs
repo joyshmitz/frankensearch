@@ -564,7 +564,8 @@ mod feature_matrix_smoke {
     #[test]
     fn hybrid_lane_behavior() {
         let dir = tempfile::tempdir().expect("hybrid lexical tempdir");
-        let index = TantivyIndex::create(dir.path()).expect("create hybrid lexical index");
+        let index = frankensearch_lexical::TantivyIndex::create(dir.path())
+            .expect("create hybrid lexical index");
         assert_eq!(index.doc_count(), 0);
         emit_evidence(
             "hybrid",
