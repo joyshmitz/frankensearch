@@ -64,6 +64,13 @@ pub struct QuillConfig {
     /// the writer must run a seal-and-publish barrier instead of waiting for
     /// the ordinary cadence (visibility contract, `max_visibility_lag_ms`).
     pub max_visibility_lag_ms: u64,
+    /// Permit a durability-enabled writer to quarantine an unrepairable
+    /// segment and publish a degraded successor that omits it.
+    ///
+    /// This is deliberately off for library embedders. Applications that turn
+    /// it on must couple the resulting degraded snapshot to a freshness audit
+    /// and backfill path.
+    pub quarantine_on_unrepairable: bool,
 }
 
 impl Default for QuillConfig {
@@ -82,6 +89,7 @@ impl Default for QuillConfig {
             max_ingest_shards: DEFAULT_MAX_INGEST_SHARDS,
             deterministic_ingest: false,
             max_visibility_lag_ms: DEFAULT_MAX_VISIBILITY_LAG_MS,
+            quarantine_on_unrepairable: false,
         }
     }
 }
@@ -216,6 +224,7 @@ mod tests {
                 max_ingest_shards: 32,
                 deterministic_ingest: false,
                 max_visibility_lag_ms: 1_000,
+                quarantine_on_unrepairable: false,
             }
         );
         assert!(QuillConfig::default().validate().is_ok());

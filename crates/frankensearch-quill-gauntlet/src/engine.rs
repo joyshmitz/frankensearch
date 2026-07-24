@@ -919,7 +919,7 @@ fn offset_tie_group(
 
 fn quill_config_hash(config: &QuillConfig) -> String {
     let canonical = format!(
-        "scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};shards={};deterministic={};visibility_ms={}",
+        "scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};shards={};deterministic={};visibility_ms={};quarantine={}",
         config.scribe_shard_budget_bytes,
         config.delta_budget_bytes,
         config.tier_fanout,
@@ -932,7 +932,8 @@ fn quill_config_hash(config: &QuillConfig) -> String {
         config.glob_expansion_limit,
         config.max_ingest_shards,
         config.deterministic_ingest,
-        config.max_visibility_lag_ms
+        config.max_visibility_lag_ms,
+        config.quarantine_on_unrepairable
     );
     format!("{:016x}", xxh3_64(canonical.as_bytes()))
 }
@@ -3145,6 +3146,13 @@ mod tests {
                 "max_visibility_lag_ms",
                 QuillConfig {
                     max_visibility_lag_ms: baseline_config.max_visibility_lag_ms + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "quarantine_on_unrepairable",
+                QuillConfig {
+                    quarantine_on_unrepairable: !baseline_config.quarantine_on_unrepairable,
                     ..baseline_config.clone()
                 },
             ),

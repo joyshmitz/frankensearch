@@ -25,6 +25,7 @@ use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
     HitExplanation, IndexableDocument, ScoreComponent, SearchError, SearchResult,
 };
+use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
 use frankensearch_embed::{
     ConsentSource, DownloadConsent, EmbedderStack, HashAlgorithm, HashEmbedder, ModelDownloader,
     ModelLifecycle, ModelManifest, ensure_default_semantic_models,
@@ -89,6 +90,11 @@ use crate::explanation_payload::{FsfsExplanationPayload, FusionContext, RankingE
 use crate::file_classification::{
     FileClassificationContractDefinition, FileClassificationDecision,
     IngestAction as FileClassificationIngestAction,
+};
+use crate::incremental_change::{
+    CatalogSnapshotEntry, FilesystemSnapshotEntry, IndexFreshnessAuditInput,
+    IndexFreshnessAuditReport, IndexFreshnessFindingKind, IndexFreshnessRepairActionKind,
+    IndexMembershipEntry, WatcherCheckpointSnapshot,
 };
 use crate::lexical_pipeline::{LexicalMutation, LexicalPipeline, QuillLexicalBackend};
 use crate::lifecycle::{
@@ -1242,6 +1248,10 @@ struct IndexSentinel {
 
 const FSFS_QUILL_ENGINE_DIR: &str = "quill-v1";
 
+fn fsfs_quill_protector() -> SearchResult<FileProtector> {
+    FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LexicalEngineLayout {
     Missing {
@@ -1793,6 +1803,102 @@ impl WatchIngestPipeline for LiveIngestPipeline {
 }
 
 impl LiveIngestPipeline {
+    fn quarantine_freshness_audit(
+        &self,
+        manifests: &BTreeMap<String, IndexManifestEntry>,
+    ) -> SearchResult<IndexFreshnessAuditReport> {
+        let observed_at_ms = pressure_timestamp_ms();
+        let vector_ids = {
+            let index = self
+                .vector_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            vector_live_doc_ids(&index)?
+        };
+        let mut filesystem = Vec::new();
+        let mut catalog = Vec::new();
+        let mut vector_index = Vec::new();
+        let mut lexical_index = Vec::new();
+
+        for manifest in manifests.values() {
+            let ingestion_class = ingestion_class_from_label(&manifest.ingestion_class)?;
+            if !matches!(
+                ingestion_class,
+                IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
+            ) {
+                continue;
+            }
+
+            let source_path = self.target_root.join(&manifest.file_key);
+            match fs::metadata(&source_path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+
+            let revision = u64::try_from(manifest.revision).unwrap_or_default();
+            let content_hash = format!(
+                "manifest:{}:{}:{}",
+                manifest.revision, manifest.canonical_bytes, manifest.reason_code
+            );
+            filesystem.push(FilesystemSnapshotEntry {
+                file_key: manifest.file_key.clone(),
+                path: source_path.display().to_string(),
+                content_hash: content_hash.clone(),
+                observed_at_ms,
+            });
+            catalog.push(CatalogSnapshotEntry {
+                file_key: manifest.file_key.clone(),
+                path: source_path.display().to_string(),
+                content_hash,
+                revision,
+                last_seen_at_ms: observed_at_ms,
+                deleted_at_ms: None,
+            });
+
+            if matches!(ingestion_class, IngestionClass::LexicalOnly)
+                || vector_ids.contains(&manifest.file_key)
+            {
+                vector_index.push(IndexMembershipEntry {
+                    doc_id: format!("vector:{}", manifest.file_key),
+                    file_key: manifest.file_key.clone(),
+                    revision,
+                });
+            }
+            if self
+                .lexical_index
+                .document_witness(&manifest.file_key)?
+                .is_some()
+            {
+                lexical_index.push(IndexMembershipEntry {
+                    doc_id: format!("quill:{}", manifest.file_key),
+                    file_key: manifest.file_key.clone(),
+                    revision,
+                });
+            }
+        }
+
+        Ok(IndexFreshnessAuditReport::from_input(
+            IndexFreshnessAuditInput {
+                run_id: format!(
+                    "quill-quarantine-generation-{}",
+                    self.lexical_index.segment_stats().published_generation
+                ),
+                filesystem,
+                catalog,
+                vector_index,
+                lexical_index,
+                watcher_checkpoint: WatcherCheckpointSnapshot {
+                    checkpoint_id: "fsfs-watch-quarantine-recovery".to_owned(),
+                    last_applied_seq: 0,
+                    pending_changes: 0,
+                    watermark_ms: observed_at_ms,
+                },
+            },
+        ))
+    }
+
     async fn acknowledge_flush_barrier(&self, cx: &Cx) -> SearchResult<bool> {
         let Some(directory) = self.lexical_index.directory() else {
             return Ok(false);
@@ -2226,6 +2332,83 @@ impl LiveIngestPipeline {
         } else {
             self.soft_delete_vector(&rel_key);
             Self::purge_storage_document(storage_ctx, &rel_key)?;
+        }
+
+        Ok(true)
+    }
+
+    /// Restore index membership after a quarantined lexical segment without
+    /// reopening the local-only storage transaction path.
+    ///
+    /// The coupled freshness audit only emits this repair for a file already
+    /// certified by the paired catalog manifests. Rewriting storage here would
+    /// be redundant and would make watch startup's spawned future non-`Send`;
+    /// the repair therefore updates Quill and FSVI membership only.
+    async fn apply_quarantine_reindex_op(
+        &self,
+        cx: &Cx,
+        file_key: &str,
+        revision: i64,
+        ingestion_class: IngestionClass,
+    ) -> SearchResult<bool> {
+        let (abs_path, rel_key) = self.resolve_paths(file_key)?;
+        let bytes = match async_file_read(&abs_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut classification_metadata = None;
+        let canonical = if is_pdf_file(&abs_path) {
+            let Some(pdf_text) = try_extract_pdf_text(&bytes, &abs_path) else {
+                return Ok(false);
+            };
+            self.canonicalizer.canonicalize(&pdf_text)
+        } else {
+            let classification = classify_file_for_ingest(&abs_path, &bytes);
+            if !file_classification_allows_index(&classification) {
+                return Ok(false);
+            }
+            let raw_text = String::from_utf8_lossy(&bytes);
+            classification_metadata = Some(classification);
+            self.canonicalizer.canonicalize(&raw_text)
+        };
+        if canonical.trim().is_empty() {
+            return Ok(false);
+        }
+
+        let file_name = abs_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut doc =
+            IndexableDocument::new(rel_key.clone(), canonical.clone()).with_title(file_name);
+        if let Some(classification) = classification_metadata.as_ref() {
+            doc = attach_file_classification_metadata(doc, classification);
+        }
+        let mut mutation = LexicalMutation::upsert(
+            rel_key.clone(),
+            u64::try_from(revision).unwrap_or(0),
+            ingestion_class,
+            canonical.clone(),
+            "quarantine_freshness_reindex",
+        );
+        mutation.title = doc.title;
+        mutation.metadata = doc.metadata;
+        self.apply_lexical_mutations(cx, &[mutation]).await?;
+
+        if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
+            let vector_plan = Self::plan_live_vector_upsert(
+                &rel_key,
+                revision,
+                ingestion_class,
+                u64::try_from(canonical.len()).unwrap_or(u64::MAX),
+            );
+            self.apply_live_vector_actions(cx, &rel_key, revision, &canonical, &vector_plan)
+                .await?;
+        } else {
+            self.soft_delete_vector(&rel_key);
         }
 
         Ok(true)
@@ -8456,27 +8639,43 @@ impl FsfsRuntime {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let stats = if active_engine == BlueGreenEngine::Quill {
+        let (stats, quill_degraded) = if active_engine == BlueGreenEngine::Quill {
             let snapshot = KeeperSnapshot::open(&active_dir, DEFAULT_SCHEMA)?;
             let stats = snapshot.segment_stats();
             let (fec_protected, fec_artifacts) = Self::quill_fec_coverage(&active_dir)?;
-            format!(
-                "segments={} (sealed={}, delta={}), live_docs={}, tombstones={}, fec={fec_protected}/{fec_artifacts}",
-                stats.sealed_segments.saturating_add(stats.delta_segments),
-                stats.sealed_segments,
-                stats.delta_segments,
-                stats.live_docs,
-                stats.tombstones,
+            (
+                format!(
+                    "segments={} (sealed={}, delta={}), live_docs={}, tombstones={}, fec={fec_protected}/{fec_artifacts}, degraded={}, quarantined_segments={}, estimated_missing_docs={}, unknown_missing_doc_segments={}",
+                    stats.sealed_segments.saturating_add(stats.delta_segments),
+                    stats.sealed_segments,
+                    stats.delta_segments,
+                    stats.live_docs,
+                    stats.tombstones,
+                    stats.degraded,
+                    stats.quarantined_segments,
+                    stats.estimated_missing_docs,
+                    stats.unknown_missing_doc_segments,
+                ),
+                stats.degraded,
             )
         } else {
-            "segments=tantivy-managed, tombstones=tantivy-managed, fec=tantivy-managed".to_owned()
+            (
+                "segments=tantivy-managed, tombstones=tantivy-managed, fec=tantivy-managed"
+                    .to_owned(),
+                false,
+            )
         };
 
         let retained = engine_dirs
             .iter()
             .filter(|(_, path)| *path != active_dir)
             .collect::<Vec<_>>();
-        let suggestion = if active_engine == BlueGreenEngine::Tantivy {
+        let suggestion = if quill_degraded {
+            Some(
+                "run `fsfs watch` to execute the coupled freshness audit and synchronous reindex; retained quarantine artifacts keep degraded status loud until explicitly investigated"
+                    .to_owned(),
+            )
+        } else if active_engine == BlueGreenEngine::Tantivy {
             Some("open the index with `fsfs search` or run `fsfs index <source-dir>` to rebuild into a fresh Quill sibling".to_owned())
         } else if retained.is_empty() {
             None
@@ -8490,11 +8689,12 @@ impl FsfsRuntime {
                 "rollback data retained; after confirming it is no longer needed, reclaim with: {commands}"
             ))
         };
-        let verdict = if active_engine == BlueGreenEngine::Quill && retained.is_empty() {
-            DoctorVerdict::Pass
-        } else {
-            DoctorVerdict::Warn
-        };
+        let verdict =
+            if active_engine == BlueGreenEngine::Quill && retained.is_empty() && !quill_degraded {
+                DoctorVerdict::Pass
+            } else {
+                DoctorVerdict::Warn
+            };
 
         Ok(DoctorCheck {
             name: "lexical_engine".to_owned(),
@@ -8924,6 +9124,10 @@ impl FsfsRuntime {
             published_generation: stats.published_generation,
             last_publish_unix: stats.last_publish_unix,
             live_writer: stats.live_writer,
+            degraded: stats.degraded,
+            quarantined_segments: stats.quarantined_segments,
+            estimated_missing_docs: stats.estimated_missing_docs,
+            unknown_missing_doc_segments: stats.unknown_missing_doc_segments,
         }
     }
 
@@ -11425,14 +11629,16 @@ impl FsfsRuntime {
         };
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
-        let lexical_index = QuillIndex::create(
+        let lexical_index = QuillIndex::create_durable(
             cx,
             &lexical_path,
             QuillConfig {
                 max_ingest_shards: 1,
                 deterministic_ingest: true,
+                quarantine_on_unrepairable: true,
                 ..QuillConfig::default()
             },
+            fsfs_quill_protector()?,
         )
         .await?;
         let vector_index = VectorIndex::open(&vector_path)?;
@@ -11448,8 +11654,113 @@ impl FsfsRuntime {
 
         let pipeline = LiveIngestPipeline::new(target_root, lexical_index, vector_index, embedder)
             .with_storage_db_path(storage_db_path);
+        self.repair_quarantined_lexical_gap(cx, &index_root, &pipeline)
+            .await?;
         let vi_handle = Arc::clone(&pipeline.vector_index);
         Ok((pipeline, vi_handle))
+    }
+
+    async fn repair_quarantined_lexical_gap(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+        pipeline: &LiveIngestPipeline,
+    ) -> SearchResult<()> {
+        let degraded = pipeline.lexical_index.segment_stats();
+        if !degraded.degraded {
+            return Ok(());
+        }
+
+        let manifests = Self::read_matching_manifest_generation(index_root)?.ok_or_else(|| {
+            SearchError::InvalidConfig {
+                field: "fsfs.watch.quarantine_audit".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "quarantined Quill segment requires matching lexical/vector manifests before repair"
+                    .to_owned(),
+            }
+        })?;
+        let pre_repair = pipeline.quarantine_freshness_audit(&manifests)?;
+        if let Some(unexpected) = pre_repair
+            .findings
+            .iter()
+            .find(|finding| finding.kind != IndexFreshnessFindingKind::MissingLexical)
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "fsfs.watch.quarantine_audit".to_owned(),
+                value: unexpected.file_key.clone(),
+                reason: format!(
+                    "quarantine audit found unsupported drift {:?} ({})",
+                    unexpected.kind, unexpected.reason_code
+                ),
+            });
+        }
+
+        let missing = pre_repair
+            .repair_plan
+            .actions
+            .iter()
+            .filter(|action| action.action == IndexFreshnessRepairActionKind::EnqueueReindex)
+            .map(|action| action.file_key.clone())
+            .collect::<BTreeSet<_>>();
+        let mut operations = Vec::with_capacity(missing.len());
+        for file_key in &missing {
+            let manifest = manifests
+                .get(file_key)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "fsfs.watch.quarantine_audit".to_owned(),
+                    value: file_key.clone(),
+                    reason: "freshness repair action has no paired manifest row".to_owned(),
+                })?;
+            operations.push(WatchIngestOp::Upsert {
+                file_key: file_key.clone(),
+                revision: manifest.revision,
+                ingestion_class: ingestion_class_from_label(&manifest.ingestion_class)?,
+            });
+        }
+
+        let mut reindexed = 0_usize;
+        for operation in &operations {
+            let WatchIngestOp::Upsert {
+                file_key,
+                revision,
+                ingestion_class,
+            } = operation
+            else {
+                unreachable!("quarantine repair only builds upsert operations");
+            };
+            if pipeline
+                .apply_quarantine_reindex_op(cx, file_key, *revision, *ingestion_class)
+                .await?
+            {
+                reindexed = reindexed.saturating_add(1);
+            }
+        }
+        if reindexed > 0 {
+            pipeline.lexical_index.commit(cx).await?;
+        }
+        let post_repair = pipeline.quarantine_freshness_audit(&manifests)?;
+        if !post_repair.is_clean() {
+            return Err(SearchError::InvalidConfig {
+                field: "fsfs.watch.quarantine_audit".to_owned(),
+                value: index_root.display().to_string(),
+                reason: format!(
+                    "post-reindex freshness audit remained fail-closed with {} finding(s): {:?}",
+                    post_repair.summary.finding_count, post_repair.findings
+                ),
+            });
+        }
+
+        warn!(
+            quarantined_segments = degraded.quarantined_segments,
+            estimated_missing_docs = degraded.estimated_missing_docs,
+            unknown_missing_doc_segments = degraded.unknown_missing_doc_segments,
+            audit_findings = pre_repair.summary.finding_count,
+            queued_reindexes = operations.len(),
+            reindexed,
+            post_audit = ?post_repair.summary.verdict,
+            "fsfs watch recovered quarantined Quill membership before watcher start; retained quarantine keeps search visibly degraded"
+        );
+        Ok(())
     }
 
     fn collect_index_candidates(
@@ -16606,9 +16917,18 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
             .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
         let _ = writeln!(
             out,
-            "  published generation: {}  last publish unix: {}  live writer: {}",
-            freshness.published_generation, last_publish, freshness.live_writer,
+            "  published generation: {}  last publish unix: {}  live writer: {}  degraded: {}",
+            freshness.published_generation, last_publish, freshness.live_writer, freshness.degraded,
         );
+        if freshness.degraded {
+            let _ = writeln!(
+                out,
+                "  quarantine: segments={} estimated missing docs={} unknown estimates={}",
+                freshness.quarantined_segments,
+                freshness.estimated_missing_docs,
+                freshness.unknown_missing_doc_segments,
+            );
+        }
     }
 
     let _ = writeln!(out);
@@ -17020,6 +17340,21 @@ const fn ingestion_class_label(class: IngestionClass) -> &'static str {
     }
 }
 
+fn ingestion_class_from_label(label: &str) -> SearchResult<IngestionClass> {
+    match label {
+        "full_semantic_lexical" => Ok(IngestionClass::FullSemanticLexical),
+        "lexical_only" => Ok(IngestionClass::LexicalOnly),
+        "metadata_only" => Ok(IngestionClass::MetadataOnly),
+        "skip" => Ok(IngestionClass::Skip),
+        _ => Err(SearchError::InvalidConfig {
+            field: "index_manifest.ingestion_class".to_owned(),
+            value: label.to_owned(),
+            reason: "expected full_semantic_lexical, lexical_only, metadata_only, or skip"
+                .to_owned(),
+        }),
+    }
+}
+
 const fn ingestion_plan_reason(class: IngestionClass) -> &'static str {
     match class {
         IngestionClass::FullSemanticLexical => "index.plan.full_semantic_lexical",
@@ -17034,13 +17369,7 @@ fn content_sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn vector_live_doc_ids(index: &VectorIndex) -> SearchResult<HashSet<String>> {
-    let mut ids = HashSet::with_capacity(index.record_count());
-    for record_index in 0..index.record_count() {
-        if !index.is_deleted(record_index) {
-            ids.insert(index.doc_id_at(record_index)?.to_owned());
-        }
-    }
-    Ok(ids)
+    index.live_doc_ids()
 }
 
 fn reconcile_vector_generation(
@@ -17718,6 +18047,10 @@ mod tests {
                     published_generation: 7,
                     last_publish_unix: Some(1_700_000_000),
                     live_writer: false,
+                    degraded: false,
+                    quarantined_segments: 0,
+                    estimated_missing_docs: 0,
+                    unknown_missing_doc_segments: 0,
                 }),
             },
             models: vec![FsfsModelStatus {
@@ -19337,6 +19670,149 @@ mod tests {
                 .expect("watch mode with shutdown");
 
             worker.join().expect("shutdown trigger thread join");
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn watch_quarantine_audit_reindexes_missing_lexical_membership_before_start() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("project dirs");
+            fs::write(
+                project.join("src/lib.rs"),
+                "pub fn quarantine_backfill_token() -> bool { true }\n",
+            )
+            .expect("write source file");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            config.storage.db_path = temp
+                .path()
+                .join("quarantine-watch.db")
+                .display()
+                .to_string();
+            let index_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                ..CliInput::default()
+            });
+            index_runtime
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("build initial index");
+
+            let index_root = project.join(".frankensearch");
+            let watch_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Watch,
+                target_path: Some(project.clone()),
+                watch: true,
+                ..CliInput::default()
+            });
+            let (protected, vector_handle) = watch_runtime
+                .build_live_ingest_pipeline(&cx)
+                .await
+                .expect("bootstrap durable watch writer");
+            let lexical_path = protected
+                .lexical_index
+                .directory()
+                .expect("durable lexical directory")
+                .to_path_buf();
+            assert!(!protected.lexical_index.segment_stats().degraded);
+            drop(protected);
+            drop(vector_handle);
+
+            let segment_path = fs::read_dir(&lexical_path)
+                .expect("scan lexical directory")
+                .map(|entry| entry.expect("read lexical entry").path())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "fslx")
+                })
+                .expect("published FSLX segment");
+            let sidecar = frankensearch_durability::FileProtector::sidecar_path(&segment_path);
+            assert!(
+                sidecar.is_file(),
+                "watch bootstrap must protect the segment"
+            );
+            let mut corrupt = fs::read(&segment_path).expect("read segment");
+            let corrupt_offset = corrupt.len() / 2;
+            corrupt[corrupt_offset] ^= 0x80;
+            fs::write(&segment_path, corrupt).expect("corrupt segment");
+            fs::write(&sidecar, b"invalid repair sidecar").expect("corrupt repair sidecar");
+
+            let (recovered, _vector_handle) = watch_runtime
+                .build_live_ingest_pipeline(&cx)
+                .await
+                .expect("quarantine, audit, and reindex before watch start");
+            let stats = recovered.lexical_index.segment_stats();
+            assert!(stats.degraded);
+            assert_eq!(stats.quarantined_segments, 1);
+            assert!(
+                stats.estimated_missing_docs >= 1 || stats.unknown_missing_doc_segments == 1,
+                "quarantine must retain either a manifest-backed count or an explicit unknown"
+            );
+            assert!(
+                !segment_path.exists(),
+                "corrupt canonical segment must leave the active namespace"
+            );
+            assert!(
+                lexical_path
+                    .join(format!(
+                        "{}.quarantine",
+                        segment_path
+                            .file_name()
+                            .expect("segment file name")
+                            .to_string_lossy()
+                    ))
+                    .is_file(),
+                "corrupt bytes must remain retained for investigation"
+            );
+
+            let hits = recovered
+                .lexical_index
+                .search(&cx, "quarantine_backfill_token", 5)
+                .await
+                .expect("search recovered index");
+            assert!(
+                hits.iter().any(|hit| hit.doc_id == "src/lib.rs"),
+                "coupled reindex must restore the quarantined document"
+            );
+
+            let manifests = FsfsRuntime::read_matching_manifest_generation(&index_root)
+                .expect("read paired manifests")
+                .expect("paired manifests exist");
+            let post_repair = recovered
+                .quarantine_freshness_audit(&manifests)
+                .expect("run post-repair audit");
+            assert!(post_repair.is_clean());
+            let freshness = FsfsRuntime::index_freshness_payload(stats);
+            assert!(freshness.degraded);
+            assert_eq!(freshness.quarantined_segments, 1);
+            let search_only = QuillSearchIndex::open(&cx, &lexical_path, QuillConfig::default())
+                .await
+                .expect("open search-only degraded topology");
+            let search_only_freshness =
+                FsfsRuntime::index_freshness_payload(search_only.segment_stats());
+            assert!(search_only_freshness.degraded);
+            assert_eq!(search_only_freshness.quarantined_segments, 1);
+            let search_json =
+                serde_json::to_value(search_only_freshness).expect("serialize search freshness");
+            assert_eq!(search_json["degraded"], true);
+            assert_eq!(search_json["quarantined_segments"], 1);
+
+            let doctor = FsfsRuntime::collect_lexical_engine_doctor_check(&index_root)
+                .expect("collect Quill doctor check");
+            assert_eq!(doctor.verdict, super::DoctorVerdict::Warn);
+            assert!(doctor.detail.contains("degraded=true"));
+            assert!(doctor.detail.contains("quarantined_segments=1"));
+            assert!(
+                doctor
+                    .suggestion
+                    .as_deref()
+                    .is_some_and(|value| value.contains("freshness audit"))
+            );
         });
     }
 
@@ -21747,6 +22223,10 @@ mod tests {
                     published_generation: expected_generation,
                     last_publish_unix: expected_last_publish_unix,
                     live_writer: false,
+                    degraded: false,
+                    quarantined_segments: 0,
+                    estimated_missing_docs: 0,
+                    unknown_missing_doc_segments: 0,
                 })
             );
             assert_eq!(payload.models[0].tier, "fast");

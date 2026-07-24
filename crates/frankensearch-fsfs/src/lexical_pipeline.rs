@@ -604,6 +604,9 @@ impl<'a> QuillLexicalBackend<'a> {
                         LexicalSearch::index_documents(self.index, cx, &documents).await?;
                         documents.clear();
                     }
+                    if self.index.has_uncommitted_changes() {
+                        LexicalSearch::commit(self.index, cx).await?;
+                    }
                     if self.index.delete_document(cx, &doc_id).await? {
                         stats.deleted = stats.deleted.saturating_add(1);
                     }
@@ -1093,6 +1096,87 @@ mod tests {
                     .search_doc_ids(&cx, "alpha", 10)
                     .expect("query deleted Quill document")
                     .is_empty()
+            );
+
+            let mixed = [
+                LexicalMutation::upsert(
+                    "doc-c",
+                    4,
+                    IngestionClass::FullSemanticLexical,
+                    "delta replacement body",
+                    "mixed barrier",
+                ),
+                LexicalMutation::delete("doc-b", 4, IngestionClass::LexicalOnly, "mixed barrier"),
+            ];
+            pipeline
+                .apply_incremental(&mixed)
+                .expect("plan mixed Quill barrier");
+            pipeline
+                .backend_mut()
+                .flush_resumable(&cx)
+                .await
+                .expect("flush upsert before delete barrier");
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "delta", 10)
+                    .expect("query mixed upsert")
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>(),
+                vec!["doc-c"]
+            );
+            assert!(
+                index
+                    .search_doc_ids(&cx, "beta", 10)
+                    .expect("query mixed delete")
+                    .is_empty()
+            );
+
+            let staged = [LexicalMutation::upsert(
+                "doc-d",
+                5,
+                IngestionClass::FullSemanticLexical,
+                "epsilon pending body",
+                "cross-flush barrier",
+            )];
+            pipeline
+                .apply_incremental(&staged)
+                .expect("plan cross-flush upsert");
+            pipeline
+                .backend_mut()
+                .flush_resumable(&cx)
+                .await
+                .expect("stage cross-flush upsert");
+            assert!(index.has_uncommitted_changes());
+
+            let cross_flush_delete = [LexicalMutation::delete(
+                "doc-c",
+                6,
+                IngestionClass::FullSemanticLexical,
+                "cross-flush barrier",
+            )];
+            pipeline
+                .apply_incremental(&cross_flush_delete)
+                .expect("plan cross-flush delete");
+            pipeline
+                .backend_mut()
+                .flush_resumable(&cx)
+                .await
+                .expect("commit prior upsert before cross-flush delete");
+            assert!(
+                index
+                    .search_doc_ids(&cx, "delta", 10)
+                    .expect("query cross-flush delete")
+                    .is_empty()
+            );
+            assert_eq!(
+                index
+                    .search_doc_ids(&cx, "epsilon", 10)
+                    .expect("query cross-flush upsert")
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>(),
+                vec!["doc-d"]
             );
         });
     }
