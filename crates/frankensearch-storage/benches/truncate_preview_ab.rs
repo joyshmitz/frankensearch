@@ -92,18 +92,18 @@ fn bench(_c: &mut Criterion) {
         let len_cand = || {
             black_box(content_char_len(black_box(doc)));
         };
-        let lnull = paired_median_ratio(41, inner, len_orig, len_orig);
-        let llever = paired_median_ratio(41, inner, len_orig, len_cand);
+        let length_null = paired_median_ratio(41, inner, len_orig, len_orig);
+        let length_lever = paired_median_ratio(41, inner, len_orig, len_cand);
         eprintln!(
             "[null]  clen/{label}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
-            lnull.median, lnull.p5, lnull.p95, lnull.rounds
+            length_null.median, length_null.p5, length_null.p95, length_null.rounds
         );
         eprintln!(
             "[lever] clen/{label}: cand/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
-            llever.median,
-            llever.p5,
-            llever.p95,
-            verdict(&llever, &lnull)
+            length_lever.median,
+            length_lever.p5,
+            length_lever.p95,
+            verdict(&length_lever, &length_null)
         );
     }
 }
