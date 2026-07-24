@@ -31,19 +31,21 @@ fn cjk_tokens() -> Vec<String> {
     let pool: Vec<char> = "搜索引擎向量嵌入検索とうきょうデータ한국어처리文档分析語彙"
         .chars()
         .collect();
+    let pool_len = u64::try_from(pool.len()).expect("CJK pool length fits u64");
     let mut tokens = Vec::with_capacity(2048);
     let mut r = 0x1234_5678_9abc_def0_u64;
     for _ in 0..2048 {
         r ^= r << 13;
         r ^= r >> 7;
         r ^= r << 17;
-        let len = 2 + (r % 30) as usize; // 2..=31 CJK chars per token
+        let len = 2 + usize::try_from(r % 30).expect("token length remainder fits usize");
         let mut s = String::new();
         for _ in 0..len {
             r ^= r << 13;
             r ^= r >> 7;
             r ^= r << 17;
-            s.push(pool[(r as usize) % pool.len()]);
+            let pool_index = usize::try_from(r % pool_len).expect("CJK pool remainder fits usize");
+            s.push(pool[pool_index]);
         }
         tokens.push(s);
     }

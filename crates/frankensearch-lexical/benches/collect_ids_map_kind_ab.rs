@@ -7,7 +7,7 @@
 //! `segment_ord` (O(1), no hash) — but opened every segment eagerly. This bench
 //! measures the best-of-both candidate: a **lazily-populated `Vec<Option<Option<
 //! Column>>>`** (O(1) index, no hash, still only opens touched segments) vs the
-//! shipped lazy HashMap. Both are byte-identical (same columns, same ords, same
+//! shipped lazy `HashMap`. Both are byte-identical (same columns, same ords, same
 //! id clones); the single-segment fixture isolates the per-hit map access so the
 //! ratio is the pure SipHash-vs-index cost against a String-clone-dominated loop.
 //!
@@ -74,13 +74,16 @@ fn build_fixture() -> Fixture {
     let index = Index::create_in_ram(schema);
     let mut writer: tantivy::IndexWriter = index.writer(60_000_000).expect("writer");
     let mut table = Vec::with_capacity(N);
+    let vocab_len = u64::try_from(VOCAB.len()).expect("VOCAB length fits u64");
     for i in 0..N {
         let mut state = (i as u64).wrapping_add(1);
         let doc_id = format!("doc-{i:06}");
         let mut body = String::with_capacity(160);
         body.push_str("search ");
         for _ in 0..13 {
-            let w = VOCAB[(xorshift(&mut state) as usize) % VOCAB.len()];
+            let word_index = usize::try_from(xorshift(&mut state) % vocab_len)
+                .expect("VOCAB remainder fits usize");
+            let w = VOCAB[word_index];
             body.push_str(w);
             body.push(' ');
         }
@@ -119,7 +122,8 @@ fn materialize_hashmap_lazy(
             })
             .as_ref()
             .and_then(|c| c.first(addr.doc_id))
-            .expect("ord fast field") as usize;
+            .expect("ord fast field");
+        let ord = usize::try_from(ord).expect("document ordinal fits usize");
         out.push(table[ord].clone());
     }
     out
@@ -153,7 +157,8 @@ fn materialize_vec_lazy(
             .expect("slot populated")
             .as_ref()
             .and_then(|c| c.first(addr.doc_id))
-            .expect("ord fast field") as usize;
+            .expect("ord fast field");
+        let ord = usize::try_from(ord).expect("document ordinal fits usize");
         out.push(table[ord].clone());
     }
     out
