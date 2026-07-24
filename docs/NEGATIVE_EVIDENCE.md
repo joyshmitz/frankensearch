@@ -16120,3 +16120,32 @@ the same binary can run under genuinely isolated/pinned CPU conditions; still
 require exact scalar/shipping parity, both A/A bands wholly within 0.97–1.03,
 every arm CV below 5%, short candidate/shipping at most 0.97, and no decidable
 long-token regression.
+
+### 2026-07-23 — BLOCKED / UNTIMED: isolated top-k A/A/CV retry still cannot link inside its admission window (`bd-3srq`, TurquoiseTern)
+
+The fresh ledger/log pass selected the retained `int8_vs_f16_fast_ab` harness
+without changing production source. It already contains the real-method
+f16/f16 A/A null, exact-f16/int8-two-pass A/B, 32-query recall/order oracle,
+and 30-sample Criterion arms required to revalidate the shipped top-k result.
+The only temporary bench edit suppressed its teardown-time file deletion to
+obey repository policy; that edit was manually removed exactly after the run.
+
+The first strict-remote request sought all 8/8 slots on `vmi1227854` and failed
+closed with `RCH-I001 queue_timeout` before worker selection or execution. A
+second admissible route, job `j-29944835100115068`, reserved all 6/6 slots on
+`vmi1264463` with zero capacity remaining. Its delta sync completed, and Cargo
+entered remote execution at 02:09:15Z, but the worker-scoped release target was
+not warm: it downloaded and compiled the dependency graph from scratch. The
+job still had not linked the benchmark or emitted its recall, A/A, A/B,
+Criterion, or CV output after crossing the prior row's ten-minute admission
+window, so it was cancelled cleanly. RCH immediately returned the worker to
+the fleet.
+
+**Decision: BLOCKED / UNTIMED, not REJECT; the consecutive-REJECT count remains
+1.** No source or benchmark change ships, and the previously shipped top-k
+result is not overturned. The queued RRF A/A retrofit was not started after
+this lane-level release-link blocker surfaced. Retry only when RCH can reuse a
+worker-scoped target containing the exact `int8_vs_f16_fast_ab` release graph,
+or when a fully reserved worker can link it inside ten minutes. Then require
+32/32 exact-order and recall@10=1.0000, an A/A band wholly within 0.97–1.03,
+and both Criterion arm CVs below 5% before making any fresh top-k claim.

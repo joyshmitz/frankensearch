@@ -6964,3 +6964,31 @@ different mechanism or the exact binary can run on genuinely isolated/pinned
 CPU; require exact scalar/shipping parity, both A/A bands wholly within
 0.97–1.03, every arm CV below 5%, short candidate/shipping at most 0.97, and no
 decidable long-token regression.
+
+## 2026-07-23 — BLOCKED / UNTIMED: isolated top-k A/A/CV retry still cannot link inside its admission window (`bd-3srq`, TurquoiseTern)
+
+Ledger and recent-history mining selected the existing
+`int8_vs_f16_fast_ab` target rather than duplicating benchmark infrastructure
+or changing production source. That target already supplies the real-method
+f16/f16 A/A null, exact-f16/int8-two-pass A/B, 32-query recall/order proof, and
+30-sample Criterion arms. A temporary teardown-only edit prevented the remote
+benchmark from deleting its index artifact under repository policy; it was
+manually restored exactly after the attempt.
+
+The first strict-remote all-8-slot pin to `vmi1227854` failed closed with
+`RCH-I001 queue_timeout` before selection or execution. Strict-remote job
+`j-29944835100115068` then reserved all 6/6 slots on `vmi1264463`, completed
+its delta sync, and entered Cargo execution at 02:09:15Z. The worker-scoped
+target was cold, however, and rebuilt the dependency graph from scratch. The
+job crossed the prior ledger row's ten-minute admission limit without linking
+or emitting the recall proof, paired A/A or A/B ratios, Criterion samples, or
+per-arm CVs, and was cancelled cleanly.
+
+**Decision: BLOCKED / UNTIMED, not REJECT; the consecutive-REJECT count remains
+1.** No source or benchmark change ships, and no new top-k performance claim
+is made. The RRF A/A retrofit remained untouched after this release-link
+blocker surfaced. Retry only with a reusable worker-scoped target containing
+the exact release bench graph, or a fully reserved worker that can link it
+inside ten minutes; retain the 32/32 exact-order and recall@10=1.0000 proof,
+require A/A wholly within 0.97–1.03, and require both Criterion arm CVs below
+5%.
