@@ -16087,3 +16087,36 @@ link the exact release benchmark binary inside ten minutes. Require exact
 SWAR/scalar/shipping parity, 64-pass shipping/shipping A/A p5–p95 wholly within
 0.97–1.03 for both corpora, every shipping/candidate Criterion CV below 5%,
 short candidate/shipping <=0.97, and no decidable long-token regression.
+
+### 2026-07-23 — REJECT / INVALID-CV: short-token ASCII boundary selection mask remains inside its null floor (`bd-l5x3`, TurquoiseTern)
+
+The retry predicate above was finally satisfied operationally: strict-remote
+job `j-29944835100115026` reserved all 8/8 slots on `vmi1227854` and passed all
+three conformance tests (randomized mixed Unicode, lane-edge scalar oracle, and
+retained shipping SWAR comparator). The candidate again classified one
+eight-byte ASCII word, derived its token-run transition mask, and enumerated
+the selected boundary bits; Unicode-containing words retained the scalar path.
+
+Strict-remote release job `j-29944835100115037` then reserved the same worker's
+full 8/8 slots and executed the shipping and candidate implementations in one
+binary with 64-pass paired A/A and A/B controls plus 30-sample Criterion arms:
+
+| corpus | shipping/shipping A/A median [p5, p95] | candidate/shipping A/B median [p5, p95] | shipping Criterion interval / CV | candidate Criterion interval / CV |
+|---|---:|---:|---:|---:|
+| short 48 KiB | 1.0056 [0.7606, 1.2099] | 0.8223 [0.6695, 0.9588] | 184.57–193.09 us / **7.9933%** | 162.44–183.43 us / **15.9965%** |
+| long 48 KiB | 0.9999 [0.9004, 1.0346] | 0.9978 [0.8487, 1.0920] | 81.448–87.058 us / **5.4384%** | 80.453–84.471 us / **14.2068%** |
+
+The short direction is favorable, but both A/A intervals escape the mandatory
+0.97–1.03 envelope and all four raw per-iteration CVs exceed 5%. The candidate
+therefore remains inside an unstable null floor rather than establishing a
+shippable speedup.
+
+**Decision: REJECT this representation / INVALID-CV for KEEP (consecutive
+REJECT 1).** Production and benchmark source were manually restored exactly;
+shipping SWAR remains unchanged. Do not retry the same boundary-mask
+representation under ordinary fleet scheduling. Retry only if a fresh profile
+or disassembly identifies a materially different short-token mechanism, or if
+the same binary can run under genuinely isolated/pinned CPU conditions; still
+require exact scalar/shipping parity, both A/A bands wholly within 0.97–1.03,
+every arm CV below 5%, short candidate/shipping at most 0.97, and no decidable
+long-token regression.

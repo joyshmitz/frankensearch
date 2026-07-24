@@ -6936,3 +6936,31 @@ whose exact release binary links or is reused within ten minutes. KEEP still
 requires exact SWAR/scalar/shipping parity, 64-pass A/A p5–p95 wholly within
 0.97–1.03 on both corpora, every decisive-arm CV below 5%, short
 candidate/shipping <=0.97, and no decidable long-token regression.
+
+## 2026-07-23 — REJECT / INVALID-CV: short-token ASCII boundary selection mask remains inside its null floor (`bd-l5x3`, TurquoiseTern)
+
+The previously blocked retry reached both proof and timing on a fully reserved
+worker. Strict-remote job `j-29944835100115026` used all 8/8 slots on
+`vmi1227854` and passed the randomized mixed-Unicode, lane-edge scalar-oracle,
+and retained shipping-SWAR conformance tests. Strict-remote release job
+`j-29944835100115037` then used the same worker's full 8/8 slots and executed a
+single binary containing the shipping and candidate implementations, symmetric
+64-pass paired A/A and A/B controls, and 30-sample Criterion arms.
+
+| corpus | shipping/shipping A/A median [p5, p95] | candidate/shipping A/B median [p5, p95] | shipping Criterion interval / CV | candidate Criterion interval / CV |
+|---|---:|---:|---:|---:|
+| short 48 KiB | 1.0056 [0.7606, 1.2099] | 0.8223 [0.6695, 0.9588] | 184.57–193.09 us / **7.9933%** | 162.44–183.43 us / **15.9965%** |
+| long 48 KiB | 0.9999 [0.9004, 1.0346] | 0.9978 [0.8487, 1.0920] | 81.448–87.058 us / **5.4384%** | 80.453–84.471 us / **14.2068%** |
+
+The short direction remains favorable, but neither A/A band is wholly inside
+0.97–1.03 and every raw per-iteration CV exceeds 5%. Thus the apparent gain is
+inside an unstable null floor and cannot satisfy the KEEP policy.
+
+**Decision: REJECT this representation / INVALID-CV for KEEP (consecutive
+REJECT 1).** Production and benchmark source were manually restored exactly.
+Do not retry the same boundary-mask representation under ordinary fleet
+scheduling. Retry only after a fresh profile/disassembly yields a materially
+different mechanism or the exact binary can run on genuinely isolated/pinned
+CPU; require exact scalar/shipping parity, both A/A bands wholly within
+0.97–1.03, every arm CV below 5%, short candidate/shipping at most 0.97, and no
+decidable long-token regression.
