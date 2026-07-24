@@ -3603,6 +3603,12 @@ impl QuillSearchIndex {
         self.reader.published_snapshot.load().live_doc_count()
     }
 
+    /// Durable MANIFEST generation pinned by the currently published snapshot.
+    #[must_use]
+    pub fn keeper_generation(&self) -> u64 {
+        self.reader.published_snapshot.load().keeper_generation()
+    }
+
     /// Refresh this read-only handle to the latest durable MANIFEST.
     ///
     /// Queries that already loaded the prior snapshot remain pinned to it;

@@ -10,7 +10,8 @@ use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
@@ -529,12 +530,85 @@ impl SemanticVoiDecision {
 struct SearchExecutionResources {
     index_root: PathBuf,
     lexical_index: Option<QuillSearchIndex>,
+    shadow_observer: Option<frankensearch_core::ShadowLexicalObserver>,
+    shadow_pressure_sampler: Option<Arc<ShadowPressureSampler>>,
     vector_index: Option<VectorIndex>,
     fast_embedder: Option<Arc<dyn Embedder>>,
     quality_embedder: Option<Arc<dyn Embedder>>,
     fast_embedder_attempted: bool,
     quality_embedder_attempted: bool,
     degradation_advice: Vec<DegradationAdvice>,
+}
+
+struct ShadowPressureSampler {
+    probe: Arc<frankensearch_core::AtomicShadowLoadProbe>,
+    collector: Mutex<HostPressureCollector>,
+    sample_interval: Duration,
+    memory_ceiling_mb: usize,
+    cpu_ceiling_pct: f64,
+    sampling: AtomicBool,
+}
+
+impl ShadowPressureSampler {
+    fn new(config: &FsfsConfig) -> SearchResult<Self> {
+        const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+        #[allow(clippy::cast_precision_loss)]
+        let io_ceiling_mib_per_sec =
+            config.pressure.io_ceiling_bytes_per_sec as f64 / BYTES_PER_MIB;
+        Ok(Self {
+            probe: Arc::new(frankensearch_core::AtomicShadowLoadProbe::default()),
+            collector: Mutex::new(HostPressureCollector::new(io_ceiling_mib_per_sec)?),
+            sample_interval: Duration::from_millis(config.pressure.sample_interval_ms),
+            memory_ceiling_mb: config.pressure.memory_ceiling_mb,
+            cpu_ceiling_pct: f64::from(config.pressure.cpu_ceiling_pct),
+            sampling: AtomicBool::new(false),
+        })
+    }
+
+    fn sample_now(&self) -> SearchResult<()> {
+        let sample = self
+            .collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .collect(self.sample_interval, self.memory_ceiling_mb)?;
+        self.probe
+            .set_cpu_pressure(sample.cpu_pct >= self.cpu_ceiling_pct);
+        self.probe.set_io_pressure(sample.io_pct >= 100.0);
+        Ok(())
+    }
+
+    fn schedule(self: &Arc<Self>, cx: &Cx, observer: &frankensearch_core::ShadowLexicalObserver) {
+        if self.sampling.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let guard = ShadowPressureSampleGuard {
+            sampler: Arc::clone(self),
+        };
+        let observer_for_task = observer.clone();
+        if let Err(error) = cx.spawn_blocking(move |_| {
+            if let Err(error) = guard.sampler.sample_now() {
+                observer_for_task.record_degradation(
+                    frankensearch_core::ShadowDegradationKind::PressureSample,
+                    error.to_string(),
+                );
+            }
+        }) {
+            observer.record_degradation(
+                frankensearch_core::ShadowDegradationKind::PressureSample,
+                error.to_string(),
+            );
+        }
+    }
+}
+
+struct ShadowPressureSampleGuard {
+    sampler: Arc<ShadowPressureSampler>,
+}
+
+impl Drop for ShadowPressureSampleGuard {
+    fn drop(&mut self) {
+        self.sampler.sampling.store(false, Ordering::Release);
+    }
 }
 
 impl SearchExecutionResources {
@@ -610,7 +684,7 @@ struct SearchCacheKey {
 }
 
 type SharedSearchServeState = Arc<
-    std::sync::Mutex<(
+    asupersync::sync::Mutex<(
         SearchExecutionResources,
         HashMap<SearchCacheKey, Vec<SearchPayload>>,
     )>,
@@ -4963,7 +5037,7 @@ impl FsfsRuntime {
             .await?;
         let hot_cache: HashMap<SearchCacheKey, Vec<SearchPayload>> = HashMap::new();
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
-        let shared = Arc::new(std::sync::Mutex::new((resources, hot_cache)));
+        let shared = Arc::new(asupersync::sync::Mutex::new((resources, hot_cache)));
         let stop_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Every accepted client runs on its own scoped thread so one stalled
@@ -5077,11 +5151,17 @@ impl FsfsRuntime {
                         return;
                     }
                 };
-                let cx = Cx::for_request();
-                let execute = scheduler.block_on(async {
-                    let mut guard = shared
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let execute_task = scheduler.handle().spawn(async move {
+                    let cx = Cx::current().expect("asupersync runtime installs a request context");
+                    let mut guard =
+                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), &cx)
+                            .await
+                            .map_err(|error| SearchError::SubsystemError {
+                                subsystem: "fsfs.search.serve",
+                                source: Box::new(std::io::Error::other(format!(
+                                    "failed to lock shared daemon search state: {error}"
+                                ))),
+                            })?;
                     let (resources, hot_cache) = &mut *guard;
                     runtime
                         .execute_search_serve_request(
@@ -5093,6 +5173,7 @@ impl FsfsRuntime {
                         )
                         .await
                 });
+                let execute = scheduler.block_on(execute_task);
                 match execute {
                     Ok(response) => response,
                     Err(error) => Self::search_serve_error_response(
@@ -5145,6 +5226,12 @@ impl FsfsRuntime {
             && index.refresh(cx).await?
         {
             hot_cache.clear();
+            if let Some(observer) = resources.shadow_observer.as_ref() {
+                observer.mark_generation_degraded(
+                    index.keeper_generation(),
+                    "serving generation advanced beyond the retained shadow-oracle snapshot",
+                );
+            }
         }
         let mode = parse_search_execution_mode(request.mode.as_deref())?;
         let requested_limit = request.limit.unwrap_or_else(|| {
@@ -6802,6 +6889,36 @@ impl FsfsRuntime {
             (Vec::new(), Vec::new())
         };
         let lexical_elapsed_ms = lexical_start.elapsed().as_millis();
+        if plan.lexical_stage.enabled
+            && let Some(observer) = resources.shadow_observer.as_ref()
+        {
+            if let Some(sampler) = resources.shadow_pressure_sampler.as_ref() {
+                sampler.schedule(cx, observer);
+            }
+            let serving_results = lexical_candidates
+                .iter()
+                .map(|candidate| frankensearch_core::ScoredResult {
+                    doc_id: candidate.doc_id.clone().into(),
+                    score: candidate.score,
+                    source: frankensearch_core::ScoreSource::Lexical,
+                    index: None,
+                    fast_score: None,
+                    quality_score: None,
+                    lexical_score: Some(candidate.score),
+                    rerank_score: None,
+                    explanation: None,
+                    metadata: None,
+                })
+                .collect::<Vec<_>>();
+            observer.observe_serving_results(
+                cx,
+                &normalized_query,
+                output_limit,
+                &serving_results,
+                true,
+                u64::try_from(lexical_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+        }
 
         let semantic_start = Instant::now();
         let force_full_semantic_recall =
@@ -8073,6 +8190,7 @@ impl FsfsRuntime {
         }
 
         checks.push(Self::collect_lexical_engine_doctor_check(&index_root)?);
+        checks.push(self.collect_shadow_oracle_doctor_check(&index_root)?);
 
         // 5. Index directory writable
         if index_root.exists() {
@@ -8177,6 +8295,83 @@ impl FsfsRuntime {
             warn_count,
             fail_count,
             overall,
+        })
+    }
+
+    fn collect_shadow_oracle_doctor_check(&self, index_root: &Path) -> SearchResult<DoctorCheck> {
+        if !self.config.search.shadow_mode {
+            return Ok(DoctorCheck {
+                name: "shadow_oracle".to_owned(),
+                verdict: DoctorVerdict::Pass,
+                detail: "disabled (default-off)".to_owned(),
+                suggestion: None,
+            });
+        }
+        if !cfg!(feature = "shadow-oracle") {
+            return Ok(DoctorCheck {
+                name: "shadow_oracle".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: "enabled in config, unavailable in this binary".to_owned(),
+                suggestion: Some(
+                    "rebuild fsfs with the `shadow-oracle` feature or disable shadow mode"
+                        .to_owned(),
+                ),
+            });
+        }
+
+        let summary = frankensearch_core::ShadowArtifactSummary::read_index_root(index_root)?;
+        let generation = summary
+            .latest_generation
+            .map_or_else(|| "none".to_owned(), |value| value.to_string());
+        let detail = format!(
+            "enabled, observations={}, divergences={}, degradations={}, malformed={}, latest_generation={}, sample_rate_basis_points={}, max_in_flight={}",
+            summary.observation_count,
+            summary.divergence_count,
+            summary.degradation_count,
+            summary.malformed_line_count,
+            generation,
+            self.config.search.shadow_sample_rate_basis_points,
+            self.config.search.shadow_max_in_flight,
+        );
+        if summary.malformed_line_count != 0 {
+            return Ok(DoctorCheck {
+                name: "shadow_oracle".to_owned(),
+                verdict: DoctorVerdict::Fail,
+                detail,
+                suggestion: Some(format!(
+                    "inspect schema-invalid JSONL under {}",
+                    index_root
+                        .join(frankensearch_core::SHADOW_ARTIFACT_DIRECTORY)
+                        .display()
+                )),
+            });
+        }
+        if summary.degradation_count != 0 || summary.divergence_count != 0 {
+            return Ok(DoctorCheck {
+                name: "shadow_oracle".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail,
+                suggestion: Some(
+                    "inspect typed shadow degradations and shrink classified divergences before the default flip"
+                        .to_owned(),
+                ),
+            });
+        }
+        if summary.observation_count == 0 {
+            return Ok(DoctorCheck {
+                name: "shadow_oracle".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail,
+                suggestion: Some(
+                    "run representative fsfs queries to collect G2.5 shadow evidence".to_owned(),
+                ),
+            });
+        }
+        Ok(DoctorCheck {
+            name: "shadow_oracle".to_owned(),
+            verdict: DoctorVerdict::Pass,
+            detail,
+            suggestion: None,
         })
     }
 
@@ -10808,6 +11003,13 @@ impl FsfsRuntime {
             _ => None,
         };
         let lexical_available = lexical_index.is_some();
+        let shadow_runtime = lexical_index.as_ref().and_then(|index| {
+            self.prepare_shadow_oracle_observer(&index_root, &lexical_layout, index)
+        });
+        let (shadow_observer, shadow_pressure_sampler) = shadow_runtime
+            .map_or((None, None), |(observer, sampler)| {
+                (Some(observer), Some(sampler))
+            });
 
         let should_open_vector =
             !matches!(mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
@@ -10849,6 +11051,8 @@ impl FsfsRuntime {
         Ok(SearchExecutionResources {
             index_root,
             lexical_index,
+            shadow_observer,
+            shadow_pressure_sampler,
             vector_index,
             fast_embedder: None,
             quality_embedder: None,
@@ -10856,6 +11060,181 @@ impl FsfsRuntime {
             quality_embedder_attempted: false,
             degradation_advice,
         })
+    }
+
+    #[cfg(feature = "shadow-oracle")]
+    fn prepare_shadow_oracle_observer(
+        &self,
+        index_root: &Path,
+        layout: &LexicalEngineLayout,
+        serving_index: &QuillSearchIndex,
+    ) -> Option<(
+        frankensearch_core::ShadowLexicalObserver,
+        Arc<ShadowPressureSampler>,
+    )> {
+        if !self.config.search.shadow_mode {
+            return None;
+        }
+        let manifest_generation = serving_index.keeper_generation();
+        let artifact_directory = index_root.join(frankensearch_core::SHADOW_ARTIFACT_DIRECTORY);
+        let persist_degradation = |kind: frankensearch_core::ShadowDegradationKind,
+                                   detail: String| {
+            if let Err(error) = frankensearch_core::append_shadow_degradation(
+                artifact_directory.clone(),
+                manifest_generation,
+                kind,
+                detail,
+            ) {
+                warn!(
+                    event = "shadow_artifact_write_failed",
+                    error = %error,
+                    "shadow preparation degradation could not be persisted"
+                );
+            }
+        };
+        let active = layout.engine_dir();
+        let lexical_root = layout.lexical_root();
+        let mut candidates = Vec::new();
+        if lexical_root.join("meta.json").is_file() {
+            candidates.push(lexical_root.to_path_buf());
+        }
+        if let Ok(entries) = fs::read_dir(lexical_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && path.join("meta.json").is_file()
+                    && active.as_deref() != Some(path.as_path())
+                {
+                    candidates.push(path);
+                }
+            }
+        }
+        candidates.sort();
+        let Some(oracle_path) = candidates.into_iter().next() else {
+            persist_degradation(
+                frankensearch_core::ShadowDegradationKind::OracleUnavailable,
+                "no retained Tantivy generation".to_owned(),
+            );
+            warn!(
+                event = "shadow_oracle_unavailable",
+                index_root = %index_root.display(),
+                reason = "no retained Tantivy generation",
+                "shadow mode is enabled but serving remains unaffected"
+            );
+            return None;
+        };
+        let oracle = match frankensearch_lexical::TantivyIndex::open(&oracle_path) {
+            Ok(index) => index,
+            Err(error) => {
+                persist_degradation(
+                    frankensearch_core::ShadowDegradationKind::OracleUnavailable,
+                    error.to_string(),
+                );
+                warn!(
+                    event = "shadow_oracle_degraded",
+                    oracle_path = %oracle_path.display(),
+                    error = %error,
+                    "retained Tantivy oracle could not be opened; serving remains unaffected"
+                );
+                return None;
+            }
+        };
+        let replay_documents = match oracle.all_documents() {
+            Ok(documents) => documents,
+            Err(error) => {
+                persist_degradation(
+                    frankensearch_core::ShadowDegradationKind::CorpusExport,
+                    error.to_string(),
+                );
+                warn!(
+                    event = "shadow_oracle_degraded",
+                    oracle_path = %oracle_path.display(),
+                    error = %error,
+                    "retained Tantivy replay corpus could not be exported; serving remains unaffected"
+                );
+                return None;
+            }
+        };
+        let config = frankensearch_core::ShadowLexicalConfig {
+            enabled: true,
+            sample_rate_basis_points: self.config.search.shadow_sample_rate_basis_points,
+            max_in_flight: self.config.search.shadow_max_in_flight,
+            score_epsilon: self.config.search.shadow_score_epsilon,
+            artifact_directory: artifact_directory.clone(),
+            initial_generation: manifest_generation,
+        };
+        let sampler = match ShadowPressureSampler::new(&self.config) {
+            Ok(sampler) => Arc::new(sampler),
+            Err(error) => {
+                persist_degradation(
+                    frankensearch_core::ShadowDegradationKind::PressureSample,
+                    error.to_string(),
+                );
+                warn!(
+                    event = "shadow_oracle_degraded",
+                    error = %error,
+                    "shadow pressure sampler could not be initialized; serving remains unaffected"
+                );
+                return None;
+            }
+        };
+        let observer = match frankensearch_core::ShadowLexicalObserver::with_load_probe(
+            Arc::new(oracle),
+            config,
+            sampler.probe.clone(),
+        ) {
+            Ok(observer) => observer,
+            Err(error) => {
+                persist_degradation(
+                    frankensearch_core::ShadowDegradationKind::OracleUnavailable,
+                    error.to_string(),
+                );
+                warn!(
+                    event = "shadow_oracle_degraded",
+                    error = %error,
+                    "shadow observer configuration was rejected; serving remains unaffected"
+                );
+                return None;
+            }
+        };
+        observer.seed_corpus(&replay_documents, manifest_generation);
+        if let Err(error) = sampler.sample_now() {
+            observer.record_degradation(
+                frankensearch_core::ShadowDegradationKind::PressureSample,
+                error.to_string(),
+            );
+        }
+        info!(
+            event = "shadow_oracle_enabled",
+            oracle_path = %oracle_path.display(),
+            manifest_generation,
+            replay_documents = replay_documents.len(),
+            sample_rate_basis_points = self.config.search.shadow_sample_rate_basis_points,
+            max_in_flight = self.config.search.shadow_max_in_flight,
+            "fsfs shadow oracle is ready"
+        );
+        Some((observer, sampler))
+    }
+
+    #[cfg(not(feature = "shadow-oracle"))]
+    fn prepare_shadow_oracle_observer(
+        &self,
+        index_root: &Path,
+        _layout: &LexicalEngineLayout,
+        _serving_index: &QuillSearchIndex,
+    ) -> Option<(
+        frankensearch_core::ShadowLexicalObserver,
+        Arc<ShadowPressureSampler>,
+    )> {
+        if self.config.search.shadow_mode {
+            warn!(
+                event = "shadow_oracle_unavailable",
+                index_root = %index_root.display(),
+                reason = "binary built without shadow-oracle feature",
+                "shadow mode is enabled but serving remains unaffected"
+            );
+        }
+        None
     }
 
     fn hash_embedder_for_vector_index(index: &VectorIndex) -> Option<Arc<dyn Embedder>> {
@@ -17625,6 +18004,8 @@ mod tests {
             let mut resources = SearchExecutionResources {
                 index_root: temp.path().to_path_buf(),
                 lexical_index: Some(reader),
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
                 vector_index: None,
                 fast_embedder: None,
                 quality_embedder: None,
@@ -20740,6 +21121,8 @@ mod tests {
             let mut resources = SearchExecutionResources {
                 index_root: temp.path().to_path_buf(),
                 lexical_index: None,
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
@@ -20914,6 +21297,8 @@ mod tests {
             let mut resources = SearchExecutionResources {
                 index_root: temp.path().to_path_buf(),
                 lexical_index: Some(lexical_index),
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
                 fast_embedder: Some(Arc::new(CancelledEmbedder)),
                 quality_embedder: None,
@@ -20991,6 +21376,8 @@ mod tests {
             let mut resources = SearchExecutionResources {
                 index_root: temp.path().to_path_buf(),
                 lexical_index: None,
+                shadow_observer: None,
+                shadow_pressure_sampler: None,
                 vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
                 fast_embedder: Some(Arc::new(fast_embedder)),
                 quality_embedder: Some(Arc::new(CancelledEmbedder)),
@@ -21847,6 +22234,123 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "shadow-oracle")]
+    #[test]
+    fn shadow_oracle_real_quill_tantivy_query_is_non_interfering_and_persists_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let quill_path = index_root.join("quill-v1");
+        let tantivy_path = index_root.join("lexical");
+        let document = IndexableDocument::new("docs/shadow.md", "exact shadow oracle witness");
+        let scheduler = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        let test_task = scheduler.handle().spawn(async move {
+            let cx = Cx::current().expect("runtime installs a spawn-capable context");
+            let quill = create_test_quill(&cx, &quill_path).await;
+            quill
+                .index_document(&cx, &document)
+                .await
+                .expect("index Quill document");
+            quill.commit(&cx).await.expect("commit Quill document");
+            drop(quill);
+
+            let tantivy = TantivyIndex::create(&tantivy_path).expect("create Tantivy oracle");
+            tantivy
+                .index_document(&cx, &document)
+                .await
+                .expect("index Tantivy document");
+            tantivy.commit(&cx).await.expect("commit Tantivy document");
+            drop(tantivy);
+
+            let pointer = CurrentPointer::new(
+                BlueGreenEngine::Quill,
+                "quill-v1",
+                frankensearch_quill::FSLX_FORMAT_VERSION,
+            )
+            .expect("create Quill CURRENT");
+            publish_current(&index_root, &pointer).expect("publish Quill CURRENT");
+
+            let mut config = FsfsConfig::default();
+            config.search.shadow_mode = true;
+            config.search.shadow_sample_rate_basis_points = 10_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("shadow oracle witness".to_owned()),
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let mut resources = runtime
+                .prepare_search_execution_resources(&cx, SearchExecutionMode::LexicalOnly)
+                .await
+                .expect("prepare real shadow resources");
+            let observer = resources
+                .shadow_observer
+                .as_ref()
+                .expect("shadow observer enabled")
+                .clone();
+            let sampler = resources
+                .shadow_pressure_sampler
+                .as_ref()
+                .expect("pressure sampler enabled");
+            sampler.probe.set_cpu_pressure(false);
+            sampler.probe.set_io_pressure(false);
+
+            let serving_before = resources
+                .lexical_index
+                .as_ref()
+                .expect("Quill serving index")
+                .search_doc_ids(&cx, "shadow oracle witness", 10)
+                .expect("baseline Quill search")
+                .into_iter()
+                .map(|hit| hit.document_id)
+                .collect::<Vec<_>>();
+            let phases = runtime
+                .execute_search_phase_artifacts_with_mode_using_resources(
+                    &cx,
+                    "shadow oracle witness",
+                    10,
+                    SearchExecutionMode::LexicalOnly,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    None,
+                )
+                .await
+                .expect("serve query with shadow observation");
+            let serving_after = phases[0]
+                .payload
+                .hits
+                .iter()
+                .map(|hit| hit.path.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                serving_after,
+                serving_before
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<&str>>(),
+                "shadow execution must not change Quill serving top-k"
+            );
+
+            for _ in 0..100 {
+                if observer.status().completed == 1 {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(5)).await;
+            }
+            assert_eq!(observer.status().completed, 1);
+            let summary = frankensearch_core::ShadowArtifactSummary::read_index_root(&index_root)
+                .expect("read persisted shadow evidence");
+            assert_eq!(summary.observation_count, 1);
+            assert_eq!(summary.malformed_line_count, 0);
+        });
+        scheduler.block_on(test_task);
+    }
+
     #[test]
     fn failed_tantivy_rebuild_never_flips_current_or_removes_old_directory() {
         run_test_with_cx(|cx| async move {
@@ -21928,10 +22432,88 @@ mod tests {
             payload.checks.iter().any(|c| c.name == "config"),
             "doctor should check config"
         );
+        assert!(
+            payload.checks.iter().any(|c| c.name == "shadow_oracle"),
+            "doctor should expose shadow-oracle state"
+        );
         assert_eq!(
             payload.pass_count + payload.warn_count + payload.fail_count,
             payload.checks.len(),
             "verdict counts should sum to total checks"
+        );
+    }
+
+    #[cfg(feature = "shadow-oracle")]
+    #[test]
+    fn shadow_oracle_doctor_surfaces_clean_and_degraded_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact_dir = temp
+            .path()
+            .join(frankensearch_core::SHADOW_ARTIFACT_DIRECTORY);
+        fs::create_dir_all(&artifact_dir).expect("create shadow artifact dir");
+        let observation = frankensearch_core::ShadowObservationRecord {
+            schema_version: frankensearch_core::SHADOW_OBSERVATION_SCHEMA_VERSION,
+            manifest_generation: 9,
+            query: "alpha".to_owned(),
+            classification: frankensearch_core::ShadowDivergenceClass::Exact,
+            serve_latency_micros: 5,
+            shadow_latency_micros: 8,
+        };
+        fs::write(
+            artifact_dir.join(frankensearch_core::SHADOW_OBSERVATIONS_FILE),
+            format!(
+                "{}\n",
+                serde_json::to_string(&observation).expect("serialize observation")
+            ),
+        )
+        .expect("write clean observation");
+        let mut config = FsfsConfig::default();
+        config.search.shadow_mode = true;
+        let runtime = FsfsRuntime::new(config);
+        let clean = runtime
+            .collect_shadow_oracle_doctor_check(temp.path())
+            .expect("collect clean shadow check");
+        assert_eq!(clean.verdict, super::DoctorVerdict::Pass);
+        assert!(clean.detail.contains("observations=1"));
+        assert!(clean.detail.contains("latest_generation=9"));
+
+        let degradation = frankensearch_core::ShadowDegradationRecord {
+            schema_version: frankensearch_core::SHADOW_DEGRADATION_SCHEMA_VERSION,
+            manifest_generation: 9,
+            kind: frankensearch_core::ShadowDegradationKind::Index,
+            detail: "injected index failure".to_owned(),
+        };
+        fs::write(
+            artifact_dir.join(frankensearch_core::SHADOW_DEGRADATIONS_FILE),
+            format!(
+                "{}\n",
+                serde_json::to_string(&degradation).expect("serialize degradation")
+            ),
+        )
+        .expect("write degradation");
+        let degraded = runtime
+            .collect_shadow_oracle_doctor_check(temp.path())
+            .expect("collect degraded shadow check");
+        assert_eq!(degraded.verdict, super::DoctorVerdict::Warn);
+        assert!(degraded.detail.contains("degradations=1"));
+        assert!(degraded.suggestion.is_some());
+    }
+
+    #[cfg(not(feature = "shadow-oracle"))]
+    #[test]
+    fn shadow_oracle_doctor_surfaces_missing_build_feature() {
+        let mut config = FsfsConfig::default();
+        config.search.shadow_mode = true;
+        let check = FsfsRuntime::new(config)
+            .collect_shadow_oracle_doctor_check(Path::new("."))
+            .expect("collect unavailable-feature check");
+        assert_eq!(check.verdict, super::DoctorVerdict::Warn);
+        assert!(check.detail.contains("unavailable in this binary"));
+        assert!(
+            check
+                .suggestion
+                .as_deref()
+                .is_some_and(|suggestion| suggestion.contains("shadow-oracle"))
         );
     }
 
