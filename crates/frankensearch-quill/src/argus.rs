@@ -2200,6 +2200,12 @@ impl<'a> ReferenceScorer<'a> {
     fn competitive_score_upper_bound(&self) -> Option<f32> {
         match &self.node {
             ScorerNode::Term(term) => term.term_score_upper_bound,
+            // A pure-term group (nested multi-field union) reports its ceiling
+            // as the sum of its terms' ceilings. Behavior-neutral today: the
+            // sole consumer (`competitive_candidates`) only reads this behind
+            // the all-direct-terms gate, which a union child never satisfies;
+            // the deferred grouped-MaxScore follow-up will consume it directly.
+            ScorerNode::Union(union) => union.group_upper_bound(),
             _ => None,
         }
     }
@@ -3427,6 +3433,29 @@ impl<'a> BufferedUnionScorer<'a> {
 
     fn refill(&mut self) -> Result<bool, ArgusError> {
         self.refill_with_cutoff(None)
+    }
+
+    /// Whole-group score ceiling for a pure-term group: the sum of every active
+    /// child's whole-term ceiling, summed in active order to mirror the
+    /// exhaustive window scoring. Returns `None` when the group is empty or any
+    /// active child is not a bounded direct term (a nested non-term child, or a
+    /// cursor without a ceiling), so callers can fail closed.
+    ///
+    /// Foundation for the deferred grouped-`MaxScore` lever
+    /// (`bd-quill-e8-perf-doctrine-x4e4.5.1`): a nested pure-term union exposes
+    /// this ceiling to a root `MaxScore` over groups. The bound is conservative
+    /// only if the summed `f32` never rounds below a realized group score; the
+    /// grouped candidate path that consumes it (follow-up layer) is gated by an
+    /// exhaustive parity harness that verifies rank-safety.
+    fn group_upper_bound(&self) -> Option<f32> {
+        if self.active.is_empty() {
+            return None;
+        }
+        let mut total = 0.0_f32;
+        for child in &self.active {
+            total += child.competitive_score_upper_bound()?;
+        }
+        Some(total)
     }
 
     fn refill_with_cutoff(&mut self, cutoff: Option<f32>) -> Result<bool, ArgusError> {
