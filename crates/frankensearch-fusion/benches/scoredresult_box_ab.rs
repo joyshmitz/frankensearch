@@ -32,6 +32,7 @@ use frankensearch_core::types::ScoreSource;
 use frankensearch_fusion::bench_support::paired_median_ratio;
 
 /// Mirrors the production `ScoredResult` (explanation INLINE).
+#[allow(dead_code, reason = "the benchmark compares complete struct layouts")]
 struct SrInline {
     doc_id: CompactString,
     score: f32,
@@ -46,6 +47,7 @@ struct SrInline {
 }
 
 /// Candidate: explanation BOXED.
+#[allow(dead_code, reason = "the benchmark compares complete struct layouts")]
 struct SrBoxed {
     doc_id: CompactString,
     score: f32,

@@ -315,7 +315,7 @@ fn bench(c: &mut Criterion) {
         //
         // Same alternating-round paired sampler + A/A null control as the limit_all block
         // above; one null+lever pair per remaining comparison.
-        let mut top10_orig = || {
+        let top10_orig = || {
             black_box(pool_minmax_fuse(
                 black_box(&lex),
                 black_box(&sem),
@@ -324,7 +324,7 @@ fn bench(c: &mut Criterion) {
                 &cfg,
             ));
         };
-        let mut top10_merge = || {
+        let top10_merge = || {
             black_box(pool_minmax_fuse_merge(
                 black_box(&lex),
                 black_box(&sem),
@@ -350,7 +350,7 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut dispatch_direct = || {
+        let dispatch_direct = || {
             black_box(rrf_fuse_with_graph_merge_unique(
                 black_box(&lex),
                 black_box(&sem),
@@ -361,7 +361,7 @@ fn bench(c: &mut Criterion) {
                 &cfg,
             ));
         };
-        let mut dispatch_strategy = || {
+        let dispatch_strategy = || {
             black_box(fuse_by_strategy(
                 black_box(FusionStrategy::Rrf),
                 black_box(&lex),

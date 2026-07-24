@@ -107,10 +107,10 @@ fn bench(c: &mut Criterion) {
         // drift between them is not cancelled. The paired sampler runs both arms in ONE
         // routine in alternating rounds; gate on the median against the A/A null's
         // observed spread.
-        let mut sip = || {
+        let sip = || {
             black_box(run_sip(black_box(&fast), black_box(&quality)));
         };
-        let mut ahash = || {
+        let ahash = || {
             black_box(run_ahash(black_box(&fast), black_box(&quality)));
         };
         let null = paired_median_ratio(41, 8, sip, sip);

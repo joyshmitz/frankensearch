@@ -18,6 +18,7 @@ use frankensearch_fusion::bench_support::paired_median_ratio;
 /// Faithful stand-in for `FusedCandidate`: only `doc_id` allocates on clone;
 /// every other field is `Copy` (matches the real struct's clone cost).
 #[derive(Clone)]
+#[allow(dead_code, reason = "the benchmark charges the full candidate clone")]
 struct Cand {
     doc_id: String,
     fused_score: f64,
@@ -115,10 +116,10 @@ fn bench(c: &mut Criterion) {
         // drift between them is not cancelled. The paired sampler runs both arms in ONE
         // routine in alternating rounds; gate on the median against the A/A null's
         // observed spread.
-        let mut sip = || {
+        let sip = || {
             black_box(merge_sip(black_box(&head), black_box(&tail)));
         };
-        let mut ahash = || {
+        let ahash = || {
             black_box(merge_ahash(black_box(&head), black_box(&tail)));
         };
         let null = paired_median_ratio(41, 8, sip, sip);

@@ -388,14 +388,14 @@ fn bench(c: &mut Criterion) {
         // routine in alternating rounds; gate on the median against the A/A null's
         // observed spread. One null+lever pair per comparison: the mutual lever (v3 and
         // the v2 stepping-stone) and the non-mutual regression guard.
-        let mut mutual_orig = || {
+        let mutual_orig = || {
             black_box(neighbor_smooth(
                 black_box(&hits),
                 black_box(&graph),
                 &mutual,
             ));
         };
-        let mut mutual_v3 = || {
+        let mutual_v3 = || {
             black_box(smooth_v3(black_box(&hits), black_box(&graph), &mutual));
         };
         let null = paired_median_ratio(41, 8, mutual_orig, mutual_orig);
@@ -415,14 +415,14 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut mutual_orig = || {
+        let mutual_orig = || {
             black_box(neighbor_smooth(
                 black_box(&hits),
                 black_box(&graph),
                 &mutual,
             ));
         };
-        let mut mutual_v2 = || {
+        let mutual_v2 = || {
             black_box(smooth_v2(black_box(&hits), black_box(&graph), &mutual));
         };
         let null = paired_median_ratio(41, 8, mutual_orig, mutual_orig);
@@ -442,14 +442,14 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut nonmutual_orig = || {
+        let nonmutual_orig = || {
             black_box(neighbor_smooth(
                 black_box(&hits),
                 black_box(&graph),
                 &smooth,
             ));
         };
-        let mut nonmutual_v3 = || {
+        let nonmutual_v3 = || {
             black_box(smooth_v3(black_box(&hits), black_box(&graph), &smooth));
         };
         let null = paired_median_ratio(41, 8, nonmutual_orig, nonmutual_orig);

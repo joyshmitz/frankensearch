@@ -36,6 +36,10 @@ struct Winner<'a> {
 }
 
 /// `FusedHit` with a `String` doc_id — the pre-landing production type.
+#[allow(
+    dead_code,
+    reason = "the benchmark charges complete result materialization"
+)]
 struct FusedHitString {
     doc_id: String,
     rrf_score: f64,
@@ -48,6 +52,10 @@ struct FusedHitString {
 }
 
 /// `FusedHit` with a `CompactString` doc_id — the landed production type (~96 B).
+#[allow(
+    dead_code,
+    reason = "the benchmark charges complete result materialization"
+)]
 struct FusedHitCompact {
     doc_id: CompactString,
     rrf_score: f64,
@@ -64,6 +72,10 @@ struct FusedHitCompact {
 /// `f32` with a `NaN` sentinel. Same doc_id (CompactString). Tests whether the
 /// ~40 % struct-size cut speeds the `limit_all` materialize (smaller memcpy +
 /// smaller Vec alloc) enough to justify the public-API break it would require.
+#[allow(
+    dead_code,
+    reason = "the benchmark charges complete result materialization"
+)]
 struct FusedHitPacked {
     doc_id: CompactString,
     rrf_score: f64,
@@ -166,11 +178,11 @@ fn bench(c: &mut Criterion) {
         // routine in alternating rounds; gate on the median against the A/A null's
         // observed spread. Base is the pre-landing `string` arm; one null+lever pair
         // per candidate (`compact`, `packed`).
-        let mut string_build = || {
+        let string_build = || {
             let out: Vec<FusedHitString> = black_box(&ws).iter().map(to_string).collect();
             black_box(out);
         };
-        let mut compact_build = || {
+        let compact_build = || {
             let out: Vec<FusedHitCompact> = black_box(&ws).iter().map(to_compact).collect();
             black_box(out);
         };
@@ -191,11 +203,11 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut string_build = || {
+        let string_build = || {
             let out: Vec<FusedHitString> = black_box(&ws).iter().map(to_string).collect();
             black_box(out);
         };
-        let mut packed_build = || {
+        let packed_build = || {
             let out: Vec<FusedHitPacked> = black_box(&ws).iter().map(to_packed).collect();
             black_box(out);
         };

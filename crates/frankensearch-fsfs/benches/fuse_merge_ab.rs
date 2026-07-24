@@ -50,7 +50,7 @@ fn make_candidates(n: usize, overlap: usize) -> (Vec<LexicalCandidate>, Vec<Sema
     (lexical, semantic)
 }
 
-fn bench(c: &mut Criterion) {
+fn bench(_c: &mut Criterion) {
     let inner: u32 = std::env::var("FUSE_AB_INNER")
         .ok()
         .and_then(|v| v.parse().ok())

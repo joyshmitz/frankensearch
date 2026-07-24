@@ -70,14 +70,14 @@ fn bench(c: &mut Criterion) {
         // cancelled. The paired sampler runs both arms in ONE routine in alternating
         // rounds and takes the median per-round ratio; gate on the median against the
         // A/A null's observed spread, not on cv.
-        let mut divide = || {
+        let divide = || {
             let mut acc = 0.0_f64;
             for &r in black_box(&ranks) {
                 acc += rank_contribution(K, r);
             }
             black_box(acc);
         };
-        let mut lut_read = || {
+        let lut_read = || {
             let mut acc = 0.0_f64;
             for &r in black_box(&ranks) {
                 acc += black_box(&lut)[r];

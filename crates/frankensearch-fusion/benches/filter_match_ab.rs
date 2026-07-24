@@ -102,10 +102,10 @@ fn bench(c: &mut Criterion) {
         // drift between them is not cancelled. The paired sampler runs both arms in ONE
         // routine in alternating rounds; gate on the median against the A/A null's
         // observed spread. One null+lever pair per filter comparison.
-        let mut path_old = || {
+        let path_old = || {
             black_box(run_old(black_box(&path_filter), black_box(&d)));
         };
-        let mut path_new = || {
+        let path_new = || {
             black_box(run_new(black_box(&path_filter), black_box(&d)));
         };
         let null = paired_median_ratio(41, 8, path_old, path_old);
@@ -125,10 +125,10 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut ext_old = || {
+        let ext_old = || {
             black_box(run_old(black_box(&ext_filter), black_box(&d)));
         };
-        let mut ext_new = || {
+        let ext_new = || {
             black_box(run_new(black_box(&ext_filter), black_box(&d)));
         };
         let null = paired_median_ratio(41, 8, ext_old, ext_old);

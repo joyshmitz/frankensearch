@@ -206,10 +206,10 @@ fn bench(c: &mut Criterion) {
         // routine in alternating rounds; gate on the median against the A/A null's
         // observed spread. Base is the ORIGINAL scalar dot; one null+lever pair per
         // candidate kernel.
-        let mut scalar = || {
+        let scalar = || {
             black_box(dot_scalar(black_box(&lhs), black_box(&rhs)));
         };
-        let mut multiacc = || {
+        let multiacc = || {
             black_box(dot_multiacc(black_box(&lhs), black_box(&rhs)));
         };
         let null = paired_median_ratio(41, 8, scalar, scalar);
@@ -229,10 +229,10 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut scalar = || {
+        let scalar = || {
             black_box(dot_scalar(black_box(&lhs), black_box(&rhs)));
         };
-        let mut simd = || {
+        let simd = || {
             black_box(dot_simd(black_box(&lhs), black_box(&rhs)));
         };
         let null = paired_median_ratio(41, 8, scalar, scalar);
@@ -367,7 +367,7 @@ fn bench(c: &mut Criterion) {
         // observed spread. One null+lever pair per comparison: the inner-dot levers
         // (multiacc, simd vs scalar), the outer-loop lever (simd_par vs simd), and the
         // shipped entry point vs its simd_par mirror.
-        let mut scalar_build = || {
+        let scalar_build = || {
             black_box(hubness_with(
                 black_box(&doc_vecs),
                 black_box(&query_sample),
@@ -375,7 +375,7 @@ fn bench(c: &mut Criterion) {
                 dot_scalar,
             ));
         };
-        let mut multiacc_build = || {
+        let multiacc_build = || {
             black_box(hubness_with(
                 black_box(&doc_vecs),
                 black_box(&query_sample),
@@ -400,7 +400,7 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut scalar_build = || {
+        let scalar_build = || {
             black_box(hubness_with(
                 black_box(&doc_vecs),
                 black_box(&query_sample),
@@ -408,7 +408,7 @@ fn bench(c: &mut Criterion) {
                 dot_scalar,
             ));
         };
-        let mut simd_build = || {
+        let simd_build = || {
             black_box(hubness_with(
                 black_box(&doc_vecs),
                 black_box(&query_sample),
@@ -433,7 +433,7 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut simd_build = || {
+        let simd_build = || {
             black_box(hubness_with(
                 black_box(&doc_vecs),
                 black_box(&query_sample),
@@ -441,7 +441,7 @@ fn bench(c: &mut Criterion) {
                 dot_simd,
             ));
         };
-        let mut simd_par_build = || {
+        let simd_par_build = || {
             black_box(hubness_par(
                 black_box(&doc_vecs),
                 black_box(&query_sample),
@@ -466,7 +466,7 @@ fn bench(c: &mut Criterion) {
                 "INSIDE NULL FLOOR (not decidable)"
             }
         );
-        let mut simd_par_build = || {
+        let simd_par_build = || {
             black_box(hubness_par(
                 black_box(&doc_vecs),
                 black_box(&query_sample),
@@ -474,7 +474,7 @@ fn bench(c: &mut Criterion) {
                 dot_simd,
             ));
         };
-        let mut shipped_build = || {
+        let shipped_build = || {
             black_box(compute_query_hubness(
                 black_box(&doc_vecs),
                 black_box(&query_sample),
