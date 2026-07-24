@@ -1,6 +1,6 @@
 //! Validate the IDF/selectivity-aware count-free gate (route-next from the 2026-07-14
 //! "count-free WAND gate is on the wrong axis" ledger). The count-free `execute_top_k`
-//! (TopDocs → block-max WAND) beats the counted `execute_query_with_offset` (TopDocs +
+//! (`TopDocs` → block-max WAND) beats the counted `execute_query_with_offset` (`TopDocs` +
 //! Count full scan) precisely when a query has a SELECTIVE anchor term (skewed scores →
 //! WAND prunes) and loses on FLAT mid-IDF disjunctions (no anchor → WAND can't prune).
 //!
@@ -17,6 +17,7 @@
 //!   --features bench-internals --bench count_free_idf_gate_ab
 //! ```
 
+use std::fmt::Write as _;
 use std::hint::black_box;
 
 use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
@@ -26,7 +27,7 @@ use tantivy::schema::{STORED, STRING, Schema, TEXT};
 use tantivy::{Index, Term, doc};
 
 const N: usize = 50_000;
-const RARE_VOCAB: usize = 5_000;
+const RARE_VOCAB: u64 = 5_000;
 const COMMON_VOCAB: usize = 8;
 const LIMIT: usize = 100;
 
@@ -55,13 +56,14 @@ fn build_index() -> Index {
         // → the flat-score pathology when a query is all-common.
         for j in 0..COMMON_VOCAB {
             if xorshift(&mut state) & 1 == 1 {
-                body.push_str(&format!("common{j} "));
+                write!(&mut body, "common{j} ").expect("writing to String cannot fail");
             }
         }
         // Rare/selective terms: 10 draws from a 5k vocab → each ~0.2% doc frequency.
         for _ in 0..10 {
-            let t = (xorshift(&mut state) as usize) % RARE_VOCAB;
-            body.push_str(&format!("rare{t} "));
+            let t = usize::try_from(xorshift(&mut state) % RARE_VOCAB)
+                .expect("RARE_VOCAB remainder fits usize");
+            write!(&mut body, "rare{t} ").expect("writing to String cannot fail");
         }
         writer
             .add_document(doc!(id => format!("doc-{i:06}"), content => body))

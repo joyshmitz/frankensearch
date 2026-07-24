@@ -82,13 +82,16 @@ fn build_fixture() -> Fixture {
     let index = Index::create_in_ram(schema);
     let mut writer: tantivy::IndexWriter = index.writer(80_000_000).expect("writer");
     let mut table = Vec::with_capacity(N);
+    let vocab_len = u64::try_from(VOCAB.len()).expect("VOCAB length fits u64");
     for i in 0..N {
         let mut state = (i as u64).wrapping_add(1);
         let doc_id = format!("doc-{i:06}");
         let mut body = String::with_capacity(120);
         body.push_str("search ");
         for _ in 0..12 {
-            body.push_str(VOCAB[(xorshift(&mut state) as usize) % VOCAB.len()]);
+            let word_index = usize::try_from(xorshift(&mut state) % vocab_len)
+                .expect("VOCAB remainder fits usize");
+            body.push_str(VOCAB[word_index]);
             body.push(' ');
         }
         // Realistic metadata JSON object (~8 fields, a few hundred bytes) — the payload
@@ -179,11 +182,19 @@ fn materialize_fastfield_id(
     }
     let mut ids = Vec::with_capacity(hits.len());
     for &(_, addr) in hits {
-        let ord = cols[addr.segment_ord as usize]
-            .as_ref()
-            .and_then(|c| c.first(addr.doc_id))
-            .expect("ord") as usize;
-        ids.push(table[ord].clone());
+        let segment_index = usize::try_from(addr.segment_ord).expect("segment ordinal fits usize");
+        let column = cols
+            .get(segment_index)
+            .and_then(Option::as_ref)
+            .expect("segment ordinal has an ord column");
+        let ord = column.first(addr.doc_id).expect("document has an ord");
+        let ord = usize::try_from(ord).expect("document ordinal fits usize");
+        ids.push(
+            table
+                .get(ord)
+                .expect("document ordinal is in range")
+                .clone(),
+        );
     }
     ids
 }
@@ -339,14 +350,14 @@ fn run_product_gate() {
             index
                 .hydrate_fusion_metadata_scored_for_bench(&cx, &mut scored)
                 .await
-                .expect("scored hydration parity")
+                .expect("scored hydration parity");
         });
         let mut unscored = seed.clone();
         runtime.block_on(async {
             index
                 .hydrate_fusion_metadata(&cx, &mut unscored)
                 .await
-                .expect("unscored hydration parity")
+                .expect("unscored hydration parity");
         });
         assert_eq!(
             serde_json::to_vec(&scored).expect("serialize scored hydration"),
@@ -364,7 +375,7 @@ fn run_product_gate() {
                     index
                         .hydrate_fusion_metadata_scored_for_bench(&cx, &mut null_a)
                         .await
-                        .expect("scored hydration null A")
+                        .expect("scored hydration null A");
                 });
                 black_box(&null_a);
                 clear_hydrated_metadata(&mut null_a);
@@ -374,7 +385,7 @@ fn run_product_gate() {
                     index
                         .hydrate_fusion_metadata_scored_for_bench(&cx, &mut null_b)
                         .await
-                        .expect("scored hydration null B")
+                        .expect("scored hydration null B");
                 });
                 black_box(&null_b);
                 clear_hydrated_metadata(&mut null_b);
@@ -391,7 +402,7 @@ fn run_product_gate() {
                     index
                         .hydrate_fusion_metadata_scored_for_bench(&cx, &mut original)
                         .await
-                        .expect("scored hydration")
+                        .expect("scored hydration");
                 });
                 black_box(&original);
                 clear_hydrated_metadata(&mut original);
@@ -401,7 +412,7 @@ fn run_product_gate() {
                     index
                         .hydrate_fusion_metadata(&cx, &mut candidate)
                         .await
-                        .expect("unscored hydration")
+                        .expect("unscored hydration");
                 });
                 black_box(&candidate);
                 clear_hydrated_metadata(&mut candidate);
