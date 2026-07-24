@@ -3,7 +3,9 @@
 //! Visualizes lifecycle transition events to support rapid triage.
 
 use std::any::Any;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(any(test, feature = "bench-internals"))]
+use std::collections::HashMap;
 
 use ahash::AHashMap;
 
