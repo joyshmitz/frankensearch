@@ -55,7 +55,7 @@ struct RateLimiter {
 
 #[derive(Debug)]
 struct RateLimiterState {
-    tokens: f64,
+    available_permits: f64,
     last_refill: Instant,
 }
 
@@ -63,7 +63,7 @@ impl RateLimiter {
     fn new(requests_per_minute: u32) -> Self {
         Self {
             state: Mutex::new(RateLimiterState {
-                tokens: requests_per_minute as f64,
+                available_permits: f64::from(requests_per_minute),
                 last_refill: Instant::now(),
             }),
             requests_per_minute,
@@ -79,17 +79,20 @@ impl RateLimiter {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-        let refill = elapsed * (self.requests_per_minute as f64 / 60.0);
-        state.tokens = (state.tokens + refill).min(self.requests_per_minute as f64);
+        let requests_per_minute = f64::from(self.requests_per_minute);
+        let refill = elapsed * (requests_per_minute / 60.0);
+        state.available_permits = (state.available_permits + refill).min(requests_per_minute);
         state.last_refill = now;
 
-        if state.tokens >= 1.0 {
-            state.tokens -= 1.0;
+        if state.available_permits >= 1.0 {
+            state.available_permits -= 1.0;
+            drop(state);
             None
         } else {
-            let deficit = 1.0 - state.tokens;
-            state.tokens = 0.0; // consume all partial tokens
-            let wait_secs = deficit / (self.requests_per_minute as f64 / 60.0);
+            let deficit = 1.0 - state.available_permits;
+            state.available_permits = 0.0; // consume all partial permits
+            drop(state);
+            let wait_secs = deficit / (requests_per_minute / 60.0);
             Some(Duration::from_secs_f64(wait_secs))
         }
     }
@@ -113,7 +116,7 @@ impl fmt::Debug for ApiEmbedder {
         f.debug_struct("ApiEmbedder")
             .field("provider", &self.provider)
             .field("config", &self.config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

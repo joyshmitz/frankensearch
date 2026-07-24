@@ -1,4 +1,4 @@
-//! Cloud API embedding provider trait and implementations (OpenAI, Gemini).
+//! Cloud API embedding provider trait and implementations (`OpenAI`, Gemini).
 //!
 //! Each provider knows its endpoint, auth, JSON format, and batch limits.
 //! The shared [`super::api_embedder::ApiEmbedder`] handles HTTP, retry, and
@@ -49,16 +49,26 @@ pub trait ApiProvider: Send + Sync + fmt::Debug {
     fn request_headers(&self) -> Vec<(String, String)>;
 
     /// Serialize a batch of texts into the provider's JSON request body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::EmbeddingFailed`] when the request cannot be
+    /// serialized.
     fn serialize_request(&self, texts: &[&str]) -> SearchResult<Vec<u8>>;
 
     /// Deserialize the provider's JSON response into embedding vectors.
     /// The returned vectors MUST be in the same order as the input texts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::EmbeddingFailed`] when the response is malformed
+    /// or reports a provider error.
     fn deserialize_response(&self, body: &[u8]) -> SearchResult<Vec<Vec<f32>>>;
 }
 
 // ─── OpenAI ─────────────────────────────────────────────────────────────────
 
-/// OpenAI embeddings API provider (`text-embedding-3-small`, `text-embedding-3-large`).
+/// `OpenAI` embeddings API provider (`text-embedding-3-small`, `text-embedding-3-large`).
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
     api_key: String,
@@ -69,7 +79,7 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// Create an OpenAI provider for `text-embedding-3-small`.
+    /// Create an `OpenAI` provider for `text-embedding-3-small`.
     ///
     /// Default dimension is 1536; pass a smaller value for MRL truncation.
     #[must_use]
@@ -84,7 +94,7 @@ impl OpenAiProvider {
         }
     }
 
-    /// Create an OpenAI provider for `text-embedding-3-large`.
+    /// Create an `OpenAI` provider for `text-embedding-3-large`.
     ///
     /// Default dimension is 3072; pass a smaller value for MRL truncation.
     #[must_use]
@@ -120,7 +130,7 @@ impl OpenAiProvider {
 }
 
 impl ApiProvider for OpenAiProvider {
-    fn provider_name(&self) -> &str {
+    fn provider_name(&self) -> &'static str {
         "openai"
     }
 
@@ -171,6 +181,10 @@ impl ApiProvider for OpenAiProvider {
         })
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the API's JSON float values are defined to produce f32 embeddings"
+    )]
     fn deserialize_response(&self, body: &[u8]) -> SearchResult<Vec<Vec<f32>>> {
         let v: serde_json::Value =
             serde_json::from_slice(body).map_err(|e| SearchError::EmbeddingFailed {
@@ -201,7 +215,14 @@ impl ApiProvider for OpenAiProvider {
         let mut indexed: Vec<(usize, Vec<f32>)> = data
             .iter()
             .map(|item| {
-                let idx = item.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let raw_index = item
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let idx = usize::try_from(raw_index).map_err(|_| SearchError::EmbeddingFailed {
+                    model: self.embedder_id.clone(),
+                    source: format!("embedding index {raw_index} exceeds usize::MAX").into(),
+                })?;
                 let emb = item
                     .get("embedding")
                     .and_then(|e| e.as_array())
@@ -211,9 +232,9 @@ impl ApiProvider for OpenAiProvider {
                             .collect()
                     })
                     .unwrap_or_default();
-                (idx, emb)
+                Ok((idx, emb))
             })
-            .collect();
+            .collect::<SearchResult<_>>()?;
         indexed.sort_by_key(|(idx, _)| *idx);
 
         Ok(indexed.into_iter().map(|(_, emb)| emb).collect())
@@ -256,7 +277,7 @@ impl GeminiProvider {
 }
 
 impl ApiProvider for GeminiProvider {
-    fn provider_name(&self) -> &str {
+    fn provider_name(&self) -> &'static str {
         "gemini"
     }
 
@@ -280,7 +301,7 @@ impl ApiProvider for GeminiProvider {
         false
     }
 
-    fn endpoint_url(&self) -> &str {
+    fn endpoint_url(&self) -> &'static str {
         "https://generativelanguage.googleapis.com"
     }
 
@@ -312,6 +333,10 @@ impl ApiProvider for GeminiProvider {
         })
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the API's JSON float values are defined to produce f32 embeddings"
+    )]
     fn deserialize_response(&self, body: &[u8]) -> SearchResult<Vec<Vec<f32>>> {
         let v: serde_json::Value =
             serde_json::from_slice(body).map_err(|e| SearchError::EmbeddingFailed {

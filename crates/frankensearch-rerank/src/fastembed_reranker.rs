@@ -37,16 +37,19 @@ pub struct FastEmbedReranker {
 
 impl FastEmbedReranker {
     /// Stable reranker identifier for ms-marco-MiniLM-L-6-v2.
+    #[must_use]
     pub fn reranker_id_static() -> &'static str {
         RERANKER_ID
     }
 
     /// Stable model identifier for ms-marco-MiniLM-L-6-v2.
+    #[must_use]
     pub fn model_id_static() -> &'static str {
         MODEL_ID
     }
 
     /// Required model files for the reranker (must all exist locally).
+    #[must_use]
     pub fn required_model_files() -> &'static [&'static str] {
         &[
             MODEL_FILE,
@@ -58,6 +61,7 @@ impl FastEmbedReranker {
     }
 
     /// Default model directory relative to a data directory.
+    #[must_use]
     pub fn default_model_dir(data_dir: &Path) -> PathBuf {
         data_dir.join("models").join(MODEL_DIR_NAME)
     }
@@ -65,6 +69,11 @@ impl FastEmbedReranker {
     /// Load the reranker model + tokenizer from a local directory.
     ///
     /// This never downloads; it returns an error if any required file is missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::RerankFailed`] when the directory or a required
+    /// model file is missing, unreadable, or rejected by `fastembed`.
     pub fn load_from_dir(model_dir: &Path) -> SearchResult<Self> {
         if !model_dir.is_dir() {
             return Err(SearchError::RerankFailed {
@@ -97,13 +106,15 @@ impl FastEmbedReranker {
             });
         }
 
-        let model_file = Self::read_required(model_dir.join(MODEL_FILE), MODEL_FILE)?;
-        let tokenizer_file = Self::read_required(model_dir.join(TOKENIZER_JSON), TOKENIZER_JSON)?;
-        let config_file = Self::read_required(model_dir.join(CONFIG_JSON), CONFIG_JSON)?;
+        let model_file = Self::read_required(&model_dir.join(MODEL_FILE), MODEL_FILE)?;
+        let tokenizer_file = Self::read_required(&model_dir.join(TOKENIZER_JSON), TOKENIZER_JSON)?;
+        let config_file = Self::read_required(&model_dir.join(CONFIG_JSON), CONFIG_JSON)?;
         let special_tokens_map_file =
-            Self::read_required(model_dir.join(SPECIAL_TOKENS_JSON), SPECIAL_TOKENS_JSON)?;
-        let tokenizer_config_file =
-            Self::read_required(model_dir.join(TOKENIZER_CONFIG_JSON), TOKENIZER_CONFIG_JSON)?;
+            Self::read_required(&model_dir.join(SPECIAL_TOKENS_JSON), SPECIAL_TOKENS_JSON)?;
+        let tokenizer_config_file = Self::read_required(
+            &model_dir.join(TOKENIZER_CONFIG_JSON),
+            TOKENIZER_CONFIG_JSON,
+        )?;
 
         let tokenizer_files = fastembed::TokenizerFiles {
             tokenizer_file,
@@ -130,12 +141,13 @@ impl FastEmbedReranker {
     }
 
     /// Stable model identifier for compatibility checks.
+    #[must_use]
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
 
-    fn read_required(path: PathBuf, label: &str) -> SearchResult<Vec<u8>> {
-        fs::read(&path).map_err(|e| SearchError::RerankFailed {
+    fn read_required(path: &Path, label: &str) -> SearchResult<Vec<u8>> {
+        fs::read(path).map_err(|e| SearchError::RerankFailed {
             model: RERANKER_ID.to_string(),
             source: format!("unable to read {label} at {}: {e}", path.display()).into(),
         })
@@ -185,6 +197,7 @@ impl SyncRerank for FastEmbedReranker {
                 model: self.id.clone(),
                 source: format!("fastembed rerank failed: {e}").into(),
             })?;
+        drop(model);
 
         // Convert to RerankScore in original document order
         let mut scores: Vec<RerankScore> = documents
@@ -227,17 +240,12 @@ mod tests {
     #[test]
     fn reranker_missing_files_returns_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let err = match FastEmbedReranker::load_from_dir(tmp.path()) {
-            Ok(_) => panic!("expected missing-model error"),
-            Err(err) => err,
-        };
-        match err {
-            SearchError::RerankFailed { model, source } => {
-                assert_eq!(model, RERANKER_ID);
-                assert!(source.to_string().contains("model files missing"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let result = FastEmbedReranker::load_from_dir(tmp.path());
+        assert!(matches!(
+            result,
+            Err(SearchError::RerankFailed { model, source })
+                if model == RERANKER_ID && source.to_string().contains("model files missing")
+        ));
     }
 
     #[test]

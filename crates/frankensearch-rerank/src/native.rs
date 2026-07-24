@@ -1458,9 +1458,10 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
                 source: format!("safetensors tensor {name} has out-of-range offsets").into(),
             });
         }
-        let vals: Vec<f32> = data[start..end]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        let (chunks, _) = data[start..end].as_chunks::<4>();
+        let vals: Vec<f32> = chunks
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         // Normalize HuggingFace BERT key conventions to the `bert.`-prefixed scheme
         // the shared encoder/`build_model` use. sentence-transformers all-MiniLM-L6-v2
