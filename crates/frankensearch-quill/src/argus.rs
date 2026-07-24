@@ -2229,6 +2229,43 @@ impl<'a> ReferenceScorer<'a> {
         }
     }
 
+    /// A pure-term group eligible for grouped `MaxScore`: a union whose active
+    /// children are all bounded direct terms, so it exposes a conservative
+    /// whole-group ceiling. Deferred grouped-`MaxScore` foundation
+    /// (`bd-quill-e8-perf-doctrine-x4e4.5.1`).
+    fn competitive_is_groupable(&self) -> bool {
+        matches!(&self.node, ScorerNode::Union(union) if union.group_upper_bound().is_some())
+    }
+
+    /// Append this group's competitive documents in `[_, horizon_end)` to
+    /// `docs`, enumerated through fresh per-term competitive cursors so the
+    /// group's own scan state is left untouched (mirrors how the term
+    /// `MaxScore` path uses [`CompetitiveTermCursor`]). Returns `false`
+    /// (fail-closed) when the scorer is not a pure-term group or any child
+    /// lacks a competitive cursor, so the caller falls back to exhaustive.
+    fn group_competitive_docs(
+        &self,
+        horizon_end: u64,
+        docs: &mut Vec<u32>,
+    ) -> Result<bool, ArgusError> {
+        let ScorerNode::Union(union) = &self.node else {
+            return Ok(false);
+        };
+        for child in &union.active {
+            let Some(mut cursor) = child.competitive_term_cursor() else {
+                return Ok(false);
+            };
+            while let Some(doc) = cursor.doc() {
+                if u64::from(doc) >= horizon_end {
+                    break;
+                }
+                docs.push(doc);
+                cursor.next()?;
+            }
+        }
+        Ok(true)
+    }
+
     fn union_pruning_stats(&self) -> Option<UnionPruningStats> {
         let ScorerNode::Union(union) = &self.node else {
             return None;
@@ -3532,6 +3569,38 @@ impl<'a> BufferedUnionScorer<'a> {
         horizon_end: u64,
         cutoff: f32,
     ) -> Result<Option<CompetitiveCandidates>, ArgusError> {
+        // Grouped MaxScore: a nested union whose active children are all
+        // pure-term groups (multi-field terms) rather than direct terms
+        // (`bd-quill-e8-perf-doctrine-x4e4.5.1`). Dormant until the query gate
+        // opens BLOCKMAX for group terms — without their whole-term ceilings
+        // `competitive_is_groupable` is `false`, so this branch is skipped and
+        // nested unions keep scoring exhaustively (behavior-neutral today).
+        if (2..=MAX_SCORE_MAX_CLAUSES).contains(&self.active.len())
+            && !self
+                .active
+                .iter()
+                .all(ReferenceScorer::competitive_is_direct_term)
+            && self
+                .active
+                .iter()
+                .all(ReferenceScorer::competitive_is_groupable)
+        {
+            let Some(candidates) =
+                Self::grouped_max_score_candidates(&self.active, horizon_end, cutoff)?
+            else {
+                return Ok(None);
+            };
+            if candidates
+                .docs
+                .iter()
+                .any(|doc| *doc < window_start || u64::from(*doc) >= horizon_end)
+            {
+                return Err(ArgusError::CursorInvariant(
+                    "grouped competitive candidate escaped its union window",
+                ));
+            }
+            return Ok(Some(candidates));
+        }
         let strategy = match self.active.len() {
             2..=MAX_SCORE_MAX_CLAUSES
                 if self
@@ -3675,6 +3744,84 @@ impl<'a> BufferedUnionScorer<'a> {
                 }
                 docs.push(doc);
                 cursors[index].next()?;
+            }
+        }
+        docs.sort_unstable();
+        docs.dedup();
+        Ok(Some(CompetitiveCandidates {
+            strategy: UnionPruningStrategy::MaxScore,
+            docs,
+            blocks_skipped: 0,
+        }))
+    }
+
+    /// Grouped `MaxScore` over pure-term groups (nested multi-field unions):
+    /// the direct analog of [`Self::max_score_candidates`] with each group's
+    /// conservative whole-group ceiling as the partition key and each group's
+    /// per-term competitive cursors as the doc source. A candidate document
+    /// must appear in an *essential* group; documents confined to the
+    /// low-ceiling non-essential groups cannot reach `cutoff` and are skipped.
+    /// Fails closed (`Ok(None)` → exhaustive) if any group lacks a ceiling or a
+    /// competitive cursor. Rank-safety and f32 score-bit parity are gated by
+    /// the exhaustive parity harness that lands with the query gate
+    /// (`bd-quill-e8-perf-doctrine-x4e4.5.1`).
+    fn grouped_max_score_candidates(
+        groups: &[ReferenceScorer<'_>],
+        horizon_end: u64,
+        cutoff: f32,
+    ) -> Result<Option<CompetitiveCandidates>, ArgusError> {
+        let mut ceilings = Vec::new();
+        ceilings
+            .try_reserve_exact(groups.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "grouped MaxScore ceilings",
+                count: groups.len(),
+            })?;
+        for group in groups {
+            let Some(bound) = group.competitive_score_upper_bound() else {
+                return Ok(None);
+            };
+            ceilings.push(bound);
+        }
+
+        let mut by_upper_bound = Vec::new();
+        by_upper_bound
+            .try_reserve_exact(groups.len())
+            .map_err(|_| ArgusError::Allocation {
+                resource: "grouped MaxScore bound order",
+                count: groups.len(),
+            })?;
+        by_upper_bound.extend(0..groups.len());
+        by_upper_bound.sort_unstable_by(|left, right| {
+            ceilings[*left]
+                .total_cmp(&ceilings[*right])
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut nonessential = 0_usize;
+        while nonessential < by_upper_bound.len() {
+            let bound = conservative_bound_sum(
+                by_upper_bound[..=nonessential]
+                    .iter()
+                    .map(|index| ceilings[*index]),
+            )
+            .ok_or(ArgusError::CursorInvariant(
+                "grouped MaxScore bound sum was not finite and conservative",
+            ))?;
+            if bound < cutoff {
+                nonessential += 1;
+            } else {
+                break;
+            }
+        }
+        if nonessential == 0 {
+            return Ok(None);
+        }
+
+        let mut docs = Vec::new();
+        for &index in &by_upper_bound[nonessential..] {
+            if !groups[index].group_competitive_docs(horizon_end, &mut docs)? {
+                return Ok(None);
             }
         }
         docs.sort_unstable();
