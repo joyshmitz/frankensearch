@@ -1,4 +1,4 @@
-//! Embed a real text corpus with a Model2Vec (potion) model → a flat little-endian
+//! Embed a real text corpus with a `Model2Vec` (potion) model → a flat little-endian
 //! f32 slab (`N × dim`), plus a JSON sidecar with `{n, dim}`.
 //!
 //! This is the real-embedding generator behind the ANN/quantization validation

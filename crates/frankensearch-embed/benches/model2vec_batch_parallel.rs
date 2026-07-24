@@ -1,4 +1,4 @@
-//! Model2Vec `embed_batch` parallel-dispatch A/B.
+//! `Model2Vec` `embed_batch` parallel-dispatch A/B.
 //!
 //! `Model2VecEmbedder::embed_batch` now dispatches per-document `embed_sync` across Rayon
 //! threads once a batch reaches `PARALLEL_BATCH_MIN` — the sibling of the FNV hash embedder's
@@ -42,8 +42,10 @@ fn build_embeddings() -> Vec<f32> {
     let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
     let mut emb = vec![0.0_f32; VOCAB * DIM];
     for v in &mut emb {
+        let sample = u32::try_from(rng.next() >> 40).expect("shifted sample fits u32");
+        let centered = i32::try_from(sample % 2000).expect("sample remainder fits i32") - 1000;
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-        let val = ((rng.next() >> 40) as i64 % 2000 - 1000) as f32 / 1000.0;
+        let val = centered as f32 / 1000.0;
         *v = val;
     }
     emb

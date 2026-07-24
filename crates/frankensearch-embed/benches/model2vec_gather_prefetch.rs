@@ -1,4 +1,4 @@
-//! Model2Vec embed GATHER software-prefetch A/B.
+//! `Model2Vec` embed GATHER software-prefetch A/B.
 //!
 //! `Model2VecEmbedder::embed_sync` mean-pools token vectors: for each token id it
 //! indexes a random row `emb[id*DIM .. id*DIM+DIM]` of the `[vocab, DIM]` static
@@ -45,27 +45,31 @@ const LINE_F32: usize = 16; // 64-byte cache line = 16 f32
 
 /// Prefetch the row starting at `row_start` (f32 offset). `full` = every cache line
 /// of the DIM-wide row; else just the first line (HW streams the rest).
-#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+#[inline]
 #[allow(unsafe_code)]
-fn prefetch_row(_emb: &[f32], _row_start: usize, _full: bool) {
-    #[cfg(target_arch = "x86_64")]
+fn prefetch_row(emb: &[f32], row_start: usize, full: bool) {
     // SAFETY: _mm_prefetch is a hint; any address is architecturally valid to
     // prefetch and we bound the offset by the slice length anyway.
     unsafe {
-        if !_full {
-            if _row_start < _emb.len() {
-                _mm_prefetch(_emb.as_ptr().add(_row_start) as *const i8, _MM_HINT_T0);
+        if !full {
+            if row_start < emb.len() {
+                _mm_prefetch(emb.as_ptr().add(row_start).cast::<i8>(), _MM_HINT_T0);
             }
             return;
         }
-        let mut off = _row_start;
-        let end = (_row_start + DIM).min(_emb.len());
+        let mut off = row_start;
+        let end = (row_start + DIM).min(emb.len());
         while off < end {
-            _mm_prefetch(_emb.as_ptr().add(off) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(emb.as_ptr().add(off).cast::<i8>(), _MM_HINT_T0);
             off += LINE_F32;
         }
     }
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn prefetch_row(_emb: &[f32], _row_start: usize, _full: bool) {}
 
 /// ORIGINAL: gather each token's row and accumulate, no prefetch.
 fn gather_base(emb: &[f32], ids: &[u32], sum: &mut [f32]) -> usize {
@@ -147,7 +151,7 @@ fn run_corpus(emb: &[f32], ids: &[u32], tokens_per_doc: usize, sum: &mut [f32], 
 fn corpus_ids(tokens_per_doc: usize) -> Vec<u32> {
     let docs = VOCAB.div_ceil(tokens_per_doc);
     (0..docs * tokens_per_doc)
-        .map(|position| ((position * 7_919) % VOCAB) as u32)
+        .map(|position| u32::try_from((position * 7_919) % VOCAB).expect("VOCAB fits in u32"))
         .collect()
 }
 
@@ -272,7 +276,7 @@ fn ids_fixture(t: usize) -> Vec<u32> {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        out.push(((s >> 33) as usize % VOCAB) as u32);
+        out.push(u32::try_from((s >> 33) % 30_000).expect("modulus fits in u32"));
     }
     out
 }
