@@ -292,7 +292,7 @@ fn commit<E: LexicalSearch>(context: &BenchContext, index: &E) -> Duration {
     timer.elapsed()
 }
 
-fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
     let corpus = corpus_for(count);
@@ -307,6 +307,26 @@ fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f
         }
     };
     count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
+}
+
+fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+    if spec.gate != PerfGate::Qg8 || arm != EngineArm::Quill {
+        return bulk_metric_unpooled(context, spec, arm);
+    }
+
+    let threads = spec.threads.expect("QG-8 thread count");
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("build QG-8 Quill thread pool")
+        .install(|| {
+            assert_eq!(
+                rayon::current_num_threads(),
+                threads,
+                "QG-8 Quill cell escaped its pinned Rayon pool"
+            );
+            bulk_metric_unpooled(context, spec, arm)
+        })
 }
 
 fn tokenize_metric(context: &BenchContext, spec: &PerfCellSpec) -> f64 {
