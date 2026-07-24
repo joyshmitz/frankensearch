@@ -1454,7 +1454,7 @@ mod tests {
 
     fn membership(file_key: &str, source: &str, revision: u64) -> IndexMembershipEntry {
         IndexMembershipEntry {
-            doc_id: format!("{source}:{file_key}:{revision}").into(),
+            doc_id: format!("{source}:{file_key}:{revision}"),
             file_key: file_key.to_owned(),
             revision,
         }

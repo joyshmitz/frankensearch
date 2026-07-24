@@ -363,7 +363,7 @@ impl FsWatcher {
     /// # Errors
     ///
     /// Returns an error if the watcher backend cannot be created or started.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn start(&self, cx: &Cx) -> SearchResult<()> {
         if cx.is_cancel_requested() {
             return Err(SearchError::Cancelled {
@@ -466,7 +466,7 @@ impl FsWatcher {
     }
 
     /// Stop background watch processing.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn stop(&self) {
         let (stop_flag, worker) = {
             let mut control = lock_or_recover(&self.control);

@@ -1,5 +1,5 @@
 //! `code_structure_sidecar::tokenize` ASCII fast-path bench.
-//! Old: `chars().flat_map(char::to_lowercase)` (per-char ToLowercase iterator).
+//! Old: `chars().flat_map(char::to_lowercase)` (per-char `ToLowercase` iterator).
 //! New: byte loop with `to_ascii_lowercase` for ASCII input. Bit-identical for
 //! ASCII; non-ASCII falls back to the Unicode path.
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -51,10 +51,10 @@ fn bench_tok(c: &mut Criterion) {
         debug_assert_eq!(tok_old(&s), tok_new(&s));
         let id = format!("ascii_{n}");
         g.bench_with_input(BenchmarkId::new("unicode", &id), &(), |b, ()| {
-            b.iter(|| black_box(tok_old(black_box(&s))))
+            b.iter(|| black_box(tok_old(black_box(&s))));
         });
         g.bench_with_input(BenchmarkId::new("ascii", &id), &(), |b, ()| {
-            b.iter(|| black_box(tok_new(black_box(&s))))
+            b.iter(|| black_box(tok_new(black_box(&s))));
         });
     }
     g.finish();

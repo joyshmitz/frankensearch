@@ -1305,14 +1305,14 @@ mod tests {
                 bytes.len()
             );
             assert_eq!(
-                got.non_printable_ratio,
-                rnp,
+                got.non_printable_ratio.to_bits(),
+                rnp.to_bits(),
                 "np ratio mismatch (len={})",
                 bytes.len()
             );
             assert_eq!(
-                got.high_bit_ratio,
-                rhb,
+                got.high_bit_ratio.to_bits(),
+                rhb.to_bits(),
                 "hb ratio mismatch (len={})",
                 bytes.len()
             );

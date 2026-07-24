@@ -942,7 +942,7 @@ impl QueryExecutionOrchestrator {
             let contribution = rrf_contribution(k, rank);
             let lexical_score = sanitize_score(candidate.score);
             merged
-                .entry(candidate.doc_id.to_string())
+                .entry(candidate.doc_id.clone())
                 .and_modify(|hit| {
                     hit.fused_score += contribution;
                     hit.lexical_rank = Some(rank);
@@ -976,7 +976,7 @@ impl QueryExecutionOrchestrator {
             let contribution = rrf_contribution(k, rank);
             let semantic_score = sanitize_score(candidate.score);
             merged
-                .entry(candidate.doc_id.to_string())
+                .entry(candidate.doc_id.clone())
                 .and_modify(|hit| {
                     hit.fused_score += contribution;
                     hit.semantic_rank = Some(rank);
@@ -1253,9 +1253,10 @@ mod tests {
     use crate::query_planning::QueryPlanner;
     use std::collections::HashMap;
 
-    /// BYTE-IDENTITY GATE: the production `merge_ranked` (get_mut/insert) must produce the
-    /// same fused map as the retained `merge_ranked_orig` (get + entry) for every fixture —
-    /// disjoint, full/partial overlap, in-tier duplicate doc_ids, tie scores, and empty.
+    /// BYTE-IDENTITY GATE: the production `merge_ranked` (`get_mut`/`insert`) must produce
+    /// the same fused map as the retained `merge_ranked_orig` (`get` + `entry`) for every
+    /// fixture — disjoint, full/partial overlap, in-tier duplicate `doc_id`s, tie scores,
+    /// and empty.
     #[test]
     fn merge_ranked_matches_orig() {
         fn sorted(map: HashMap<String, FusedCandidate>) -> Vec<FusedCandidate> {

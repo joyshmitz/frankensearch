@@ -4,8 +4,8 @@
 //! `max_chars`-sized prefix+suffix (O(text) alloc + fill, called at ~21 render sites).
 //! The new form walks at most ~`max_chars` chars (bounded overflow check + `char_indices`
 //! for the prefix + `char_indices().rev()` for the suffix) with no `Vec<char>` alloc, so
-//! it is O(max_chars) regardless of input length. Both arms must produce byte-identical
-//! strings. Run both in one process (immune to the RCH_WORKER soft-pin) with an A/A null.
+//! it is `O(max_chars)` regardless of input length. Both arms must produce byte-identical
+//! strings. Run both in one process (immune to the `RCH_WORKER` soft-pin) with an A/A null.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -40,7 +40,11 @@ fn truncate_middle_new(text: &str, max_chars: usize) -> String {
     let left = (max_chars - 3) / 2;
     let right = max_chars - 3 - left;
     let left_end = text.char_indices().nth(left).map_or(text.len(), |(i, _)| i);
-    let suffix_start = text.char_indices().rev().nth(right - 1).map_or(0, |(i, _)| i);
+    let suffix_start = text
+        .char_indices()
+        .rev()
+        .nth(right - 1)
+        .map_or(0, |(i, _)| i);
     format!("{}...{}", &text[..left_end], &text[suffix_start..])
 }
 
@@ -92,12 +96,18 @@ fn main() {
         truncate_middle_new(&long, 80),
         "MISMATCH long"
     );
-    println!("[sanity] arms byte-identical across {} cases + long input", cases.len());
+    println!(
+        "[sanity] arms byte-identical across {} cases + long input",
+        cases.len()
+    );
 
     let iters = 4000usize;
     let rounds = 50usize;
     // Two regimes: a typical path (len ~72, mc 60) and a long value (len ~7200, mc 80).
-    for (label, text, mc) in [("path72", ascii_path.to_string(), 60usize), ("long7200", long, 80usize)] {
+    for (label, text, mc) in [
+        ("path72", ascii_path.to_string(), 60usize),
+        ("long7200", long, 80usize),
+    ] {
         let mut orig = Vec::new();
         let mut new = Vec::new();
         let mut na = Vec::new();
@@ -116,7 +126,11 @@ fn main() {
             "[{label:>8}] orig {:>9.1} ns  new {:>9.1} ns  ratio {ratio:.4}  null_p5 {null_p5:.4}  -> {}",
             m_orig * 1e9,
             m_new * 1e9,
-            if ratio < null_p5 { "CANDIDATE_FASTER" } else { "INCONCLUSIVE" }
+            if ratio < null_p5 {
+                "CANDIDATE_FASTER"
+            } else {
+                "INCONCLUSIVE"
+            }
         );
     }
 }

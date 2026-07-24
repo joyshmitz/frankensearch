@@ -14,7 +14,7 @@ use frankensearch_fsfs::query_execution::{FusedCandidate, RankingPriorSignals};
 
 fn rust_doc(i: usize) -> String {
     format!(
-        r#"
+        r"
         use crate::auth::token_store::TokenStore{i};
         use std::collections::HashMap;
 
@@ -36,7 +36,7 @@ fn rust_doc(i: usize) -> String {
         }}
 
         mod session_cookie_jar_{i};
-        "#
+        "
     )
 }
 

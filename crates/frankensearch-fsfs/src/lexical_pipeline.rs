@@ -315,6 +315,10 @@ const fn is_token_byte(b: u8) -> bool {
 /// Byte→token-class lookup table (`1` = token byte) for the `count_lexical_tokens`
 /// ASCII fast path. Built from [`is_token_byte`] at compile time, so it is exactly
 /// equal to the scalar predicate for every byte (bit-identical token counts).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the loop bounds prove every index fits in u8"
+)]
 const TOKEN_BYTE: [u8; 256] = {
     let mut t = [0u8; 256];
     let mut i = 0usize;
@@ -732,7 +736,7 @@ impl<B: LexicalIndexBackend> LexicalPipeline<B> {
             });
         }
 
-        let chunks = self.chunk_policy.chunk_text(&body);
+        let chunks = self.chunk_policy.chunk_text(body);
         if chunks.is_empty() {
             return Ok(LexicalAction::Skip {
                 doc_id: mutation.doc_id.clone(),
@@ -1053,6 +1057,12 @@ mod tests {
         clippy::cast_sign_loss
     )]
     fn quill_backend_meets_fsfs_throughput_contract() {
+        // The ranked visibility probe fans out through Rayon. A thread-local
+        // subscriber override does not reach those workers, so install the
+        // no-op subscriber before `run_test_with_cx` can initialize tracing.
+        // Otherwise per-segment INFO output becomes part of the timed workload.
+        tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default())
+            .expect("install quiet subscriber for isolated performance contract");
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
             run_test_with_cx(|cx| async move {
                 const INITIAL_DOCS: usize = 20_000;

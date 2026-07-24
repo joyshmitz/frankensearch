@@ -182,16 +182,16 @@ fn assert_schema_validation(
             .iter_errors(&value)
             .map(|err| err.to_string())
             .collect();
-        if !messages.is_empty() {
-            panic!(
-                "fixture {} failed schema {}: {}",
-                fixture_path.display(),
-                schema_file,
-                messages.join("; ")
-            );
-        }
-    } else if schema.is_valid(&value) {
-        panic!(
+        assert!(
+            messages.is_empty(),
+            "fixture {} failed schema {}: {}",
+            fixture_path.display(),
+            schema_file,
+            messages.join("; ")
+        );
+    } else {
+        assert!(
+            !schema.is_valid(&value),
             "fixture {} unexpectedly passed schema {}",
             fixture_path.display(),
             schema_file

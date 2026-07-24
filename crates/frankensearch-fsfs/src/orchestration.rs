@@ -823,7 +823,7 @@ impl FsWatcher {
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] when `watching_dirs` is zero.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn start(&mut self, cx: &Cx, watching_dirs: usize) -> SearchResult<()> {
         let _ = cx;
         if watching_dirs == 0 {
@@ -839,7 +839,7 @@ impl FsWatcher {
     }
 
     /// Stop watcher processing and clear in-memory debounce state.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn stop(&mut self, cx: &Cx) {
         let _ = cx;
         self.running = false;

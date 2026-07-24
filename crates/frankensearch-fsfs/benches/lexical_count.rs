@@ -1,6 +1,6 @@
 //! `count_lexical_tokens` ASCII fast-path benchmark.
 //! Old: `chars()` UTF-8 decode loop. New: byte loop for ASCII text. Bit-identical
-//! for ASCII (is_token_byte(b) == is_token_char(b as char)); the count state
+//! for ASCII (`is_token_byte(b) == is_token_char(b as char)`); the count state
 //! machine is unchanged.
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -47,6 +47,10 @@ fn count_new(text: &str) -> usize {
 // LUT candidate: 256-byte class table + branchless transition counting. Each byte
 // is one table load; a token is counted at every token→non-token transition via
 // `prev & !cur` (no data-dependent `in_token` branch). Bit-identical to count_new.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the loop invariant keeps i within the complete u8 domain"
+)]
 const TOKEN_BYTE: [u8; 256] = {
     let mut t = [0u8; 256];
     let mut i = 0usize;
@@ -87,13 +91,13 @@ fn bench_count(c: &mut Criterion) {
         );
         let id = format!("ascii_{n}");
         g.bench_with_input(BenchmarkId::new("chars", &id), &(), |b, ()| {
-            b.iter(|| black_box(count_old(black_box(&text))))
+            b.iter(|| black_box(count_old(black_box(&text))));
         });
         g.bench_with_input(BenchmarkId::new("bytes", &id), &(), |b, ()| {
-            b.iter(|| black_box(count_new(black_box(&text))))
+            b.iter(|| black_box(count_new(black_box(&text))));
         });
         g.bench_with_input(BenchmarkId::new("lut", &id), &(), |b, ()| {
-            b.iter(|| black_box(count_lut(black_box(&text))))
+            b.iter(|| black_box(count_lut(black_box(&text))));
         });
     }
     g.finish();

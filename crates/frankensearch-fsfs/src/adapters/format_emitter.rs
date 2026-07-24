@@ -554,12 +554,8 @@ fn should_use_ansi_color() -> bool {
 }
 
 fn env_var_disables_color() -> bool {
-    env::var("FRANKENSEARCH_NO_COLOR")
-        .ok()
-        .is_some_and(|value| truthy_env(&value))
-        || env::var("NO_COLOR")
-            .ok()
-            .is_some_and(|value| truthy_env(&value))
+    env::var("FRANKENSEARCH_NO_COLOR").is_ok_and(|value| truthy_env(&value))
+        || env::var("NO_COLOR").is_ok_and(|value| truthy_env(&value))
 }
 
 fn truthy_env(value: &str) -> bool {

@@ -62,10 +62,10 @@ fn bench_sniff(c: &mut Criterion) {
         debug_assert_eq!(sniff_old(&probe), sniff_new(&probe));
         let id = format!("probe_{n}");
         g.bench_with_input(BenchmarkId::new("old", &id), &(), |b, ()| {
-            b.iter(|| black_box(sniff_old(black_box(&probe))))
+            b.iter(|| black_box(sniff_old(black_box(&probe))));
         });
         g.bench_with_input(BenchmarkId::new("new", &id), &(), |b, ()| {
-            b.iter(|| black_box(sniff_new(black_box(&probe))))
+            b.iter(|| black_box(sniff_new(black_box(&probe))));
         });
     }
     g.finish();

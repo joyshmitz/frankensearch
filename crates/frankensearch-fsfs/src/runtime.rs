@@ -242,7 +242,7 @@ struct SearchPhaseArtifact {
     payload: SearchPayload,
 }
 
-type SearchPhaseSink<'a> = &'a mut dyn FnMut(&SearchPayload) -> SearchResult<()>;
+type SearchPhaseSink<'a> = &'a mut (dyn FnMut(&SearchPayload) -> SearchResult<()> + Send);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SearchFilterClause {
@@ -608,6 +608,13 @@ struct SearchCacheKey {
     fast_only: bool,
     rrf_k_milli: u64,
 }
+
+type SharedSearchServeState = Arc<
+    std::sync::Mutex<(
+        SearchExecutionResources,
+        HashMap<SearchCacheKey, Vec<SearchPayload>>,
+    )>,
+>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchCacheRecord {
@@ -4759,7 +4766,7 @@ impl FsfsRuntime {
             .await
     }
 
-    async fn run_search_stream_command_with_writer<W: Write>(
+    async fn run_search_stream_command_with_writer<W: Write + Send>(
         &self,
         cx: &Cx,
         query: &str,
@@ -5017,15 +5024,16 @@ impl FsfsRuntime {
     }
 
     #[cfg(unix)]
+    #[allow(
+        clippy::await_holding_lock,
+        clippy::needless_pass_by_value,
+        clippy::significant_drop_tightening,
+        reason = "the handler owns its thread inputs and serializes mutation of shared search resources"
+    )]
     fn handle_search_serve_socket_client(
         runtime: Self,
         mut stream: UnixStream,
-        shared: Arc<
-            std::sync::Mutex<(
-                SearchExecutionResources,
-                HashMap<SearchCacheKey, Vec<SearchPayload>>,
-            )>,
-        >,
+        shared: SharedSearchServeState,
         stop_requested: Arc<std::sync::atomic::AtomicBool>,
         hot_cache_enabled: bool,
     ) {
@@ -7132,7 +7140,7 @@ impl FsfsRuntime {
                     fused: fused_initial.clone(),
                     payload: failed_payload,
                 };
-                if let Some(sink) = phase_sink.as_deref_mut() {
+                if let Some(sink) = phase_sink {
                     sink(&failed_artifact.payload)?;
                 }
                 artifacts.push(failed_artifact);
@@ -7560,13 +7568,12 @@ impl FsfsRuntime {
         self.rebuild_tantivy_lexical_index_if_needed(cx, &index_root)
             .await?;
         let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
-        let lexical_path = match (lexical_layout.engine(), lexical_layout.engine_dir()) {
-            (Some(BlueGreenEngine::Quill), Some(path)) => path,
-            _ => {
-                return Err(SearchError::IndexNotFound {
-                    path: index_root.join("lexical"),
-                });
-            }
+        let (Some(BlueGreenEngine::Quill), Some(lexical_path)) =
+            (lexical_layout.engine(), lexical_layout.engine_dir())
+        else {
+            return Err(SearchError::IndexNotFound {
+                path: index_root.join("lexical"),
+            });
         };
 
         let index_freshness =
@@ -8375,9 +8382,11 @@ impl FsfsRuntime {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !matches!(name, "MANIFEST" | "MANIFEST.prev")
-                && !(name.starts_with("seg-") && name.ends_with(".fslx"))
-            {
+            let is_segment = name.starts_with("seg-")
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("fslx"));
+            if !matches!(name, "MANIFEST" | "MANIFEST.prev") && !is_segment {
                 continue;
             }
             artifacts = artifacts.saturating_add(1);
@@ -9169,7 +9178,6 @@ impl FsfsRuntime {
         let mut embedder_degraded = false;
         let mut degradation_reason: Option<String> = None;
         let mut recent_warnings: Vec<IndexingWarning> = Vec::new();
-        let mut deferred_semantic_file_keys: Vec<String> = Vec::new();
 
         // Helper to push a warning, keeping at most 8 recent entries
         let push_warning = |warnings: &mut Vec<IndexingWarning>, severity, message: String| {
@@ -9421,6 +9429,10 @@ impl FsfsRuntime {
         )?;
 
         let mut vector_generation_compatible = false;
+        #[allow(
+            clippy::suspicious_operation_groupings,
+            reason = "VectorIndex and Embedder intentionally expose different identifier method names"
+        )]
         let mut vector_index = if checkpoint_manifests.is_some() && vector_path.exists() {
             match VectorIndex::open(&vector_path) {
                 Ok(index)
@@ -9931,9 +9943,6 @@ impl FsfsRuntime {
                                     IndexingWarningSeverity::Error,
                                     msg,
                                 );
-                                for pending in &semantic_docs {
-                                    deferred_semantic_file_keys.push(pending.file_key.clone());
-                                }
                                 semantic_deferred_files =
                                     semantic_deferred_files.saturating_add(semantic_docs.len());
                             }
@@ -10403,7 +10412,6 @@ impl FsfsRuntime {
                         vector_index =
                             VectorIndex::install_replacement(&vector_path, &upgrade_path)?;
 
-                        deferred_semantic_file_keys.clear();
                         semantic_deferred_files = 0;
                         embedder_is_hash_fallback = false;
                         embedder_degraded = false;
@@ -10998,13 +11006,12 @@ impl FsfsRuntime {
         }
 
         let lexical_layout = Self::resolve_lexical_engine(&index_root)?;
-        let lexical_path = match (lexical_layout.engine(), lexical_layout.engine_dir()) {
-            (Some(BlueGreenEngine::Quill), Some(path)) => path,
-            _ => {
-                return Err(SearchError::IndexNotFound {
-                    path: index_root.join("lexical"),
-                });
-            }
+        let (Some(BlueGreenEngine::Quill), Some(lexical_path)) =
+            (lexical_layout.engine(), lexical_layout.engine_dir())
+        else {
+            return Err(SearchError::IndexNotFound {
+                path: index_root.join("lexical"),
+            });
         };
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
@@ -12857,6 +12864,7 @@ impl FsfsRuntime {
         }
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn finalize_shutdown(
         &self,
         _cx: &Cx,
@@ -17216,12 +17224,11 @@ mod tests {
             );
         }
 
-        for required in ["async_file_remove(&socket_path).await"] {
-            assert!(
-                source.contains(required),
-                "async fsfs mutation path should use asupersync helper: {required}"
-            );
-        }
+        let required = "async_file_remove(&socket_path).await";
+        assert!(
+            source.contains(required),
+            "async fsfs mutation path should use asupersync helper: {required}"
+        );
         assert!(
             source.contains("VectorIndex::install_replacement(&vector_path, &upgrade_path)"),
             "semantic upgrade should use the WAL-safe durable replacement API"
@@ -20637,11 +20644,11 @@ mod tests {
             self.inner.dimension()
         }
 
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "barrier-quality-384"
         }
 
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "Barrier Quality Embedder"
         }
 
@@ -20701,6 +20708,7 @@ mod tests {
             let pending = std::mem::take(&mut state.pending);
             state.visible.extend_from_slice(&pending);
             state.flushes = state.flushes.saturating_add(1);
+            drop(state);
             Ok(())
         }
     }
@@ -20823,7 +20831,7 @@ mod tests {
     }
 
     /// Embedder that always returns `SearchError::Cancelled` — used to prove
-    /// cancellation is never swallowed into a fallback or a RefinementFailed
+    /// cancellation is never swallowed into a fallback or a `RefinementFailed`
     /// artifact (bd-jwis).
     struct CancelledEmbedder;
 
@@ -20845,11 +20853,11 @@ mod tests {
             384
         }
 
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "cancelled-embedder"
         }
 
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "Cancelled Embedder"
         }
 

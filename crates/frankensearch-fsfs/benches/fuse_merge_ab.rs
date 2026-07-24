@@ -1,7 +1,7 @@
 //! Hybrid-fuse merge A/B: the per-query RRF fuse (`fuse_rankings_with_priors`) merges the
 //! score-sorted lexical + semantic candidate lists into one map. The former shape did a separate
 //! `merged.get(doc_id)` (to skip already-ranked dups) AND a `merged.entry(doc_id.to_string())`
-//! per candidate — hashing the doc_id twice and cloning it into an owned key on EVERY candidate,
+//! per candidate — hashing the `doc_id` twice and cloning it into an owned key on EVERY candidate,
 //! including the lexical∩semantic overlap where the clone was immediately discarded by
 //! `and_modify`. The lever (`merge_ranked`) does one `get_mut`-or-`insert`: overlap docs are
 //! modified in place (single hash, no key clone); only genuinely new docs pay the insert.
@@ -23,8 +23,8 @@ use frankensearch_fsfs::{LexicalCandidate, QueryExecutionOrchestrator, SemanticC
 
 const K: f64 = 60.0;
 
-/// Deterministic hybrid candidate set: `n` lexical + `n` semantic, with `overlap` shared doc_ids
-/// (the regime the lever targets — shared docs hit the modify path). doc_ids are realistic-length.
+/// Deterministic hybrid candidate set: `n` lexical + `n` semantic, with `overlap` shared `doc_ids`
+/// (the regime the lever targets — shared docs hit the modify path). `doc_ids` are realistic-length.
 fn make_candidates(n: usize, overlap: usize) -> (Vec<LexicalCandidate>, Vec<SemanticCandidate>) {
     let mut lexical = Vec::with_capacity(n);
     let mut semantic = Vec::with_capacity(n);
