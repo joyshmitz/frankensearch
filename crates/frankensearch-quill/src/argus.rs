@@ -2072,10 +2072,10 @@ impl<'a> ReferenceScorer<'a> {
 
     /// Build one numeric-range scorer from an already materialized sorted doc set.
     ///
-    /// Fast-only numeric columns are retained outside NUMERIC, so the index layer
-    /// scans their leaf-local column and supplies the exact matches here. Planning
-    /// metadata and constant-score behavior remain identical to NUMERIC-backed
-    /// ranges.
+    /// The index layer binary-searches the persisted NUMERIC pair run, filters
+    /// snapshot-visible documents with cancellation checks, and supplies the
+    /// exact matches here. Planning metadata and constant-score behavior remain
+    /// identical to the direct NUMERIC range constructor.
     pub(crate) fn materialized_numeric_range(
         field_ord: u16,
         docids: Vec<u32>,

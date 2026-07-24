@@ -8106,7 +8106,7 @@ impl<'a> NumericFieldInput<'a> {
 /// Explicit resource ceilings for an FSLX NUMERIC section.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NumericLimits {
-    /// Maximum schema-derived indexed numeric field count.
+    /// Maximum schema-derived indexed-or-fast numeric field count.
     pub max_fields: usize,
     /// Maximum entries in one numeric field.
     pub max_entries_per_field: u64,
@@ -8328,7 +8328,7 @@ pub struct EncodedNumericSection {
 }
 
 impl EncodedNumericSection {
-    /// Encode every indexed numeric field in canonical schema and typed-value
+    /// Encode every indexed-or-fast numeric field in canonical schema and typed-value
     /// order.
     ///
     /// # Errors
@@ -8477,7 +8477,7 @@ impl EncodedNumericSection {
 
     /// K-way merge ordered, non-overlapping canonical NUMERIC sections.
     ///
-    /// Each indexed numeric field is merged independently by its schema-typed
+    /// Each indexed-or-fast numeric field is merged independently by its schema-typed
     /// `(value, docid)` order. The implementation never concatenates pair
     /// streams and never materializes all entries for a global re-sort.
     ///
@@ -8737,7 +8737,7 @@ impl EncodedNumericSection {
         NumericSection::parse(&self.bytes, self.schema, self.docid_lo, self.docid_hi)
     }
 
-    /// Encode the schema's indexed numeric columns directly from one Scribe
+    /// Encode the schema's indexed-or-fast numeric columns directly from one Scribe
     /// accumulator, rebasing sparse lease-relative document ordinals exactly
     /// once at the seal boundary.
     ///
@@ -9059,7 +9059,7 @@ impl<'a> NumericSection<'a> {
         })
     }
 
-    /// Number of schema-derived indexed numeric fields.
+    /// Number of schema-derived indexed-or-fast numeric fields.
     #[must_use]
     pub fn field_count(&self) -> usize {
         self.fields.len()
@@ -9154,7 +9154,46 @@ impl<'a> NumericField<'a> {
         NumericEntries {
             field: self,
             next: 0,
+            end: self.count,
         }
+    }
+
+    /// Borrow the canonical pair run covered by typed range bounds.
+    ///
+    /// The iterator remains in `(value, docid)` order and performs no
+    /// allocation. Callers that need cursor-friendly order can select live
+    /// entries, check cancellation, and sort only the surviving document IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NumericCodecError::BoundTypeMismatch`] when either bound does
+    /// not match this field's schema type.
+    pub fn range_entries(
+        self,
+        lower: Bound<NumericValue>,
+        upper: Bound<NumericValue>,
+    ) -> Result<NumericEntries<'a>, NumericCodecError> {
+        validate_numeric_bound(self.field_ord, self.kind, &lower)?;
+        validate_numeric_bound(self.field_ord, self.kind, &upper)?;
+        let start = match lower {
+            Bound::Unbounded => 0,
+            Bound::Included(value) => self
+                .partition_point(|entry| numeric_value_cmp(self.kind, entry.value, value).is_lt()),
+            Bound::Excluded(value) => self
+                .partition_point(|entry| !numeric_value_cmp(self.kind, entry.value, value).is_gt()),
+        };
+        let end = match upper {
+            Bound::Unbounded => self.count,
+            Bound::Included(value) => self
+                .partition_point(|entry| !numeric_value_cmp(self.kind, entry.value, value).is_gt()),
+            Bound::Excluded(value) => self
+                .partition_point(|entry| numeric_value_cmp(self.kind, entry.value, value).is_lt()),
+        };
+        Ok(NumericEntries {
+            field: self,
+            next: start.min(end),
+            end,
+        })
     }
 
     /// Binary-search typed bounds and materialize a docid-sorted predicate set.
@@ -9172,23 +9211,8 @@ impl<'a> NumericField<'a> {
         lower: Bound<NumericValue>,
         upper: Bound<NumericValue>,
     ) -> Result<NumericDocIdSet, NumericCodecError> {
-        validate_numeric_bound(self.field_ord, self.kind, &lower)?;
-        validate_numeric_bound(self.field_ord, self.kind, &upper)?;
-        let start = match lower {
-            Bound::Unbounded => 0,
-            Bound::Included(value) => self
-                .partition_point(|entry| numeric_value_cmp(self.kind, entry.value, value).is_lt()),
-            Bound::Excluded(value) => self
-                .partition_point(|entry| !numeric_value_cmp(self.kind, entry.value, value).is_gt()),
-        };
-        let end = match upper {
-            Bound::Unbounded => self.count,
-            Bound::Included(value) => self
-                .partition_point(|entry| !numeric_value_cmp(self.kind, entry.value, value).is_gt()),
-            Bound::Excluded(value) => self
-                .partition_point(|entry| numeric_value_cmp(self.kind, entry.value, value).is_lt()),
-        };
-        let count = end.saturating_sub(start);
+        let entries = self.range_entries(lower, upper)?;
+        let count = entries.len();
         let mut docids = Vec::new();
         docids
             .try_reserve_exact(count)
@@ -9196,10 +9220,8 @@ impl<'a> NumericField<'a> {
                 resource: "range docid set",
                 bytes: count.saturating_mul(std::mem::size_of::<u32>()),
             })?;
-        for index in start..end {
-            if let Some(entry) = self.entry(index) {
-                docids.push(entry.docid);
-            }
+        for entry in entries {
+            docids.push(entry.docid);
         }
         docids.sort_unstable();
         docids.dedup();
@@ -9233,19 +9255,23 @@ impl<'a> NumericField<'a> {
 pub struct NumericEntries<'a> {
     field: NumericField<'a>,
     next: usize,
+    end: usize,
 }
 
 impl Iterator for NumericEntries<'_> {
     type Item = NumericEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.end {
+            return None;
+        }
         let entry = self.field.entry(self.next)?;
         self.next += 1;
         Some(entry)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.field.count.saturating_sub(self.next);
+        let remaining = self.end.saturating_sub(self.next);
         (remaining, Some(remaining))
     }
 }
@@ -9316,13 +9342,13 @@ fn numeric_schema_fields(
         })?;
     for field in schema.fields {
         let kind = match field.kind {
-            FieldKind::I64 { indexed: true, .. } => NumericKind::I64,
-            FieldKind::U64 { indexed: true, .. } => NumericKind::U64,
+            FieldKind::I64 { indexed, fast } if indexed || fast => NumericKind::I64,
+            FieldKind::U64 { indexed, fast } if indexed || fast => NumericKind::U64,
             _ => continue,
         };
         if fields.len() == max_fields {
             return Err(NumericCodecError::ResourceLimit {
-                resource: "indexed numeric fields",
+                resource: "indexed-or-fast numeric fields",
                 actual: u64::try_from(fields.len()).unwrap_or(u64::MAX) + 1,
                 limit: u64::try_from(max_fields).unwrap_or(u64::MAX),
             });
@@ -11724,7 +11750,7 @@ mod tests {
         let _ = tracing::subscriber::set_global_default(subscriber);
     }
 
-    const NUMERIC_TEST_FIELDS: [FieldDescriptor; 3] = [
+    const NUMERIC_TEST_FIELDS: [FieldDescriptor; 2] = [
         FieldDescriptor {
             id: 0,
             name: "signed",
@@ -11739,15 +11765,6 @@ mod tests {
             name: "unsigned",
             kind: FieldKind::U64 {
                 indexed: true,
-                fast: true,
-            },
-            stored: false,
-        },
-        FieldDescriptor {
-            id: 2,
-            name: "fast_only",
-            kind: FieldKind::U64 {
-                indexed: false,
                 fast: true,
             },
             stored: false,
@@ -16449,7 +16466,6 @@ mod tests {
         let section = encoded.section()?;
         assert_eq!(section.field_count(), 2);
         assert_eq!(section.entry_count(), 8);
-        assert!(section.field(2).is_none(), "fast-only field is not indexed");
 
         let signed_field = section.field(0).ok_or("signed NUMERIC field")?;
         assert!(signed_field.is_signed());
@@ -16976,7 +16992,7 @@ mod tests {
                 }
             ),
             Err(NumericCodecError::ResourceLimit {
-                resource: "indexed numeric fields",
+                resource: "indexed-or-fast numeric fields",
                 ..
             })
         ));

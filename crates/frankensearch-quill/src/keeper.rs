@@ -5599,12 +5599,10 @@ fn concat_schema_has_positions(schema: SchemaDescriptor) -> bool {
 }
 
 fn concat_schema_has_numeric(schema: SchemaDescriptor) -> bool {
-    schema.fields.iter().any(|field| {
-        matches!(
-            field.kind,
-            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
-        )
-    })
+    schema
+        .fields
+        .iter()
+        .any(|field| field.kind.has_numeric_column())
 }
 
 fn reconcile_published_segment(
@@ -12227,6 +12225,24 @@ mod tests {
         let doc_count = u32::try_from(entries.iter().flatten().count())?;
         let id_map = EncodedIdMapSection::encode(docid_lo, docid_hi, &entries)?;
         let id_hash = EncodedIdHashSection::encode(id_map.section()?)?;
+        let mut numeric_entries = Vec::new();
+        for (ordinal, document_id) in document_ids.iter().enumerate() {
+            if document_id.is_none() {
+                continue;
+            }
+            let global_docid = docid_lo
+                .checked_add(u64::try_from(ordinal)?)
+                .ok_or_else(|| QuillError::Invariant {
+                    detail: "test numeric docid overflow".to_owned(),
+                })?;
+            numeric_entries.push(NumericEntry::u64(
+                global_docid,
+                u32::try_from(global_docid)?,
+            ));
+        }
+        let numeric_inputs = [NumericFieldInput::new(4, &numeric_entries)];
+        let numeric =
+            EncodedNumericSection::encode(DEFAULT_SCHEMA, docid_lo, docid_hi, &numeric_inputs)?;
         Ok(EncodedSegment::encode(
             SegmentHeaderInput {
                 segment_id,
@@ -12245,6 +12261,7 @@ mod tests {
                 SectionInput::new(SectionKind::DOCLEN, b"doclen"),
                 SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()),
                 SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()),
+                SectionInput::new(SectionKind::NUMERIC, numeric.as_bytes()),
                 SectionInput::new(SectionKind::STOREDMETA, b"storedmeta"),
                 SectionInput::new(SectionKind::STATS, b"stats"),
             ],
