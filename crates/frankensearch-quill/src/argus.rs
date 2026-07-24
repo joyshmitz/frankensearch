@@ -3435,27 +3435,26 @@ impl<'a> BufferedUnionScorer<'a> {
         self.refill_with_cutoff(None)
     }
 
-    /// Whole-group score ceiling for a pure-term group: the sum of every active
-    /// child's whole-term ceiling, summed in active order to mirror the
-    /// exhaustive window scoring. Returns `None` when the group is empty or any
-    /// active child is not a bounded direct term (a nested non-term child, or a
-    /// cursor without a ceiling), so callers can fail closed.
+    /// Whole-group score ceiling for a pure-term group: the conservative sum of
+    /// every active child's whole-term ceiling. Returns `None` when the group is
+    /// empty or any active child is not a bounded direct term (a nested non-term
+    /// child, or a cursor without a ceiling), so callers can fail closed.
     ///
     /// Foundation for the deferred grouped-`MaxScore` lever
     /// (`bd-quill-e8-perf-doctrine-x4e4.5.1`): a nested pure-term union exposes
-    /// this ceiling to a root `MaxScore` over groups. The bound is conservative
-    /// only if the summed `f32` never rounds below a realized group score; the
-    /// grouped candidate path that consumes it (follow-up layer) is gated by an
-    /// exhaustive parity harness that verifies rank-safety.
+    /// this ceiling to a root `MaxScore` over groups. Uses the same
+    /// [`conservative_optional_bound_sum`] as the term `MaxScore` path so the
+    /// ceiling is rounded outward and never falls below a realized group score
+    /// — a rank-safety precondition for the follow-up grouped candidate path.
     fn group_upper_bound(&self) -> Option<f32> {
         if self.active.is_empty() {
             return None;
         }
-        let mut total = 0.0_f32;
-        for child in &self.active {
-            total += child.competitive_score_upper_bound()?;
-        }
-        Some(total)
+        conservative_optional_bound_sum(
+            self.active
+                .iter()
+                .map(ReferenceScorer::competitive_score_upper_bound),
+        )
     }
 
     fn refill_with_cutoff(&mut self, cutoff: Option<f32>) -> Result<bool, ArgusError> {
