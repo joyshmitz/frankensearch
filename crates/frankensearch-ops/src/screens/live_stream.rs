@@ -316,7 +316,7 @@ impl LiveSearchStreamScreen {
     }
 
     /// Recompute the cached project/host filter-value lists from the current fleet.
-    /// Called from update_state only when the fleet changed.
+    /// Called from `update_state` only when the fleet changed.
     fn rebuild_filter_values(&mut self) {
         let fleet = self.state.fleet();
         let projects: BTreeSet<String> = fleet

@@ -125,19 +125,17 @@ struct SloProjectRow {
 type SloRollupBits = (usize, usize, u64, u64, u64, u64, u64, &'static str);
 
 #[cfg(any(test, feature = "bench-internals"))]
-fn rollup_bits(row: Option<SloProjectRow>) -> Option<SloRollupBits> {
-    row.map(|r| {
-        (
-            r.instance_count,
-            r.unhealthy_count,
-            r.pending_jobs,
-            r.p95_latency_us,
-            r.burn_ratio.to_bits(),
-            r.remaining_ratio.to_bits(),
-            r.backlog_eta_s,
-            r.saturation_risk,
-        )
-    })
+fn rollup_bits(row: &SloProjectRow) -> SloRollupBits {
+    (
+        row.instance_count,
+        row.unhealthy_count,
+        row.pending_jobs,
+        row.p95_latency_us,
+        row.burn_ratio.to_bits(),
+        row.remaining_ratio.to_bits(),
+        row.backlog_eta_s,
+        row.saturation_risk,
+    )
 }
 
 /// Bench-only opaque handle wrapping a synthetic set of per-project SLO rows.
@@ -181,14 +179,18 @@ pub fn bench_make_slo_rollup(n_projects: usize) -> BenchSloRollup {
 #[cfg(feature = "bench-internals")]
 #[must_use]
 pub fn bench_fleet_rollup_fused(input: &BenchSloRollup) -> Option<SloRollupBits> {
-    rollup_bits(AlertsSloScreen::fleet_rollup_row(&input.rows))
+    AlertsSloScreen::fleet_rollup_row(&input.rows)
+        .as_ref()
+        .map(rollup_bits)
 }
 
 /// Bench-only: legacy eight-pass rollup over the corpus.
 #[cfg(feature = "bench-internals")]
 #[must_use]
 pub fn bench_fleet_rollup_slow(input: &BenchSloRollup) -> Option<SloRollupBits> {
-    rollup_bits(AlertsSloScreen::fleet_rollup_row_slow(&input.rows))
+    AlertsSloScreen::fleet_rollup_row_slow(&input.rows)
+        .as_ref()
+        .map(rollup_bits)
 }
 
 /// Single-pass `(oldest, newest)` `ts_ms` bounds over a non-empty alert slice.
@@ -422,8 +424,7 @@ impl AlertsSloScreen {
             Self::active_filter_value(self.project_filter_index, || self.project_filters());
         let reason_filter =
             Self::active_filter_value(self.reason_filter_index, || self.reason_filters());
-        let host_filter =
-            Self::active_filter_value(self.host_filter_index, || self.host_filters());
+        let host_filter = Self::active_filter_value(self.host_filter_index, || self.host_filters());
 
         let fleet = self.state.fleet();
         // id -> project map built once (matches all_alerts / project_resolve_ab).
@@ -863,10 +864,10 @@ impl AlertsSloScreen {
             total_instances += row.instance_count;
             total_unhealthy += row.unhealthy_count;
             total_pending += row.pending_jobs;
-            let weight_u64 = u64::try_from(row.instance_count).unwrap_or(0);
-            weighted_p95_sum += row.p95_latency_us.saturating_mul(weight_u64);
-            let weight_f64 = f64::from(u32::try_from(row.instance_count).unwrap_or(0));
-            weighted_burn_sum += row.burn_ratio * weight_f64;
+            let integer_weight = u64::try_from(row.instance_count).unwrap_or(0);
+            weighted_p95_sum += row.p95_latency_us.saturating_mul(integer_weight);
+            let float_weight = f64::from(u32::try_from(row.instance_count).unwrap_or(0));
+            weighted_burn_sum += row.burn_ratio * float_weight;
             backlog_eta_s = backlog_eta_s.max(row.backlog_eta_s);
             has_high |= matches!(row.saturation_risk, "high");
             has_elevated |= matches!(row.saturation_risk, "elevated");
@@ -993,8 +994,9 @@ impl AlertsSloScreen {
         // without building its event-scanning list. `active_filter_value` returns
         // None for index 0 / out-of-range / a literal "all", all displayed as "all"
         // — byte-identical to `list.get(index).cloned().unwrap_or("all")`.
-        let project = Self::active_filter_value(self.project_filter_index, || self.project_filters())
-            .unwrap_or_else(|| "all".to_owned());
+        let project =
+            Self::active_filter_value(self.project_filter_index, || self.project_filters())
+                .unwrap_or_else(|| "all".to_owned());
         let reason = Self::active_filter_value(self.reason_filter_index, || self.reason_filters())
             .unwrap_or_else(|| "all".to_owned());
         let host = Self::active_filter_value(self.host_filter_index, || self.host_filters())
@@ -1667,8 +1669,12 @@ mod tests {
         for n in [0usize, 1, 2, 3, 4, 5, 50, 137, 500] {
             let rows = synth_rows(n);
             assert_eq!(
-                rollup_bits(AlertsSloScreen::fleet_rollup_row(&rows)),
-                rollup_bits(AlertsSloScreen::fleet_rollup_row_slow(&rows)),
+                AlertsSloScreen::fleet_rollup_row(&rows)
+                    .as_ref()
+                    .map(rollup_bits),
+                AlertsSloScreen::fleet_rollup_row_slow(&rows)
+                    .as_ref()
+                    .map(rollup_bits),
                 "fused/slow rollup parity for n={n}"
             );
         }
@@ -1951,27 +1957,27 @@ mod tests {
         let rows = screen.all_alerts();
 
         let mut expected_projects = vec!["all".to_owned()];
-        expected_projects.extend(
-            rows.iter()
-                .map(|row| row.project.clone())
-                .collect::<std::collections::BTreeSet<String>>(),
-        );
+        let project_set = rows
+            .iter()
+            .map(|row| row.project.clone())
+            .collect::<std::collections::BTreeSet<String>>();
+        expected_projects.extend(project_set);
         assert_eq!(screen.project_filters(), expected_projects);
 
         let mut expected_reasons = vec!["all".to_owned()];
-        expected_reasons.extend(
-            rows.iter()
-                .map(|row| row.reason_code.clone())
-                .collect::<std::collections::BTreeSet<String>>(),
-        );
+        let reason_set = rows
+            .iter()
+            .map(|row| row.reason_code.clone())
+            .collect::<std::collections::BTreeSet<String>>();
+        expected_reasons.extend(reason_set);
         assert_eq!(screen.reason_filters(), expected_reasons);
 
         let mut expected_hosts = vec!["all".to_owned()];
-        expected_hosts.extend(
-            rows.iter()
-                .map(|row| row.host.clone())
-                .collect::<std::collections::BTreeSet<String>>(),
-        );
+        let host_set = rows
+            .iter()
+            .map(|row| row.host.clone())
+            .collect::<std::collections::BTreeSet<String>>();
+        expected_hosts.extend(host_set);
         assert_eq!(screen.host_filters(), expected_hosts);
     }
 

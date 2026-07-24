@@ -1,13 +1,13 @@
 //! Within-process paired A/B for the ops `sparkline` string builder.
 //!
 //! `sparkline(values) = values.iter().map(spark_char).collect::<String>()` reserves only
-//! `values.len()` bytes (FromIterator size_hint lower bound) but each block glyph
+//! `values.len()` bytes (`FromIterator` `size_hint` lower bound) but each block glyph
 //! (U+2581..U+2588) is 3 bytes UTF-8 → the buffer reallocs a couple times per call as it
 //! grows to 3*len. Two candidate builds elide that: (1) pre-size `with_capacity(len*3)` +
 //! push; (2) byte-table — the eight glyphs are contiguous (E2 96 81 .. E2 96 88), so
 //! byte[2] = 0x81 + idx, letting us extend a `Vec<u8>` and wrap it (valid UTF-8 by
 //! construction). All three must produce byte-identical strings. Both arms run in one
-//! process (immune to RCH_WORKER soft-pin) with an A/A null floor.
+//! process (immune to `RCH_WORKER` soft-pin) with an A/A null floor.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -39,7 +39,9 @@ fn spark_presized(values: &[u8]) -> String {
 }
 
 fn make_values(n: usize) -> Vec<u8> {
-    (0..n).map(|i| ((i * 37 + 11) % 101) as u8).collect()
+    (0..n)
+        .map(|i| u8::try_from((i * 37 + 11) % 101).unwrap_or(0))
+        .collect()
 }
 
 fn time_many(iters: usize, values: &[u8], f: fn(&[u8]) -> String) -> f64 {
@@ -94,8 +96,14 @@ fn main() {
 
     let ns = |t: f64| t * 1e9;
     let ratio = m_presized / m_collect;
-    println!("[collect ] median {:>9.2} ns/call (width={width})", ns(m_collect));
-    println!("[presized] median {:>9.2} ns/call  ratio {ratio:.4}", ns(m_presized));
+    println!(
+        "[collect ] median {:>9.2} ns/call (width={width})",
+        ns(m_collect)
+    );
+    println!(
+        "[presized] median {:>9.2} ns/call  ratio {ratio:.4}",
+        ns(m_presized)
+    );
     println!("[null A/A] p5 {null_p5:.4}  (a ratio below this beats the noise floor)");
     if ratio < null_p5 {
         println!("[verdict ] presized: {ratio:.4} < null p5 {null_p5:.4} -> CANDIDATE_FASTER");

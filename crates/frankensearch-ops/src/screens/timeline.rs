@@ -1135,7 +1135,7 @@ pub fn bench_make_lifecycle_events(n: usize) -> Vec<LifecycleEvent> {
             to: LifecycleState::Healthy,
             reason_code: "startup".to_owned(),
             at_ms: 1_700_000_000_000 + (r % 5_000_000),
-            attribution_confidence_score: (i % 100) as u8,
+            attribution_confidence_score: u8::try_from(i % 100).unwrap_or(0),
             attribution_collision: i % 7 == 0,
         });
     }
@@ -1179,7 +1179,7 @@ pub fn bench_make_instances(n: usize) -> Vec<crate::state::InstanceInfo> {
         .map(|i| crate::state::InstanceInfo {
             id: format!("instance-{i:06}"),
             project: format!("project-{}", i % 8),
-            pid: Some(i as u32),
+            pid: Some(u32::try_from(i).unwrap_or(u32::MAX)),
             healthy: i % 3 != 0,
             doc_count: (i as u64) * 10,
             pending_jobs: (i as u64) % 5,
@@ -1230,10 +1230,10 @@ pub fn bench_count_project_mapped(
         .count()
 }
 
-/// Bench-only: identical to `bench_count_project_mapped` but with the production
-/// `ahash::AHashMap` hasher (vs the `std` SipHash above) — the SipHash-vs-aHash A/B
-/// that retroactively measures the ops instance-id-map aHash swap (626aa865, which
-/// shipped via citation of the search-crate results).
+/// Bench-only: use the production `ahash::AHashMap` hasher.
+///
+/// This is otherwise identical to `bench_count_project_mapped`. It provides the
+/// `std` `SipHash` versus aHash comparison for the shipped instance-id map.
 #[cfg(feature = "bench-internals")]
 #[must_use]
 pub fn bench_count_project_mapped_ahash(

@@ -1393,7 +1393,7 @@ mod tests {
         InstanceInfo {
             id: format!("i-{seed:04}"),
             project: format!("p-{}", seed % 3),
-            pid: Some(seed as u32),
+            pid: Some(u32::try_from(seed).unwrap_or(u32::MAX)),
             healthy,
             doc_count: seed.wrapping_mul(97) % 1_000_000,
             pending_jobs: (seed * 7) % 4_000,
@@ -1403,8 +1403,7 @@ mod tests {
     #[test]
     fn visible_fleet_totals_matches_three_pass() {
         for n in [0u64, 1, 3, 512, 2_048] {
-            let owned: Vec<InstanceInfo> =
-                (0..n).map(|i| totals_instance(i, i % 4 != 0)).collect();
+            let owned: Vec<InstanceInfo> = (0..n).map(|i| totals_instance(i, i % 4 != 0)).collect();
             let visible: Vec<&InstanceInfo> = owned.iter().collect();
             let fused = visible_fleet_totals(&visible);
             let slow = (

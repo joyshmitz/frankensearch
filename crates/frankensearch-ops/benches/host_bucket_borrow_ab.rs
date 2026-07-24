@@ -5,8 +5,8 @@
 //! (`eq_ignore_ascii_case`) and dropped — a throwaway heap allocation per event. The
 //! landed change returns a borrowed `&str` (all three branches are subslices), eliding
 //! the allocation. This bench reproduces that filter-site workload for both arms in one
-//! process (immune to the fleet's RCH_WORKER soft-pin: both arms share one core), with
-//! an A/A null floor. Verdict CANDIDATE_FASTER iff the borrowed median < the null p5.
+//! process (immune to the fleet's `RCH_WORKER` soft-pin: both arms share one core), with
+//! an A/A null floor. Verdict `CANDIDATE_FASTER` iff the borrowed median < the null p5.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -122,7 +122,10 @@ fn main() {
     let speedup = m_owned / m_borrowed; // >1 means borrowed is faster
     let lever_ratio = m_borrowed / m_owned; // <1 means borrowed faster
 
-    println!("[owned   ] median {:>9.2} ns/call", m_owned * 1e9 / n as f64);
+    println!(
+        "[owned   ] median {:>9.2} ns/call",
+        m_owned * 1e9 / n as f64
+    );
     println!(
         "[borrowed] median {:>9.2} ns/call",
         m_borrowed * 1e9 / n as f64
