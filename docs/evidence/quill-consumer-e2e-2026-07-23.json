@@ -1,0 +1,282 @@
+{
+  "schema": "quill-consumer-e2e-sweep-v1",
+  "generated_at_utc": "2026-07-24T06:05:32Z",
+  "bead": {
+    "id": "bd-quill-e7-7-consumer-e2e-cg41",
+    "status": "pass"
+  },
+  "revisions": {
+    "implementation_revision": "bddeb009738d9b8e72cebb72e25e1e3a7da13c82",
+    "proof_revision": "da6b3bfcd29d8fc85911215d9ed9685f23e856a8",
+    "pre_rebase_base_revision": "bacf932a",
+    "note": "This is a pre-default-flip consumer proof. The full feature still excludes Quill; the default flip remains owned by E7.6."
+  },
+  "feature_contract": {
+    "lexical_engine": "quill",
+    "full_feature_includes_quill": false,
+    "feature_matrix_script": {
+      "command": "scripts/check_feature_matrix.sh",
+      "lanes": 10,
+      "result": "pass"
+    },
+    "exact_lane_tests": [
+      {
+        "lane": "default",
+        "passed": 1,
+        "failed": 0
+      },
+      {
+        "lane": "cass-compat",
+        "passed": 1,
+        "failed": 0
+      },
+      {
+        "lane": "lexical-tantivy",
+        "passed": 1,
+        "failed": 0
+      },
+      {
+        "lane": "quill",
+        "passed": 1,
+        "failed": 0
+      },
+      {
+        "lane": "full-preflip",
+        "passed": 1,
+        "failed": 0,
+        "observations": {
+          "native": true,
+          "ann": true,
+          "download": true
+        },
+        "worker": "hz1"
+      }
+    ],
+    "quill_only_check": "pass"
+  },
+  "golden_artifact": {
+    "sha256": "4f300cd48bb78bec4ac4049f5cd414edf4149493486e7df39f97944aa582c308",
+    "comparison_profile": "release-perf",
+    "worker": "ovh-a",
+    "before": {
+      "revision": "e663dff4",
+      "documents_per_second": 73713,
+      "updates_per_second": 2716,
+      "update_to_searchable_p95_us": 32766
+    },
+    "after": {
+      "revision": "d4649471",
+      "documents_per_second": 69279,
+      "updates_per_second": 5462,
+      "update_to_searchable_p95_us": 13017
+    }
+  },
+  "consumer_suites": {
+    "fsfs_library": {
+      "passed": 1832,
+      "ignored": 1,
+      "failed": 0
+    },
+    "fsfs_binary": {
+      "passed": 13,
+      "ignored": 0,
+      "failed": 0
+    },
+    "fsfs_integration": {
+      "binaries": 15,
+      "passed": 326,
+      "ignored": 2,
+      "failed": 0,
+      "breakdown": {
+        "agent_contract_regression": {
+          "passed": 59
+        },
+        "benchmark_baseline_matrix": {
+          "passed": 24
+        },
+        "cli_command_tests": {
+          "passed": 33
+        },
+        "cli_e2e_contract": {
+          "passed": 10,
+          "ignored": 1
+        },
+        "concurrency_stress": {
+          "passed": 31
+        },
+        "deluxe_tui_e2e": {
+          "passed": 4
+        },
+        "e2e_recall": {
+          "passed": 4
+        },
+        "explanation_payload_contract": {
+          "passed": 3
+        },
+        "filesystem_chaos": {
+          "passed": 12
+        },
+        "limit_all_large_corpus_benchmark": {
+          "passed": 0,
+          "ignored": 1
+        },
+        "pressure_simulation_harness": {
+          "passed": 15
+        },
+        "privacy_redaction_suite": {
+          "passed": 3
+        },
+        "profiling_harness_workflow": {
+          "passed": 9
+        },
+        "schema_conformance": {
+          "passed": 118
+        },
+        "search_quality_harness": {
+          "passed": 1
+        }
+      }
+    },
+    "facade": {
+      "library_passed": 30,
+      "integration_passed": 21,
+      "doctest_passed": 1,
+      "doctest_ignored": 2,
+      "failed": 0
+    },
+    "basic_search_example": {
+      "result": "pass",
+      "documents": 5,
+      "lexical_hits": 1,
+      "evidence": "structured"
+    }
+  },
+  "release_contract": {
+    "result": "pass",
+    "worker": "ovh-a",
+    "profile": "release-perf",
+    "observed": {
+      "documents_per_second": 81695,
+      "updates_per_second": 6194,
+      "update_to_searchable_p95_ms": 11.824
+    },
+    "thresholds": {
+      "documents_per_second_min": 20000,
+      "updates_per_second_min": 5000,
+      "update_to_searchable_p95_ms_max": 25
+    }
+  },
+  "workspace_gates": [
+    {
+      "command": "cargo check --locked --workspace --all-targets",
+      "result": "pass",
+      "worker": "vmi1227854",
+      "elapsed": "8m44s"
+    },
+    {
+      "command": "cargo check --locked --workspace --all-targets --all-features",
+      "result": "pass",
+      "worker": "vmi1156319",
+      "elapsed": "11m19s"
+    },
+    {
+      "command": "cargo clippy --locked -p frankensearch-quill --all-targets --all-features -- -D warnings",
+      "result": "pass",
+      "worker": "vmi1264463",
+      "elapsed": "9m10s"
+    },
+    {
+      "command": "cargo clippy --locked -p frankensearch-fusion --all-targets --all-features -- -D warnings",
+      "result": "pass",
+      "worker": "hz1",
+      "elapsed": "3m36s"
+    },
+    {
+      "command": "cargo clippy --locked -p frankensearch --all-targets --all-features -- -D warnings",
+      "result": "pass",
+      "worker": "hz1",
+      "elapsed": "5m34s"
+    },
+    {
+      "command": "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+      "result": "pass",
+      "worker": "hz1",
+      "elapsed": "7m56s",
+      "revision": "da6b3bfcd29d8fc85911215d9ed9685f23e856a8"
+    }
+  ],
+  "ubs": {
+    "result": "reviewed",
+    "aggregate_scan": {
+      "files": 41,
+      "critical": 0,
+      "warnings": 557
+    },
+    "facade_followup": {
+      "files": 1,
+      "critical": 0
+    },
+    "interpretation": "Direct modified-file groups and the aggregate scan had zero critical findings. Remaining warnings are reviewed benchmark and test heuristics such as intentional assertions, clones, indexing, bounded conversion expects, and benchmark allocations; no new flagged production defect remained."
+  },
+  "remote_only": {
+    "required": true,
+    "local_cargo_fallback": false,
+    "admissible_failures": [
+      {
+        "worker": "vmi1149989",
+        "reason": "valid under-load release-contract failure",
+        "observed": {
+          "documents_per_second": 69275,
+          "updates_per_second": 1991,
+          "update_to_searchable_p95_ms": 43.633,
+          "load_average": [
+            6.08,
+            6.95,
+            6.84
+          ]
+        }
+      }
+    ],
+    "refusals": [
+      {
+        "worker": "ovh-a",
+        "reason": "disk_critical_without_fresh_telemetry"
+      },
+      {
+        "worker": "hz2/vmi1152480",
+        "reason": "alias_wrong_target"
+      },
+      {
+        "worker": "vmi1149989",
+        "reason": "rsync SSH resets"
+      },
+      {
+        "worker": "hz1",
+        "reason": "critical pressure: disk_free_below_critical_gb"
+      }
+    ],
+    "noise_fix": "The isolated release-contract test installs a process-global NoSubscriber because Rayon workers do not inherit thread-local tracing subscribers. Thresholds were not weakened."
+  },
+  "coordination": {
+    "agent_mail": "degraded",
+    "reason": "database corruption circuit breaker",
+    "repair_attempted": false,
+    "fallback_truth": [
+      "git",
+      "worktree",
+      "beads"
+    ]
+  },
+  "rch_watchdog": {
+    "timer": "active",
+    "timer_substate": "waiting",
+    "rchd": "active",
+    "one_shot_result": "success",
+    "restored_after_remote_sweep": true
+  },
+  "artifact_validation": {
+    "jq": "pass",
+    "git_diff_check": "pass",
+    "ubs": "not_applicable_unsupported_json"
+  }
+}
