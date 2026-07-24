@@ -513,7 +513,7 @@ mod feature_matrix_smoke {
 
     use super::*;
 
-    fn emit_evidence(lane: &str, behavior: &str, observations: serde_json::Value) {
+    fn emit_evidence(lane: &str, behavior: &str, observations: &serde_json::Value) {
         eprintln!(
             "{}",
             serde_json::json!({
@@ -539,7 +539,7 @@ mod feature_matrix_smoke {
             emit_evidence(
                 lane,
                 "hash_embed_roundtrip",
-                serde_json::json!({"dimension": vector.len()}),
+                &serde_json::json!({"dimension": vector.len()}),
             );
         });
     }
@@ -570,7 +570,7 @@ mod feature_matrix_smoke {
         emit_evidence(
             "hybrid",
             "tantivy_lexical_create",
-            serde_json::json!({"documents": index.doc_count()}),
+            &serde_json::json!({"documents": index.doc_count()}),
         );
     }
 
@@ -583,7 +583,7 @@ mod feature_matrix_smoke {
         emit_evidence(
             "persistent",
             "real_in_memory_storage",
-            serde_json::json!({"schema_version": schema_version}),
+            &serde_json::json!({"schema_version": schema_version}),
         );
         drop(storage);
     }
@@ -603,7 +603,7 @@ mod feature_matrix_smoke {
         emit_evidence(
             "durable",
             "protect_verify_roundtrip",
-            serde_json::json!({
+            &serde_json::json!({
                 "source_bytes": protection.source_size,
                 "repair_bytes": protection.repair_size,
             }),
@@ -620,7 +620,7 @@ mod feature_matrix_smoke {
         emit_evidence(
             "full",
             "full_surface_exports",
-            serde_json::json!({"native": true, "ann": true, "download": true}),
+            &serde_json::json!({"native": true, "ann": true, "download": true}),
         );
     }
 
@@ -644,7 +644,7 @@ mod feature_matrix_smoke {
             emit_evidence(
                 "full-fts5",
                 "real_fts5_index_search",
-                serde_json::json!({"documents": adapter.doc_count(), "hits": hits.len()}),
+                &serde_json::json!({"documents": adapter.doc_count(), "hits": hits.len()}),
             );
         });
     }
@@ -686,7 +686,7 @@ mod feature_matrix_smoke {
             emit_evidence(
                 "quill",
                 "real_index_build_search",
-                serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
+                &serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
             );
         });
     }
@@ -715,7 +715,7 @@ mod feature_matrix_smoke {
             emit_evidence(
                 "lexical-tantivy",
                 "real_index_build_search",
-                serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
+                &serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
             );
         });
     }
@@ -751,7 +751,7 @@ mod feature_matrix_smoke {
         emit_evidence(
             "cass-compat",
             "real_cass_index_commit",
-            serde_json::json!({
+            &serde_json::json!({
                 "documents": documents.len(),
                 "segments": index.segment_count(),
             }),
