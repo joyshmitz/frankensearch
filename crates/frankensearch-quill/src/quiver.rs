@@ -4279,6 +4279,12 @@ impl PositionCursor<'_> {
         self.postings.posting_ordinal()
     }
 
+    /// Current zero-based POSTINGS block index.
+    #[must_use]
+    pub const fn posting_block_index(&self) -> Option<usize> {
+        self.postings.block_index()
+    }
+
     /// Stream the current posting's absolute positions without allocation.
     ///
     /// # Errors

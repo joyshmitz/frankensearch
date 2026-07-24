@@ -919,7 +919,7 @@ fn offset_tie_group(
 
 fn quill_config_hash(config: &QuillConfig) -> String {
     let canonical = format!(
-        "scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};shards={};deterministic={};visibility_ms={};quarantine={}",
+        "scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};fuel={};shards={};deterministic={};visibility_ms={};quarantine={}",
         config.scribe_shard_budget_bytes,
         config.delta_budget_bytes,
         config.tier_fanout,
@@ -930,6 +930,7 @@ fn quill_config_hash(config: &QuillConfig) -> String {
         config.compaction_tombstone_density.to_bits(),
         config.merge_max_hole_ratio.to_bits(),
         config.glob_expansion_limit,
+        config.query_fuel_budget,
         config.max_ingest_shards,
         config.deterministic_ingest,
         config.max_visibility_lag_ms,
@@ -3125,6 +3126,13 @@ mod tests {
                 "glob_expansion_limit",
                 QuillConfig {
                     glob_expansion_limit: baseline_config.glob_expansion_limit + 1,
+                    ..baseline_config.clone()
+                },
+            ),
+            (
+                "query_fuel_budget",
+                QuillConfig {
+                    query_fuel_budget: baseline_config.query_fuel_budget + 1,
                     ..baseline_config.clone()
                 },
             ),

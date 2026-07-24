@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -26,17 +27,18 @@ use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::argus::{
-    ArgusError, BMW_MIN_CLAUSES, Bm25FieldSnapshot, DeltaFieldNorms, DeltaPostingCursor,
-    DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer, PhraseTerm,
-    PositionsHandle, PositionsReader, PostingCursor, PruningTelemetry, ReferenceScorer,
-    ScorerClause, SealedPostingCursor, TermScorer, TopDocsCollector,
+    ArgusError, BMW_MIN_CLAUSES, Bm25FieldSnapshot, CheckpointPostingCursor, DeltaFieldNorms,
+    DeltaPostingCursor, DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer,
+    PhraseTerm, PositionsHandle, PositionsReader, PostingCursor, PruningTelemetry,
+    QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer, ScorerClause, SealedPostingCursor,
+    TermScorer, TopDocsCollector,
 };
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
 use crate::grimoire::{
     ByteSpan, TermDictionary, TermDictionaryError, TermSectionLengths, star_glob_matches,
-    validate_bound_term, validate_query_term,
+    trailing_star_prefix, validate_bound_term, validate_query_term,
 };
 #[cfg(feature = "durability")]
 use crate::keeper::UnrepairableSegmentPolicy;
@@ -118,7 +120,7 @@ pub enum QuillIndexError {
     StoredMeta(#[from] StoredMetaCodecError),
     /// Exhaustive scorer construction or collection failed.
     #[error(transparent)]
-    Argus(#[from] ArgusError),
+    Argus(ArgusError),
     /// Composite process-local snapshot construction or publication failed.
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
@@ -134,6 +136,50 @@ pub enum QuillIndexError {
     /// Structured cancellation was observed before a state transition.
     #[error("scalar Quill operation cancelled during {phase}")]
     Cancelled { phase: &'static str },
+    /// Deterministic coarse query work exceeded the configured budget.
+    #[error(
+        "scalar Quill query fuel exhausted after {consumed}/{budget} units \
+         (segments={segments_touched}, dictionary_blocks={dictionary_blocks}, \
+         posting_blocks={posting_blocks}, position_docs={position_docs})"
+    )]
+    QueryFuelExhausted {
+        /// Configured work-unit ceiling.
+        budget: u64,
+        /// Successfully admitted work before exhaustion.
+        consumed: u64,
+        /// Segment transitions admitted before exhaustion.
+        segments_touched: u64,
+        /// Dictionary blocks admitted before exhaustion.
+        dictionary_blocks: u64,
+        /// Posting blocks admitted before exhaustion.
+        posting_blocks: u64,
+        /// Phrase candidate documents admitted before exhaustion.
+        position_docs: u64,
+    },
+}
+
+impl From<ArgusError> for QuillIndexError {
+    fn from(error: ArgusError) -> Self {
+        match error {
+            ArgusError::QueryCancelled { phase } => Self::Cancelled { phase },
+            ArgusError::QueryFuelExhausted {
+                budget,
+                consumed,
+                segments_touched,
+                dictionary_blocks,
+                posting_blocks,
+                position_docs,
+            } => Self::QueryFuelExhausted {
+                budget,
+                consumed,
+                segments_touched,
+                dictionary_blocks,
+                posting_blocks,
+                position_docs,
+            },
+            other => Self::Argus(other),
+        }
+    }
 }
 
 /// One final lexical winner.
@@ -1065,6 +1111,164 @@ struct ScribeShardState {
     accumulator: ColumnarAccumulator,
     identities: Vec<PendingIdentity>,
     current_lease_base: Option<u64>,
+}
+
+#[derive(Default)]
+struct QueryFuelState {
+    consumed: AtomicU64,
+    segments_touched: AtomicU64,
+    dictionary_blocks: AtomicU64,
+    posting_blocks: AtomicU64,
+    position_docs: AtomicU64,
+}
+
+struct QueryCheckpoint<'a> {
+    cx: &'a Cx,
+    phase: &'static str,
+    budget: u64,
+    metering: bool,
+    state: QueryFuelState,
+}
+
+impl<'a> QueryCheckpoint<'a> {
+    fn new(cx: &'a Cx, phase: &'static str, budget: u64, upper_bound: u64) -> Arc<Self> {
+        Arc::new(Self {
+            cx,
+            phase,
+            budget,
+            metering: upper_bound > budget,
+            state: QueryFuelState::default(),
+        })
+    }
+
+    const fn metering(&self) -> bool {
+        self.metering
+    }
+
+    fn exhausted(&self, consumed: u64) -> ArgusError {
+        let segments_touched = self.state.segments_touched.load(Ordering::Acquire);
+        let dictionary_blocks = self.state.dictionary_blocks.load(Ordering::Acquire);
+        let posting_blocks = self.state.posting_blocks.load(Ordering::Acquire);
+        let position_docs = self.state.position_docs.load(Ordering::Acquire);
+        tracing::warn!(
+            target: crate::tracing_conventions::TARGET,
+            event = "quill.argus.query_fuel_exhausted",
+            phase = self.phase,
+            budget = self.budget,
+            consumed,
+            segments_touched,
+            dictionary_blocks,
+            posting_blocks,
+            position_docs,
+            "Quill query exhausted its deterministic coarse work budget"
+        );
+        ArgusError::QueryFuelExhausted {
+            budget: self.budget,
+            consumed,
+            segments_touched,
+            dictionary_blocks,
+            posting_blocks,
+            position_docs,
+        }
+    }
+}
+
+impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
+    fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
+        if self.cx.is_cancel_requested() {
+            return Err(ArgusError::QueryCancelled { phase: self.phase });
+        }
+        if units == 0 || !self.metering {
+            return Ok(());
+        }
+        let admitted =
+            self.state
+                .consumed
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |consumed| {
+                    consumed
+                        .checked_add(units)
+                        .filter(|next| *next <= self.budget)
+                });
+        let previous = match admitted {
+            Ok(previous) => previous,
+            Err(consumed) => return Err(self.exhausted(consumed)),
+        };
+        debug_assert!(previous.saturating_add(units) <= self.budget);
+        let counter = match kind {
+            QueryWorkKind::Segment => &self.state.segments_touched,
+            QueryWorkKind::DictionaryBlock => &self.state.dictionary_blocks,
+            QueryWorkKind::PostingBlock => &self.state.posting_blocks,
+            QueryWorkKind::PositionDocument => &self.state.position_docs,
+        };
+        let _ = counter.fetch_add(units, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+type QueryCheckpointHandle<'a> = Arc<dyn QueryWorkCheckpoint + 'a>;
+
+#[derive(Default)]
+struct QueryWorkShape {
+    posting_streams: u64,
+    dictionary_scans: u64,
+    phrase_streams: u64,
+    phrase_fields: u64,
+}
+
+impl QueryWorkShape {
+    fn visit(&mut self, query: &Query, glob_expansion_limit: usize) {
+        match query {
+            Query::Empty | Query::All => {}
+            Query::Term { fields, .. } => {
+                let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
+                self.posting_streams = self.posting_streams.saturating_add(fields);
+            }
+            Query::Phrase { fields, terms, .. } => {
+                let fields = u64::try_from(fields.len()).unwrap_or(u64::MAX);
+                let terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
+                let streams = fields.saturating_mul(terms);
+                self.posting_streams = self.posting_streams.saturating_add(streams);
+                self.phrase_streams = self.phrase_streams.saturating_add(streams);
+                self.phrase_fields = self.phrase_fields.saturating_add(fields);
+            }
+            Query::Boolean { clauses, .. } => {
+                for clause in clauses {
+                    self.visit(&clause.query, glob_expansion_limit);
+                }
+            }
+            Query::Boost { query, .. } => self.visit(query, glob_expansion_limit),
+            Query::Range { lower, upper, .. } => {
+                let string_range = matches!(
+                    lower,
+                    Bound::Included(QueryValue::Str(_)) | Bound::Excluded(QueryValue::Str(_))
+                ) || matches!(
+                    upper,
+                    Bound::Included(QueryValue::Str(_)) | Bound::Excluded(QueryValue::Str(_))
+                );
+                if string_range {
+                    self.dictionary_scans = self.dictionary_scans.saturating_add(1);
+                    self.posting_streams = self
+                        .posting_streams
+                        .saturating_add(u64::try_from(glob_expansion_limit).unwrap_or(u64::MAX));
+                }
+            }
+            Query::Glob { field_ids, .. } => {
+                let fields = u64::try_from(field_ids.len()).unwrap_or(u64::MAX);
+                self.dictionary_scans = self.dictionary_scans.saturating_add(fields);
+                self.posting_streams = self.posting_streams.saturating_add(
+                    fields.saturating_mul(u64::try_from(glob_expansion_limit).unwrap_or(u64::MAX)),
+                );
+            }
+            Query::Set { values, .. } => {
+                let strings = values
+                    .iter()
+                    .filter(|value| matches!(value, QueryValue::Str(_)))
+                    .count();
+                let strings = u64::try_from(strings).unwrap_or(u64::MAX);
+                self.posting_streams = self.posting_streams.saturating_add(strings);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3127,13 +3331,24 @@ impl QuillReader {
         let snapshot = published.as_ref();
         let rank_pruning = limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
         let mut collector = TopDocsCollector::new(limit, 0)?;
+        let work_upper_bound =
+            query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
+        let concrete_checkpoint = QueryCheckpoint::new(
+            cx,
+            "search",
+            self.config.query_fuel_budget,
+            work_upper_bound,
+        );
+        let metering = concrete_checkpoint.metering();
+        let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
         self.collect_sealed_segments(
             cx,
+            &checkpoint,
             &mut collector,
             &parsed.query,
             snapshot,
             rank_pruning,
-            fan_out,
+            fan_out && !metering,
         )?;
         let collected = collector.finish()?;
         Ok(collected
@@ -3154,6 +3369,16 @@ impl QuillReader {
         diagnostics: Vec<QueryDiagnostic>,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         validate_query_lowering(query, 1.0, self.schema)?;
+        let work_upper_bound =
+            query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
+        let concrete_checkpoint = QueryCheckpoint::new(
+            cx,
+            "search",
+            self.config.query_fuel_budget,
+            work_upper_bound,
+        );
+        let metering = concrete_checkpoint.metering();
+        let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
         let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
@@ -3170,10 +3395,18 @@ impl QuillReader {
             .iter()
             .map(|segment| u64::from(segment.doc_count()))
             .sum();
-        let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs);
-        self.collect_sealed_segments(cx, &mut collector, query, snapshot, rank_pruning, fan_out)?;
+        let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs) && !metering;
+        self.collect_sealed_segments(
+            cx,
+            &checkpoint,
+            &mut collector,
+            query,
+            snapshot,
+            rank_pruning,
+            fan_out,
+        )?;
         for delta in snapshot.delta_snapshots() {
-            check_cancel(cx, "search")?;
+            checkpoint.admit(QueryWorkKind::Segment, 1)?;
             let score_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
                 crate::tracing_conventions::ARGUS_SCORE,
@@ -3192,6 +3425,7 @@ impl QuillReader {
             let _score_entered = score_span.enter();
             let mut scorer = lower_query(
                 cx,
+                &checkpoint,
                 query,
                 1.0,
                 QueryLeaf::Delta(delta),
@@ -3262,6 +3496,7 @@ impl QuillReader {
     fn collect_sealed_segments(
         &self,
         cx: &Cx,
+        checkpoint: &QueryCheckpointHandle<'_>,
         collector: &mut TopDocsCollector,
         query: &Query,
         snapshot: &QuillSearchSnapshot,
@@ -3278,6 +3513,7 @@ impl QuillReader {
                 .segments()
                 .par_iter()
                 .map(|segment| {
+                    checkpoint.admit(QueryWorkKind::Segment, 1)?;
                     let mut local = template.empty_like()?;
                     let score_span = tracing::info_span!(
                         target: crate::tracing_conventions::TARGET,
@@ -3296,6 +3532,7 @@ impl QuillReader {
                     let _score_entered = score_span.enter();
                     let mut scorer = lower_query(
                         cx,
+                        checkpoint,
                         query,
                         1.0,
                         QueryLeaf::Sealed(segment),
@@ -3315,7 +3552,7 @@ impl QuillReader {
             }
         } else {
             for segment in keeper.segments() {
-                check_cancel(cx, "search")?;
+                checkpoint.admit(QueryWorkKind::Segment, 1)?;
                 let score_span = tracing::info_span!(
                     target: crate::tracing_conventions::TARGET,
                     crate::tracing_conventions::ARGUS_SCORE,
@@ -3333,6 +3570,7 @@ impl QuillReader {
                 let _score_entered = score_span.enter();
                 let mut scorer = lower_query(
                     cx,
+                    checkpoint,
                     query,
                     1.0,
                     QueryLeaf::Sealed(segment),
@@ -3357,6 +3595,7 @@ impl QuillReader {
     fn collect_docids_sealed(
         &self,
         cx: &Cx,
+        checkpoint: &QueryCheckpointHandle<'_>,
         collector: &mut DocSetCollector,
         query: &Query,
         snapshot: &QuillSearchSnapshot,
@@ -3371,6 +3610,7 @@ impl QuillReader {
                 .segments()
                 .par_iter()
                 .map(|segment| {
+                    checkpoint.admit(QueryWorkKind::Segment, 1)?;
                     let mut local = DocSetCollector::new();
                     let score_span = tracing::info_span!(
                         target: crate::tracing_conventions::TARGET,
@@ -3390,6 +3630,7 @@ impl QuillReader {
                     let _score_entered = score_span.enter();
                     let mut scorer = lower_query_unscored(
                         cx,
+                        checkpoint,
                         query,
                         1.0,
                         QueryLeaf::Sealed(segment),
@@ -3407,7 +3648,7 @@ impl QuillReader {
             }
         } else {
             for segment in keeper.segments() {
-                check_cancel(cx, "collect_docids")?;
+                checkpoint.admit(QueryWorkKind::Segment, 1)?;
                 let score_span = tracing::info_span!(
                     target: crate::tracing_conventions::TARGET,
                     crate::tracing_conventions::ARGUS_SCORE,
@@ -3426,6 +3667,7 @@ impl QuillReader {
                 let _score_entered = score_span.enter();
                 let mut scorer = lower_query_unscored(
                     cx,
+                    checkpoint,
                     query,
                     1.0,
                     QueryLeaf::Sealed(segment),
@@ -3460,7 +3702,24 @@ impl QuillReader {
         let published = self.published_snapshot.load();
         let snapshot = published.as_ref();
         let mut collector = DocSetCollector::new();
-        self.collect_docids_sealed(cx, &mut collector, &parsed.query, snapshot, fan_out)?;
+        let work_upper_bound =
+            query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
+        let concrete_checkpoint = QueryCheckpoint::new(
+            cx,
+            "collect_docids",
+            self.config.query_fuel_budget,
+            work_upper_bound,
+        );
+        let metering = concrete_checkpoint.metering();
+        let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
+        self.collect_docids_sealed(
+            cx,
+            &checkpoint,
+            &mut collector,
+            &parsed.query,
+            snapshot,
+            fan_out && !metering,
+        )?;
         Ok(collector.finish())
     }
 
@@ -3471,6 +3730,16 @@ impl QuillReader {
         snapshot: &QuillSearchSnapshot,
     ) -> Result<Vec<u32>, QuillIndexError> {
         validate_query_lowering(query, 1.0, self.schema)?;
+        let work_upper_bound =
+            query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
+        let concrete_checkpoint = QueryCheckpoint::new(
+            cx,
+            "collect_docids",
+            self.config.query_fuel_budget,
+            work_upper_bound,
+        );
+        let metering = concrete_checkpoint.metering();
+        let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
         let keeper = snapshot.keeper_snapshot();
         let segment_count = keeper
             .segments()
@@ -3482,10 +3751,10 @@ impl QuillReader {
             .iter()
             .map(|segment| u64::from(segment.doc_count()))
             .sum();
-        let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs);
-        self.collect_docids_sealed(cx, &mut collector, query, snapshot, fan_out)?;
+        let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs) && !metering;
+        self.collect_docids_sealed(cx, &checkpoint, &mut collector, query, snapshot, fan_out)?;
         for delta in snapshot.delta_snapshots() {
-            check_cancel(cx, "collect_docids")?;
+            checkpoint.admit(QueryWorkKind::Segment, 1)?;
             let score_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
                 crate::tracing_conventions::ARGUS_SCORE,
@@ -3505,6 +3774,7 @@ impl QuillReader {
             let _score_entered = score_span.enter();
             let mut scorer = lower_query_unscored(
                 cx,
+                &checkpoint,
                 query,
                 1.0,
                 QueryLeaf::Delta(delta),
@@ -3850,8 +4120,25 @@ impl QuillIndex {
         rank_pruning: bool,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
-        self.reader
-            .collect_sealed_segments(cx, collector, query, snapshot, rank_pruning, fan_out)
+        let work_upper_bound =
+            query_work_upper_bound(query, snapshot, self.reader.config.glob_expansion_limit)?;
+        let concrete_checkpoint = QueryCheckpoint::new(
+            cx,
+            "search",
+            self.reader.config.query_fuel_budget,
+            work_upper_bound,
+        );
+        let metering = concrete_checkpoint.metering();
+        let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
+        self.reader.collect_sealed_segments(
+            cx,
+            &checkpoint,
+            collector,
+            query,
+            snapshot,
+            rank_pruning,
+            fan_out && !metering,
+        )
     }
 
     /// Create a shipping-schema index or open an existing compatible index.
@@ -4533,6 +4820,87 @@ const fn sealed_segment_fanout(segment_count: usize, total_sealed_docs: u64) -> 
             || segment_count >= SEGMENT_COUNT_FANOUT_THRESHOLD)
 }
 
+fn query_work_upper_bound(
+    query: &Query,
+    snapshot: &QuillSearchSnapshot,
+    glob_expansion_limit: usize,
+) -> Result<u64, QuillIndexError> {
+    let mut shape = QueryWorkShape::default();
+    shape.visit(query, glob_expansion_limit);
+
+    let keeper = snapshot.keeper_snapshot();
+    let segment_count = keeper
+        .segments()
+        .len()
+        .saturating_add(snapshot.delta_count());
+    let segment_count = u64::try_from(segment_count).unwrap_or(u64::MAX);
+    let keeper_count = u64::try_from(keeper.segments().len()).unwrap_or(u64::MAX);
+
+    let mut physical_docs = 0_u64;
+    let mut posting_blocks_per_stream = 0_u64;
+    let mut dictionary_blocks = 0_u64;
+    for segment in keeper.segments() {
+        let docs = u64::from(segment.doc_count());
+        physical_docs = physical_docs.saturating_add(docs);
+        posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
+        let bytes = required_section(segment, SectionKind::TERMDICT)?;
+        let count_bytes = bytes
+            .get(..4)
+            .ok_or_else(|| invalid_state("TERMDICT is shorter than its block-count header"))?;
+        let count = u32::from_le_bytes([
+            count_bytes[0],
+            count_bytes[1],
+            count_bytes[2],
+            count_bytes[3],
+        ]);
+        dictionary_blocks = dictionary_blocks.saturating_add(u64::from(count));
+    }
+    for delta in snapshot.delta_snapshots() {
+        let docs = u64::try_from(delta.live_document_count()).unwrap_or(u64::MAX);
+        physical_docs = physical_docs.saturating_add(docs);
+        posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
+        let terms = u64::try_from(delta.segment().sorted_terms().len()).unwrap_or(u64::MAX);
+        dictionary_blocks = dictionary_blocks.saturating_add(terms.div_ceil(16));
+    }
+
+    // A rank-pruning fork can traverse a sealed posting stream independently
+    // of the scorer-owned cursor. Two full traversals are therefore a safe
+    // ceiling for every syntactic stream.
+    let posting_blocks = shape
+        .posting_streams
+        .saturating_mul(posting_blocks_per_stream)
+        .saturating_mul(2);
+    // Snapshot-level expansions run while each segment scorer is lowered.
+    let scanned_dictionary_blocks = shape
+        .dictionary_scans
+        .saturating_mul(dictionary_blocks)
+        .saturating_mul(segment_count);
+    // Exact term statistics probe every sealed dictionary for each lowered
+    // segment, then the segment-local cursor performs one more indexed probe.
+    // Every posting stream is opened through `lower_leaf_term`, including
+    // terms materialized by range and glob expansion. Each opening probes all
+    // sealed dictionaries for snapshot statistics and then the leaf-local
+    // dictionary, so use the complete stream ceiling rather than only the
+    // syntactic exact-term count.
+    let indexed_dictionary_blocks = shape.posting_streams.saturating_mul(
+        segment_count
+            .saturating_mul(keeper_count)
+            .saturating_add(keeper_count),
+    );
+    // Existing phrase lowering materializes positioned rows before candidate
+    // verification. Bound both the decode and verification passes.
+    let position_docs = shape
+        .phrase_streams
+        .saturating_add(shape.phrase_fields)
+        .saturating_mul(physical_docs);
+
+    Ok(segment_count
+        .saturating_add(posting_blocks)
+        .saturating_add(scanned_dictionary_blocks)
+        .saturating_add(indexed_dictionary_blocks)
+        .saturating_add(position_docs))
+}
+
 fn check_cancel(cx: &Cx, phase: &'static str) -> Result<(), QuillIndexError> {
     if cx.is_cancel_requested() {
         Err(QuillIndexError::Cancelled { phase })
@@ -4977,6 +5345,7 @@ fn validate_cumulative_boost(inherited: f32, factor: f32) -> Result<f32, QuillIn
 
 fn lower_query<'a>(
     cx: &Cx,
+    checkpoint: &QueryCheckpointHandle<'a>,
     query: &Query,
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
@@ -4987,6 +5356,7 @@ fn lower_query<'a>(
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         cx,
+        checkpoint,
         query,
         inherited_boost,
         leaf,
@@ -5000,6 +5370,7 @@ fn lower_query<'a>(
 
 fn lower_query_unscored<'a>(
     cx: &Cx,
+    checkpoint: &QueryCheckpointHandle<'a>,
     query: &Query,
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
@@ -5009,6 +5380,7 @@ fn lower_query_unscored<'a>(
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         cx,
+        checkpoint,
         query,
         inherited_boost,
         leaf,
@@ -5266,6 +5638,7 @@ fn lower_boolean(
 
 fn lower_query_with_mode<'a>(
     cx: &Cx,
+    checkpoint: &QueryCheckpointHandle<'a>,
     query: &Query,
     inherited_boost: f32,
     leaf: QueryLeaf<'a>,
@@ -5300,6 +5673,7 @@ fn lower_query_with_mode<'a>(
                     text.as_bytes(),
                     inherited_boost * field.boost,
                     rank_pruning,
+                    checkpoint,
                 )?));
             }
             lower_boolean(clauses, mode)
@@ -5327,6 +5701,7 @@ fn lower_query_with_mode<'a>(
                         term.text.as_bytes(),
                         inherited_boost * field.boost,
                         false,
+                        checkpoint,
                     )?));
                 }
                 return lower_boolean(clauses, mode);
@@ -5339,43 +5714,60 @@ fn lower_query_with_mode<'a>(
                     .try_reserve_exact(terms.len())
                     .map_err(|_| invalid_state("could not allocate phrase terms"))?;
                 for term in terms {
-                    let snapshot_doc_freq =
-                        snapshot.bm25_doc_freq(field.field_id, term.text.as_bytes())?;
+                    let snapshot_doc_freq = checkpointed_snapshot_doc_freq(
+                        checkpoint,
+                        snapshot,
+                        field.field_id,
+                        term.text.as_bytes(),
+                    )?;
                     phrase_terms.push(match leaf {
-                        QueryLeaf::Sealed(segment) => PhraseTerm::new(
-                            field.field_id,
-                            term.position,
-                            open_owned_cursor(
+                        QueryLeaf::Sealed(segment) => {
+                            let cursor = open_owned_cursor(
                                 segment,
                                 schema,
                                 field.field_id,
                                 term.text.as_bytes(),
                                 true,
-                            )?,
-                            snapshot_doc_freq,
-                        ),
-                        QueryLeaf::Delta(delta) => PhraseTerm::new(
-                            field.field_id,
-                            term.position,
-                            DeltaPostingCursor::new(delta, field.field_id, term.text.as_bytes())?,
-                            snapshot_doc_freq,
-                        ),
+                                Some(checkpoint),
+                            )?;
+                            PhraseTerm::new(
+                                field.field_id,
+                                term.position,
+                                CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?,
+                                snapshot_doc_freq,
+                            )
+                        }
+                        QueryLeaf::Delta(delta) => {
+                            let cursor = DeltaPostingCursor::new(
+                                delta,
+                                field.field_id,
+                                term.text.as_bytes(),
+                            )?;
+                            PhraseTerm::new(
+                                field.field_id,
+                                term.position,
+                                CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?,
+                                snapshot_doc_freq,
+                            )
+                        }
                     });
                 }
                 let bm25 = Bm25FieldSnapshot::new(stats)?;
                 let boost = inherited_boost * field.boost;
                 let scorer = match leaf {
-                    QueryLeaf::Sealed(segment) => PhraseScorer::new(
+                    QueryLeaf::Sealed(segment) => PhraseScorer::new_with_checkpoint(
                         phrase_terms,
                         owned_fieldnorms(segment, schema, field.field_id)?,
                         bm25,
                         boost,
+                        Some(Arc::clone(checkpoint)),
                     )?,
-                    QueryLeaf::Delta(delta) => PhraseScorer::new(
+                    QueryLeaf::Delta(delta) => PhraseScorer::new_with_checkpoint(
                         phrase_terms,
                         DeltaFieldNorms::new(delta, field.field_id),
                         bm25,
                         boost,
+                        Some(Arc::clone(checkpoint)),
                     )?,
                 };
                 clauses.push(ScorerClause::should(ReferenceScorer::phrase(scorer)));
@@ -5392,6 +5784,7 @@ fn lower_query_with_mode<'a>(
                     clause.occur,
                     lower_query_with_mode(
                         cx,
+                        checkpoint,
                         &clause.query,
                         inherited_boost,
                         leaf,
@@ -5414,6 +5807,7 @@ fn lower_query_with_mode<'a>(
             }
             lower_query_with_mode(
                 cx,
+                checkpoint,
                 query,
                 boost,
                 leaf,
@@ -5430,6 +5824,7 @@ fn lower_query_with_mode<'a>(
             upper,
         } => lower_leaf_range(
             cx,
+            checkpoint,
             leaf,
             snapshot,
             schema,
@@ -5440,6 +5835,7 @@ fn lower_query_with_mode<'a>(
             mode,
         ),
         Query::Glob { field_ids, pattern } => lower_leaf_glob(
+            checkpoint,
             leaf,
             snapshot,
             schema,
@@ -5450,6 +5846,7 @@ fn lower_query_with_mode<'a>(
             mode,
         ),
         Query::Set { field_id, values } => lower_leaf_set(
+            checkpoint,
             leaf,
             snapshot,
             schema,
@@ -5463,6 +5860,7 @@ fn lower_query_with_mode<'a>(
 
 fn lower_leaf_range<'a>(
     cx: &Cx,
+    checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
@@ -5485,8 +5883,11 @@ fn lower_leaf_range<'a>(
         } => lower_leaf_numeric_range(cx, leaf, schema, field_ord, lower, upper, boost, mode),
         FieldKind::Keyword | FieldKind::Text { .. } => {
             let (lower, upper) = string_query_bounds(field_ord, lower, upper)?;
-            let terms = snapshot_string_range_terms(snapshot, schema, field_ord, lower, upper)?;
-            lower_leaf_string_predicate(leaf, snapshot, schema, field_ord, terms, boost, mode)
+            let terms =
+                snapshot_string_range_terms(checkpoint, snapshot, schema, field_ord, lower, upper)?;
+            lower_leaf_string_predicate(
+                checkpoint, leaf, snapshot, schema, field_ord, terms, boost, mode,
+            )
         }
         FieldKind::I64 {
             indexed: false,
@@ -5725,6 +6126,7 @@ fn string_query_bound(
 }
 
 fn snapshot_string_range_terms(
+    checkpoint: &QueryCheckpointHandle<'_>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
     field_ord: u16,
@@ -5740,15 +6142,29 @@ fn snapshot_string_range_terms(
         let dictionary = open_dictionary(segment, schema)?;
         let limit = usize::try_from(dictionary.term_count())
             .map_err(|_| invalid_state("dictionary term count does not fit usize"))?;
-        for term in dictionary
-            .range_cursor(field_ord, lower, upper)?
-            .collect_bounded(limit)?
-        {
-            terms.insert(term.term);
+        let mut cursor = dictionary.range_cursor(field_ord, lower, upper)?;
+        let mut admitted_block = None;
+        while let Some(current) = cursor.current() {
+            let block = cursor.current_block_index();
+            if block != admitted_block {
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+                admitted_block = block;
+            }
+            if terms.len() >= limit {
+                return Err(TermDictionaryError::MaterializationLimitExceeded { limit }.into());
+            }
+            terms.insert(current.term.to_vec());
+            cursor.next()?;
         }
     }
     for delta in snapshot.delta_snapshots() {
-        for term in delta.segment().sorted_terms() {
+        let mut admitted_block = None;
+        for (term_index, term) in delta.segment().sorted_terms().iter().enumerate() {
+            let block = term_index / 16;
+            if Some(block) != admitted_block {
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+                admitted_block = Some(block);
+            }
             if term.field_ord() == field_ord
                 && term.live_doc_freq() != 0
                 && term_in_string_range(term.term(), &lower, &upper)
@@ -5832,6 +6248,7 @@ fn encode_live_delta_numeric(
 }
 
 fn lower_leaf_set<'a>(
+    checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
@@ -5852,6 +6269,7 @@ fn lower_leaf_set<'a>(
                 terms.insert(value.as_bytes().to_vec());
             }
             lower_leaf_string_predicate(
+                checkpoint,
                 leaf,
                 snapshot,
                 schema,
@@ -5981,6 +6399,7 @@ fn lower_numeric_field_set<'a>(
 }
 
 fn lower_leaf_string_predicate<'a>(
+    checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
@@ -5995,7 +6414,7 @@ fn lower_leaf_string_predicate<'a>(
         .map_err(|_| invalid_state("could not allocate string predicate clauses"))?;
     for term in terms {
         clauses.push(ScorerClause::should(lower_leaf_term(
-            leaf, snapshot, schema, field_ord, &term, 1.0, false,
+            leaf, snapshot, schema, field_ord, &term, 1.0, false, checkpoint,
         )?));
     }
     let matching = lower_boolean(clauses, QueryLoweringMode::Unscored)?;
@@ -6008,6 +6427,7 @@ fn lower_leaf_string_predicate<'a>(
 }
 
 fn lower_leaf_glob<'a>(
+    checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
@@ -6022,15 +6442,24 @@ fn lower_leaf_glob<'a>(
         .try_reserve_exact(field_ids.len())
         .map_err(|_| invalid_state("could not allocate glob field clauses"))?;
     for &field_ord in field_ids {
-        let terms = snapshot_glob_terms(snapshot, schema, field_ord, pattern, expansion_limit)?;
-        let field_scorer =
-            lower_leaf_string_predicate(leaf, snapshot, schema, field_ord, terms, boost, mode)?;
+        let terms = snapshot_glob_terms(
+            Some(checkpoint),
+            snapshot,
+            schema,
+            field_ord,
+            pattern,
+            expansion_limit,
+        )?;
+        let field_scorer = lower_leaf_string_predicate(
+            checkpoint, leaf, snapshot, schema, field_ord, terms, boost, mode,
+        )?;
         fields.push(ScorerClause::should(field_scorer));
     }
     lower_boolean(fields, mode)
 }
 
 fn snapshot_glob_terms(
+    checkpoint: Option<&QueryCheckpointHandle<'_>>,
     snapshot: &QuillSearchSnapshot,
     schema: SchemaDescriptor,
     field_ord: u16,
@@ -6041,12 +6470,51 @@ fn snapshot_glob_terms(
     let mut terms = BTreeSet::<Vec<u8>>::new();
     for segment in snapshot.keeper_snapshot().segments() {
         let dictionary = open_dictionary(segment, schema)?;
-        for term in dictionary.expand_glob(field_ord, pattern, expansion_limit)? {
-            insert_glob_term(&mut terms, field_ord, term.term, expansion_limit)?;
+        if !pattern.contains(&b'*') {
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+            }
+            if dictionary.lookup(field_ord, pattern)?.is_some() {
+                insert_glob_term(&mut terms, field_ord, pattern.to_vec(), expansion_limit)?;
+            }
+            continue;
+        }
+        let trailing_prefix = trailing_star_prefix(pattern);
+        let mut cursor = if let Some(prefix) = trailing_prefix {
+            dictionary.prefix_cursor(field_ord, prefix)?
+        } else {
+            dictionary.field_cursor(field_ord)?
+        };
+        let mut admitted_block = None;
+        while let Some(current) = cursor.current() {
+            let block = cursor.current_block_index();
+            if block != admitted_block {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+                }
+                admitted_block = block;
+            }
+            if trailing_prefix.is_some() || star_glob_matches(pattern, current.term) {
+                insert_glob_term(
+                    &mut terms,
+                    field_ord,
+                    current.term.to_vec(),
+                    expansion_limit,
+                )?;
+            }
+            cursor.next()?;
         }
     }
     for delta in snapshot.delta_snapshots() {
-        for term in delta.segment().sorted_terms() {
+        let mut admitted_block = None;
+        for (term_index, term) in delta.segment().sorted_terms().iter().enumerate() {
+            let block = term_index / 16;
+            if Some(block) != admitted_block {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+                }
+                admitted_block = Some(block);
+            }
             if term.field_ord() == field_ord
                 && term.live_doc_freq() != 0
                 && star_glob_matches(pattern, term.term())
@@ -6101,6 +6569,7 @@ fn collect_snippet_term_bytes(
                 if prefix_index == Some(index) {
                     let pattern = format!("{}*", term.text);
                     terms.extend(snapshot_glob_terms(
+                        None,
                         snapshot,
                         schema,
                         CONTENT_FIELD,
@@ -6134,6 +6603,7 @@ fn collect_snippet_term_bytes(
         }
         Query::Glob { field_ids, pattern } if field_ids.contains(&CONTENT_FIELD) => {
             terms.extend(snapshot_glob_terms(
+                None,
                 snapshot,
                 schema,
                 CONTENT_FIELD,
@@ -6180,23 +6650,68 @@ fn lower_leaf_term<'a>(
     term: &[u8],
     boost: f32,
     rank_pruning: bool,
+    checkpoint: &QueryCheckpointHandle<'a>,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let stats = composite_snapshot_field(snapshot, field_ord)?;
-    let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
+    let doc_freq = checkpointed_snapshot_doc_freq(checkpoint, snapshot, field_ord, term)?;
     match leaf {
         QueryLeaf::Sealed(segment) => {
+            checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
             let (cursor, fieldnorms) =
                 open_sealed_term_cursor(segment, schema, field_ord, term, rank_pruning)?;
+            let cursor = CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?;
             build_term_scorer(cursor, fieldnorms, stats, doc_freq, boost)
         }
-        QueryLeaf::Delta(delta) => build_term_scorer(
-            DeltaPostingCursor::new(delta, field_ord, term)?,
-            DeltaFieldNorms::new(delta, field_ord),
-            stats,
-            doc_freq,
-            boost,
-        ),
+        QueryLeaf::Delta(delta) => {
+            let cursor = DeltaPostingCursor::new(delta, field_ord, term)?;
+            let cursor = CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?;
+            build_term_scorer(
+                cursor,
+                DeltaFieldNorms::new(delta, field_ord),
+                stats,
+                doc_freq,
+                boost,
+            )
+        }
     }
+}
+
+fn checkpointed_snapshot_doc_freq(
+    checkpoint: &QueryCheckpointHandle<'_>,
+    snapshot: &QuillSearchSnapshot,
+    field_ord: u16,
+    term: &[u8],
+) -> Result<u64, QuillIndexError> {
+    if snapshot.bm25_field_stats(field_ord).is_none() {
+        return Err(invalid_state(format!(
+            "snapshot has no BM25 statistics for field {field_ord}"
+        )));
+    }
+    let mut total = 0_u64;
+    for segment in snapshot.keeper_snapshot().segments() {
+        let dictionary = open_dictionary(segment, snapshot.keeper_snapshot().schema())?;
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+        if let Some(found) = dictionary.lookup(field_ord, term)? {
+            total = total
+                .checked_add(u64::from(found.metadata.doc_freq))
+                .ok_or_else(|| invalid_state("snapshot document frequency overflow"))?;
+        }
+    }
+    for delta in snapshot.delta_snapshots() {
+        let delta_doc_freq = delta
+            .find_term(field_ord, term)
+            .map_or(0, |found| found.live_doc_freq());
+        total = total
+            .checked_add(u64::try_from(delta_doc_freq).map_err(|_| {
+                SnapshotError::CounterOverflow {
+                    counter: "live Delta document frequency",
+                }
+            })?)
+            .ok_or(SnapshotError::CounterOverflow {
+                counter: "snapshot document frequency",
+            })?;
+    }
+    Ok(total)
 }
 
 fn open_sealed_term_cursor<'a>(
@@ -6287,7 +6802,7 @@ fn lower_term(
 ) -> Result<ReferenceScorer<'static>, QuillIndexError> {
     let stats = snapshot_field(snapshot, field_ord)?;
     let doc_freq = snapshot_doc_freq(snapshot, schema, field_ord, term)?;
-    let cursor = open_owned_cursor(segment, schema, field_ord, term, false)?;
+    let cursor = open_owned_cursor(segment, schema, field_ord, term, false, None)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
     build_term_scorer(cursor, norms, stats, doc_freq, boost)
 }
@@ -6325,7 +6840,7 @@ fn lower_composite_sealed_term(
         invalid_state(format!("snapshot has no field statistics for {field_ord}"))
     })?;
     let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
-    let cursor = open_owned_cursor(segment, schema, field_ord, term, false)?;
+    let cursor = open_owned_cursor(segment, schema, field_ord, term, false, None)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
     build_term_scorer(cursor, norms, stats, doc_freq, boost)
 }
@@ -6394,15 +6909,41 @@ fn open_owned_cursor(
     field_ord: u16,
     term: &[u8],
     positioned: bool,
+    checkpoint: Option<&QueryCheckpointHandle<'_>>,
 ) -> Result<OwnedPostingCursor, QuillIndexError> {
     let dictionary = open_dictionary(segment, schema)?;
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+    }
     let Some(found) = dictionary.lookup(field_ord, term)? else {
         return Ok(OwnedPostingCursor::empty(segment.doc_count(), positioned));
     };
     let postings_section = required_section(segment, SectionKind::POSTINGS)?;
     let postings_bytes = span(postings_section, found.metadata.postings, "POSTINGS")?;
     let postings = PostingList::parse(postings_bytes, found.metadata.doc_freq)?;
-    let rows = postings.decode_all_bounded(found.metadata.doc_freq as usize)?;
+    let posting_count = usize::try_from(found.metadata.doc_freq)
+        .map_err(|_| invalid_state("posting count does not fit usize"))?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(posting_count).map_err(|_| {
+        PostingCodecError::MaterializationAllocation {
+            count: posting_count,
+        }
+    })?;
+    let mut posting_cursor = postings.cursor()?;
+    let mut admitted_block = None;
+    while let Some(posting) = posting_cursor.current() {
+        let block = posting_cursor
+            .block_index()
+            .ok_or_else(|| invalid_state("positioned posting cursor has no block index"))?;
+        if admitted_block != Some(block) {
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
+            }
+            admitted_block = Some(block);
+        }
+        rows.push(posting);
+        posting_cursor.next()?;
+    }
     let positions = if positioned {
         let position_span =
             found
@@ -6660,6 +7201,121 @@ mod tests {
         QuillConfig {
             deterministic_ingest: true,
             ..QuillConfig::default()
+        }
+    }
+
+    fn fuel_diagnostics(error: &QuillIndexError) -> (u64, u64, u64, u64, u64, u64) {
+        let QuillIndexError::QueryFuelExhausted {
+            budget,
+            consumed,
+            segments_touched,
+            dictionary_blocks,
+            posting_blocks,
+            position_docs,
+        } = error
+        else {
+            panic!("expected typed query fuel exhaustion, got {error:?}");
+        };
+        (
+            *budget,
+            *consumed,
+            *segments_touched,
+            *dictionary_blocks,
+            *posting_blocks,
+            *position_docs,
+        )
+    }
+
+    #[test]
+    fn query_fuel_checkpoint_diagnostics_and_cancellation_are_deterministic() {
+        fn exhaust_once(cx: &Cx) -> (u64, u64, u64, u64, u64, u64) {
+            let checkpoint = QueryCheckpoint::new(cx, "fuel_test", 4, 5);
+            checkpoint
+                .admit(QueryWorkKind::Segment, 1)
+                .expect("admit segment");
+            checkpoint
+                .admit(QueryWorkKind::DictionaryBlock, 1)
+                .expect("admit dictionary block");
+            checkpoint
+                .admit(QueryWorkKind::PostingBlock, 1)
+                .expect("admit posting block");
+            checkpoint
+                .admit(QueryWorkKind::PositionDocument, 1)
+                .expect("admit position document");
+            let error = checkpoint
+                .admit(QueryWorkKind::PostingBlock, 1)
+                .expect_err("fifth coarse unit must exhaust a four-unit budget");
+            fuel_diagnostics(&QuillIndexError::from(error))
+        }
+
+        let cx = Cx::for_testing();
+        let first = exhaust_once(&cx);
+        assert_eq!(exhaust_once(&cx), first);
+        assert_eq!(first, (4, 4, 1, 1, 1, 1));
+
+        for (schedule, kind) in [
+            QueryWorkKind::Segment,
+            QueryWorkKind::DictionaryBlock,
+            QueryWorkKind::PostingBlock,
+            QueryWorkKind::PositionDocument,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seed = 0xf0e1_0000_u64
+                .checked_add(u64::try_from(schedule).expect("checkpoint schedule fits u64"))
+                .expect("checkpoint schedule seed");
+            let mut lab = LabRuntime::new(LabConfig::new(seed).max_steps(10_000));
+            let region = lab.state.create_root_region(Budget::INFINITE);
+            let cancelled = Arc::new(Cx::for_testing());
+            let observed = Arc::new(AtomicBool::new(false));
+
+            let query_cx = Arc::clone(&cancelled);
+            let query_observed = Arc::clone(&observed);
+            let (query, _) = lab
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    while !query_cx.is_cancel_requested() {
+                        yield_now().await;
+                    }
+                    let checkpoint =
+                        QueryCheckpoint::new(query_cx.as_ref(), "checkpoint_test", 4, 5);
+                    assert!(matches!(
+                        checkpoint.admit(kind, 1),
+                        Err(ArgusError::QueryCancelled {
+                            phase: "checkpoint_test"
+                        })
+                    ));
+                    query_observed.store(true, Ordering::SeqCst);
+                })
+                .expect("create checkpoint query task");
+            let cancel_cx = Arc::clone(&cancelled);
+            let (cancel, _) = lab
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    yield_now().await;
+                    cancel_cx.set_cancel_requested(true);
+                })
+                .expect("create checkpoint cancellation task");
+
+            lab.scheduler.lock().schedule(query, 0);
+            lab.scheduler.lock().schedule(cancel, 0);
+            let report = lab.run_until_quiescent_with_report();
+            assert!(
+                observed.load(Ordering::SeqCst),
+                "checkpoint kind {kind:?} did not observe cancellation"
+            );
+            assert!(report.quiescent, "checkpoint schedule did not quiesce");
+            assert!(
+                report.oracle_report.all_passed(),
+                "checkpoint schedule oracle failed: {:?}",
+                report.oracle_report
+            );
+            assert!(
+                report.invariant_violations.is_empty(),
+                "checkpoint schedule invariants failed: {:?}",
+                report.invariant_violations
+            );
         }
     }
 
@@ -7283,10 +7939,16 @@ mod tests {
                 .collect_bounded(limit)
                 .expect("materialize Q1-OB2a terms");
             for term in terms {
-                let postings =
-                    open_owned_cursor(segment, DEFAULT_SCHEMA, term.field_ord, &term.term, false)
-                        .expect("decode Q1-OB2a postings")
-                        .postings;
+                let postings = open_owned_cursor(
+                    segment,
+                    DEFAULT_SCHEMA,
+                    term.field_ord,
+                    &term.term,
+                    false,
+                    None,
+                )
+                .expect("decode Q1-OB2a postings")
+                .postings;
                 let entry = decoded.entry((term.field_ord, term.term)).or_default();
                 entry.0 = entry
                     .0
@@ -7601,9 +8263,30 @@ mod tests {
         let _ = canonicalize_query(&mut parsed.query);
         let snapshot = index.search_snapshot();
         let mut collector = DocSetCollector::new();
+        let work_upper_bound = query_work_upper_bound(
+            &parsed.query,
+            &snapshot,
+            index.reader.config.glob_expansion_limit,
+        )
+        .expect("bound sealed docid work");
+        let checkpoint = QueryCheckpoint::new(
+            cx,
+            "collect_docids_test",
+            index.reader.config.query_fuel_budget,
+            work_upper_bound,
+        );
+        let metering = checkpoint.metering();
+        let checkpoint: QueryCheckpointHandle<'_> = checkpoint;
         index
             .reader
-            .collect_docids_sealed(cx, &mut collector, &parsed.query, &snapshot, fan_out)
+            .collect_docids_sealed(
+                cx,
+                &checkpoint,
+                &mut collector,
+                &parsed.query,
+                &snapshot,
+                fan_out && !metering,
+            )
             .expect("sealed docid collection");
         collector.finish()
     }
@@ -11274,8 +11957,11 @@ mod tests {
                 0,
                 "exact counting must not trigger BLOCKMAX validation"
             );
+            let direct_checkpoint: QueryCheckpointHandle<'_> =
+                QueryCheckpoint::new(&cx, "lower_query_test", u64::MAX, 0);
             let mut direct = lower_query(
                 &cx,
+                &direct_checkpoint,
                 &parsed.query,
                 1.0,
                 QueryLeaf::Sealed(segment),
@@ -12317,6 +13003,77 @@ mod tests {
                 source_path.exists(),
                 "compaction does not delete old files inline"
             );
+        });
+    }
+
+    #[test]
+    fn adversarial_glob_and_phrase_queries_exhaust_fuel_deterministically() {
+        run_with_cx(|cx| async move {
+            let queries = [
+                (
+                    4,
+                    (4, 4, 1, 3, 0, 0),
+                    Query::Glob {
+                        field_ids: vec![CONTENT_FIELD],
+                        pattern: "rust*".to_owned(),
+                    },
+                ),
+                (
+                    7,
+                    (7, 7, 1, 4, 2, 0),
+                    Query::Phrase {
+                        fields: vec![crate::query::QueryField::new(CONTENT_FIELD, 1.0)],
+                        terms: vec![
+                            crate::query::PositionedTerm::new(0, "rust"),
+                            crate::query::PositionedTerm::new(1, "ownership"),
+                        ],
+                        slop: 0,
+                        prefix: false,
+                    },
+                ),
+            ];
+            for (budget, expected, query) in &queries {
+                let limited = QuillIndex::in_memory(QuillConfig {
+                    query_fuel_budget: *budget,
+                    deterministic_ingest: true,
+                    ..QuillConfig::default()
+                })
+                .expect("memory index with bounded query fuel");
+                limited
+                    .index_documents(&cx, &fixture_documents())
+                    .await
+                    .expect("accumulate fixture");
+                limited.commit(&cx).await.expect("publish fixture");
+                let limited_snapshot = limited.search_snapshot();
+                let first = limited
+                    .execute_ranked_query(&cx, query, &limited_snapshot, 10, 0, true, Vec::new())
+                    .expect_err("adversarial query must exhaust its boundary budget");
+                let second = limited
+                    .execute_ranked_query(&cx, query, &limited_snapshot, 10, 0, true, Vec::new())
+                    .expect_err("repeated adversarial query must exhaust identically");
+                let first = fuel_diagnostics(&first);
+                assert_eq!(fuel_diagnostics(&second), first, "query={query:?}");
+                assert_eq!(first, *expected, "query={query:?}");
+            }
+
+            let default = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            default
+                .index_documents(&cx, &fixture_documents())
+                .await
+                .expect("accumulate default-budget fixture");
+            default
+                .commit(&cx)
+                .await
+                .expect("publish default-budget fixture");
+            let default_snapshot = default.search_snapshot();
+            for (_, _, query) in &queries {
+                default
+                    .execute_ranked_query(&cx, query, &default_snapshot, 10, 0, true, Vec::new())
+                    .expect("default fuel budget must cover fixture corpus");
+                default
+                    .execute_docid_query(&cx, query, &default_snapshot)
+                    .expect("default fuel budget must cover fixture docset collection");
+            }
         });
     }
 
