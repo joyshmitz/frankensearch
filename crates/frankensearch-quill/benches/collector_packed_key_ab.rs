@@ -3,7 +3,7 @@
 //! each heap comparison to one native integer compare (`bd-y1ab`).
 //!
 //! Sibling of the KEPT FSVI int8 pass-1 packed-selection-key win (bd-b5wl,
-//! PERF_LEDGER 2026-07-10). The quill `TopDocsCollector` calls `record_live`
+//! `PERF_LEDGER` 2026-07-10). The quill `TopDocsCollector` calls `record_live`
 //! per matched live doc — the query hot path — and each push/replace does a
 //! float `total_cmp` then a conditional docid tiebreak. The packed arm folds
 //! score and docid into one `u64` so the whole comparison is a single integer
@@ -90,7 +90,7 @@ fn collect_current(stream: &[(u32, f32)], retained: usize) -> Vec<(u32, u32)> {
 
 /// Monotonic f32 -> u32 bijection: ascending u32 order == ascending f32 order
 /// for all finite values (and signed zeros).
-#[inline(always)]
+#[inline]
 fn sortable(score: f32) -> u32 {
     let bits = score.to_bits();
     if bits & 0x8000_0000 != 0 {
@@ -101,7 +101,7 @@ fn sortable(score: f32) -> u32 {
 }
 
 /// Inverse of [`sortable`].
-#[inline(always)]
+#[inline]
 fn from_sortable(s: u32) -> f32 {
     if s & 0x8000_0000 != 0 {
         f32::from_bits(s & 0x7fff_ffff)
@@ -112,7 +112,7 @@ fn from_sortable(s: u32) -> f32 {
 
 /// Badness key: greatest for the worst entry (lowest score; highest docid on a
 /// tie), so a max-heap keeps the best `retained` entries.
-#[inline(always)]
+#[inline]
 fn packed_key(global_docid: u32, score: f32) -> u64 {
     (u64::from(!sortable(score)) << 32) | u64::from(global_docid)
 }
@@ -162,7 +162,7 @@ fn make_stream(n: usize, buckets: u32, signed: bool, seed: u64) -> Vec<(u32, f32
             if signed && xorshift(&mut state) % 5 == 0 {
                 score = -score;
             }
-            (index as u32, score)
+            (u32::try_from(index).unwrap_or(u32::MAX), score)
         })
         .collect()
 }
@@ -187,7 +187,12 @@ fn main() {
     ];
 
     for &(label, n, buckets, signed, retained) in shapes {
-        let stream = make_stream(n, buckets, signed, 0x01ab_babe_0000_0001_u64.wrapping_add(n as u64));
+        let stream = make_stream(
+            n,
+            buckets,
+            signed,
+            0x01ab_babe_0000_0001_u64.wrapping_add(n as u64),
+        );
         let current = collect_current(&stream, retained);
         let packed = collect_packed(&stream, retained);
         assert_eq!(

@@ -2,7 +2,7 @@
 //!
 //! [`neighbor_smooth`] is a label-propagation pass that rescues below-threshold relevants
 //! sitting in confident clusters — measured **+0.0052…+0.0114 hybrid nDCG@10 on recall-bound
-//! BEIR corpora** (docs/NEGATIVE_EVIDENCE.md; pool-restricted deployable form). This bench
+//! BEIR corpora** (`docs/NEGATIVE_EVIDENCE.md`; pool-restricted deployable form). This bench
 //! confirms it is nearly free atop an existing k-NN neighbor graph: the LEGACY ORIGINAL is
 //! the pipeline with no smoothing (identity, α=0 — a plain pool clone); the candidate is the
 //! full diffusion pass (α=0.3, M=10) and its reciprocal-kNN refinement. Cost is O(pool · M).
@@ -36,7 +36,7 @@ const PAIR_BATCH: u32 = 16;
 fn build(pool: usize, m: usize) -> (Vec<VectorHit>, DocumentGraph) {
     let hits: Vec<VectorHit> = (0..pool)
         .map(|i| VectorHit {
-            index: i as u32,
+            index: u32::try_from(i).expect("benchmark pool indices fit in u32"),
             score: 1.0 / ((i as f32) + 1.0), // heavy-tailed like real cosine pools
             doc_id: format!("doc{i:06}").into(),
         })

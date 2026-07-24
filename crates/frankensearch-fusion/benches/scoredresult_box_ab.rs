@@ -13,7 +13,7 @@
 //! common None case, and the `Box` is only allocated when `explain=true` (rare).
 //! Bit-identical: `Box<HitExplanation>` derefs to `HitExplanation`. This measures
 //! the materialization delta (N-vec build) inline vs boxed, both with explanation
-//! = None (the limit_all common case).
+//! = None (the `limit_all` common case).
 //!
 //! Run with:
 //! ```bash
@@ -61,7 +61,7 @@ struct SrBoxed {
     metadata: Option<Arc<serde_json::Value>>,
 }
 
-/// Borrowed winner shape (Copy fields + &str doc_id), like FusedHitScratch.
+/// Borrowed winner shape (`Copy` fields + `&str` `doc_id`), like `FusedHitScratch`.
 #[derive(Clone, Copy)]
 struct Winner<'a> {
     doc_id: &'a str,
@@ -118,7 +118,7 @@ fn bench(c: &mut Criterion) {
             .map(|(i, s)| Winner {
                 doc_id: s.as_str(),
                 score: 1.0 - i as f32 * 1e-6,
-                index: i as u32,
+                index: u32::try_from(i).expect("benchmark index fits u32"),
                 lexical_score: 1.0,
             })
             .collect();

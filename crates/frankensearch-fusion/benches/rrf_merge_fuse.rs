@@ -1,7 +1,7 @@
 //! Full `rrf_fuse` head-to-head: the shipped map version (`rrf_fuse_with_graph`,
 //! N-entry value hashmap → random-order collect → from-scratch sort) vs the
 //! merge-structured version (`rrf_fuse_with_graph_merge`, small contribution maps
-//! + semantic-ordered emission → near-sorted adaptive sort). Both are verified
+//! plus semantic-ordered emission → near-sorted adaptive sort). Both are verified
 //! byte-identical by the `merge_matches_map_fusion` unit test.
 //!
 //! Models the `limit_all` shape (the gap row): all-N semantic candidates in
@@ -42,7 +42,7 @@ fn lexical(doc_id: String, score: f32) -> ScoredResult {
 fn build(n: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
     let semantic: Vec<VectorHit> = (0..n)
         .map(|i| VectorHit {
-            index: i as u32,
+            index: u32::try_from(i).expect("benchmark index fits u32"),
             #[allow(clippy::cast_precision_loss)]
             score: 1.0 - (i as f32) / (n as f32), // strictly descending
             doc_id: format!("doc-{i:06}").into(),

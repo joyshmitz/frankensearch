@@ -1,6 +1,6 @@
 //! Federated `appeared_in` representation A/B: `BTreeSet<String>` (current) vs a
 //! shard-name-interned integer bitset (the untested route-next from the reverted
-//! key-clone lever — NEGATIVE_EVIDENCE 2026-06-27, "attack the BTreeSet<String>
+//! key-clone lever — `NEGATIVE_EVIDENCE` 2026-06-27, "attack the `BTreeSet<String>`
 //! churn ... dedup shard names to a small interned id set").
 //!
 //! `accumulate_doc` runs once per (shard, hit) — thousands of times — and each
@@ -9,9 +9,9 @@
 //! interns each distinct shard name to its sorted rank (so ascending id order ==
 //! lexicographic name order) and does `appeared_in |= 1 << id` — O(1), no alloc,
 //! natural dedup. **Both arms materialize the same sorted `Vec<String>`
-//! `appeared_in` at output** (faithful to `into_ranked_hits`, which the SipHash
+//! `appeared_in` at output** (faithful to `into_ranked_hits`, which the `SipHash`
 //! bench omitted), so the measured delta is honest: the bitset relocates the
-//! output `String` allocs but eliminates the per-accumulate BTree churn.
+//! output `String` allocs but eliminates the per-accumulate `BTree` churn.
 //!
 //! Bit-identity (full output, not just len) is asserted before timing.
 //!
@@ -30,6 +30,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 const K: f64 = 60.0;
 
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 fn rank_contribution(rank: usize) -> f32 {
     (1.0 / (K + rank as f64 + 1.0)) as f32
 }
@@ -45,7 +46,7 @@ struct Shard {
     hits: Vec<Hit>,
 }
 
-/// One output row: (doc_id, fused_score, sorted appeared_in names). Used to
+/// One output row: (`doc_id`, `fused_score`, sorted `appeared_in` names). Used to
 /// assert both arms produce byte-identical results.
 type Row = (String, f32, Vec<String>);
 
@@ -67,7 +68,7 @@ fn accumulate_set(
     rank: usize,
     contribution: f32,
 ) {
-    let entry = docs.entry(hit.doc_id.to_string()).or_insert_with(|| {
+    let entry = docs.entry(hit.doc_id.clone()).or_insert_with(|| {
         let mut template = hit.clone();
         template.score = 0.0;
         AggDocSet {
@@ -124,7 +125,7 @@ fn accumulate_bits(
     rank: usize,
     contribution: f32,
 ) {
-    let entry = docs.entry(hit.doc_id.to_string()).or_insert_with(|| {
+    let entry = docs.entry(hit.doc_id.clone()).or_insert_with(|| {
         let mut template = hit.clone();
         template.score = 0.0;
         AggDocBits {
@@ -156,7 +157,12 @@ fn fuse_bits(shards: &[Shard]) -> Vec<Row> {
     let name_to_id: AHashMap<&str, u32> = names
         .iter()
         .enumerate()
-        .map(|(i, &n)| (n, i as u32))
+        .map(|(i, &n)| {
+            (
+                n,
+                u32::try_from(i).expect("at most 64 interned shard names"),
+            )
+        })
         .collect();
 
     let mut docs: AHashMap<String, AggDocBits, RandomState> =
@@ -177,12 +183,14 @@ fn fuse_bits(shards: &[Shard]) -> Vec<Row> {
     let mut out: Vec<Row> = docs
         .drain()
         .map(|(id, agg)| {
-            let mut appeared: Vec<String> =
-                Vec::with_capacity(agg.appeared_in.count_ones() as usize);
+            let capacity = usize::try_from(agg.appeared_in.count_ones())
+                .expect("u32 population count fits usize");
+            let mut appeared: Vec<String> = Vec::with_capacity(capacity);
             let mut bits = agg.appeared_in;
             while bits != 0 {
                 let id_bit = bits.trailing_zeros();
-                appeared.push(names[id_bit as usize].to_owned());
+                let id_index = usize::try_from(id_bit).expect("u32 bit index fits usize");
+                appeared.push(names[id_index].to_owned());
                 bits &= bits - 1;
             }
             (id, agg.fused_score, appeared)
@@ -211,7 +219,7 @@ fn accumulate_vec(
     rank: usize,
     contribution: f32,
 ) {
-    let entry = docs.entry(hit.doc_id.to_string()).or_insert_with(|| {
+    let entry = docs.entry(hit.doc_id.clone()).or_insert_with(|| {
         let mut template = hit.clone();
         template.score = 0.0;
         AggDocVec {
@@ -240,7 +248,7 @@ fn fuse_vec(shards: &[Shard]) -> Vec<Row> {
     let name_to_id: AHashMap<&str, u32> = names
         .iter()
         .enumerate()
-        .map(|(i, &n)| (n, i as u32))
+        .map(|(i, &n)| (n, u32::try_from(i).expect("interned shard count fits u32")))
         .collect();
 
     let mut docs: AHashMap<String, AggDocVec, RandomState> =
@@ -266,7 +274,10 @@ fn fuse_vec(shards: &[Shard]) -> Vec<Row> {
             let appeared: Vec<String> = agg
                 .appeared_in
                 .iter()
-                .map(|&sid| names[sid as usize].to_owned())
+                .map(|&sid| {
+                    let index = usize::try_from(sid).expect("u32 shard id fits usize");
+                    names[index].to_owned()
+                })
                 .collect();
             (id, agg.fused_score, appeared)
         })
@@ -282,7 +293,7 @@ fn make_shards(shards: usize, per_shard: usize, universe: usize) -> Vec<Shard> {
                 .map(|i| {
                     let id = (s * (per_shard / 2) + i) % universe;
                     Hit {
-                        doc_id: format!("doc_{id:07}").into(),
+                        doc_id: format!("doc_{id:07}"),
                         score: 1.0 - (i as f32) / (per_shard as f32),
                     }
                 })

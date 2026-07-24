@@ -59,7 +59,7 @@ fn old_match(query_tokens: &BTreeSet<String>, value: &str) -> Option<String> {
 
 #[inline]
 fn consider(best: &mut Option<String>, current: &str, query_tokens: &BTreeSet<String>) {
-    if query_tokens.contains(current) && best.as_deref().map_or(true, |b| current < b) {
+    if query_tokens.contains(current) && best.as_deref().is_none_or(|b| current < b) {
         *best = Some(current.to_owned());
     }
 }

@@ -53,7 +53,7 @@ fn cmp_current(a: &Scratch, b: &Scratch) -> Ordering {
         .then_with(|| a.doc_id.cmp(&b.doc_id))
 }
 
-/// Returns (map keyed by doc_id, semantic-ordered doc_id list). Semantic order =
+/// Returns (map keyed by `doc_id`, semantic-ordered `doc_id` list). Semantic order =
 /// ascending `semantic_rank` = fused order for the vector-only majority.
 fn build(n: usize) -> (AHashMap<String, Scratch>, Vec<String>) {
     let mut map = AHashMap::with_capacity(n);
@@ -77,7 +77,7 @@ fn build(n: usize) -> (AHashMap<String, Scratch>, Vec<String>) {
                 rrf_score,
                 lexical_rank: in_both.then_some(i),
                 semantic_rank: Some(rank),
-                semantic_index: Some(i as u32),
+                semantic_index: Some(u32::try_from(i).expect("benchmark indices fit in u32")),
                 graph_rank: None,
                 lexical_score,
                 semantic_score: Some(0.5),
@@ -91,6 +91,10 @@ fn build(n: usize) -> (AHashMap<String, Scratch>, Vec<String>) {
     (map, sem.into_iter().map(|(_, d)| d).collect())
 }
 
+#[allow(
+    clippy::many_single_char_names,
+    reason = "the benchmark uses compact conventional names for sort arms and rows"
+)]
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("rrf_sort_order");
     group.warm_up_time(Duration::from_millis(500));

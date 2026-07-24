@@ -2,7 +2,7 @@
 //!
 //! [`apply_hubness_penalty`] demotes high-hub docs before fusion — measured **all-positive
 //! +0.0033 mean hybrid nDCG@10 (β=0.2, leakage-free) across 4 BEIR corpora**, with genuine
-//! dense-tier gains on stance/citation corpora (docs/NEGATIVE_EVIDENCE.md). The query-time
+//! dense-tier gains on stance/citation corpora (`docs/NEGATIVE_EVIDENCE.md`). The query-time
 //! kernel is a trivial O(pool) subtract; the LEGACY ORIGINAL is the pipeline with no correction
 //! (identity, β=0 — a plain pool clone). We also bench the offline `compute_query_hubness`
 //! builder (amortized: recomputed periodically from the query log, not per query).
@@ -25,7 +25,7 @@ use frankensearch_fusion::{HubnessConfig, apply_hubness_penalty, compute_query_h
 fn build_pool(pool: usize) -> (Vec<VectorHit>, Vec<f32>) {
     let hits: Vec<VectorHit> = (0..pool)
         .map(|i| VectorHit {
-            index: i as u32,
+            index: u32::try_from(i).expect("benchmark index fits u32"),
             score: 1.0 / ((i as f32) + 1.0),
             doc_id: format!("doc{i:06}").into(),
         })
@@ -41,10 +41,15 @@ fn build_pool(pool: usize) -> (Vec<VectorHit>, Vec<f32>) {
 fn vecs(n: usize, dim: usize, seed: u32) -> Vec<Vec<f32>> {
     (0..n)
         .map(|i| {
+            let i_u32 = u32::try_from(i).expect("benchmark vector index fits u32");
             let mut v: Vec<f32> = (0..dim)
                 .map(|j| {
-                    (((i as u32 * 2_654_435_761 + j as u32 * 40_503 + seed) % 997) as f32) / 997.0
-                        - 0.5
+                    let j_u32 = u32::try_from(j).expect("benchmark dimension index fits u32");
+                    let mixed = i_u32
+                        .wrapping_mul(2_654_435_761)
+                        .wrapping_add(j_u32.wrapping_mul(40_503))
+                        .wrapping_add(seed);
+                    ((mixed % 997) as f32) / 997.0 - 0.5
                 })
                 .collect();
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
@@ -56,6 +61,10 @@ fn vecs(n: usize, dim: usize, seed: u32) -> Vec<Vec<f32>> {
         .collect()
 }
 
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "Criterion benchmark groups intentionally span their complete arm sets"
+)]
 fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("hubness_penalty");
     g.sample_size(50);

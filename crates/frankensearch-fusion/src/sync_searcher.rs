@@ -117,8 +117,8 @@ pub fn bench_nqc_cv_ilp(lexical: &[ScoredResult]) -> f32 {
     const NUMERIC_EPSILON: f32 = 1e-10;
     let (mut s0, mut s1, mut s2, mut s3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
     let (mut q0, mut q1, mut q2, mut q3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-    let mut chunks = lexical.chunks_exact(4);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = lexical.as_chunks::<4>();
+    for chunk in chunks {
         let a = f64::from(chunk[0].score);
         let b = f64::from(chunk[1].score);
         let c = f64::from(chunk[2].score);
@@ -134,14 +134,12 @@ pub fn bench_nqc_cv_ilp(lexical: &[ScoredResult]) -> f32 {
     }
     let mut sum = s0 + s1 + s2 + s3;
     let mut sum_sq = q0 + q1 + q2 + q3;
-    let remainder = chunks.remainder();
-    let mut count = (lexical.len() - remainder.len()) as u32;
     for hit in remainder {
         let v = f64::from(hit.score);
         sum += v;
         sum_sq += v * v;
-        count += 1;
     }
+    let count = u32::try_from(lexical.len()).unwrap_or(u32::MAX);
     if count == 0 {
         return 0.0;
     }
@@ -150,7 +148,8 @@ pub fn bench_nqc_cv_ilp(lexical: &[ScoredResult]) -> f32 {
     if mean <= f64::from(NUMERIC_EPSILON) {
         return 0.0;
     }
-    let variance = (sum_sq / n - mean * mean).max(0.0);
+    let second_moment = sum_sq / n;
+    let variance = (second_moment - mean * mean).max(0.0);
     #[allow(clippy::cast_possible_truncation)]
     let cv = (variance.sqrt() / mean) as f32;
     cv

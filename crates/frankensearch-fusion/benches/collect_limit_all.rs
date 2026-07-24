@@ -2,7 +2,7 @@
 //!
 //! `SyncTwoTierSearcher::search_collect` returns only `(final_results, metrics)`
 //! and throws away `outcome.phases` — yet `search_internal` used to build those
-//! phases by cloning the full `Vec<ScoredResult>` (N owned doc_ids each) once per
+//! phases by cloning the full `Vec<ScoredResult>` (N owned `doc_id`s each) once per
 //! phase (Initial + Refined). At `limit_all` (k = N) that is up to 2·N wasted
 //! short-`String` allocations per query. `search_collect` now passes
 //! `want_phases = false` and skips them; only `search_iter` (the streaming API)
@@ -10,9 +10,11 @@
 //!
 //! This measures the exact end-to-end delta using only public APIs on the same
 //! searcher over the same queries:
-//!   - `collect` (new): `search_collect` — no phase clones.
-//!   - `iter`    (old): `search_iter` — builds both phases (the pre-change
-//!                       `search_collect` behavior); drained so nothing is elided.
+//!
+//! - `collect` (new): `search_collect` — no phase clones.
+//! - `iter` (old): `search_iter` — builds both phases (the pre-change
+//!   `search_collect` behavior); drained so nothing is elided.
+//!
 //! Both run identical search work (fast scan → quality rescore → blend), so the
 //! ratio is purely the phase-clone cost. `final_results` are unchanged.
 //!
@@ -230,7 +232,10 @@ fn bench_refined_rrf_callsite(c: &mut Criterion) {
     );
     for (legacy_hit, unique_hit) in legacy.iter().zip(&unique) {
         assert_eq!(legacy_hit.doc_id, unique_hit.doc_id);
-        assert_eq!(legacy_hit.rrf_score, unique_hit.rrf_score);
+        assert_eq!(
+            legacy_hit.rrf_score.to_bits(),
+            unique_hit.rrf_score.to_bits()
+        );
         assert_eq!(legacy_hit.lexical_rank, unique_hit.lexical_rank);
         assert_eq!(legacy_hit.semantic_rank, unique_hit.semantic_rank);
         assert_eq!(legacy_hit.semantic_index, unique_hit.semantic_index);

@@ -1,12 +1,12 @@
-//! RRF final-sort comparator probe: the shipped `cmp_for_ranking`
+//! `RRF` final-sort comparator probe: the shipped `cmp_for_ranking`
 //! (`f64::total_cmp` + `f32::total_cmp` + `str::cmp` per comparison, evaluated
 //! O(N log N)×) vs a comparator over **precomputed** monotonic integer keys
-//! computed O(N)× — `total_cmp`-equivalent i64/i32 keys for the score levels and
-//! a big-endian u64 doc_id prefix that resolves the pervasive String tiebreak in
+//! computed O(N)× — `total_cmp`-equivalent `i64`/`i32` keys for the score levels and
+//! a big-endian `u64` `doc_id` prefix that resolves the pervasive `String` tiebreak in
 //! one integer compare (full `str::cmp` fallback only on prefix-tie).
 //!
-//! This is the largest single slice of the `limit_all` gap (the RRF full sort,
-//! ~22% of limit_all, `rrf.rs:341`). The radix refutation (NEGATIVE_EVIDENCE
+//! This is the largest single slice of the `limit_all` gap (the `RRF` full sort,
+//! ~22% of `limit_all`, `rrf.rs:341`). The radix refutation (`NEGATIVE_EVIDENCE`
 //! 2026-06-29) rejected *replacing the sort algorithm*; this keeps
 //! `sort_unstable_by` and only makes the comparator cheaper — bit-identical order
 //! (asserted before timing).
@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-/// Mirrors the private FusedHitScratch shape (current production: no keys).
+/// Mirrors the private `FusedHitScratch` shape (current production: no keys).
 #[derive(Clone)]
 #[allow(dead_code)]
 struct Scratch {
@@ -39,7 +39,7 @@ struct Scratch {
     in_both_sources: bool,
 }
 
-/// Proposed shape: FusedHitScratch + 3 precomputed sort keys (bigger struct).
+/// Proposed shape: `FusedHitScratch` + 3 precomputed sort keys (bigger struct).
 #[derive(Clone)]
 #[allow(dead_code)]
 struct ScratchKeyed {
@@ -58,18 +58,18 @@ struct ScratchKeyed {
     prefix: u64,
 }
 
-/// `total_cmp`-equivalent ascending i64 key for an f64 (the exact transform
+/// `total_cmp`-equivalent ascending `i64` key for an `f64` (the exact transform
 /// `f64::total_cmp` applies internally).
 #[inline]
 fn key_f64(x: f64) -> i64 {
-    let b = x.to_bits() as i64;
-    b ^ (((b >> 63) as u64 >> 1) as i64)
+    let b = x.to_bits().cast_signed();
+    b ^ ((b >> 63).cast_unsigned() >> 1).cast_signed()
 }
 
 #[inline]
 fn key_f32(x: f32) -> i32 {
-    let b = x.to_bits() as i32;
-    b ^ (((b >> 31) as u32 >> 1) as i32)
+    let b = x.to_bits().cast_signed();
+    b ^ ((b >> 31).cast_unsigned() >> 1).cast_signed()
 }
 
 /// First 8 bytes of `doc_id`, big-endian, zero-padded — orders identically to
@@ -83,8 +83,8 @@ fn doc_prefix(s: &str) -> u64 {
     u64::from_be_bytes(buf)
 }
 
-/// The shipped comparator (replicated): RRF desc, in_both desc, lexical desc,
-/// doc_id asc.
+/// The shipped comparator (replicated): `RRF` desc, `in_both` desc, lexical desc,
+/// `doc_id` asc.
 fn cmp_current(a: &Scratch, b: &Scratch) -> Ordering {
     b.rrf_score
         .total_cmp(&a.rrf_score)
@@ -97,7 +97,7 @@ fn cmp_current(a: &Scratch, b: &Scratch) -> Ordering {
         .then_with(|| a.doc_id.cmp(&b.doc_id))
 }
 
-/// Precomputed-key comparator: integer compares for the score levels + doc_id
+/// Precomputed-key comparator: integer compares for the score levels + `doc_id`
 /// prefix, full `str::cmp` only on prefix-tie. Bit-identical order.
 fn cmp_fast(a: &ScratchKeyed, b: &ScratchKeyed) -> Ordering {
     b.rrf_key
@@ -123,11 +123,11 @@ fn build(n: usize) -> Vec<Scratch> {
                 None
             };
             Scratch {
-                doc_id: format!("doc-{i:06}").into(),
+                doc_id: format!("doc-{i:06}"),
                 rrf_score,
                 lexical_rank: in_both.then_some(i),
                 semantic_rank: Some(rank),
-                semantic_index: Some(i as u32),
+                semantic_index: Some(u32::try_from(i).expect("benchmark index fits u32")),
                 graph_rank: None,
                 lexical_score,
                 semantic_score: Some(0.5),

@@ -1,13 +1,15 @@
 //! `fuse_expanded_payloads` accumulation A/B: the cross-query RRF fusion over
-//! query-expansion variants (runtime.rs) builds FIVE maps keyed by doc path and
+//! query-expansion variants (`runtime.rs`) builds FIVE maps keyed by doc path and
 //! calls `.entry(hit.path.clone())` per hit across every payload — up to 5 owned
 //! `String` allocations per hit, and the fusion case (a doc in ≥2 variants) is
 //! exactly when the key already exists so the clone is pure waste. This bench
 //! replicates that accumulation loop (+ the final score sort and top-`limit`
 //! output build) three ways to attribute the two independent levers:
-//!   - `clone_sip`    : current — `HashMap<String,_>` (SipHash), `.entry(clone)`
-//!   - `borrow_sip`   : `HashMap<&str,_>` (SipHash), `.entry(&str)` — clone elided
-//!   - `borrow_ahash` : `AHashMap<&str,_>` (ahash), `.entry(&str)` — clone + hasher
+//!
+//! - `clone_sip`: current — `HashMap<String,_>` (`SipHash`), `.entry(clone)`
+//! - `borrow_sip`: `HashMap<&str,_>` (`SipHash`), `.entry(&str)` — clone elided
+//! - `borrow_ahash`: `AHashMap<&str,_>` (ahash), `.entry(&str)` — clone + hasher
+//!
 //! All three produce the identical ranked output (asserted).
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -109,7 +111,7 @@ fn fuse_clone_sip(payloads: &[Payload]) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// Borrow `&str` keys (payloads outlive the fusion), std SipHash.
+/// Borrow `&str` keys (payloads outlive the fusion), standard `SipHash`.
 fn fuse_borrow_sip(payloads: &[Payload]) -> Vec<(String, f64)> {
     let mut scores: HashMap<&str, f64> = HashMap::new();
     let mut snippets: HashMap<&str, &str> = HashMap::new();
@@ -211,6 +213,10 @@ fn fuse_borrow_ahash(payloads: &[Payload]) -> Vec<(String, f64)> {
         .collect()
 }
 
+#[allow(
+    clippy::many_single_char_names,
+    reason = "the benchmark uses compact conventional names for arms and dimensions"
+)]
 fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("expand_fuse");
     // (variants P, hits-per-variant H, distinct-pool D)

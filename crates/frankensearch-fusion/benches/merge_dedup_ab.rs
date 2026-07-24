@@ -1,10 +1,10 @@
 //! `merge_with_lexical_tail` dedup A/B: the default fsfs result-assembly merge
-//! (runtime.rs) builds a `HashSet<&str>` of the fused head's doc_ids, then probes
-//! it once per lexical-tail candidate (O(tail), which is the FULL lexical result
+//! (`runtime.rs`) builds a `HashSet<&str>` of the fused head's `doc_id`s, then probes
+//! it once per lexical-tail candidate (`O(tail)`, which is the FULL lexical result
 //! set — large on big corpora) to skip duplicates, cloning each kept candidate
-//! into the merged output. The set is std SipHash; siblings use `ahash`. Keys are
+//! into the merged output. The set is standard `SipHash`; siblings use `ahash`. Keys are
 //! already borrowed (`&str`), so the only lever here is the hasher — but the
-//! per-candidate `FusedCandidate` clone (a `String` doc_id alloc) runs in BOTH
+//! per-candidate `FusedCandidate` clone (a `String` `doc_id` alloc) runs in BOTH
 //! arms and may dominate, so this bench measures the REAL merge shape to decide
 //! honestly whether the hasher swap survives end-to-end (not just the isolated
 //! set op). Identical merged output asserted across arms.
@@ -30,6 +30,10 @@ struct Cand {
     in_both_sources: bool,
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the synthetic benchmark scores are finite and bounded to 0..=1"
+)]
 fn cand(id: usize, score: f64) -> Cand {
     Cand {
         doc_id: format!("docs/section-{:02}/file-{:05}.md", id % 32, id),

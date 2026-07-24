@@ -5,7 +5,7 @@
 //! an alloc-free ASCII-case-insensitive substring test (needles are already
 //! lowercased at parse time, and `to_ascii_lowercase` only folds ASCII bytes, so a
 //! byte-wise fold is bit-identical). This bench measures the per-candidate filter
-//! over a realistic candidate set for a PathContains filter (the allocating case)
+//! over a realistic candidate set for a `PathContains` filter (the allocating case)
 //! and an Extension filter (old allocates uselessly), old vs new. Identical
 //! match verdicts asserted.
 use std::hint::black_box;
@@ -31,7 +31,7 @@ fn matches_old(clauses: &[Clause], doc_id: &str) -> bool {
     })
 }
 
-/// Proposed: allocate `lowered` ONLY when a PathContains clause needs it (the flag
+/// Proposed: allocate `lowered` ONLY when a `PathContains` clause needs it (the flag
 /// is precomputed once per query at parse time, modeled here by `has_path`). Path
 /// filters keep the fast SIMD `str::contains` (identical to old); extension-only
 /// filters allocate nothing.

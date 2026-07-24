@@ -1,18 +1,19 @@
-//! RRF final-sort **indirect index sort** probe (the untested route-next whose
+//! `RRF` final-sort **indirect index sort** probe (the untested route-next whose
 //! prior rejection rested on a false premise).
 //!
 //! `FusedHitScratch` (`rrf.rs`) is a ~112-byte, 10-field struct, but the sort
 //! comparator (`cmp_for_ranking`) reads only 4 fields, and its `doc_id` is
-//! `&'a str` (BORROWED). NEGATIVE_EVIDENCE 2026-06-29 dismissed "sort a separate
+//! `&'a str` (BORROWED). `NEGATIVE_EVIDENCE` 2026-06-29 dismissed "sort a separate
 //! (key, idx) array then gather" because "gather-by-index needs an unsafe move-out
-//! of the FusedHitScratch Vec" — but that is wrong: gathering by index reads Copy
+//! of the `FusedHitScratch` `Vec`" — but that is wrong: gathering by index reads
+//! `Copy`
 //! fields and `into_owned`s the borrowed `&str` (a clone, no move, no unsafe).
 //!
 //! So this A/B (both bit-identical output, asserted): sort the fat structs in place
 //! (`struct_sort`, production today) vs sort a `Vec<u32>` of 4-byte indices with an
 //! indirect comparator, then gather by index (`index_sort`). 4-byte swaps vs
 //! ~112-byte swaps, at the cost of scattered comparator + gather reads — the
-//! empirical question this measures. The gather (doc_id `into_owned` + score) is
+//! empirical question this measures. The gather (`doc_id` `into_owned` + score) is
 //! charged to both. `iter_batched` clones the base in untimed setup.
 //!
 //! Run with:
@@ -43,7 +44,7 @@ struct Scratch<'a> {
     in_both_sources: bool,
 }
 
-/// The shipped comparator (RRF desc, in_both desc, lexical desc, doc_id asc).
+/// The shipped comparator (`RRF` desc, `in_both` desc, lexical desc, `doc_id` asc).
 #[inline]
 fn cmp_current(a: &Scratch, b: &Scratch) -> Ordering {
     b.rrf_score
@@ -57,7 +58,7 @@ fn cmp_current(a: &Scratch, b: &Scratch) -> Ordering {
         .then_with(|| a.doc_id.cmp(b.doc_id))
 }
 
-/// Output row: owned doc_id (the `into_owned` the real fuse pays) + score. Charged
+/// Output row: owned `doc_id` (the `into_owned` the real fuse pays) + score. Charged
 /// to both arms so the delta is purely the sort + read-order.
 type Row = (String, f32);
 
@@ -72,7 +73,8 @@ fn gather_struct(v: &[Scratch]) -> Vec<Row> {
 fn gather_index(v: &[Scratch], idx: &[u32]) -> Vec<Row> {
     idx.iter()
         .map(|&i| {
-            let s = &v[i as usize];
+            let index = usize::try_from(i).expect("u32 scratch index fits usize");
+            let s = &v[index];
             (s.doc_id.to_owned(), s.rrf_score as f32)
         })
         .collect()
@@ -84,7 +86,7 @@ fn doc_ids(n: usize) -> Vec<String> {
 
 /// Realistic `limit_all` shape: RRF scores `1/(60+rank)` with a wrap that forces
 /// pervasive ties, ~20% in-both.
-fn build<'a>(ids: &'a [String]) -> Vec<Scratch<'a>> {
+fn build(ids: &[String]) -> Vec<Scratch<'_>> {
     let n = ids.len();
     ids.iter()
         .enumerate()
@@ -96,7 +98,7 @@ fn build<'a>(ids: &'a [String]) -> Vec<Scratch<'a>> {
                 rrf_score: 1.0 / (60.0 + rank as f64),
                 lexical_rank: in_both.then_some(i),
                 semantic_rank: Some(rank),
-                semantic_index: Some(i as u32),
+                semantic_index: Some(u32::try_from(i).expect("benchmark index fits u32")),
                 graph_rank: None,
                 #[allow(clippy::cast_precision_loss)]
                 lexical_score: in_both.then_some((i % 97) as f32 * 0.01),
@@ -113,11 +115,15 @@ fn struct_sort(mut v: Vec<Scratch>) -> Vec<Row> {
     gather_struct(&v)
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn index_sort(v: Vec<Scratch>) -> Vec<Row> {
-    let mut idx: Vec<u32> = (0..v.len() as u32).collect();
-    idx.sort_unstable_by(|&a, &b| cmp_current(&v[a as usize], &v[b as usize]));
-    gather_index(&v, &idx)
+fn index_sort(v: &[Scratch]) -> Vec<Row> {
+    let len = u32::try_from(v.len()).expect("benchmark input length fits u32");
+    let mut idx: Vec<u32> = (0..len).collect();
+    idx.sort_unstable_by(|&a, &b| {
+        let a_index = usize::try_from(a).expect("u32 scratch index fits usize");
+        let b_index = usize::try_from(b).expect("u32 scratch index fits usize");
+        cmp_current(&v[a_index], &v[b_index])
+    });
+    gather_index(v, &idx)
 }
 
 fn bench(c: &mut Criterion) {
@@ -132,7 +138,7 @@ fn bench(c: &mut Criterion) {
 
         // Bit-identity: same final ordering (doc_id sequence).
         let a = struct_sort(base.clone());
-        let b = index_sort(base.clone());
+        let b = index_sort(&base);
         assert_eq!(a, b, "index_sort reorders vs struct_sort at n={n}");
 
         g.bench_with_input(BenchmarkId::new("struct_sort", n), &n, |bch, _| {
@@ -145,7 +151,7 @@ fn bench(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("index_sort", n), &n, |bch, _| {
             bch.iter_batched(
                 || base.clone(),
-                |v| black_box(index_sort(v)),
+                |v| black_box(index_sort(&v)),
                 BatchSize::LargeInput,
             );
         });

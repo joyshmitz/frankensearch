@@ -18,6 +18,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(feature = "tantivy-bench")]
+#[allow(clippy::many_single_char_names)]
 fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     use std::hint::black_box;
 
@@ -98,7 +99,7 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
                 id: doc_ids[i].clone(),
                 content: corpus_texts[i].clone(),
                 title: None,
-                metadata: Default::default(),
+                metadata: std::collections::HashMap::default(),
             })
             .collect();
         tantivy.index_documents(&cx, &docs).await.expect("index");
@@ -109,10 +110,7 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     let rank_of =
         |ids: &[String], target: &str| -> Option<usize> { ids.iter().position(|d| d == target) };
     let recall_mrr = |ids: &[String], target: &str| -> (f64, f64) {
-        match rank_of(ids, target) {
-            Some(rank) => (1.0, 1.0 / (rank as f64 + 1.0)),
-            None => (0.0, 0.0),
-        }
+        rank_of(ids, target).map_or((0.0, 0.0), |rank| (1.0, 1.0 / (rank as f64 + 1.0)))
     };
 
     // Precompute per-query lexical + vector rankings (k-independent); the hybrid is

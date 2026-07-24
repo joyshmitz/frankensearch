@@ -32,12 +32,12 @@ fn lexical(doc_id: String, score: f32) -> ScoredResult {
 }
 
 /// Realistic inputs: strictly descending scores, ~20% lexical/semantic overlap (few
-/// exact rrf_score ties — the common case).
+/// exact `rrf_score` ties — the common case).
 #[allow(clippy::cast_precision_loss)]
 fn build_realistic(n: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
     let semantic: Vec<VectorHit> = (0..n)
         .map(|i| VectorHit {
-            index: i as u32,
+            index: u32::try_from(i).expect("benchmark indices fit in u32"),
             score: 1.0 - (i as f32) / (n as f32),
             doc_id: format!("doc-{i:06}").into(),
         })
@@ -50,14 +50,14 @@ fn build_realistic(n: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
 }
 
 /// Adversarial inputs for the tiebreak: disjoint lexical/semantic doc sets with parallel
-/// ranks, so the lexical-only doc at rank i ties with the semantic-only doc at rank i
-/// (both contribute `1/(k+i+1)`, neither is in both sources) — `n` exact rrf_score ties,
+/// ranks, so the lexical-only doc at rank `i` ties with the semantic-only doc at rank `i`
+/// (both contribute `1/(k+i+1)`, neither is in both sources) — `n` exact `rrf_score` ties,
 /// the worst case for tiebreak work.
 #[allow(clippy::cast_precision_loss)]
 fn build_tied(n: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
     let semantic: Vec<VectorHit> = (0..n)
         .map(|i| VectorHit {
-            index: i as u32,
+            index: u32::try_from(i).expect("benchmark indices fit in u32"),
             score: 1.0 - (i as f32) / (n as f32),
             doc_id: format!("sem-{i:06}").into(),
         })
@@ -68,6 +68,10 @@ fn build_tied(n: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
     (lex, semantic)
 }
 
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "Criterion benchmark groups intentionally span their complete arm sets"
+)]
 fn bench(c: &mut Criterion) {
     let n = 2000;
     let (lex, sem) = build_realistic(n);

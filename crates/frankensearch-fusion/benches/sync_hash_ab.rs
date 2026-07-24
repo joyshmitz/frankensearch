@@ -1,11 +1,11 @@
-//! Sync-searcher per-query map/set hasher A/B: std SipHash vs `ahash`.
+//! Sync-searcher per-query map/set hasher A/B: standard `SipHash` vs `ahash`.
 //!
-//! `vector_hits_to_scored_results` (sync_searcher.rs) builds, per query, two
+//! `vector_hits_to_scored_results` (`sync_searcher.rs`) builds, per query, two
 //! `HashMap<&str, f32>` score maps (fast + quality, one entry per candidate) and
-//! a `seen` dedup `HashSet<&str>`, then probes every candidate's doc_id in both
-//! maps. Today those are std `HashMap`/`HashSet` (SipHash), while the sibling
+//! a `seen` dedup `HashSet<&str>`, then probes every candidate's `doc_id` in both
+//! maps. Today those are standard `HashMap`/`HashSet` (`SipHash`), while the sibling
 //! fusion paths (`rrf.rs`, `blend.rs`) and `search.rs` already use `ahash`.
-//! SipHash is a cryptographic hash; for short non-adversarial `&str` doc_ids the
+//! `SipHash` is a cryptographic hash; for short non-adversarial `&str` `doc_id`s the
 //! non-crypto `ahash` is materially faster on both insert and lookup. This bench
 //! measures the *full* per-query shape (build both maps + seen set, then one
 //! fast + one quality `.get()` per candidate) so the ratio reflects the real
@@ -31,7 +31,7 @@ fn make(n: usize, off: usize) -> Vec<VHit> {
         .collect()
 }
 
-/// std SipHash arm — mirrors the current sync_searcher.rs code exactly.
+/// Standard `SipHash` arm — mirrors the current `sync_searcher.rs` code exactly.
 fn run_sip(fast: &[VHit], quality: &[VHit]) -> f32 {
     let fast_scores: HashMap<&str, f32> =
         fast.iter().map(|h| (h.doc_id.as_str(), h.score)).collect();

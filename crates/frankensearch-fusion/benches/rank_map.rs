@@ -1,6 +1,6 @@
-//! compute_rank_changes rank-map build: old (clone into Vec<VectorHit>) vs new
-//! (borrow doc_id straight from ScoredResult). Bit-identical maps; the new path
-//! drops 2 Vec allocs + 2*N String clones per sync query.
+//! `compute_rank_changes` rank-map build: old (clone into `Vec<VectorHit>`) vs new
+//! (borrow `doc_id` straight from `ScoredResult`). Bit-identical maps; the new path
+//! drops 2 `Vec` allocs + 2*N `String` clones per sync query.
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -31,7 +31,9 @@ fn old_build(initial: &[Scored], refined: &[Scored]) -> usize {
         .iter()
         .enumerate()
         .map(|(i, h)| VHit {
-            _index: h.index.unwrap_or(i as u32),
+            _index: h
+                .index
+                .unwrap_or_else(|| u32::try_from(i).expect("benchmark indices fit in u32")),
             _score: h.score,
             doc_id: h.doc_id.clone(),
         })
@@ -40,7 +42,9 @@ fn old_build(initial: &[Scored], refined: &[Scored]) -> usize {
         .iter()
         .enumerate()
         .map(|(i, h)| VHit {
-            _index: h.index.unwrap_or(i as u32),
+            _index: h
+                .index
+                .unwrap_or_else(|| u32::try_from(i).expect("benchmark indices fit in u32")),
             _score: h.score,
             doc_id: h.doc_id.clone(),
         })
@@ -67,7 +71,7 @@ fn make(n: usize, off: usize) -> Vec<Scored> {
         .map(|i| Scored {
             doc_id: format!("doc-{:06}", off + i),
             score: 1.0 / (i as f32 + 1.0),
-            index: Some((off + i) as u32),
+            index: Some(u32::try_from(off + i).expect("benchmark indices fit in u32")),
         })
         .collect()
 }
@@ -79,10 +83,10 @@ fn bench(c: &mut Criterion) {
         debug_assert_eq!(old_build(&initial, &refined), new_build(&initial, &refined));
         let id = format!("n{n}");
         g.bench_with_input(BenchmarkId::new("clone", &id), &(), |b, ()| {
-            b.iter(|| black_box(old_build(black_box(&initial), black_box(&refined))))
+            b.iter(|| black_box(old_build(black_box(&initial), black_box(&refined))));
         });
         g.bench_with_input(BenchmarkId::new("borrow", &id), &(), |b, ()| {
-            b.iter(|| black_box(new_build(black_box(&initial), black_box(&refined))))
+            b.iter(|| black_box(new_build(black_box(&initial), black_box(&refined))));
         });
     }
     g.finish();

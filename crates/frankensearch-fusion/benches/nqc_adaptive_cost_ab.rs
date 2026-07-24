@@ -1,9 +1,11 @@
 //! Same-binary gate for the DEFAULT-ON `AdaptiveNqcDenseWeight` rolling-order lever.
 //!
 //! Both arms execute the complete adaptive production boundary with precomputed NQC values:
+//!
 //! - ORIG: retain insertion order and sort all 2,048 values every 64 queries.
 //! - CAND: maintain the exact rolling multiset in sorted order on each observation, then copy
 //!   that order into the 64-query snapshot without sorting.
+//!
 //! Before timing, the harness proves every returned weight bit-identical across warm-up,
 //! eviction, duplicates, signed zero, and ignored non-finite observations. Timings use the
 //! shared alternating-round paired sampler (`bench_support::paired_median_ratio`) against an

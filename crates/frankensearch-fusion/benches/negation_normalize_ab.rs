@@ -20,6 +20,7 @@
 //! ```
 #![allow(clippy::doc_markdown, clippy::cast_precision_loss)]
 
+use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -116,7 +117,8 @@ fn ascii_document(seed: usize, words: usize) -> String {
         let word = VOCAB[(seed.wrapping_mul(31).wrapping_add(i * 7)) % VOCAB.len()];
         out.push_str(word);
         if i % 5 == 4 {
-            out.push_str(&format!("{}", (seed + i) % 1000));
+            write!(&mut out, "{}", (seed + i) % 1000)
+                .expect("writing a number to String cannot fail");
         }
     }
     out

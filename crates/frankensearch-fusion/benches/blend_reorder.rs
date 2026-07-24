@@ -33,7 +33,7 @@ fn make_blended(n: usize) -> Vec<VectorHit> {
             // coarse bucket so the tiebreak is exercised but does not dominate.
             let tie = (i % (n / 16).max(1)) as f32 * 1e-6;
             VectorHit {
-                index: i as u32,
+                index: u32::try_from(i).expect("benchmark indices fit in u32"),
                 score: scrambled as f32 * 0.5 + tie,
                 doc_id: format!("doc_{i:08}").into(),
             }

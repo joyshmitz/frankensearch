@@ -2,7 +2,7 @@
 //!
 //! `pool_minmax_fuse` is a drop-in for `rrf_fuse` that recovers the score MAGNITUDE
 //! the rank transform discards — measured **+0.0038 mean nDCG@10 over RRF across 4
-//! BEIR corpora, never-negative** (docs/NEGATIVE_EVIDENCE.md, `45530fb`). This bench
+//! BEIR corpora, never-negative** (`docs/NEGATIVE_EVIDENCE.md`, `45530fb`). This bench
 //! confirms it is **latency-neutral** vs RRF: both are O(pool) hashmap accumulation +
 //! a windowed sort; pool-min-max adds two O(pool) min/max passes and a per-doc
 //! normalize (a couple of extra flops per candidate), so it should land within noise
@@ -55,7 +55,7 @@ fn build(pool: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
             semantic(
                 &format!("doc{i:06}"),
                 1.0 / ((i - half) as f32 + 1.0),
-                i as u32,
+                u32::try_from(i).expect("benchmark index fits u32"),
             )
         })
         .collect();

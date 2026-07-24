@@ -1,8 +1,8 @@
-//! fused_hits_to_scored_results materialization: old (&[FusedHit] + clone doc_id)
-//! vs new (Vec<FusedHit> + move doc_id). The rrf_fuse result is a fresh temporary,
-//! so moving doc_ids is bit-identical and drops a per-result String clone.
-//! iter_batched clones the input per iteration so both arms pay the same setup;
-//! the measured delta is the doc_id clone vs move.
+//! `fused_hits_to_scored_results` materialization: old (`&[FusedHit]` + clone
+//! `doc_id`) vs new (`Vec<FusedHit>` + move `doc_id`). The `rrf_fuse` result is a
+//! fresh temporary, so moving `doc_ids` is bit-identical and drops a per-result
+//! `String` clone. `iter_batched` clones the input per iteration so both arms pay
+//! the same setup; the measured delta is the `doc_id` clone vs move.
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -22,6 +22,7 @@ struct Scored {
     lexical_score: Option<f32>,
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn old_mat(hits: &[Fused], k: usize) -> Vec<Scored> {
     hits.iter()
         .take(k)
@@ -34,6 +35,7 @@ fn old_mat(hits: &[Fused], k: usize) -> Vec<Scored> {
         })
         .collect()
 }
+#[allow(clippy::cast_possible_truncation)]
 fn new_mat(hits: Vec<Fused>, k: usize) -> Vec<Scored> {
     hits.into_iter()
         .take(k)
@@ -60,9 +62,9 @@ fn consume_scored(rows: &[Scored]) -> usize {
 fn make(n: usize) -> Vec<Fused> {
     (0..n)
         .map(|i| Fused {
-            doc_id: format!("doc-{:06}", i).into(),
+            doc_id: format!("doc-{i:06}"),
             rrf_score: 1.0 / (i as f64 + 1.0),
-            semantic_index: Some(i as u32),
+            semantic_index: Some(u32::try_from(i).expect("benchmark index fits u32")),
             semantic_score: Some(0.5),
             lexical_score: Some(0.3),
         })
@@ -79,20 +81,20 @@ fn bench(c: &mut Criterion) {
                 || input.clone(),
                 |owned| {
                     let rows = old_mat(black_box(&owned), k);
-                    black_box(consume_scored(&rows))
+                    black_box(consume_scored(&rows));
                 },
                 BatchSize::SmallInput,
-            )
+            );
         });
         g.bench_with_input(BenchmarkId::new("move", &id), &(), |b, ()| {
             b.iter_batched(
                 || input.clone(),
                 |owned| {
                     let rows = new_mat(owned, k);
-                    black_box(consume_scored(&rows))
+                    black_box(consume_scored(&rows));
                 },
                 BatchSize::SmallInput,
-            )
+            );
         });
     }
     g.finish();

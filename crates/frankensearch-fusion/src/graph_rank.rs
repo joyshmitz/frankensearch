@@ -223,7 +223,7 @@ impl GraphRanker {
         let mut next = vec![0.0_f64; n];
 
         for _ in 0..self.max_iterations {
-            next.iter_mut().for_each(|v| *v = 0.0);
+            next.fill(0.0);
 
             for &(i, w) in &seeds {
                 next[i] += teleport_scale * w;
@@ -373,7 +373,7 @@ impl GraphRanker {
         let mut next = vec![0.0_f64; n];
 
         for _ in 0..self.max_iterations {
-            next.iter_mut().for_each(|v| *v = 0.0);
+            next.fill(0.0);
 
             for &(i, w) in &seeds {
                 next[i] += teleport_scale * w;
@@ -511,7 +511,7 @@ impl GraphRanker {
         let mut next = vec![0.0_f64; n];
 
         for _ in 0..self.max_iterations {
-            next.iter_mut().for_each(|v| *v = 0.0);
+            next.fill(0.0);
 
             for &(i, w) in &seeds {
                 next[i] += teleport_scale * w;
@@ -657,8 +657,8 @@ mod tests {
         });
     }
 
-    /// Reference: the pre-dense PageRank using an ordered (`BTreeMap`)
-    /// accumulator — deterministic, mirroring the original HashMap algorithm.
+    /// Reference: the pre-dense `PageRank` using an ordered (`BTreeMap`)
+    /// accumulator — deterministic, mirroring the original `HashMap` algorithm.
     fn rank_phase1_reference(
         graph: &DocumentGraph,
         seed_hits: &[VectorHit],
@@ -759,10 +759,11 @@ mod tests {
                 state
             };
             let n = 40usize;
+            let n_u64 = u64::try_from(n).expect("test graph size fits u64");
             let mut graph = DocumentGraph::new();
             for i in 0..n {
                 for _ in 0..4 {
-                    let j = (next() as usize) % n;
+                    let j = usize::try_from(next() % n_u64).expect("reduced node index fits usize");
                     if j != i {
                         let w = 0.25 + (next() % 1000) as f32 / 1000.0;
                         graph.add_edge(
@@ -776,7 +777,7 @@ mod tests {
             }
             let seed_hits: Vec<VectorHit> = (0..5usize)
                 .map(|s| VectorHit {
-                    index: s as u32,
+                    index: u32::try_from(s).expect("test seed index fits u32"),
                     score: 0.5 + (s as f32) * 0.1,
                     doc_id: format!("d{:03}", (s * 7) % n).into(),
                 })

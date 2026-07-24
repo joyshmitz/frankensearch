@@ -69,6 +69,11 @@ fn make_vector(centroids: &[Vec<f32>], c: usize, noise_seed: u64) -> Vec<f32> {
 
 /// Zipf-ish access trace over `QUERIES` distinct queries: index = Q·u^skew (skew>1
 /// concentrates on the hot few). Deterministic xorshift, no rng dep.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the finite generated index is bounded to the configured query count"
+)]
 fn zipf_query_order(seed: u64) -> Vec<usize> {
     let mut s = seed | 1;
     let mut out = Vec::with_capacity(REPLAY);
@@ -82,6 +87,11 @@ fn zipf_query_order(seed: u64) -> Vec<usize> {
     out
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the percentile index is finite, nonnegative, and clamped to the slice"
+)]
 fn percentile(sorted: &[u128], q: f64) -> u128 {
     if sorted.is_empty() {
         return 0;

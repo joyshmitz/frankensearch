@@ -38,6 +38,11 @@ fn unit_f32(bits: u64) -> f32 {
     ((bits >> 40) as f32) / 16_777_216.0 * 2.0 - 1.0
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn narrow_f64(value: f64) -> f32 {
+    value as f32
+}
+
 fn make_vec(state: &mut u64) -> Vec<f32> {
     (0..DIM).map(|_| unit_f32(next(state))).collect()
 }
@@ -60,14 +65,14 @@ fn two_buffer(original: &[f32], feedback: &[(Vec<f32>, f64)], alpha: f64) -> Opt
     }
     let mut centroid = vec![0.0_f32; dims];
     for (emb, weight) in feedback {
-        let w = (weight.max(0.0) / total_weight) as f32;
+        let w = narrow_f64(weight.max(0.0) / total_weight);
         let len = emb.len().min(dims);
         for j in 0..len {
             centroid[j] = emb[j].mul_add(w, centroid[j]);
         }
     }
-    let alpha_f32 = alpha as f32;
-    let beta_f32 = beta as f32;
+    let alpha_f32 = narrow_f64(alpha);
+    let beta_f32 = narrow_f64(beta);
     let mut expanded = vec![0.0_f32; dims];
     for i in 0..dims {
         expanded[i] = alpha_f32 * original[i] + beta_f32 * centroid[i];
@@ -101,14 +106,14 @@ fn in_place(original: &[f32], feedback: &[(Vec<f32>, f64)], alpha: f64) -> Optio
     }
     let mut centroid = vec![0.0_f32; dims];
     for (emb, weight) in feedback {
-        let w = (weight.max(0.0) / total_weight) as f32;
+        let w = narrow_f64(weight.max(0.0) / total_weight);
         let len = emb.len().min(dims);
         for j in 0..len {
             centroid[j] = emb[j].mul_add(w, centroid[j]);
         }
     }
-    let alpha_f32 = alpha as f32;
-    let beta_f32 = beta as f32;
+    let alpha_f32 = narrow_f64(alpha);
+    let beta_f32 = narrow_f64(beta);
     for i in 0..dims {
         centroid[i] = alpha_f32 * original[i] + beta_f32 * centroid[i];
     }

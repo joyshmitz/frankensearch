@@ -1,4 +1,4 @@
-//! `tokenize_lexical` ASCII fast-path A/B (fsfs lexical_pipeline.rs). The lexical
+//! `tokenize_lexical` ASCII fast-path A/B (`fsfs lexical_pipeline.rs`). The lexical
 //! tokenizer runs a per-character loop over EVERY document's full text at index
 //! time. The current impl uses `text.char_indices()` (UTF-8 decode per char) +
 //! `is_token_char` (Unicode `is_alphanumeric()`). Its sibling `count_lexical_tokens`
@@ -47,13 +47,18 @@ const TOKEN_BYTE: [u8; 256] = {
     let mut t = [0u8; 256];
     let mut i = 0usize;
     while i < 256 {
-        t[i] = is_token_byte(i as u8) as u8;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the loop invariant keeps i strictly below 256"
+        )]
+        let byte = i as u8;
+        t[i] = is_token_byte(byte) as u8;
         i += 1;
     }
     t
 };
 
-/// Current: char_indices + Unicode is_alphanumeric.
+/// Current: `char_indices` + Unicode `is_alphanumeric`.
 fn tokenize_char(text: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut token_start: Option<usize> = None;

@@ -7,10 +7,10 @@
 //! `&str → (rank, score)` lexical contribution map and walks the already-score-sorted `semantic`
 //! slice once in order, so `results` is **near-sorted** and the final sort runs near-`O(N)`
 //! (pdqsort is adaptive). This is the same primitive that made `rrf_fuse_with_graph_merge` beat
-//! the RRF value-map (`4aeb66b`, 1.31–1.46× on limit_all); it had never been ported to the
+//! the RRF value-map (`4aeb66b`, 1.31–1.46× on `limit_all`); it had never been ported to the
 //! pool-min-max quality operator (`a9e53b4`, +0.0038 nDCG@10 over RRF).
 //!
-//! Two shapes: `limit_all` (window ≥ N — where the merge pays) and `top10` (select_nth dominates
+//! Two shapes: `limit_all` (window ≥ N — where the merge pays) and `top10` (`select_nth` dominates
 //! — a regression guard: the merge must not lose the small-window path). Bit-identity is gated
 //! before timing.
 //!
@@ -64,7 +64,7 @@ fn build(pool: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
             semantic(
                 &format!("doc{i:06}"),
                 1.0 / ((i - half) as f32 + 1.0),
-                i as u32,
+                u32::try_from(i).expect("benchmark indices fit in u32"),
             )
         })
         .collect();

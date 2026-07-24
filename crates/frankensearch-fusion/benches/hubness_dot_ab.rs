@@ -165,6 +165,10 @@ fn assert_bit_identical(a: &[f32], b: &[f32], what: &str) {
     }
 }
 
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "Criterion benchmark groups intentionally span their complete arm sets"
+)]
 fn bench(c: &mut Criterion) {
     // ── Micro: the dot kernel in isolation on one realistic 384-dim pair ──────────────────────
     {

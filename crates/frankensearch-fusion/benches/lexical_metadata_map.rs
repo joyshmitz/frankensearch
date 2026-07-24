@@ -1,5 +1,5 @@
 //! A/B for the lexical-metadata re-attachment in the async hybrid's
-//! `fused_hits_to_scored_results` (searcher.rs). The map is keyed by doc_id and
+//! `fused_hits_to_scored_results` (`searcher.rs`). The map is keyed by `doc_id` and
 //! only the `fused` (top-k) hits read it, but the old code cloned EVERY lexical
 //! candidate's `serde_json::Value` metadata into the map (incl. candidates
 //! dropped from the top-k). The new code borrows `&Value` into the map and

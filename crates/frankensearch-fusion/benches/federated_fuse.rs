@@ -2,8 +2,8 @@
 //!
 //! `federated::fuse_rrf` accumulates per-doc aggregates in a
 //! `std::collections::HashMap<String, AggregateDoc>` — i.e. the DoS-resistant
-//! **SipHash** hasher — while the sibling single-node `rrf_fuse_with_graph` path
-//! uses `ahash::AHashMap`. This bench isolates the hasher swap (SipHash → aHash)
+//! `SipHash` hasher — while the sibling single-node `rrf_fuse_with_graph` path
+//! uses `ahash::AHashMap`. This bench isolates the hasher swap (`SipHash` → `aHash`)
 //! on the real federated merge shape: a `String` doc-id key (cloned per hit), a
 //! `BTreeSet<String>` `appeared_in`, and a small template clone — so the measured
 //! ratio reflects the real proportion of hash-compute vs the per-hit allocations
@@ -26,6 +26,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 const K: f64 = 60.0;
 
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 fn rank_contribution(rank: usize) -> f32 {
     (1.0 / (K + rank as f64 + 1.0)) as f32
 }
@@ -57,7 +58,7 @@ fn accumulate<S: std::hash::BuildHasher>(
     rank: usize,
     contribution: f32,
 ) {
-    let entry = docs.entry(hit.doc_id.to_string()).or_insert_with(|| {
+    let entry = docs.entry(hit.doc_id.clone()).or_insert_with(|| {
         let mut template = hit.clone();
         template.score = 0.0;
         AggDoc {
@@ -113,7 +114,7 @@ fn make_shards(shards: usize, per_shard: usize, universe: usize) -> Vec<Shard> {
                     // Stride the pool per shard so overlap is ~50% across shards.
                     let id = (s * (per_shard / 2) + i) % universe;
                     Hit {
-                        doc_id: format!("doc_{id:07}").into(),
+                        doc_id: format!("doc_{id:07}"),
                         score: 1.0 - (i as f32) / (per_shard as f32),
                     }
                 })

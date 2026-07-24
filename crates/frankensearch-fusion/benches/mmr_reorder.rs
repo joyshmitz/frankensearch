@@ -6,7 +6,7 @@
 //! off the tail and MOVES each head element into its MMR slot (zero clones).
 //!
 //! - `clone_reorder` : clone head + clone-per-order-index (old).
-//! - `move_reorder`  : split_off tail + `Option::take` move per index (new).
+//! - `move_reorder`: `split_off` tail + `Option::take` move per index (new).
 //!
 //! Both produce identical output (asserted). `order` is a distinct permutation,
 //! as `mmr_rerank` guarantees. Run with:

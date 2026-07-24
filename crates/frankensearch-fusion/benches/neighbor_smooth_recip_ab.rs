@@ -11,14 +11,14 @@
 //! ```
 //!
 //! called once **per in-pool neighbor per candidate** → O(pool · M · deg) String comparisons
-//! plus O(pool · M) SipHash lookups on top of the O(pool) diffusion the non-mutual path
+//! plus O(pool · M) `SipHash` lookups on top of the O(pool) diffusion the non-mutual path
 //! already pays. That is a genuine algorithmic hot spot the correctness-first landing left in.
 //!
 //! CANDIDATE (`smooth_v2`, a *succinct-structure* primitive): relabel the pool to dense u32
 //! indices and, in **one** pass over each candidate's Similar edges, build a packed-`u64`
 //! (`src_idx << 32 | dst_idx`) `AHashSet` of every in-pool directed Similar edge. Reciprocity
 //! is then an O(1) `set.contains((n_idx << 32) | d_idx)` — no re-lookup, no String eq, no
-//! SipHash. Bit-identical to the ORIGINAL (same accumulation order, same reciprocity set).
+//! `SipHash`. Bit-identical to the ORIGINAL (same accumulation order, same reciprocity set).
 //!
 //! The non-mutual path is carried through unchanged as a regression guard (candidate must not
 //! regress the default config).
@@ -44,7 +44,7 @@ use frankensearch_fusion::{SmoothConfig, neighbor_smooth};
 fn build(pool: usize, m: usize) -> (Vec<VectorHit>, DocumentGraph) {
     let hits: Vec<VectorHit> = (0..pool)
         .map(|i| VectorHit {
-            index: i as u32,
+            index: u32::try_from(i).expect("benchmark pool indices fit in u32"),
             score: 1.0 / ((i as f32) + 1.0),
             doc_id: format!("doc{i:06}").into(),
         })
@@ -124,7 +124,13 @@ fn smooth_v2(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -
     let n = hits.len();
     let mut pool: AHashMap<&str, (u32, f32)> = AHashMap::with_capacity(n);
     for (i, h) in hits.iter().enumerate() {
-        pool.insert(h.doc_id.as_str(), (i as u32, h.score));
+        pool.insert(
+            h.doc_id.as_str(),
+            (
+                u32::try_from(i).expect("benchmark pool indices fit in u32"),
+                h.score,
+            ),
+        );
     }
     // Reciprocity set: every in-pool directed Similar edge, packed `src_idx << 32 | dst_idx`.
     // Built in one full-adjacency pass — matching `is_similar_neighbor`'s un-capped scan.
@@ -183,7 +189,7 @@ fn smooth_v2(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -
 /// Candidate v3 (the version to land): a single full-adjacency pass hashes each Similar edge
 /// **exactly once**, simultaneously (a) inserting every in-pool directed edge into the packed
 /// reciprocity set and (b) capturing the M-capped in-pool forward neighbors as a flat integer
-/// CSR. The diffusion pass is then pure integer work — no `graph.neighbors` SipHash lookup, no
+/// CSR. The diffusion pass is then pure integer work — no `graph.neighbors` `SipHash` lookup, no
 /// string hashing. Non-mutual is the unchanged ORIGINAL. Bit-identical to `neighbor_smooth`.
 fn smooth_v3(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -> Vec<VectorHit> {
     if config.is_identity() || graph.is_empty() || hits.is_empty() {
@@ -232,7 +238,13 @@ fn smooth_v3(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -
     let m = config.m;
     let mut pool: AHashMap<&str, (u32, f32)> = AHashMap::with_capacity(n);
     for (i, h) in hits.iter().enumerate() {
-        pool.insert(h.doc_id.as_str(), (i as u32, h.score));
+        pool.insert(
+            h.doc_id.as_str(),
+            (
+                u32::try_from(i).expect("benchmark pool indices fit in u32"),
+                h.score,
+            ),
+        );
     }
 
     // One adjacency walk: build the reciprocity set (all in-pool Similar edges, uncapped) and the
@@ -259,7 +271,7 @@ fn smooth_v3(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -
                 }
             }
         }
-        fwd_off.push(fwd_flat.len() as u32);
+        fwd_off.push(u32::try_from(fwd_flat.len()).expect("benchmark CSR offsets fit in u32"));
     }
 
     // Integer-only diffusion: reciprocity is O(1) set membership.

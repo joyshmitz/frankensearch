@@ -1,6 +1,6 @@
 //! Same-worker A/B for the `DocId = CompactString` landing (`8529084`).
 //!
-//! `doc_id_clone_sso` measured the *bare* doc_id clone (`String` 438 µs vs
+//! `doc_id_clone_sso` measured the *bare* `doc_id` clone (`String` 438 µs vs
 //! `CompactString` 14.73 µs / 10k = 29.8×). This bench folds that clone into the
 //! **full `FusedHit` materialization** — the exact `FusedHitScratch::into_owned`
 //! the landing changed (rrf.rs:113): building the 10-field struct (9 `Copy`
@@ -35,7 +35,7 @@ struct Winner<'a> {
     in_both_sources: bool,
 }
 
-/// `FusedHit` with a `String` doc_id — the pre-landing production type.
+/// `FusedHit` with a `String` `doc_id` — the pre-landing production type.
 #[allow(
     dead_code,
     reason = "the benchmark charges complete result materialization"
@@ -51,7 +51,7 @@ struct FusedHitString {
     in_both_sources: bool,
 }
 
-/// `FusedHit` with a `CompactString` doc_id — the landed production type (~96 B).
+/// `FusedHit` with a `CompactString` `doc_id` — the landed production type (~96 B).
 #[allow(
     dead_code,
     reason = "the benchmark charges complete result materialization"
@@ -69,7 +69,7 @@ struct FusedHitCompact {
 
 /// Hypothetical packed `FusedHit` (~56 B): the `Option<usize>`/`Option<u32>` rank
 /// fields become `u32` with a `u32::MAX` sentinel, `Option<f32>` scores become
-/// `f32` with a `NaN` sentinel. Same doc_id (CompactString). Tests whether the
+/// `f32` with a `NaN` sentinel. Same `doc_id` (`CompactString`). Tests whether the
 /// ~40 % struct-size cut speeds the `limit_all` materialize (smaller memcpy +
 /// smaller Vec alloc) enough to justify the public-API break it would require.
 #[allow(
@@ -87,7 +87,7 @@ struct FusedHitPacked {
     in_both_sources: bool,
 }
 
-fn winners<'a>(ids: &'a [String]) -> Vec<Winner<'a>> {
+fn winners(ids: &[String]) -> Vec<Winner<'_>> {
     ids.iter()
         .enumerate()
         .map(|(i, s)| Winner {
@@ -95,7 +95,7 @@ fn winners<'a>(ids: &'a [String]) -> Vec<Winner<'a>> {
             rrf_score: 1.0 / (i as f64 + 60.0),
             lexical_rank: Some(i),
             semantic_rank: if i % 2 == 0 { Some(i) } else { None },
-            semantic_index: Some(i as u32),
+            semantic_index: Some(u32::try_from(i).expect("benchmark index fits u32")),
             lexical_score: Some(1.0 - i as f32 * 1e-4),
             semantic_score: if i % 2 == 0 { Some(0.9) } else { None },
             in_both_sources: i % 2 == 0,
@@ -136,8 +136,12 @@ fn to_packed(w: &Winner<'_>) -> FusedHitPacked {
     FusedHitPacked {
         doc_id: w.doc_id.into(),
         rrf_score: w.rrf_score,
-        lexical_rank: w.lexical_rank.map_or(u32::MAX, |r| r as u32),
-        semantic_rank: w.semantic_rank.map_or(u32::MAX, |r| r as u32),
+        lexical_rank: w
+            .lexical_rank
+            .map_or(u32::MAX, |rank| u32::try_from(rank).unwrap_or(u32::MAX)),
+        semantic_rank: w
+            .semantic_rank
+            .map_or(u32::MAX, |rank| u32::try_from(rank).unwrap_or(u32::MAX)),
         semantic_index: w.semantic_index.unwrap_or(u32::MAX),
         lexical_score: w.lexical_score.unwrap_or(f32::NAN),
         semantic_score: w.semantic_score.unwrap_or(f32::NAN),

@@ -3,12 +3,12 @@
 //!
 //! In `sync_searcher::search_internal` the quality tier is a re-scored subset of
 //! the fast tier (it shares every `doc_id`/`index`). The committed path built an
-//! intermediate `Vec<VectorHit>` — cloning one `String` doc_id per quality hit —
+//! intermediate `Vec<VectorHit>` — cloning one `String` `doc_id` per quality hit —
 //! purely to pass a `&[VectorHit]` to `blend_two_tier`, even though that slice's
-//! doc_ids are only ever read as `&str` (by the blend and by the downstream
+//! `doc_ids` are only ever read as `&str` (by the blend and by the downstream
 //! `quality_scores` borrow-map). `blend_two_tier_aligned` blends straight from
-//! the aligned `Vec<Option<f32>>` quality scores, borrowing each doc_id from
-//! `fast_hits` — eliding N short-String allocations. Output is bit-identical
+//! the aligned `Vec<Option<f32>>` quality scores, borrowing each `doc_id` from
+//! `fast_hits` — eliding N short-`String` allocations. Output is bit-identical
 //! (asserted once before timing).
 //!
 //! Each blend arm times the full differing region (quality-side prep + blend +
@@ -32,11 +32,11 @@ use frankensearch_fusion::{blend_two_tier, blend_two_tier_aligned, blend_two_tie
 
 const BLEND_FACTOR: f32 = 0.7;
 
-/// Realistic fast tier: N candidates, distinct doc_ids, score descending.
+/// Realistic fast tier: N candidates, distinct `doc_ids`, score descending.
 fn fast_hits(n: usize) -> Vec<VectorHit> {
     (0..n)
         .map(|i| VectorHit {
-            index: i as u32,
+            index: u32::try_from(i).expect("benchmark index fits u32"),
             score: 1.0 - (i as f32) / (n as f32),
             doc_id: format!("doc-{i:06}").into(),
         })
@@ -52,7 +52,7 @@ fn quality_scores(n: usize) -> Vec<Option<f32>> {
                 None
             } else {
                 // A different monotone mapping so blend actually reorders.
-                Some(0.5 + 0.5 * (((i * 2654435761) % n) as f32) / (n as f32))
+                Some(0.5 + 0.5 * (((i * 2_654_435_761) % n) as f32) / (n as f32))
             }
         })
         .collect()
@@ -64,6 +64,7 @@ struct BenchCalibrator {
     bias: f64,
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn calibrate(config: Option<BenchCalibrator>, score: f32) -> f32 {
     let Some(config) = config else {
         return score;
@@ -78,7 +79,7 @@ fn calibrate(config: Option<BenchCalibrator>, score: f32) -> f32 {
 
 /// Pre-change async Phase-2 prep: borrow the owned input and rebuild every slot.
 fn quality_prep_collect_copy(
-    scores: Vec<Option<f32>>,
+    scores: &[Option<f32>],
     config: Option<BenchCalibrator>,
 ) -> Vec<Option<f32>> {
     scores
@@ -104,7 +105,7 @@ fn option_bits(scores: &[Option<f32>]) -> Vec<Option<u32>> {
     scores.iter().map(|score| score.map(f32::to_bits)).collect()
 }
 
-/// Current path: materialize the quality subset (cloning doc_ids), blend, then
+/// Current path: materialize the quality subset (cloning `doc_ids`), blend, then
 /// build the downstream borrow-map from the materialized hits.
 fn current(fast: &[VectorHit], qscores: &[Option<f32>]) -> (Vec<VectorHit>, usize) {
     let quality_hits = fast
@@ -139,7 +140,7 @@ fn aligned(fast: &[VectorHit], qscores: &[Option<f32>]) -> (Vec<VectorHit>, usiz
 }
 
 /// Unique aligned path: same production precondition as vector-index search
-/// results, which already have at most one hit per doc_id.
+/// results, which already have at most one hit per `doc_id`.
 fn aligned_unique(fast: &[VectorHit], qscores: &[Option<f32>]) -> (Vec<VectorHit>, usize) {
     let blended = blend_two_tier_aligned_unique(fast, qscores, BLEND_FACTOR);
     let qmap = fast
@@ -225,7 +226,7 @@ fn bench_quality_score_prep(c: &mut Criterion) {
             bias: 0.125,
         }),
     ] {
-        let current = quality_prep_collect_copy(parity_input.clone(), config);
+        let current = quality_prep_collect_copy(&parity_input, config);
         let candidate = quality_prep_in_place(parity_input.clone(), config);
         assert_eq!(
             option_bits(&current),
@@ -243,7 +244,7 @@ fn bench_quality_score_prep(c: &mut Criterion) {
                 || input.clone(),
                 |owned| {
                     black_box(quality_prep_collect_copy(
-                        black_box(owned),
+                        black_box(&owned),
                         black_box(config),
                     ))
                 },

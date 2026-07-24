@@ -1,7 +1,7 @@
-//! Graph-rank (query-biased PageRank) power-iteration benchmark.
+//! Graph-rank (query-biased `PageRank`) power-iteration benchmark.
 //!
 //! `GraphRanker::rank_phase1` ran the power iteration over a `HashMap<String, f64>` rebuilt every
-//! iteration, cloning a `String` doc_id key on every teleport/edge relaxation (all keys already
+//! iteration, cloning a `String` `doc_id` key on every teleport/edge relaxation (all keys already
 //! present, so the clones were dead) and re-checking each edge's weight finiteness every pass. The
 //! new path dense-indexes the graph once and iterates over reused `Vec<f64>` buffers (CSR edges,
 //! hoisted weight filter). `rank_old`/`rank_new` below reproduce those two shapes self-contained.
@@ -175,7 +175,7 @@ fn rank_new(adj: &Adj, pers: &[(String, f64)], limit: usize) -> Vec<String> {
     }
     let mut next = vec![0.0_f64; n];
     for _ in 0..MAX_ITER {
-        next.iter_mut().for_each(|v| *v = 0.0);
+        next.fill(0.0);
         for &(i, w) in &seeds {
             next[i] += RESTART * w;
         }
@@ -224,13 +224,14 @@ fn make_graph(n: usize, deg: usize) -> (Adj, Vec<(String, f64)>) {
         state ^= state << 17;
         state
     };
+    let n_u64 = u64::try_from(n).expect("benchmark node count fits in u64");
     let mut adj: Adj = HashMap::new();
     for i in 0..n {
         adj.entry(format!("d{i:05}")).or_default();
     }
     for i in 0..n {
         for _ in 0..deg {
-            let j = (next() as usize) % n;
+            let j = usize::try_from(next() % n_u64).expect("reduced node index fits in usize");
             if j != i {
                 let w = 0.25 + (next() % 1000) as f32 / 1000.0;
                 adj.get_mut(&format!("d{i:05}"))
@@ -270,10 +271,11 @@ fn make_prod(n: usize, deg: usize) -> (DocumentGraph, Vec<VectorHit>) {
         state ^= state << 17;
         state
     };
+    let n_u64 = u64::try_from(n).expect("benchmark node count fits in u64");
     let mut graph = DocumentGraph::new();
     for i in 0..n {
         for _ in 0..deg {
-            let j = (next() as usize) % n;
+            let j = usize::try_from(next() % n_u64).expect("reduced node index fits in usize");
             if j != i {
                 let w = 0.25 + (next() % 1000) as f32 / 1000.0;
                 graph.add_edge(format!("d{i:05}"), format!("d{j:05}"), EdgeType::Similar, w);
@@ -298,10 +300,10 @@ fn adj_from_graph(graph: &DocumentGraph) -> Adj {
         .iter()
         .map(|(doc, edges)| {
             (
-                doc.to_string(),
+                doc.clone(),
                 edges
                     .iter()
-                    .map(|e| (e.neighbor_doc_id.to_string(), e.weight))
+                    .map(|e| (e.neighbor_doc_id.clone(), e.weight))
                     .collect(),
             )
         })

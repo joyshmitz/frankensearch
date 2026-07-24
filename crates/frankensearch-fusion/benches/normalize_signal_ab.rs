@@ -14,7 +14,8 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_fusion::bench_support::paired_median_ratio;
 
-/// Current: split_whitespace -> Vec -> join -> trim -> to_ascii_lowercase (3 allocs).
+/// Current: `split_whitespace` -> `Vec` -> `join` -> `trim` ->
+/// `to_ascii_lowercase` (3 allocs).
 fn old_normalize(value: &str) -> String {
     value
         .split_whitespace()
@@ -74,7 +75,7 @@ fn bench(c: &mut Criterion) {
         // document with many extracted signals / a search over many docs).
         let batch: Vec<&str> = vals
             .iter()
-            .cloned()
+            .copied()
             .cycle()
             .take(vals.len() * mult)
             .collect();
