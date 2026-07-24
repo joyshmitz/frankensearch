@@ -9,7 +9,7 @@
   "revisions": {
     "implementation_revision": "0bc2fa363412fc7d800e5eb29746449e345461a1",
     "implementation_base_revision": "34a16bfd723e8cdc385a332b2e1e8b5e7c1c23fe",
-    "proof_revision": "pending-evidence-commit"
+    "proof_revision": "2fbd0c4d11a2753ab9549e2b2bf745fd086356af"
   },
   "campaign": {
     "runtime": "asupersync::lab::LabRuntime",
