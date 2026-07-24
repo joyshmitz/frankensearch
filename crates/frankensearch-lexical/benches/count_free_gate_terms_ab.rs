@@ -1,7 +1,7 @@
 //! Route-next probe from the 2026-06-27 "count-free top-k is a mixed result" ledger:
-//! `search_doc_ids` gates the count-free `execute_top_k` (TopDocs alone → block-max
+//! `search_doc_ids` gates the count-free `execute_top_k` (`TopDocs` alone → block-max
 //! WAND pruning) to ≤2-term syntax-free queries and otherwise runs the counted
-//! `execute_query_with_offset` (TopDocs + Count → full scan, `total_count` then
+//! `execute_query_with_offset` (`TopDocs` + `Count` → full scan, `total_count` then
 //! discarded). The open question: does the WAND regression (measured ~2× on a broad
 //! natural-language query with a corpus-saturating term) appear at exactly 3 terms —
 //! i.e. is bumping the gate `term_count > 2` → `> 3` safe, or is per-term IDF/selectivity
@@ -17,6 +17,7 @@
 //!   --features bench-internals --bench count_free_gate_terms_ab
 //! ```
 
+use std::fmt::Write as _;
 use std::hint::black_box;
 
 use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
@@ -26,7 +27,7 @@ use tantivy::schema::{STORED, STRING, Schema, TEXT};
 use tantivy::{Index, doc};
 
 const N: usize = 40_000;
-const VOCAB: usize = 5_000;
+const VOCAB: u64 = 5_000;
 const LIMIT: usize = 100;
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -57,8 +58,9 @@ fn build_fixture() -> Fixture {
         let mut body = String::with_capacity(160);
         body.push_str("search ");
         for _ in 0..13 {
-            let t = (xorshift(&mut state) as usize) % VOCAB;
-            body.push_str(&format!("term{t} "));
+            let t =
+                usize::try_from(xorshift(&mut state) % VOCAB).expect("VOCAB remainder fits usize");
+            write!(&mut body, "term{t} ").expect("writing to String cannot fail");
         }
         writer
             .add_document(doc!(id => format!("doc-{i:06}"), content => body))
