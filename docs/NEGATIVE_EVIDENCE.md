@@ -16058,3 +16058,32 @@ Retry only when a fully reserved requested worker can link or reuse the exact
 release binary within the remote timeout. Require exact SWAR/scalar parity,
 64-pass A/A p5–p95 wholly within 0.97–1.03 for both corpora, every decisive-arm
 CV below 5%, short candidate/shipping <=0.97, and no decidable long regression.
+
+### 2026-07-23 — BLOCKED / UNTIMED retry: isolated short-token boundary-mask Criterion path remains inadmissible (`bd-l5x3`, TurquoiseTern)
+
+The mandatory ledger and recent-log pass reopened only the prior boundary-mask
+candidate; the cached-window primitive remains rejected, and no dot-product,
+top-k, RRF, or architectural source was touched. The candidate and retained
+shipping SWAR comparator shared one binary and a symmetric 64-pass paired
+harness. Strict-remote conformance job `j-29944835100114977` ran on
+`vmi1264463`: all 3 randomized mixed-Unicode, lane-edge scalar-oracle, and
+shipping-incumbent tests passed. The cold debug graph took 22m56s to build,
+already falsifying the retry's warm-graph premise.
+
+The strict-remote release measurement never reached its timed path. Fleet
+probing reported 12/12 hosts reachable, but reachability was not admissibility:
+`vmi1152480`, `hz2`, and `vmi1167313` failed hard preflight with
+`RCH-I004 alias_wrong_target`; `ovh-a` was rejected for
+`disk_critical_without_fresh_telemetry`; `ovh-b` was operator-disabled; and
+`vmi1153651` was draining/unreachable. The remaining full-worker route queued
+all 8 slots on `vmi1149989`, then failed closed with `RCH-I001 queue_timeout`
+before compilation or execution. No A/A, A/B, Criterion, or CV sample exists
+from this retry.
+
+**Decision: BLOCKED / UNTIMED, not REJECT.** The speculative production and
+benchmark edits were manually removed; shipping SWAR remains unchanged. Retry
+only when one admissible worker can reserve its full slot count and reuse or
+link the exact release benchmark binary inside ten minutes. Require exact
+SWAR/scalar/shipping parity, 64-pass shipping/shipping A/A p5–p95 wholly within
+0.97–1.03 for both corpora, every shipping/candidate Criterion CV below 5%,
+short candidate/shipping <=0.97, and no decidable long-token regression.

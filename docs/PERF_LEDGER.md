@@ -6913,3 +6913,26 @@ crate-wide `-D warnings` findings; none named the changed pressure harness.
 cannot improve steady query-edit latency because production adaptive
 recomputation replaces it before search scheduling, and the pressure evidence
 shows neither a p95 nor invocation-count benefit.
+
+## 2026-07-23 — BLOCKED / UNTIMED: isolated short-token boundary-mask retry still cannot enter Criterion (`bd-l5x3`, TurquoiseTern)
+
+Ledger-first routing reopened the previously untimed short-token selection-mask
+candidate without touching the closed SIMD dot-product, top-k, RRF, or
+architectural lanes. The same binary retained the pre-change shipping SWAR
+comparator, exact scalar oracle, and symmetric 64-pass A/A and A/B harness.
+Strict-remote job `j-29944835100114977` passed all 3 randomized mixed-Unicode,
+lane-edge, and shipping-incumbent conformance tests on `vmi1264463`; its cold
+debug graph required 22m56s.
+
+No release timing was admitted. Three requested full-worker routes failed hard
+preflight with `RCH-I004 alias_wrong_target`; other routes were disk-critical,
+operator-disabled, or draining. The last admissible 8-slot request on
+`vmi1149989` expired with `RCH-I001 queue_timeout` before compilation. Thus no
+new null band, candidate ratio, Criterion interval, or per-arm CV exists.
+
+**Decision: BLOCKED / UNTIMED, not REJECT.** The speculative source and bench
+edits were manually removed. Retry only on a fully reserved admissible worker
+whose exact release binary links or is reused within ten minutes. KEEP still
+requires exact SWAR/scalar/shipping parity, 64-pass A/A p5–p95 wholly within
+0.97–1.03 on both corpora, every decisive-arm CV below 5%, short
+candidate/shipping <=0.97, and no decidable long-token regression.
