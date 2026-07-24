@@ -1,14 +1,15 @@
 {
   "schema": "quill-consumer-e2e-sweep-v1",
-  "generated_at_utc": "2026-07-24T06:05:32Z",
+  "generated_at_utc": "2026-07-24T06:22:15Z",
   "bead": {
     "id": "bd-quill-e7-7-consumer-e2e-cg41",
     "status": "pass"
   },
   "revisions": {
-    "implementation_revision": "bddeb009738d9b8e72cebb72e25e1e3a7da13c82",
-    "proof_revision": "da6b3bfcd29d8fc85911215d9ed9685f23e856a8",
+    "implementation_revision": "6d961f5bc7f36edce0f8e78a00052c0c1bebc06b",
+    "proof_revision": "4b1f4974271d064efe44db9e5dfb092190e33b09",
     "pre_rebase_base_revision": "bacf932a",
+    "rebased_onto": "a90fcb26a56994cca44372236252c16c75a3866d",
     "note": "This is a pre-default-flip consumer proof. The full feature still excludes Quill; the default flip remains owned by E7.6."
   },
   "feature_contract": {
@@ -151,6 +152,41 @@
       "evidence": "structured"
     }
   },
+  "post_rebase_validation": {
+    "upstream_change": "Quill group upper bounds became conservative via conservative_optional_bound_sum.",
+    "quill_all_features": {
+      "command": "cargo test --locked -p frankensearch-quill --all-features",
+      "worker": "ovh-a",
+      "unit_passed": 505,
+      "doctest_passed": 2,
+      "failed": 0,
+      "elapsed": "2m53s"
+    },
+    "facade_quill_exact": {
+      "command": "cargo test -p frankensearch --lib --no-default-features --features quill feature_matrix_smoke::quill_lane_behavior -- --exact --nocapture",
+      "worker": "ovh-a",
+      "passed": 1,
+      "filtered_out": 24,
+      "failed": 0,
+      "elapsed": "2m48s",
+      "evidence": {
+        "behavior": "real_index_build_search",
+        "lane": "quill",
+        "observations": {
+          "documents": 2,
+          "hits": 1
+        },
+        "schema": "frankensearch-feature-behavior-v1",
+        "status": "pass"
+      }
+    },
+    "workspace_clippy": {
+      "command": "cargo clippy --locked --workspace --all-targets --all-features --message-format short -- -D warnings",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "427.7s"
+    }
+  },
   "release_contract": {
     "result": "pass",
     "worker": "ovh-a",
@@ -253,6 +289,10 @@
       {
         "worker": "hz1",
         "reason": "critical pressure: disk_free_below_critical_gb"
+      },
+      {
+        "worker": "hz1",
+        "reason": "no_free_slots for pinned post-rebase Quill test; automatic remote routing selected ovh-a"
       }
     ],
     "noise_fix": "The isolated release-contract test installs a process-global NoSubscriber because Rayon workers do not inherit thread-local tracing subscribers. Thresholds were not weakened."
