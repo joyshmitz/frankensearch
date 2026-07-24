@@ -1389,6 +1389,12 @@ struct QuillWriterState {
     pending_replacement_manifest: Option<Manifest>,
     pending_delta_seal: Option<PendingDeltaSeal>,
     unpublished_since: Option<Instant>,
+    /// A prior scalar ingest returned an error after mutation may have begun.
+    ///
+    /// Successfully installed segments may span multiple bounded batches, but
+    /// an ambiguous partial batch must be reconciled by `commit` before any
+    /// further scalar indexing is accepted.
+    ingest_retry_required: bool,
 }
 
 impl Deref for QuillWriterState {
@@ -1707,6 +1713,7 @@ impl QuillWriterState {
             pending_replacement_manifest: None,
             pending_delta_seal: None,
             unpublished_since: None,
+            ingest_retry_required: false,
         })
     }
 
@@ -2027,18 +2034,22 @@ impl QuillWriterState {
                     "scalar indexing cannot run while process-local Delta epochs are active",
                 ));
             }
-            if self.staged_flush.is_some()
-                || !self.pending_segments.is_empty()
+            if self.ingest_retry_required
+                || self.staged_flush.is_some()
                 || self.pending_manifest.is_some()
                 || (self.pending_replacement_manifest.is_some() && replacement_ids.is_empty())
             {
                 return Err(invalid_state(
-                    "installed segments await MANIFEST publication; retry commit before indexing",
+                    "a prior scalar mutation requires commit retry before indexing",
                 ));
             }
             if documents.is_empty() {
                 return Ok(());
             }
+            // Arm the fail-closed retry guard before allocation or mutation.
+            // Only the successful return below (or a successful commit)
+            // disarms it.
+            self.ingest_retry_required = true;
             let shard_id = self.shard_router.route_batch();
             let document_count = u32::try_from(documents.len())
                 .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
@@ -2164,6 +2175,7 @@ impl QuillWriterState {
                 "arena_bytes_reserved_high_water",
                 u64::try_from(arena_bytes_reserved_high_water).unwrap_or(u64::MAX),
             );
+            self.ingest_retry_required = false;
             Ok(())
         }
         .instrument(instrumented)
@@ -2205,6 +2217,7 @@ impl QuillWriterState {
         if !self.config.bulk_load_mode {
             self.apply_tier_policy(cx).await?;
         }
+        self.ingest_retry_required = false;
         Ok(self.backend.snapshot())
     }
 
@@ -13226,6 +13239,79 @@ mod tests {
                     .expect("search finished bulk index")
                     .total_count,
                 Some(7),
+            );
+        });
+    }
+
+    #[test]
+    fn successful_sealed_batches_compose_but_failed_batches_require_commit_retry() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                scribe_shard_budget_bytes: 1,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config).expect("bounded-batch memory index");
+
+            for ordinal in 0..2 {
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new(
+                            format!("bounded-{ordinal}"),
+                            "bounded batch searchable",
+                        )],
+                    )
+                    .await
+                    .expect("successful seal-producing batch");
+            }
+            assert_eq!(index.doc_count(), 0, "segments remain unpublished");
+            assert!(index.has_uncommitted_changes());
+
+            let duplicate_batch = [
+                IndexableDocument::new("bounded-2", "bounded batch searchable"),
+                IndexableDocument::new("bounded-2", "bounded duplicate"),
+            ];
+            assert!(
+                index.index_documents(&cx, &duplicate_batch).await.is_err(),
+                "duplicate batch must fail after accepting its unique prefix"
+            );
+            assert!(index.writer_mut().ingest_retry_required);
+            assert!(
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new(
+                            "bounded-3",
+                            "bounded batch searchable",
+                        )],
+                    )
+                    .await
+                    .is_err(),
+                "an ambiguous partial batch must fail closed until commit"
+            );
+
+            index.commit(&cx).await.expect("reconcile partial batch");
+            assert_eq!(index.doc_count(), 3);
+            assert!(!index.writer_mut().ingest_retry_required);
+
+            index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new(
+                        "bounded-3",
+                        "bounded batch searchable",
+                    )],
+                )
+                .await
+                .expect("index after retry commit");
+            index.commit(&cx).await.expect("final bounded-batch commit");
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "searchable", 10, 0, true)
+                    .expect("search committed bounded batches")
+                    .total_count,
+                Some(4),
             );
         });
     }
