@@ -1,5 +1,34 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-23 — KEEP: Quill `TermInterner::bytes_used` O(1) running counter — −12.7% ingest instructions (`bd-w4j5`, cc)
+
+First lever in the INGEST vein (the query-decode profile vein was mined). An ingest-heavy local
+profile (`segment_fanout_ab`, `QUILL_E49_SCALE=full QUILL_E49_ROUNDS=1`, ~71k docs, 1-thread) put
+`ColumnarAccumulator::bytes_used` at 7.33% of ingest self-time — because `should_flush(budget)`
+(`scribe.rs`) re-calls `bytes_used() >= budget` after EVERY ingested document to decide flush timing,
+and its dominant cost is `TermInterner::bytes_used`, which re-summed the arena chunks (O(chunks)) and
+iterated EVERY hash bucket for collision-id bytes (O(distinct terms)) — a full recompute per document.
+
+The fix reuses machinery that already exists: `intern_accounted` already returns `added_bytes`, the
+exact per-term increment to `bytes_used` (arena key + `ArenaSpan` size + bucket bytes), which the delta
+segment already trusts for its own O(1) seal check. Accumulate `added_bytes` into a `running_bytes_used`
+field (reset in `reset()`); `bytes_used()` returns it. Σ of the increments exactly equals the former
+recompute (arena bytes + `spans.len()*size` + `buckets.len()*ESTIMATE` + collision_ids), and the only
+sites that mutate arena/spans/buckets are `intern_accounted` and `reset`, so the counter never drifts.
+
+Byte-identical: because `bytes_used` is unchanged in value, flush timing — hence segment boundaries and
+on-disk layout — is identical. Pinned by the full suite including the deterministic-ingest and gauntlet
+differential tests (which would fail on any flush-timing shift) and the `bytes_used`-growth unit test.
+473/473 quill-lib tests green; scoped clippy `-D warnings` clean.
+
+MEASURED (deterministic instruction count, HEAD vs change, ingest workload `full`/`ROUNDS=1`/1-thread):
+OLD 7,299,627,724 / 7,300,562,101 → NEW 6,366,154,746 / 6,373,972,116 = **−930M (−12.7%)**, both runs
+±0.01%. Larger than the 7.33% self-time because the per-document O(distinct-terms) bucket-map traversal
+is instruction-heavy (map iteration) beyond what flat sampling attributed.
+
+**Decision: KEEP.** Route next (ingest profile): `bytes_reserved` has the same recompute shape (called
+in flush-cycle tracing), `memmove` 2.8%, tokenizer `analyze` 0.7%.
+
 ## 2026-07-23 — KEEP: Quill `consume_position_run` peel-first-iteration — −0.81% total instructions (`bd-2fha`, cc)
 
 Small profile-directed cleanup: the post-bitmap map put `consume_position_run` at ~14% of query

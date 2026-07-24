@@ -934,6 +934,12 @@ pub struct TermInterner<S: BuildHasher = ahash::RandomState> {
     hasher: S,
     /// Scratch buffer for composite-key assembly (reused, never shrunk).
     key_scratch: Vec<u8>,
+    /// Running sum of every `intern_accounted` increment, so [`Self::bytes_used`]
+    /// is O(1) instead of re-summing the arena chunks and every bucket per call
+    /// (profile-directed, bd-w4j5: `should_flush` re-called `bytes_used` once per
+    /// ingested document). Exactly equals the former recompute because each
+    /// increment already accounts for the arena key, span, and bucket bytes.
+    running_bytes_used: usize,
 }
 
 impl TermInterner<ahash::RandomState> {
@@ -958,6 +964,7 @@ impl<S: BuildHasher> TermInterner<S> {
             buckets: HashMap::new(),
             hasher,
             key_scratch: Vec::with_capacity(64),
+            running_bytes_used: 0,
         }
     }
 
@@ -1043,6 +1050,7 @@ impl<S: BuildHasher> TermInterner<S> {
             .saturating_add(term.len())
             .saturating_add(std::mem::size_of::<ArenaSpan>())
             .saturating_add(bucket_bytes);
+        self.running_bytes_used = self.running_bytes_used.saturating_add(added_bytes);
         (id, added_bytes)
     }
 
@@ -1099,18 +1107,7 @@ impl<S: BuildHasher> TermInterner<S> {
     /// [`Self::bytes_reserved`] for RSS diagnostics.
     #[must_use]
     pub fn bytes_used(&self) -> usize {
-        let collision_ids = self
-            .buckets
-            .values()
-            .map(|bucket| match bucket {
-                Bucket::One(_) => 0,
-                Bucket::Many(ids) => ids.len() * std::mem::size_of::<u32>(),
-            })
-            .sum::<usize>();
-        self.arena.bytes_used()
-            + self.spans.len() * std::mem::size_of::<ArenaSpan>()
-            + self.buckets.len() * TERM_BUCKET_BYTES_ESTIMATE
-            + collision_ids
+        self.running_bytes_used
     }
 
     /// Complete retained interner allocation for RSS/reuse diagnostics.
@@ -1147,6 +1144,7 @@ impl<S: BuildHasher> TermInterner<S> {
         self.spans.clear();
         self.buckets.clear();
         self.key_scratch.clear();
+        self.running_bytes_used = 0;
     }
 
     /// Arena diagnostics for flush-cycle tracing:
