@@ -7,9 +7,10 @@
     "title": "LabRuntime determinism + concurrency suites (engine-wide)"
   },
   "revisions": {
-    "implementation_revision": "0bc2fa363412fc7d800e5eb29746449e345461a1",
-    "implementation_base_revision": "34a16bfd723e8cdc385a332b2e1e8b5e7c1c23fe",
-    "proof_revision": "2fbd0c4d11a2753ab9549e2b2bf745fd086356af"
+    "implementation_revision": "94b5a5e265543bc91289cc72b18d6fa9143de203",
+    "implementation_base_revision": "bddbdcf529e0dc419fa2f5c6137c1f189494e783",
+    "proof_revision": "4dc5b500a23b82bfb365b1732b583345253114a5",
+    "rebased_onto": "bddbdcf529e0dc419fa2f5c6137c1f189494e783"
   },
   "campaign": {
     "runtime": "asupersync::lab::LabRuntime",
@@ -140,6 +141,28 @@
       "elapsed": "367.9s"
     }
   ],
+  "post_rebase_validation": {
+    "upstream_revision": "bddbdcf529e0dc419fa2f5c6137c1f189494e783",
+    "upstream_change": "Dormant grouped-MaxScore candidate machinery for nested unions changed another section of the same Quill source file.",
+    "randomized_all_feature_suite": {
+      "command": "cargo test --locked -p frankensearch-quill --all-features",
+      "environment": "QUILL_E6_5_RANDOM_SEEDS=2 QUILL_E3_9_RANDOM_SEEDS=2 RCH_REQUIRE_REMOTE=1",
+      "worker": "ovh-a",
+      "unit_passed": 507,
+      "unit_ignored": 2,
+      "doctest_passed": 2,
+      "failed": 0,
+      "expanded_schedule_seeds": 42,
+      "elapsed": "200.8s"
+    },
+    "quill_clippy": {
+      "command": "cargo clippy --locked -p frankensearch-quill --all-targets --all-features --message-format short -- -D warnings",
+      "environment": "RCH_REQUIRE_REMOTE=1",
+      "worker": "hz1",
+      "result": "pass",
+      "elapsed": "260.2s"
+    }
+  },
   "format_and_static_review": {
     "rustfmt": {
       "command": "rustfmt +nightly crates/frankensearch-quill/src/index.rs",
