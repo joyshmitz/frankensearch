@@ -550,6 +550,7 @@ struct ShadowPressureSampler {
 }
 
 impl ShadowPressureSampler {
+    #[cfg(feature = "shadow-oracle")]
     fn new(config: &FsfsConfig) -> SearchResult<Self> {
         const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
         #[allow(clippy::cast_precision_loss)]
@@ -9785,23 +9786,6 @@ impl FsfsRuntime {
                     .map(|(file_key, _)| file_key.clone()),
             );
         }
-        if !lexical_reconciliation_ids.is_empty() {
-            let mutations = lexical_reconciliation_ids
-                .into_iter()
-                .map(|file_key| {
-                    LexicalMutation::delete(
-                        file_key,
-                        0,
-                        IngestionClass::Skip,
-                        "bulk_reconciliation",
-                    )
-                })
-                .collect::<Vec<_>>();
-            let backend = QuillLexicalBackend::new(&lexical_index);
-            let mut pipeline = LexicalPipeline::new(backend);
-            let _stats = pipeline.apply_initial(&mutations)?;
-            pipeline.backend_mut().flush(cx).await?;
-        }
         let mut observed_reason_codes: BTreeSet<String> =
             stats.reason_codes.iter().cloned().collect();
         if checkpoint_manifests.is_some() {
@@ -9840,6 +9824,9 @@ impl FsfsRuntime {
         let mut vector_elapsed_ms = 0_u128;
         let mut embedding_elapsed_ms = 0_u128;
         let mut batch_counter = 0_usize;
+        let mut lexical_resume_absent = 0_u64;
+        let mut lexical_resume_unchanged = 0_u64;
+        let mut lexical_resume_changed = 0_u64;
         let mut remaining_reused_semantic = candidates
             .iter()
             .filter(|candidate| {
@@ -9986,6 +9973,16 @@ impl FsfsRuntime {
 
             // Lexical Indexing
             let lexical_start = Instant::now();
+            for pending in &chunk_docs {
+                if pending.lexical_required
+                    && !matches!(
+                        pending.ingestion_class,
+                        IngestionClass::MetadataOnly | IngestionClass::Skip
+                    )
+                {
+                    lexical_reconciliation_ids.remove(&pending.file_key);
+                }
+            }
             let lexical_batch = chunk_docs
                 .iter()
                 .filter(|pending| {
@@ -10012,7 +10009,12 @@ impl FsfsRuntime {
                 let backend = QuillLexicalBackend::new(&lexical_index);
                 let mut pipeline = LexicalPipeline::new(backend);
                 let _stats = pipeline.apply_initial(&lexical_batch)?;
-                pipeline.backend_mut().flush(cx).await?;
+                let resume_stats = pipeline.backend_mut().flush_resumable(cx).await?;
+                lexical_resume_absent = lexical_resume_absent.saturating_add(resume_stats.absent);
+                lexical_resume_unchanged =
+                    lexical_resume_unchanged.saturating_add(resume_stats.unchanged);
+                lexical_resume_changed =
+                    lexical_resume_changed.saturating_add(resume_stats.changed);
             }
             lexical_elapsed_ms =
                 lexical_elapsed_ms.saturating_add(lexical_start.elapsed().as_millis());
@@ -10247,6 +10249,35 @@ impl FsfsRuntime {
                 &recent_warnings,
             ))?;
         }
+
+        let stale_lexical_candidates = lexical_reconciliation_ids.len();
+        let stale_lexical_deleted = if lexical_reconciliation_ids.is_empty() {
+            0
+        } else {
+            let mutations = lexical_reconciliation_ids
+                .into_iter()
+                .map(|file_key| {
+                    LexicalMutation::delete(
+                        file_key,
+                        0,
+                        IngestionClass::Skip,
+                        "bulk_reconciliation",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let backend = QuillLexicalBackend::new(&lexical_index);
+            let mut pipeline = LexicalPipeline::new(backend);
+            let _stats = pipeline.apply_initial(&mutations)?;
+            pipeline.backend_mut().flush_resumable(cx).await?.deleted
+        };
+        info!(
+            lexical_resume_absent,
+            lexical_resume_unchanged,
+            lexical_resume_changed,
+            stale_lexical_candidates,
+            stale_lexical_deleted,
+            "fsfs classified crash-resumable Quill bulk rows"
+        );
 
         let canonicalize_elapsed_ms = canonicalize_start.elapsed().as_millis();
 
@@ -20422,12 +20453,26 @@ mod tests {
                 .map(|hit| hit.document_id)
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(partial_lexical_ids, partial_manifest_ids);
+            let changed_id = partial_manifest_ids
+                .first()
+                .expect("partial generation has a changed fixture")
+                .clone();
+            let stable_id = partial_manifest_ids
+                .iter()
+                .nth(1)
+                .expect("partial generation has a stable fixture")
+                .clone();
+            let changed_witness_before = partial_lexical
+                .document_witness(&changed_id)
+                .expect("probe pre-crash changed row")
+                .expect("pre-crash changed row");
+            let stable_witness_before = partial_lexical
+                .document_witness(&stable_id)
+                .expect("probe pre-crash stable row")
+                .expect("pre-crash stable row");
             drop(partial_lexical);
 
-            let deferred_id = partial_manifest_ids
-                .first()
-                .expect("partial generation has a semantic document")
-                .clone();
+            let deferred_id = changed_id.clone();
             assert!(
                 partial_vector
                     .soft_delete(&deferred_id)
@@ -20441,6 +20486,11 @@ mod tests {
             super::write_indexing_checkpoint(&index_root, &checkpoint)
                 .expect("publish deferred semantic checkpoint");
             drop(partial_vector);
+            fs::write(
+                project.join(&changed_id),
+                "pub fn changed_after_crash() { /* resume_common changed_after_crash */ }\n",
+            )
+            .expect("change one durable lexical row before resume");
 
             let resume_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 command: CliCommand::Index,
@@ -20495,6 +20545,35 @@ mod tests {
                 .map(|hit| hit.document_id)
                 .collect::<super::BTreeSet<_>>();
             assert_eq!(lexical_ids, expected_ids);
+            let stable_witness_after = lexical_index
+                .document_witness(&stable_id)
+                .expect("probe resumed stable row")
+                .expect("resumed stable row");
+            let changed_witness_after = lexical_index
+                .document_witness(&changed_id)
+                .expect("probe resumed changed row")
+                .expect("resumed changed row");
+            assert_eq!(
+                stable_witness_after, stable_witness_before,
+                "IDHASH equal-hash resume must preserve the stable Q1 docid"
+            );
+            assert_ne!(
+                changed_witness_after.global_docid, changed_witness_before.global_docid,
+                "IDMAP hash mismatch must upsert under a fresh Q1 docid"
+            );
+            assert_ne!(
+                changed_witness_after.content_hash,
+                changed_witness_before.content_hash
+            );
+            assert_eq!(
+                lexical_index
+                    .search_doc_ids(&cx, "changed_after_crash", 10)
+                    .expect("query changed resume row")
+                    .into_iter()
+                    .map(|hit| hit.document_id)
+                    .collect::<Vec<_>>(),
+                vec![changed_id.clone()]
+            );
 
             let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
                 .expect("read resumed sentinel")

@@ -144,6 +144,15 @@ pub struct QuillHit {
     pub score: f32,
 }
 
+/// One exact IDHASH/IDMAP identity witness from the published snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuillDocumentWitness {
+    /// Stable global Quill document id.
+    pub global_docid: u32,
+    /// Unseeded xxh3-64 witness over the canonical indexed document.
+    pub content_hash: u64,
+}
+
 /// One enriched Quill hit returned by [`QuillIndex::search_with_snippets`].
 #[derive(Clone, Debug)]
 pub struct QuillSnippetHit {
@@ -442,16 +451,35 @@ impl QuillSearchSnapshot {
             })
     }
 
-    fn resolve_document_id(&self, document_id: &str) -> Result<Option<u32>, QuillIndexError> {
+    fn resolve_document_witness(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<QuillDocumentWitness>, QuillIndexError> {
         for delta in self.deltas.iter().rev() {
             if let Some(global_docid) = delta.segment().probe_id(document_id) {
-                return Ok(Some(global_docid));
+                let content_hash = delta.content_hash(global_docid).ok_or_else(|| {
+                    invalid_state(format!(
+                        "live Delta document {document_id:?} has no resumable content witness"
+                    ))
+                })?;
+                return Ok(Some(QuillDocumentWitness {
+                    global_docid,
+                    content_hash,
+                }));
             }
         }
         Ok(self
             .keeper
             .resolve_document_id(document_id)?
-            .map(|resolved| resolved.global_docid))
+            .map(|resolved| QuillDocumentWitness {
+                global_docid: resolved.global_docid,
+                content_hash: resolved.content_hash,
+            }))
+    }
+
+    fn resolve_document_id(&self, document_id: &str) -> Result<Option<u32>, QuillIndexError> {
+        self.resolve_document_witness(document_id)
+            .map(|witness| witness.map(|witness| witness.global_docid))
     }
 
     fn materialize_metadata(
@@ -3914,6 +3942,21 @@ impl QuillIndex {
         self.reader.published_snapshot.load()
     }
 
+    /// Resolve one published document through IDHASH and return its IDMAP hash.
+    ///
+    /// The probe is allocation-free for sealed segments. It returns `None`
+    /// when the identifier is absent or tombstoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed identity corruption or an invalid live-Delta witness.
+    pub fn document_witness(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<QuillDocumentWitness>, QuillIndexError> {
+        self.search_snapshot().resolve_document_witness(document_id)
+    }
+
     /// Durable index directory, or `None` for an owned-buffer index.
     #[must_use]
     pub fn directory(&self) -> Option<&Path> {
@@ -4519,6 +4562,18 @@ fn canonical_document_preimage(
         document.title.as_deref().unwrap_or(""),
         metadata,
     ))
+}
+
+/// Compute the exact IDMAP content witness Quill will persist for a document.
+///
+/// # Errors
+///
+/// Returns a JSON error if canonical metadata serialization fails.
+pub fn indexable_document_content_hash(
+    document: &IndexableDocument,
+) -> Result<u64, QuillIndexError> {
+    let metadata = canonical_metadata(&document.metadata)?;
+    Ok(xxh3_64(&canonical_document_preimage(document, &metadata)?))
 }
 
 fn manifest_segment(encoded: &EncodedSegment, seal_seq: u64) -> ManifestSegment {

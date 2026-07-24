@@ -1999,6 +1999,8 @@ pub struct ResolvedDocumentId {
     pub seal_seq: u64,
     /// Stable global Quill document id.
     pub global_docid: u32,
+    /// Unseeded xxh3-64 witness over the canonical indexed document.
+    pub content_hash: u64,
 }
 
 #[derive(Clone)]
@@ -2308,16 +2310,18 @@ impl RecoveredSegment {
             .is_some_and(|id_map| self.id_lookup.contains_global_docid(id_map, global_docid))
     }
 
-    fn lookup_document_id(&self, document_id: &str) -> Result<Option<u32>, KeeperError> {
+    fn lookup_document_id(&self, document_id: &str) -> Result<Option<(u32, u64)>, KeeperError> {
         let id_map = required_identity_section(&self.path, &self.reader, SectionKind::IDMAP)?;
         let id_hash = required_identity_section(&self.path, &self.reader, SectionKind::IDHASH)?;
         self.id_lookup
-            .lookup(id_map, id_hash, document_id)
-            .map(|global_docid| {
-                u32::try_from(global_docid).map_err(|_| KeeperError::SegmentMetadataMismatch {
-                    path: self.path.clone(),
-                    detail: format!("IDHASH returned non-u32 global docid {global_docid}"),
-                })
+            .lookup_with_content_hash(id_map, id_hash, document_id)
+            .map(|(global_docid, content_hash)| {
+                u32::try_from(global_docid)
+                    .map(|global_docid| (global_docid, content_hash))
+                    .map_err(|_| KeeperError::SegmentMetadataMismatch {
+                        path: self.path.clone(),
+                        detail: format!("IDHASH returned non-u32 global docid {global_docid}"),
+                    })
             })
             .transpose()
     }
@@ -2942,7 +2946,8 @@ impl KeeperSnapshot {
                     ),
                 });
             }
-            let Some(global_docid) = segment.lookup_document_id(document_id)? else {
+            let Some((global_docid, content_hash)) = segment.lookup_document_id(document_id)?
+            else {
                 tracing::trace!(
                     target: crate::tracing_conventions::TARGET,
                     phase = "keeper.idhash_probe",
@@ -2972,6 +2977,7 @@ impl KeeperSnapshot {
                 segment_id: segment.manifest.segment_id,
                 seal_seq: segment.manifest.seal_seq,
                 global_docid,
+                content_hash,
             };
             if let Some(first) = live {
                 return Err(KeeperError::MultipleLiveDocumentIds {
@@ -14431,6 +14437,7 @@ mod tests {
                     segment_id: 0x201,
                     seal_seq: 10,
                     global_docid: 0,
+                    content_hash: 1,
                 })
             );
 
@@ -14547,6 +14554,7 @@ mod tests {
                 segment_id: 0x302,
                 seal_seq: 30,
                 global_docid: 20,
+                content_hash: 1,
             })
         );
 

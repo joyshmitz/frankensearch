@@ -4733,14 +4733,13 @@ fn consume_position_run(
     let mut previous = reader.read_u32_vint()?;
     for _ in 1..freq {
         let encoded = reader.read_u32_vint()?;
-        previous =
-            previous
-                .checked_add(encoded)
-                .ok_or(PositionCodecError::PositionOverflow {
-                    posting_ordinal,
-                    previous,
-                    delta: encoded,
-                })?;
+        previous = previous
+            .checked_add(encoded)
+            .ok_or(PositionCodecError::PositionOverflow {
+                posting_ordinal,
+                previous,
+                delta: encoded,
+            })?;
     }
     Ok(())
 }
@@ -7253,19 +7252,17 @@ impl IdHashLookupPlan {
         Some(DocId::new(std::str::from_utf8(document_id).ok()?))
     }
 
-    /// Probe the exact immutable section bytes from which this plan was built.
+    /// Probe one exact identifier and return its positional content witness.
     ///
-    /// The caller owns that identity binding: Keeper stores this plan beside
-    /// the same immutable `SegmentReader` used during validation. Length and
-    /// layout checks below make accidental mismatches fail closed; all slice
-    /// access remains checked.
+    /// This shares the allocation-free IDHASH walk used by ordinary identity
+    /// resolution, then reads only the winning row's validated IDMAP hash.
     #[must_use]
-    pub(crate) fn lookup(
+    pub(crate) fn lookup_with_content_hash(
         self,
         id_map_bytes: &[u8],
         id_hash_bytes: &[u8],
         document_id: &str,
-    ) -> Option<u64> {
+    ) -> Option<(u64, u64)> {
         if id_map_bytes.len() != self.id_map_len || id_hash_bytes.len() != self.id_hash_len {
             return None;
         }
@@ -7283,12 +7280,24 @@ impl IdHashLookupPlan {
                 let ordinal = usize::try_from(doc_ord_plus1 - 1).ok()?;
                 let stored_document_id = self.document_id_bytes(id_map_bytes, ordinal)?;
                 if stored_document_id == document_id.as_bytes() {
-                    return self.docid_lo.checked_add(u64::try_from(ordinal).ok()?);
+                    let global_docid = self.docid_lo.checked_add(u64::try_from(ordinal).ok()?)?;
+                    let content_hash = self.content_hash(id_map_bytes, ordinal)?;
+                    return Some((global_docid, content_hash));
                 }
             }
             slot = (slot + 1) & mask;
         }
         None
+    }
+
+    fn content_hash(self, id_map_bytes: &[u8], ordinal: usize) -> Option<u64> {
+        if ordinal >= self.span {
+            return None;
+        }
+        let hashes_len = self.span.checked_mul(ID_MAP_HASH_LEN)?;
+        let hashes_start = self.id_map_blob_offset.checked_sub(hashes_len)?;
+        let hashes = id_map_bytes.get(hashes_start..self.id_map_blob_offset)?;
+        id_map_hash(hashes, ordinal)
     }
 
     fn document_id_bytes(self, id_map_bytes: &[u8], ordinal: usize) -> Option<&[u8]> {
@@ -14884,6 +14893,31 @@ mod tests {
             hash.lookup_materialized("omega")
                 .map(|(docid, id)| (docid, id.to_string())),
             Some((12, "omega".to_owned()))
+        );
+        let lookup = hash.lookup_plan();
+        assert_eq!(
+            lookup.lookup_with_content_hash(
+                encoded_map.as_bytes(),
+                encoded_hash.as_bytes(),
+                "alpha"
+            ),
+            Some((10, 1))
+        );
+        assert_eq!(
+            lookup.lookup_with_content_hash(
+                encoded_map.as_bytes(),
+                encoded_hash.as_bytes(),
+                "omega"
+            ),
+            Some((12, 2))
+        );
+        assert_eq!(
+            lookup.lookup_with_content_hash(
+                encoded_map.as_bytes(),
+                encoded_hash.as_bytes(),
+                "missing"
+            ),
+            None
         );
 
         let collision_inputs = [
