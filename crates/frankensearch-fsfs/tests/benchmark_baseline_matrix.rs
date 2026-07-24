@@ -8,6 +8,7 @@ use frankensearch_core::metrics_eval::{
     BootstrapComparison, RunStabilityVerdict, bootstrap_compare, trim_outliers,
     verify_run_stability,
 };
+use frankensearch_fsfs::LexicalPerformanceTargets;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -22,6 +23,10 @@ const REGRESSION_SCALE: u64 = 100;
 const DRIFT_DASHBOARD_JSON: &str = "benchmark_drift_dashboard.json";
 const DRIFT_DASHBOARD_MARKDOWN: &str = "benchmark_drift_dashboard.md";
 const DRIFT_DASHBOARD_REPLAY_COMMAND: &str = "RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix benchmark_drift_dashboard -- --nocapture";
+const QUILL_LEXICAL_GOLDEN_SCHEMA_VERSION: &str = "quill-fsfs-lexical-contract-golden-v1";
+const QUILL_LEXICAL_GOLDEN_SHA256: &str =
+    "4f300cd48bb78bec4ac4049f5cd414edf4149493486e7df39f97944aa582c308";
+const QUILL_LEXICAL_DASHBOARD_SCHEMA_VERSION: &str = "quill-fsfs-lexical-contract-dashboard-v1";
 
 /// Default bootstrap parameters for statistical regression detection.
 const BOOTSTRAP_CONFIDENCE: f64 = 0.95;
@@ -131,6 +136,61 @@ struct GoldenDataset {
     workload: WorkloadStats,
     baseline_metrics: BaselineMetrics,
     notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QuillLexicalCorpus {
+    initial_documents: u32,
+    watch_documents: u32,
+    watch_batch_documents: u32,
+    replacement_segments: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QuillLexicalThresholds {
+    initial_docs_per_second: u32,
+    watch_updates_per_second: u32,
+    update_to_searchable_p95_micros: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QuillLexicalMeasurements {
+    revision: String,
+    initial_docs_per_second: u32,
+    watch_updates_per_second: u32,
+    update_to_searchable_p95_micros: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QuillLexicalProvenance {
+    profile: String,
+    machine_class: String,
+    same_worker: bool,
+    evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QuillLexicalGolden {
+    schema_version: String,
+    captured_at: String,
+    fixture_id: String,
+    corpus: QuillLexicalCorpus,
+    thresholds: QuillLexicalThresholds,
+    before: QuillLexicalMeasurements,
+    after: QuillLexicalMeasurements,
+    provenance: QuillLexicalProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QuillLexicalDashboard {
+    schema_version: String,
+    fixture_id: String,
+    thresholds: QuillLexicalThresholds,
+    before: QuillLexicalMeasurements,
+    after: QuillLexicalMeasurements,
+    before_meets_contract: bool,
+    after_meets_contract: bool,
+    evidence: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -353,6 +413,44 @@ fn load_golden_dataset(profile: &str) -> GoldenDataset {
     let path = fixture_dir().join(format!("{profile}.json"));
     let raw = fs::read_to_string(&path).expect("read golden dataset fixture");
     serde_json::from_str::<GoldenDataset>(&raw).expect("parse golden dataset fixture")
+}
+
+fn load_quill_lexical_golden() -> QuillLexicalGolden {
+    let path = fixture_dir().join("quill-e7-lexical.json");
+    let raw = fs::read_to_string(&path).expect("read Quill lexical golden");
+    serde_json::from_str(&raw).expect("parse Quill lexical golden")
+}
+
+fn lexical_measurements_meet_contract(
+    thresholds: &QuillLexicalThresholds,
+    measurements: &QuillLexicalMeasurements,
+) -> bool {
+    let targets = LexicalPerformanceTargets {
+        initial_docs_per_second: thresholds.initial_docs_per_second,
+        incremental_updates_per_second: thresholds.watch_updates_per_second,
+        incremental_p95_latency_ms: thresholds.update_to_searchable_p95_micros.div_ceil(1_000),
+    };
+    targets.meets_contract(
+        measurements.initial_docs_per_second,
+        measurements.watch_updates_per_second,
+        measurements.update_to_searchable_p95_micros.div_ceil(1_000),
+    )
+}
+
+fn build_quill_lexical_dashboard(golden: &QuillLexicalGolden) -> QuillLexicalDashboard {
+    QuillLexicalDashboard {
+        schema_version: QUILL_LEXICAL_DASHBOARD_SCHEMA_VERSION.to_owned(),
+        fixture_id: golden.fixture_id.clone(),
+        thresholds: golden.thresholds.clone(),
+        before: golden.before.clone(),
+        after: golden.after.clone(),
+        before_meets_contract: lexical_measurements_meet_contract(
+            &golden.thresholds,
+            &golden.before,
+        ),
+        after_meets_contract: lexical_measurements_meet_contract(&golden.thresholds, &golden.after),
+        evidence: golden.provenance.evidence.clone(),
+    }
 }
 
 const fn baseline_value(dataset: &GoldenDataset, metric: ComparatorMetric) -> u64 {
@@ -1030,6 +1128,46 @@ fn golden_datasets_are_versioned_and_reproducible() {
     }
 
     assert_eq!(GOLDEN_PROFILES.len(), 3);
+}
+
+#[test]
+fn quill_lexical_golden_shows_reviewed_contract_flip() {
+    let path = fixture_dir().join("quill-e7-lexical.json");
+    assert_eq!(sha256_hex_for_file(&path), QUILL_LEXICAL_GOLDEN_SHA256);
+
+    let golden = load_quill_lexical_golden();
+    assert_eq!(golden.schema_version, QUILL_LEXICAL_GOLDEN_SCHEMA_VERSION);
+    assert_eq!(golden.fixture_id, "fsfs-watch-5000-fragmented");
+    assert_eq!(golden.before.revision, "e663dff4");
+    assert_eq!(golden.after.revision, "d4649471");
+    assert!(golden.provenance.same_worker);
+    assert_eq!(golden.provenance.machine_class, "ovh-a");
+
+    let dashboard = build_quill_lexical_dashboard(&golden);
+    assert!(
+        !dashboard.before_meets_contract,
+        "pre-fanout baseline must preserve the known watch/p95 misses"
+    );
+    assert!(
+        dashboard.after_meets_contract,
+        "kept Quill result must clear the production 20k/5k/25ms contract"
+    );
+    assert!(
+        dashboard.after.initial_docs_per_second >= dashboard.thresholds.initial_docs_per_second
+    );
+    assert!(
+        dashboard.after.watch_updates_per_second >= dashboard.thresholds.watch_updates_per_second
+    );
+    assert!(
+        dashboard.after.update_to_searchable_p95_micros
+            <= dashboard.thresholds.update_to_searchable_p95_micros
+    );
+
+    let rendered = serde_json::to_string(&dashboard).expect("serialize lexical dashboard");
+    let repeated = serde_json::to_string(&build_quill_lexical_dashboard(&golden))
+        .expect("serialize repeated lexical dashboard");
+    assert_eq!(rendered, repeated);
+    eprintln!("{rendered}");
 }
 
 #[test]

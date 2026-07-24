@@ -476,6 +476,9 @@ jobs:
       matrix:
         lane:
           - default
+          - quill
+          - lexical-tantivy
+          - cass-compat
           - semantic
           - hybrid
           - persistent
@@ -536,6 +539,182 @@ jobs:
           name: feature-smoke-${{ matrix.lane }}
           path: ci_artifacts/feature_smoke/*
           retention-days: 14
+
+  quill-consumer-e2e:
+    name: Quill consumer E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            else
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          find "$GITHUB_WORKSPACE" -name Cargo.toml -exec \
+            sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
+          find "$GITHUB_WORKSPACE" -name '*.bak' -delete
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quill-consumer-e2e
+          cache-targets: true
+
+      - name: Run consumer sweep with structured logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="ci_artifacts/quill_consumer_e2e"
+          mkdir -p "${artifact_dir}"
+          results="${artifact_dir}/suite-results.jsonl"
+          : >"${results}"
+
+          run_test_suite() {
+            local suite="$1"
+            local fixture_ids="$2"
+            shift 2
+            local log="${artifact_dir}/${suite}.log"
+            "$@" 2>&1 | tee "${log}"
+            local summary
+            summary="$(grep 'test result: ok\.' "${log}" | tail -1)"
+            if [[ -z "${summary}" ]]; then
+              echo "missing successful test summary for ${suite}" >&2
+              return 1
+            fi
+            local passed failed ignored
+            passed="$(sed -E 's/.* ([0-9]+) passed;.*/\1/' <<<"${summary}")"
+            failed="$(sed -E 's/.* ([0-9]+) failed;.*/\1/' <<<"${summary}")"
+            ignored="$(sed -E 's/.* ([0-9]+) ignored;.*/\1/' <<<"${summary}")"
+            jq -cn \
+              --arg suite "${suite}" \
+              --arg fixtures "${fixture_ids}" \
+              --arg summary "${summary}" \
+              --arg log "${suite}.log" \
+              --argjson passed "${passed}" \
+              --argjson failed "${failed}" \
+              --argjson ignored "${ignored}" \
+              '{
+                suite: $suite,
+                fixture_ids: ($fixtures | split(",")),
+                status: "pass",
+                passed: $passed,
+                failed: $failed,
+                ignored: $ignored,
+                summary: $summary,
+                log: $log
+              }' >>"${results}"
+          }
+
+          run_command() {
+            local suite="$1"
+            local fixture_ids="$2"
+            shift 2
+            local log="${artifact_dir}/${suite}.log"
+            "$@" 2>&1 | tee "${log}"
+            jq -cn \
+              --arg suite "${suite}" \
+              --arg fixtures "${fixture_ids}" \
+              --arg log "${suite}.log" \
+              '{
+                suite: $suite,
+                fixture_ids: ($fixtures | split(",")),
+                status: "pass",
+                passed: 1,
+                failed: 0,
+                ignored: 0,
+                summary: "command completed successfully",
+                log: $log
+              }' >>"${results}"
+          }
+
+          run_test_suite \
+            fsfs-lib \
+            "lexical-pipeline,watch-mode,runtime-output" \
+            cargo test -p frankensearch-fsfs --lib -- --nocapture
+          run_test_suite \
+            fsfs-cli-formats \
+            "json,jsonl,toon,csv,stream" \
+            cargo test -p frankensearch-fsfs --test cli_command_tests -- --nocapture
+          run_test_suite \
+            fsfs-cli-e2e \
+            "dual-mode,index-search-status" \
+            cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
+          run_test_suite \
+            fsfs-baseline-matrix \
+            "quill-e7-lexical,drift-dashboard" \
+            cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture
+          run_test_suite \
+            fsfs-pressure \
+            "gradual-ramp,spike-recovery,hysteresis,soak-faults" \
+            cargo test -p frankensearch-fsfs --test pressure_simulation_harness -- --nocapture
+          run_test_suite \
+            facade-quill-durability \
+            "index-builder,fslx-protect-verify-repair" \
+            cargo test -p frankensearch --lib --no-default-features --features quill,durability -- --nocapture
+          run_test_suite \
+            facade-integration \
+            "cross-component,consumer-api" \
+            cargo test -p frankensearch --test integration --no-default-features --features hash,quill,durability -- --nocapture
+          run_test_suite \
+            facade-docs \
+            "crate-quickstart" \
+            cargo test -p frankensearch --doc --no-default-features --features hash,quill,durability -- --nocapture
+          run_command \
+            facade-basic-search \
+            "basic-search,quill-lexical" \
+            cargo run -p frankensearch --example basic_search --no-default-features --features hash,quill
+
+          jq -s \
+            --arg revision "${GITHUB_SHA}" \
+            '{
+              schema: "quill-consumer-e2e-sweep-v1",
+              revision: $revision,
+              lexical_engine: "quill",
+              status: (if all(.status == "pass") then "pass" else "fail" end),
+              suite_count: length,
+              total_passed: (map(.passed) | add),
+              total_failed: (map(.failed) | add),
+              total_ignored: (map(.ignored) | add),
+              suites: .
+            }' "${results}" >"${artifact_dir}/manifest.json"
+          jq -e \
+            '.status == "pass" and .suite_count == 9 and .total_failed == 0' \
+            "${artifact_dir}/manifest.json" >/dev/null
+
+      - name: Upload consumer sweep artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quill-consumer-e2e-${{ github.run_id }}
+          path: ci_artifacts/quill_consumer_e2e/*
+          retention-days: 30
 
   release-build:
     name: Release build (${{ matrix.target }})

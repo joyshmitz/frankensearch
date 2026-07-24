@@ -36,9 +36,9 @@ fn main() {
         ),
     ];
 
-    // Create a temporary directory for the index.
-    let dir = std::env::temp_dir().join(format!("frankensearch-basic-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    // Create an isolated temporary directory for the index.
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let dir = temp.path().to_path_buf();
 
     // ── Step 1: Build the index ───────────────────────────────────────────
     println!("Building index with {} documents...", documents.len());
@@ -60,6 +60,39 @@ fn main() {
             println!(
                 "Index built: {} docs, quality_tier={}, {:.1}ms",
                 stats.doc_count, stats.has_quality_index, stats.total_ms
+            );
+        }
+    });
+
+    #[cfg(feature = "quill")]
+    asupersync::test_utils::run_test_with_cx(|cx| {
+        let dir = dir.clone();
+        async move {
+            let lexical = frankensearch::QuillIndex::open(
+                &cx,
+                dir.join("lexical"),
+                frankensearch::QuillConfig::default(),
+            )
+            .await
+            .expect("open Quill lexical index");
+            let lexical_hits = lexical
+                .search_results(&cx, "ownership", 3)
+                .expect("search Quill lexical index");
+            assert!(
+                lexical_hits
+                    .iter()
+                    .any(|hit| hit.doc_id == "rust-ownership")
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "schema": "frankensearch-quickstart-e2e-v1",
+                    "fixture_id": "basic-search",
+                    "lexical_engine": "quill",
+                    "documents": documents.len(),
+                    "lexical_hits": lexical_hits.len(),
+                    "status": "pass",
+                })
             );
         }
     });
@@ -160,7 +193,5 @@ fn main() {
         }
     });
 
-    // ── Cleanup ───────────────────────────────────────────────────────────
-    let _ = std::fs::remove_dir_all(&dir);
     println!("\nDone.");
 }

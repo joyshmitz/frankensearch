@@ -1,0 +1,34 @@
+{
+  "schema_version": "quill-fsfs-lexical-contract-golden-v1",
+  "captured_at": "2026-07-23",
+  "fixture_id": "fsfs-watch-5000-fragmented",
+  "corpus": {
+    "initial_documents": 20000,
+    "watch_documents": 5000,
+    "watch_batch_documents": 50,
+    "replacement_segments": 100
+  },
+  "thresholds": {
+    "initial_docs_per_second": 20000,
+    "watch_updates_per_second": 5000,
+    "update_to_searchable_p95_micros": 25000
+  },
+  "before": {
+    "revision": "e663dff4",
+    "initial_docs_per_second": 73713,
+    "watch_updates_per_second": 2716,
+    "update_to_searchable_p95_micros": 32766
+  },
+  "after": {
+    "revision": "d4649471",
+    "initial_docs_per_second": 69279,
+    "watch_updates_per_second": 5462,
+    "update_to_searchable_p95_micros": 13017
+  },
+  "provenance": {
+    "profile": "release-perf",
+    "machine_class": "ovh-a",
+    "same_worker": true,
+    "evidence": "docs/PERF_LEDGER.md#2026-07-23--keep-fragmented-sub-10k-quill-snapshots-use-segment-parallel-scoring-bd-quill-e7-integration-flip-d0tx2-rosemaple"
+  }
+}

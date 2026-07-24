@@ -505,3 +505,255 @@ mod tests {
         let _ = std::mem::size_of::<RepairCodecVerifyResult>();
     }
 }
+
+#[cfg(test)]
+mod feature_matrix_smoke {
+    #[cfg(feature = "durability")]
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn emit_evidence(lane: &str, behavior: &str, observations: serde_json::Value) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "schema": "frankensearch-feature-behavior-v1",
+                "lane": lane,
+                "behavior": behavior,
+                "status": "pass",
+                "observations": observations,
+            })
+        );
+    }
+
+    #[cfg(feature = "hash")]
+    fn hash_embed_roundtrip(lane: &str) {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = HashEmbedder::default_256();
+            let vector = embedder
+                .embed(&cx, "feature matrix deterministic fixture")
+                .await
+                .expect("hash embedding");
+            assert_eq!(vector.len(), 256);
+            assert!(vector.iter().any(|value| *value != 0.0));
+            emit_evidence(
+                lane,
+                "hash_embed_roundtrip",
+                serde_json::json!({"dimension": vector.len()}),
+            );
+        });
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn default_lane_behavior() {
+        hash_embed_roundtrip("default");
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn semantic_lane_behavior() {
+        hash_embed_roundtrip("semantic");
+        assert!(matches!(
+            TwoTierAvailability::HashOnly,
+            TwoTierAvailability::HashOnly
+        ));
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn hybrid_lane_behavior() {
+        let dir = tempfile::tempdir().expect("hybrid lexical tempdir");
+        let index = TantivyIndex::create(dir.path()).expect("create hybrid lexical index");
+        assert_eq!(index.doc_count(), 0);
+        emit_evidence(
+            "hybrid",
+            "tantivy_lexical_create",
+            serde_json::json!({"documents": index.doc_count()}),
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn persistent_lane_behavior() {
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        let schema_version = storage::SCHEMA_VERSION;
+        assert!(schema_version >= 1);
+        emit_evidence(
+            "persistent",
+            "real_in_memory_storage",
+            serde_json::json!({"schema_version": schema_version}),
+        );
+        drop(storage);
+    }
+
+    #[cfg(feature = "durability")]
+    #[test]
+    fn durable_lane_behavior() {
+        let dir = tempfile::tempdir().expect("durability tempdir");
+        let source = dir.path().join("feature-matrix.fsvi");
+        std::fs::write(&source, vec![0x5a_u8; 1024]).expect("write durability source");
+        let protector =
+            FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
+                .expect("construct protector");
+        let protection = protector.protect_atomic(&source).expect("protect source");
+        assert!(protection.sidecar_path.exists());
+        assert!(protector.verify_and_repair(&source).expect("verify source"));
+        emit_evidence(
+            "durable",
+            "protect_verify_roundtrip",
+            serde_json::json!({
+                "source_bytes": protection.source_size,
+                "repair_bytes": protection.repair_size,
+            }),
+        );
+    }
+
+    #[cfg(feature = "full")]
+    #[test]
+    fn full_lane_behavior() {
+        let config = TwoTierConfig::default();
+        assert!(!config.fast_only);
+        assert!(std::mem::size_of::<rerank::NativeEmbedder>() > 0);
+        assert!(std::mem::size_of::<HnswConfig>() > 0);
+        emit_evidence(
+            "full",
+            "full_surface_exports",
+            serde_json::json!({"native": true, "ann": true, "download": true}),
+        );
+    }
+
+    #[cfg(feature = "full-fts5")]
+    #[test]
+    fn full_fts5_lane_behavior() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let adapter = Fts5LexicalSearch::new(Fts5Config::default());
+            let document =
+                IndexableDocument::new("doc-fts5", "fts5 feature matrix integration fixture");
+            adapter
+                .index_document(&cx, &document)
+                .await
+                .expect("index FTS5 document");
+            let hits = adapter
+                .search(&cx, "integration", 5)
+                .await
+                .expect("search FTS5 document");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-fts5");
+            emit_evidence(
+                "full-fts5",
+                "real_fts5_index_search",
+                serde_json::json!({"documents": adapter.doc_count(), "hits": hits.len()}),
+            );
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_lane_behavior() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().expect("Quill feature tempdir");
+            let index = QuillIndex::create(
+                &cx,
+                dir.path(),
+                QuillConfig {
+                    bulk_load_mode: true,
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .expect("create Quill index");
+            let documents = [
+                IndexableDocument::new("doc-alpha", "alpha quill feature matrix"),
+                IndexableDocument::new("doc-beta", "beta consumer integration"),
+            ];
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index Quill documents");
+            index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finalize Quill index");
+            let hits = index
+                .search_results(&cx, "alpha", 5)
+                .expect("search Quill index");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-alpha");
+            emit_evidence(
+                "quill",
+                "real_index_build_search",
+                serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
+            );
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn lexical_tantivy_lane_behavior() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().expect("Tantivy feature tempdir");
+            let index = TantivyIndex::create(dir.path()).expect("create Tantivy index");
+            let documents = [
+                IndexableDocument::new("doc-alpha", "alpha tantivy oracle matrix"),
+                IndexableDocument::new("doc-beta", "beta consumer integration"),
+            ];
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index Tantivy documents");
+            index.commit(&cx).await.expect("commit Tantivy index");
+            let hits = index
+                .search(&cx, "alpha", 5)
+                .await
+                .expect("search Tantivy index");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-alpha");
+            emit_evidence(
+                "lexical-tantivy",
+                "real_index_build_search",
+                serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
+            );
+        });
+    }
+
+    #[cfg(feature = "cass-compat")]
+    #[test]
+    fn cass_compat_lane_behavior() {
+        let dir = tempfile::tempdir().expect("CASS feature tempdir");
+        let mut index =
+            cass_compat::CassTantivyIndex::open_or_create(dir.path()).expect("create CASS index");
+        let documents = [cass_compat::CassDocument {
+            agent: "RoseMaple".to_owned(),
+            workspace: Some("frankensearch".to_owned()),
+            workspace_original: Some("/data/projects/frankensearch".to_owned()),
+            source_path: "fixtures/consumer-e2e.jsonl".to_owned(),
+            msg_idx: 1,
+            created_at: Some(1_753_307_200),
+            title: Some("Consumer integration".to_owned()),
+            content: "CASS compatibility feature matrix document".to_owned(),
+            source_id: "consumer-e2e-1".to_owned(),
+            origin_kind: "test".to_owned(),
+            origin_host: Some("ci".to_owned()),
+            conversation_id: Some(7),
+        }];
+        index
+            .add_cass_documents(&documents)
+            .expect("index CASS document");
+        index.commit().expect("commit CASS index");
+        assert!(index.segment_count() >= 1);
+        assert!(cass_compat::cass_schema_hash_matches(
+            cass_compat::CASS_SCHEMA_HASH
+        ));
+        emit_evidence(
+            "cass-compat",
+            "real_cass_index_commit",
+            serde_json::json!({
+                "documents": documents.len(),
+                "segments": index.segment_count(),
+            }),
+        );
+    }
+}

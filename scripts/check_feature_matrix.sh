@@ -6,8 +6,19 @@ MODE="all"
 LANE="all"
 RUN_ID="${FRANKENSEARCH_FEATURE_MATRIX_RUN_ID:-bd-pkl0.13-feature-matrix}"
 ARTIFACT_DIR="${FRANKENSEARCH_FEATURE_MATRIX_ARTIFACT_DIR:-/tmp/frankensearch-feature-matrix/${RUN_ID}}"
-SCHEMA_VERSION="feature-smoke-lanes-v1"
-REQUIRED_LANES=(default semantic hybrid persistent durable full full-fts5)
+SCHEMA_VERSION="feature-smoke-lanes-v2"
+REQUIRED_LANES=(
+  default
+  quill
+  lexical-tantivy
+  cass-compat
+  semantic
+  hybrid
+  persistent
+  durable
+  full
+  full-fts5
+)
 
 usage() {
   cat <<USAGE
@@ -98,7 +109,7 @@ fi
 
 run_cargo() {
   if [[ "${FRANKENSEARCH_FEATURE_MATRIX_USE_RCH:-0}" == "1" ]]; then
-    RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- cargo "$@"
+    RCH_REQUIRE_REMOTE=1 RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- cargo "$@"
   else
     cargo "$@"
   fi
@@ -107,6 +118,9 @@ run_cargo() {
 lane_features() {
   case "$1" in
     default) echo "default" ;;
+    quill) echo "quill" ;;
+    lexical-tantivy) echo "lexical-tantivy" ;;
+    cass-compat) echo "cass-compat" ;;
     semantic) echo "semantic" ;;
     hybrid) echo "hybrid" ;;
     persistent) echo "persistent" ;;
@@ -123,6 +137,9 @@ lane_features() {
 lane_compile_command() {
   case "$1" in
     default) echo "cargo check -p frankensearch --all-targets" ;;
+    quill) echo "cargo check -p frankensearch --lib --no-default-features --features quill" ;;
+    lexical-tantivy) echo "cargo check -p frankensearch --lib --no-default-features --features lexical-tantivy" ;;
+    cass-compat) echo "cargo check -p frankensearch --lib --no-default-features --features cass-compat" ;;
     semantic) echo "cargo check -p frankensearch --lib --no-default-features --features semantic" ;;
     hybrid) echo "cargo check -p frankensearch --lib --no-default-features --features hybrid" ;;
     persistent) echo "cargo check -p frankensearch --lib --no-default-features --features persistent" ;;
@@ -138,13 +155,16 @@ lane_compile_command() {
 
 lane_behavior_command() {
   case "$1" in
-    default) echo "cargo test -p frankensearch --lib feature_matrix_smoke::default_lane_behavior -- --exact" ;;
-    semantic) echo "cargo test -p frankensearch --lib --no-default-features --features semantic feature_matrix_smoke::semantic_lane_behavior -- --exact" ;;
-    hybrid) echo "cargo test -p frankensearch --lib --no-default-features --features hybrid feature_matrix_smoke::hybrid_lane_behavior -- --exact" ;;
-    persistent) echo "cargo test -p frankensearch --lib --no-default-features --features persistent feature_matrix_smoke::persistent_lane_behavior -- --exact" ;;
-    durable) echo "cargo test -p frankensearch --lib --no-default-features --features durable feature_matrix_smoke::durable_lane_behavior -- --exact" ;;
-    full) echo "cargo test -p frankensearch --lib --no-default-features --features full feature_matrix_smoke::full_lane_behavior -- --exact" ;;
-    full-fts5) echo "cargo test -p frankensearch --lib --no-default-features --features full-fts5 feature_matrix_smoke::full_fts5_lane_behavior -- --exact" ;;
+    default) echo "cargo test -p frankensearch --lib feature_matrix_smoke::default_lane_behavior -- --exact --nocapture" ;;
+    quill) echo "cargo test -p frankensearch --lib --no-default-features --features quill feature_matrix_smoke::quill_lane_behavior -- --exact --nocapture" ;;
+    lexical-tantivy) echo "cargo test -p frankensearch --lib --no-default-features --features lexical-tantivy feature_matrix_smoke::lexical_tantivy_lane_behavior -- --exact --nocapture" ;;
+    cass-compat) echo "cargo test -p frankensearch --lib --no-default-features --features cass-compat feature_matrix_smoke::cass_compat_lane_behavior -- --exact --nocapture" ;;
+    semantic) echo "cargo test -p frankensearch --lib --no-default-features --features semantic feature_matrix_smoke::semantic_lane_behavior -- --exact --nocapture" ;;
+    hybrid) echo "cargo test -p frankensearch --lib --no-default-features --features hybrid feature_matrix_smoke::hybrid_lane_behavior -- --exact --nocapture" ;;
+    persistent) echo "cargo test -p frankensearch --lib --no-default-features --features persistent feature_matrix_smoke::persistent_lane_behavior -- --exact --nocapture" ;;
+    durable) echo "cargo test -p frankensearch --lib --no-default-features --features durable feature_matrix_smoke::durable_lane_behavior -- --exact --nocapture" ;;
+    full) echo "cargo test -p frankensearch --lib --no-default-features --features full feature_matrix_smoke::full_lane_behavior -- --exact --nocapture" ;;
+    full-fts5) echo "cargo test -p frankensearch --lib --no-default-features --features full-fts5 feature_matrix_smoke::full_fts5_lane_behavior -- --exact --nocapture" ;;
     *)
       echo "ERROR: unknown lane '$1'" >&2
       return 2
@@ -161,6 +181,9 @@ run_compile_lane() {
   echo "[feature-matrix][$lane] $(lane_compile_command "$lane")"
   case "$lane" in
     default) run_cargo check -p frankensearch --all-targets ;;
+    quill) run_cargo check -p frankensearch --lib --no-default-features --features quill ;;
+    lexical-tantivy) run_cargo check -p frankensearch --lib --no-default-features --features lexical-tantivy ;;
+    cass-compat) run_cargo check -p frankensearch --lib --no-default-features --features cass-compat ;;
     semantic) run_cargo check -p frankensearch --lib --no-default-features --features semantic ;;
     hybrid) run_cargo check -p frankensearch --lib --no-default-features --features hybrid ;;
     persistent) run_cargo check -p frankensearch --lib --no-default-features --features persistent ;;
@@ -172,16 +195,25 @@ run_compile_lane() {
 
 run_behavior_lane() {
   local lane="$1"
+  local output
   echo "[feature-matrix][$lane] $(lane_behavior_command "$lane")"
   case "$lane" in
-    default) run_cargo test -p frankensearch --lib feature_matrix_smoke::default_lane_behavior -- --exact ;;
-    semantic) run_cargo test -p frankensearch --lib --no-default-features --features semantic feature_matrix_smoke::semantic_lane_behavior -- --exact ;;
-    hybrid) run_cargo test -p frankensearch --lib --no-default-features --features hybrid feature_matrix_smoke::hybrid_lane_behavior -- --exact ;;
-    persistent) run_cargo test -p frankensearch --lib --no-default-features --features persistent feature_matrix_smoke::persistent_lane_behavior -- --exact ;;
-    durable) run_cargo test -p frankensearch --lib --no-default-features --features durable feature_matrix_smoke::durable_lane_behavior -- --exact ;;
-    full) run_cargo test -p frankensearch --lib --no-default-features --features full feature_matrix_smoke::full_lane_behavior -- --exact ;;
-    full-fts5) run_cargo test -p frankensearch --lib --no-default-features --features full-fts5 feature_matrix_smoke::full_fts5_lane_behavior -- --exact ;;
+    default) output="$(run_cargo test -p frankensearch --lib feature_matrix_smoke::default_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    quill) output="$(run_cargo test -p frankensearch --lib --no-default-features --features quill feature_matrix_smoke::quill_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    lexical-tantivy) output="$(run_cargo test -p frankensearch --lib --no-default-features --features lexical-tantivy feature_matrix_smoke::lexical_tantivy_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    cass-compat) output="$(run_cargo test -p frankensearch --lib --no-default-features --features cass-compat feature_matrix_smoke::cass_compat_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    semantic) output="$(run_cargo test -p frankensearch --lib --no-default-features --features semantic feature_matrix_smoke::semantic_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    hybrid) output="$(run_cargo test -p frankensearch --lib --no-default-features --features hybrid feature_matrix_smoke::hybrid_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    persistent) output="$(run_cargo test -p frankensearch --lib --no-default-features --features persistent feature_matrix_smoke::persistent_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    durable) output="$(run_cargo test -p frankensearch --lib --no-default-features --features durable feature_matrix_smoke::durable_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    full) output="$(run_cargo test -p frankensearch --lib --no-default-features --features full feature_matrix_smoke::full_lane_behavior -- --exact --nocapture 2>&1)" ;;
+    full-fts5) output="$(run_cargo test -p frankensearch --lib --no-default-features --features full-fts5 feature_matrix_smoke::full_fts5_lane_behavior -- --exact --nocapture 2>&1)" ;;
   esac
+  printf '%s\n' "$output"
+  if [[ "$output" != *"test result: ok. 1 passed; 0 failed;"* ]]; then
+    echo "ERROR: feature lane '$lane' did not execute exactly one behavior test" >&2
+    return 1
+  fi
 }
 
 write_lane_artifact() {

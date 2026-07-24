@@ -149,7 +149,10 @@ max_file_size_mb = 1
     config_path
 }
 
-fn prepare_filesystem_chaos_fixture(root: &Path, scenario_id: &str) -> (PathBuf, Option<PathBuf>) {
+fn prepare_filesystem_chaos_fixture(
+    root: &Path,
+    scenario_id: &str,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
     let corpus_root = root.join("chaos-corpus");
     fs::create_dir_all(&corpus_root).expect("create chaos corpus root");
     let baseline_path = corpus_root.join("baseline.md");
@@ -171,7 +174,7 @@ fn prepare_filesystem_chaos_fixture(root: &Path, scenario_id: &str) -> (PathBuf,
                 perms.set_mode(0o000);
                 fs::set_permissions(&blocked, perms).expect("chmod blocked fixture");
             }
-            (corpus_root, None)
+            Ok((corpus_root, None))
         }
         "cli-chaos-symlink-loop" => {
             let loop_path = corpus_root.join("loop");
@@ -179,7 +182,7 @@ fn prepare_filesystem_chaos_fixture(root: &Path, scenario_id: &str) -> (PathBuf,
             symlink("loop", &loop_path).expect("create symlink loop");
             #[cfg(not(unix))]
             fs::write(&loop_path, "symlink loop unsupported").expect("write fallback loop");
-            (corpus_root, None)
+            Ok((corpus_root, None))
         }
         "cli-chaos-mount-boundary" => {
             let nested = corpus_root.join("nested");
@@ -187,21 +190,24 @@ fn prepare_filesystem_chaos_fixture(root: &Path, scenario_id: &str) -> (PathBuf,
             fs::write(nested.join("mount-edge.md"), "mount boundary fixture")
                 .expect("write mount boundary fixture");
             let config = write_mount_boundary_config(root, &corpus_root);
-            (corpus_root, Some(config))
+            Ok((corpus_root, Some(config)))
         }
         "cli-chaos-giant-log-skip" => {
-            let giant_log = corpus_root.join("giant.log");
+            // Keep the payload text-shaped without a `.log` suffix. Remote test
+            // workspaces can live below a checkout, where an ancestor ignore rule
+            // for `*.log` would hide the fixture before the size policy sees it.
+            let giant_log = corpus_root.join("giant.txt");
             let giant_bytes = vec![b'x'; 5 * 1024 * 1024];
             fs::write(&giant_log, giant_bytes).expect("write giant log fixture");
             let config = write_giant_log_config(root);
-            (corpus_root, Some(config))
+            Ok((corpus_root, Some(config)))
         }
         "cli-chaos-binary-blob-skip" => {
             let binary_blob = corpus_root.join("blob.bin");
             fs::write(&binary_blob, [0_u8, 159, 146, 150, 0, 42]).expect("write binary fixture");
-            (corpus_root, None)
+            Ok((corpus_root, None))
         }
-        other => panic!("unknown filesystem chaos scenario: {other}"),
+        other => Err(format!("unknown filesystem chaos scenario: {other}")),
     }
 }
 
@@ -210,7 +216,8 @@ fn run_binary_filesystem_chaos_scenario(scenario_id: &str) -> BinaryChaosResult 
     let temp = tempfile::tempdir().expect("create temporary chaos workspace");
     let command_context = E2eCommandContext::new(temp.path());
     let index_root = temp.path().join("chaos-index");
-    let (corpus_root, config_path) = prepare_filesystem_chaos_fixture(temp.path(), scenario_id);
+    let (corpus_root, config_path) = prepare_filesystem_chaos_fixture(temp.path(), scenario_id)
+        .expect("filesystem chaos scenario must be registered");
 
     let mut args = vec![
         "index".to_owned(),
@@ -492,7 +499,7 @@ fn scenario_cli_chaos_binary_blob_skip_binary_run() {
         "cli-chaos-binary-blob-skip",
         CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED,
         1,
-        &["discovery.file.binary_blocked"],
+        &["FSFS_BINARY_NULL_BYTE_DETECTED"],
         false,
         Some("index.plan.full_semantic_lexical"),
         false,

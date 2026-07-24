@@ -654,7 +654,9 @@ mod tests {
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     #[cfg(feature = "durability")]
-    use frankensearch_durability::FsviProtector;
+    use frankensearch_durability::{
+        DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
+    };
     #[cfg(all(feature = "lexical", not(feature = "quill")))]
     use frankensearch_lexical::TantivyIndex;
 
@@ -1034,29 +1036,77 @@ mod tests {
             #[cfg(feature = "quill")]
             {
                 let lexical_dir = dir.path().join("lexical");
-                let protected_sources = std::fs::read_dir(&lexical_dir)
+                let protected_sidecars = std::fs::read_dir(&lexical_dir)
                     .unwrap()
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
                     .filter(|path| path.extension().is_some_and(|extension| extension == "fec"))
-                    .filter_map(|sidecar| {
-                        sidecar
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .map(str::to_owned)
-                    })
                     .collect::<Vec<_>>();
                 assert!(
-                    protected_sources
+                    protected_sidecars
                         .iter()
-                        .any(|name| name.ends_with(".fslx.fec")),
+                        .any(|path| path.to_string_lossy().ends_with(".fslx.fec")),
                     "bulk-built Quill segment must have a generic FileProtector sidecar: \
-                     {protected_sources:?}"
+                     {protected_sidecars:?}"
                 );
                 assert!(
-                    protected_sources.iter().any(|name| name == "MANIFEST.fec"),
+                    protected_sidecars
+                        .iter()
+                        .any(|path| path.file_name().is_some_and(|name| name == "MANIFEST.fec")),
                     "published Quill manifest must have a generic FileProtector sidecar: \
-                     {protected_sources:?}"
+                     {protected_sidecars:?}"
+                );
+
+                let fslx_sidecar = protected_sidecars
+                    .iter()
+                    .find(|path| path.to_string_lossy().ends_with(".fslx.fec"))
+                    .expect("protected Quill FSLX segment");
+                let fslx_path = std::path::PathBuf::from(
+                    fslx_sidecar
+                        .to_string_lossy()
+                        .strip_suffix(".fec")
+                        .expect("FSLX sidecar suffix"),
+                );
+                let original = std::fs::read(&fslx_path).expect("read protected FSLX");
+                assert!(!original.is_empty());
+
+                let protector =
+                    FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
+                        .expect("construct FSLX verifier");
+                assert_eq!(
+                    protector.verify(&fslx_path).expect("verify intact FSLX"),
+                    FsviVerifyResult::Intact
+                );
+
+                let mut corrupted = original.clone();
+                corrupted[0] ^= 0xff;
+                std::fs::write(&fslx_path, &corrupted).expect("corrupt FSLX fixture");
+                assert!(matches!(
+                    protector
+                        .verify(&fslx_path)
+                        .expect("detect FSLX corruption"),
+                    FsviVerifyResult::Corrupted { repairable: true }
+                ));
+                assert!(
+                    protector
+                        .verify_and_repair(&fslx_path)
+                        .expect("repair FSLX from sidecar")
+                );
+                assert_eq!(
+                    std::fs::read(&fslx_path).expect("read repaired FSLX"),
+                    original
+                );
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": "quill-consumer-durability-e2e-v1",
+                        "fixture_id": "index-builder-fslx-repair",
+                        "source_bytes": original.len(),
+                        "corruption": "single-byte-xor",
+                        "verify_before": "intact",
+                        "verify_corrupt": "repairable",
+                        "verify_after": "intact",
+                    })
                 );
             }
         });
