@@ -35,7 +35,8 @@ fn raw(seed: u64) -> Vec<f32> {
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
-            ((s >> 11) as f64 / (1u64 << 53) as f64) as f32 - 0.5
+            let sample = u16::try_from(s >> 48).expect("upper 16 bits fit u16");
+            f32::from(sample) / 65_536.0 - 0.5
         })
         .collect()
 }

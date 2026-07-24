@@ -136,25 +136,27 @@ fn bench_hnsw_vs_flat(c: &mut Criterion) {
     }
 
     // ── Latency: flat vs HNSW at a low and the default ef (cycle queries). ──
-    let mut qi = 0usize;
-    let mut g = c.benchmark_group("hnsw_vs_flat");
-    g.bench_function("flat", |b| {
-        b.iter(|| {
-            let q = &queries[qi % QUERIES];
-            qi += 1;
-            black_box(index.search_top_k(black_box(q), K, None).expect("flat"))
-        });
-    });
-    for ef in [10usize, 20, 40, HNSW_DEFAULT_EF_SEARCH] {
-        g.bench_function(format!("hnsw_ef{ef}"), |b| {
+    {
+        let mut qi = 0usize;
+        let mut g = c.benchmark_group("hnsw_vs_flat");
+        g.bench_function("flat", |b| {
             b.iter(|| {
                 let q = &queries[qi % QUERIES];
                 qi += 1;
-                black_box(hnsw.knn_search(black_box(q), K, ef).expect("ann"))
+                black_box(index.search_top_k(black_box(q), K, None).expect("flat"))
             });
         });
+        for ef in [10usize, 20, 40, HNSW_DEFAULT_EF_SEARCH] {
+            g.bench_function(format!("hnsw_ef{ef}"), |b| {
+                b.iter(|| {
+                    let q = &queries[qi % QUERIES];
+                    qi += 1;
+                    black_box(hnsw.knn_search(black_box(q), K, ef).expect("ann"))
+                });
+            });
+        }
+        g.finish();
     }
-    g.finish();
 
     let _ = std::fs::remove_file(&path);
 }

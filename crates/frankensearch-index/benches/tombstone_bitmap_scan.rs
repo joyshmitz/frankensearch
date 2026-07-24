@@ -81,13 +81,12 @@ fn scan_records_flag(slab: &[i8], records: &[u8], query: &[i8], n: usize) -> Vec
 fn scan_bitmap(slab: &[i8], bitmap: &[u64], query: &[i8], n: usize) -> Vec<(i32, usize)> {
     let mut heap: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::with_capacity(K + 1);
     let mut cutoff = i32::MIN;
-    let words = n.div_ceil(64);
-    for w in 0..words {
-        let mut bits = bitmap[w];
+    for (word_index, &word_bits) in bitmap.iter().take(n.div_ceil(64)).enumerate() {
+        let mut bits = word_bits;
         if bits == 0 {
             continue; // all 64 candidates tombstoned — skip their dots entirely
         }
-        let base = w * 64;
+        let base = word_index * 64;
         // Iterate only the set (live) bits via trailing-zeros scan.
         while bits != 0 {
             let b = bits.trailing_zeros() as usize;
@@ -117,12 +116,14 @@ fn build_fixtures(n: usize, clustered: bool) -> (Vec<i8>, Vec<u8>, Vec<u64>, Vec
     let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
     // Clustered-ish int8 embeddings: small centered range, a few shared centroids.
     let mut slab = vec![0_i8; n * DIM];
-    for v in slab.iter_mut() {
-        *v = ((rng.next() >> 40) as i32 % 40 - 20) as i8;
+    for value in &mut slab {
+        let centered = i32::try_from((rng.next() >> 40) % 40).expect("random remainder fits i32");
+        *value = i8::try_from(centered - 20).expect("centered sample fits i8");
     }
     let mut query = vec![0_i8; DIM];
-    for v in query.iter_mut() {
-        *v = ((rng.next() >> 40) as i32 % 40 - 20) as i8;
+    for value in &mut query {
+        let centered = i32::try_from((rng.next() >> 40) % 40).expect("random remainder fits i32");
+        *value = i8::try_from(centered - 20).expect("centered sample fits i8");
     }
 
     let mut records = vec![0_u8; n * RECORD_STRIDE];
@@ -132,7 +133,7 @@ fn build_fixtures(n: usize, clustered: bool) -> (Vec<i8>, Vec<u8>, Vec<u64>, Vec
         // 25% tombstoned in contiguous runs of ~192 (spans multiple full u64 words).
         let mut j = 0;
         while j < n {
-            let run = 128 + (rng.next() as usize % 256);
+            let run = 128 + usize::try_from(rng.next() % 256).expect("run remainder fits usize");
             let dead = (rng.next() % 100) < 25; // ~25% of runs are dead runs
             for _ in 0..run {
                 if j >= n {
@@ -144,8 +145,8 @@ fn build_fixtures(n: usize, clustered: bool) -> (Vec<i8>, Vec<u8>, Vec<u64>, Vec
         }
     } else {
         // ~1% scattered tombstones (freshly-compacted common case).
-        for t in tombstoned.iter_mut() {
-            *t = (rng.next() % 100) == 0;
+        for tombstone in &mut tombstoned {
+            *tombstone = (rng.next() % 100) == 0;
         }
     }
     for (j, &dead) in tombstoned.iter().enumerate() {

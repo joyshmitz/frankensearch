@@ -16,7 +16,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(feature = "ann")]
-fn bench_real_embed_ann(c: &mut Criterion) {
+fn bench_real_embed_ann(criterion: &mut Criterion) {
     use std::hint::black_box;
 
     use frankensearch_index::{HnswConfig, HnswIndex, Quantization, VectorIndex};
@@ -48,20 +48,17 @@ fn bench_real_embed_ann(c: &mut Criterion) {
         hits as f64 / exact.len().max(1) as f64
     }
 
-    let slab = match std::env::var("FS_REAL_SLAB") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("[real_embed_ann] FS_REAL_SLAB unset — skipping.");
-            return;
-        }
+    let Ok(slab) = std::env::var("FS_REAL_SLAB") else {
+        eprintln!("[real_embed_ann] FS_REAL_SLAB unset — skipping.");
+        return;
     };
     let dim: usize = std::env::var("FS_REAL_DIM")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(256);
     let cap: usize = std::env::var("FS_REAL_N")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(100_000);
 
     let mut all = load_slab(&slab, dim);
@@ -76,7 +73,7 @@ fn bench_real_embed_ann(c: &mut Criterion) {
     let holdout: Vec<Vec<f32>> = all.split_off(all.len() - BENCH_Q);
     let calibration: Vec<Vec<f32>> = all.split_off(all.len() - CAL_Q);
     let docs = all;
-    let n = docs.len();
+    let doc_count = docs.len();
 
     // Build a real VectorIndex (FSVI) from the real embeddings.
     let path = std::env::temp_dir().join(format!("fs_real_ann_{}.fsvi", std::process::id()));
@@ -84,9 +81,9 @@ fn bench_real_embed_ann(c: &mut Criterion) {
         let mut writer =
             VectorIndex::create_with_revision(&path, "potion", "real", dim, Quantization::F32)
                 .expect("create writer");
-        for (i, v) in docs.iter().enumerate() {
+        for (ordinal, vector) in docs.iter().enumerate() {
             writer
-                .write_record(&format!("doc-{i:06}"), v)
+                .write_record(&format!("doc-{ordinal:06}"), vector)
                 .expect("write record");
         }
         writer.finish().expect("finish");
@@ -95,48 +92,48 @@ fn bench_real_embed_ann(c: &mut Criterion) {
 
     // M controls HNSW graph density (recall knob); env-overridable to test whether
     // a denser graph restores the per-query tail certificate at large N.
-    let m: usize = std::env::var("FS_REAL_M")
+    let hnsw_m: usize = std::env::var("FS_REAL_M")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(32);
     // ef_construction (build-time beam) improves graph quality at the SAME M — so it
     // can lift recall WITHOUT the ~2× graph-memory cost of raising M (only build time).
     let efc: usize = std::env::var("FS_REAL_EFC")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(HnswConfig::default().ef_construction);
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| HnswConfig::default().ef_construction);
     let hnsw_config = HnswConfig {
-        m,
+        m: hnsw_m,
         ef_construction: efc,
         ..HnswConfig::default()
     };
     let hnsw = HnswIndex::build_from_vector_index(&index, hnsw_config).expect("build hnsw");
-    eprintln!("[real_embed_ann] HNSW M={m} ef_construction={efc}");
-    eprintln!("[real_embed_ann] N={n} dim={dim} k={K} — HNSW M={m} efc={efc} built");
+    eprintln!("[real_embed_ann] HNSW M={hnsw_m} ef_construction={efc}");
+    eprintln!("[real_embed_ann] N={doc_count} dim={dim} k={K} — HNSW M={hnsw_m} efc={efc} built");
 
     // ── Recall@ef sweep vs exact flat (real data). ──
     let holdout_exact: Vec<Vec<String>> = holdout
         .iter()
-        .map(|q| {
+        .map(|query| {
             index
-                .search_top_k(q, K, None)
+                .search_top_k(query, K, None)
                 .expect("flat")
                 .into_iter()
-                .map(|h| h.doc_id.to_string())
+                .map(|hit| hit.doc_id.to_string())
                 .collect()
         })
         .collect();
 
     for ef in [40usize, 100, 200, 400, 800] {
         let mut total = 0.0;
-        for (qi, q) in holdout.iter().enumerate() {
+        for (query_index, query) in holdout.iter().enumerate() {
             let ann: Vec<String> = hnsw
-                .knn_search(q, K, ef)
+                .knn_search(query, K, ef)
                 .expect("ann")
                 .into_iter()
-                .map(|h| h.doc_id.to_string())
+                .map(|hit| hit.doc_id.to_string())
                 .collect();
-            total += recall_at_k(&holdout_exact[qi], &ann);
+            total += recall_at_k(&holdout_exact[query_index], &ann);
         }
         eprintln!(
             "[real_embed_ann] RECALL ef={ef:3} recall@{K}={:.4}",
@@ -151,28 +148,28 @@ fn bench_real_embed_ann(c: &mut Criterion) {
     //    mrl.rs claims "2–6× faster than a full-dim scan"; the open question is recall. ──
     {
         use frankensearch_index::MrlConfig;
-        for sd in [32usize, 64, 128] {
-            if sd >= dim {
+        for search_dims in [32usize, 64, 128] {
+            if search_dims >= dim {
                 continue;
             }
-            let cfg = MrlConfig {
-                search_dims: sd,
+            let config = MrlConfig {
+                search_dims,
                 rescore_dims: 0,
                 rescore_top_k: 0,
             };
-            let mut r = 0.0;
-            for (qi, q) in holdout.iter().enumerate() {
+            let mut total_recall = 0.0;
+            for (query_index, query) in holdout.iter().enumerate() {
                 let hits: Vec<String> = index
-                    .mrl_search(q, K, &cfg, None)
+                    .mrl_search(query, K, &config, None)
                     .expect("mrl")
                     .into_iter()
-                    .map(|h| h.doc_id.to_string())
+                    .map(|hit| hit.doc_id.to_string())
                     .collect();
-                r += recall_at_k(&holdout_exact[qi], &hits);
+                total_recall += recall_at_k(&holdout_exact[query_index], &hits);
             }
             eprintln!(
-                "[mrl] search_dims={sd}/{dim} rescore=3K recall@{K}={:.4}",
-                r / holdout.len() as f64
+                "[mrl] search_dims={search_dims}/{dim} rescore=3K recall@{K}={:.4}",
+                total_recall / holdout.len() as f64
             );
         }
     }
@@ -182,65 +179,73 @@ fn bench_real_embed_ann(c: &mut Criterion) {
     let cert = hnsw
         .certify_ef_search(&index, &calibration, &CANDIDATE_EFS, K, 0.95, 0.1)
         .expect("certify");
-    let certified_ef = match &cert {
-        Some(cal) => {
-            eprintln!(
-                "[real_embed_ann] CERTIFIED tail target=0.95 alpha=0.1 -> ef={} lower_bound={:.4} meets={}",
-                cal.chosen.ef_search, cal.chosen.certified_recall, cal.chosen.meets_target
-            );
-            cal.chosen.ef_search
-        }
-        None => {
+    let certified_ef = cert.as_ref().map_or_else(
+        || {
             eprintln!("[real_embed_ann] CERTIFIED: none certifiable at target=0.95");
             200
-        }
-    };
+        },
+        |calibration_result| {
+            eprintln!(
+                "[real_embed_ann] CERTIFIED tail target=0.95 alpha=0.1 -> ef={} lower_bound={:.4} meets={}",
+                calibration_result.chosen.ef_search,
+                calibration_result.chosen.certified_recall,
+                calibration_result.chosen.meets_target
+            );
+            calibration_result.chosen.ef_search
+        },
+    );
 
     // ── Latency: flat exact vs HNSW at the certified ef (and ef=40/100). ──
-    let mut qi = 0usize;
-    let mut g = c.benchmark_group("real_embed_ann");
-    g.bench_function("flat", |b| {
-        b.iter(|| {
-            let q = &holdout[qi % BENCH_Q];
-            qi += 1;
-            black_box(index.search_top_k(black_box(q), K, None).expect("flat"))
-        });
-    });
-    let mut efs = vec![40usize, 100, 200, certified_ef];
-    efs.sort_unstable();
-    efs.dedup();
-    for ef in efs {
-        g.bench_function(format!("hnsw_ef{ef}"), |b| {
-            b.iter(|| {
-                let q = &holdout[qi % BENCH_Q];
-                qi += 1;
-                black_box(hnsw.knn_search(black_box(q), K, ef).expect("ann"))
+    {
+        let mut query_index = 0usize;
+        let mut group = criterion.benchmark_group("real_embed_ann");
+        group.bench_function("flat", |bencher| {
+            bencher.iter(|| {
+                let query = &holdout[query_index % BENCH_Q];
+                query_index += 1;
+                black_box(index.search_top_k(black_box(query), K, None).expect("flat"))
             });
         });
-    }
-    // MRL truncated-scan latency (flat's competitor when ANN isn't wired): first
-    // `search_dims` scan + full-dim rescore of 3K candidates.
-    {
-        use frankensearch_index::MrlConfig;
-        for sd in [64usize, 128] {
-            if sd >= dim {
-                continue;
-            }
-            g.bench_function(format!("mrl_dims{sd}"), |b| {
-                b.iter(|| {
-                    let q = &holdout[qi % BENCH_Q];
-                    qi += 1;
-                    let cfg = MrlConfig {
-                        search_dims: sd,
-                        rescore_dims: 0,
-                        rescore_top_k: 0,
-                    };
-                    black_box(index.mrl_search(black_box(q), K, &cfg, None).expect("mrl"))
+        let mut efs = vec![40usize, 100, 200, certified_ef];
+        efs.sort_unstable();
+        efs.dedup();
+        for ef in efs {
+            group.bench_function(format!("hnsw_ef{ef}"), |bencher| {
+                bencher.iter(|| {
+                    let query = &holdout[query_index % BENCH_Q];
+                    query_index += 1;
+                    black_box(hnsw.knn_search(black_box(query), K, ef).expect("ann"))
                 });
             });
         }
+        // MRL truncated-scan latency (flat's competitor when ANN isn't wired): first
+        // `search_dims` scan + full-dim rescore of 3K candidates.
+        {
+            use frankensearch_index::MrlConfig;
+            for search_dims in [64usize, 128] {
+                if search_dims >= dim {
+                    continue;
+                }
+                group.bench_function(format!("mrl_dims{search_dims}"), |bencher| {
+                    bencher.iter(|| {
+                        let query = &holdout[query_index % BENCH_Q];
+                        query_index += 1;
+                        let config = MrlConfig {
+                            search_dims,
+                            rescore_dims: 0,
+                            rescore_top_k: 0,
+                        };
+                        black_box(
+                            index
+                                .mrl_search(black_box(query), K, &config, None)
+                                .expect("mrl"),
+                        )
+                    });
+                });
+            }
+        }
+        group.finish();
     }
-    g.finish();
 
     let _ = std::fs::remove_file(&path);
 }

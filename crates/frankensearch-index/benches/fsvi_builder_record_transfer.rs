@@ -23,9 +23,9 @@ const PARITY_QUERIES: usize = 8;
 
 #[derive(Clone, Copy)]
 struct Distribution {
-    median_ms: f64,
-    p5_ms: f64,
-    p95_ms: f64,
+    median: f64,
+    p5: f64,
+    p95: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -62,9 +62,9 @@ fn percentile(sorted: &[Duration], pct: usize) -> Duration {
 fn distribution(mut samples: Vec<Duration>) -> Distribution {
     samples.sort_unstable();
     Distribution {
-        median_ms: percentile(&samples, 50).as_secs_f64() * 1_000.0,
-        p5_ms: percentile(&samples, 5).as_secs_f64() * 1_000.0,
-        p95_ms: percentile(&samples, 95).as_secs_f64() * 1_000.0,
+        median: percentile(&samples, 50).as_secs_f64() * 1_000.0,
+        p5: percentile(&samples, 5).as_secs_f64() * 1_000.0,
+        p95: percentile(&samples, 95).as_secs_f64() * 1_000.0,
     }
 }
 
@@ -307,15 +307,15 @@ fn profile_writer_handoff(source: &[(String, Vec<f32>)]) {
     let writer_profile = distribution(writer_samples);
     eprintln!(
         "[profile] record_deep_clone median_ms={:.3} p5_ms={:.3} p95_ms={:.3}",
-        clone_profile.median_ms, clone_profile.p5_ms, clone_profile.p95_ms
+        clone_profile.median, clone_profile.p5, clone_profile.p95
     );
     eprintln!(
         "[profile] borrowed_writer_ingest median_ms={:.3} p5_ms={:.3} p95_ms={:.3}",
-        writer_profile.median_ms, writer_profile.p5_ms, writer_profile.p95_ms
+        writer_profile.median, writer_profile.p5, writer_profile.p95
     );
     eprintln!(
         "[profile] clone_to_ingest_median_fraction={:.4}",
-        clone_profile.median_ms / writer_profile.median_ms
+        clone_profile.median / writer_profile.median
     );
 }
 
@@ -341,15 +341,15 @@ fn profile_builder_api(source: &[(String, Vec<f32>)]) {
     let builder_profile = distribution(builder_samples);
     eprintln!(
         "[profile] record_deep_clone median_ms={:.3} p5_ms={:.3} p95_ms={:.3}",
-        clone_profile.median_ms, clone_profile.p5_ms, clone_profile.p95_ms
+        clone_profile.median, clone_profile.p5, clone_profile.p95
     );
     eprintln!(
         "[profile] borrowed_builder_add median_ms={:.3} p5_ms={:.3} p95_ms={:.3}",
-        builder_profile.median_ms, builder_profile.p5_ms, builder_profile.p95_ms
+        builder_profile.median, builder_profile.p5, builder_profile.p95
     );
     eprintln!(
         "[profile] clone_to_builder_add_median_fraction={:.4}",
-        clone_profile.median_ms / builder_profile.median_ms
+        clone_profile.median / builder_profile.median
     );
 }
 
@@ -368,7 +368,7 @@ fn prove_writer_parity(source: &[(String, Vec<f32>)]) {
 
     let mut owned = VectorIndex::create(&owned_path, "profile-384", DIMENSION)
         .expect("create owned parity writer");
-    for (doc_id, embedding) in source.to_vec() {
+    for (doc_id, embedding) in source.iter().cloned() {
         owned
             .write_record_owned_for_benchmark(doc_id, embedding)
             .expect("write owned parity record");
@@ -438,7 +438,7 @@ fn prove_builder_api_parity(source: &[(String, Vec<f32>)]) {
 
     let mut owned = TwoTierIndex::create(&owned_dir, TwoTierConfig::default())
         .expect("create owned parity builder");
-    for (doc_id, embedding) in source.to_vec() {
+    for (doc_id, embedding) in source.iter().cloned() {
         owned
             .add_fast_record_owned_for_benchmark(doc_id, embedding)
             .expect("add owned parity record");

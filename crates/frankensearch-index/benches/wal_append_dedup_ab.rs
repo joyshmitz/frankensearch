@@ -22,9 +22,9 @@ const PAIRED_ROUND_PAIRS: usize = 21;
 
 #[derive(Clone, Copy)]
 struct Distribution {
-    median_ms: f64,
-    p5_ms: f64,
-    p95_ms: f64,
+    median: f64,
+    p5: f64,
+    p95: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -67,9 +67,9 @@ fn percentile(sorted: &[Duration], pct: usize) -> Duration {
 fn distribution(mut samples: Vec<Duration>) -> Distribution {
     samples.sort_unstable();
     Distribution {
-        median_ms: percentile(&samples, 50).as_secs_f64() * 1_000.0,
-        p5_ms: percentile(&samples, 5).as_secs_f64() * 1_000.0,
-        p95_ms: percentile(&samples, 95).as_secs_f64() * 1_000.0,
+        median: percentile(&samples, 50).as_secs_f64() * 1_000.0,
+        p5: percentile(&samples, 5).as_secs_f64() * 1_000.0,
+        p95: percentile(&samples, 95).as_secs_f64() * 1_000.0,
     }
 }
 
@@ -340,7 +340,7 @@ fn time_shipped_retain(mut resident: Vec<String>, entries: &[(String, Vec<f32>)]
 fn print_distribution(label: &str, overlap_pct: usize, value: Distribution) {
     eprintln!(
         "[profile] stage={label} overlap_pct={overlap_pct} median_ms={:.6} p5_ms={:.6} p95_ms={:.6}",
-        value.median_ms, value.p5_ms, value.p95_ms
+        value.median, value.p5, value.p95
     );
 }
 
@@ -390,7 +390,7 @@ fn main() {
         print_distribution("resident_wal_repeated_retain", overlap_pct, retain);
         eprintln!(
             "[profile] overlap_pct={overlap_pct} retain_to_product_median_fraction={:.6}",
-            retain.median_ms / product.median_ms
+            retain.median / product.median
         );
 
         prove_parity(&base, &entries, overlap_pct);

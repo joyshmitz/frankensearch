@@ -32,8 +32,8 @@ fn xorshift(s: &mut u64) -> f32 {
     *s ^= *s << 13;
     *s ^= *s >> 7;
     *s ^= *s << 17;
-    #[allow(clippy::cast_precision_loss)]
-    let u = (*s >> 40) as f32 / f64::from(1_u32 << 24) as f32;
+    let sample = u16::try_from(*s >> 48).expect("upper 16 bits fit u16");
+    let u = f32::from(sample) / 65_536.0;
     u.mul_add(20.0, -10.0)
 }
 
@@ -54,13 +54,12 @@ fn max_scalar(row: &[f32]) -> f32 {
 #[inline(never)]
 fn max_simd(row: &[f32]) -> f32 {
     let mut acc = f32x8::splat(f32::NEG_INFINITY);
-    let mut chunks = row.chunks_exact(8);
-    for c in chunks.by_ref() {
-        let v: &[f32; 8] = c.try_into().expect("chunks_exact(8)");
-        acc = acc.max(f32x8::from(*v));
+    let (chunks, remainder) = row.as_chunks::<8>();
+    for chunk in chunks {
+        acc = acc.max(f32x8::from(*chunk));
     }
     let mut m = acc.to_array().into_iter().fold(f32::NEG_INFINITY, f32::max);
-    for &x in chunks.remainder() {
+    for &x in remainder {
         m = m.max(x);
     }
     m
@@ -82,17 +81,17 @@ fn max_simd(row: &[f32]) -> f32 {
 unsafe fn max_avx2_impl(row: &[f32]) -> f32 {
     use core::arch::x86_64::{_mm256_loadu_ps, _mm256_max_ps, _mm256_set1_ps, _mm256_storeu_ps};
     let mut acc = _mm256_set1_ps(f32::NEG_INFINITY);
-    let mut chunks = row.chunks_exact(8);
-    for c in chunks.by_ref() {
-        // SAFETY: `chunks_exact(8)` guarantees 8 readable f32s at `c.as_ptr()`.
-        let v = unsafe { _mm256_loadu_ps(c.as_ptr()) };
+    let (chunks, remainder) = row.as_chunks::<8>();
+    for chunk in chunks {
+        // SAFETY: `as_chunks::<8>()` guarantees 8 readable f32s at `chunk.as_ptr()`.
+        let v = unsafe { _mm256_loadu_ps(chunk.as_ptr()) };
         acc = _mm256_max_ps(acc, v);
     }
     let mut tmp = [0.0_f32; 8];
     // SAFETY: `tmp` holds 8 f32s.
     unsafe { _mm256_storeu_ps(tmp.as_mut_ptr(), acc) };
     let mut m = tmp.into_iter().fold(f32::NEG_INFINITY, f32::max);
-    for &x in chunks.remainder() {
+    for &x in remainder {
         m = m.max(x);
     }
     m
@@ -118,13 +117,13 @@ fn bench(c: &mut Criterion) {
         let row = build_row(n, 0x1234 ^ (n as u64));
         // Equivalence (finite inputs ⇒ identical max).
         assert_eq!(
-            max_scalar(&row),
-            max_simd(&row),
+            max_scalar(&row).to_bits(),
+            max_simd(&row).to_bits(),
             "simd max must equal scalar at n={n}"
         );
         assert_eq!(
-            max_avx2(&row),
-            max_simd(&row),
+            max_avx2(&row).to_bits(),
+            max_simd(&row).to_bits(),
             "avx2 max must equal wide-simd at n={n}"
         );
 

@@ -222,53 +222,55 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
     let tail_holdout = holdout_recall_at(tail_ef);
     let mean_holdout = holdout_recall_at(mean_ef);
 
-    let mut qi = 0usize;
-    let mut g = c.benchmark_group("hnsw_vs_flat_100k");
-    g.bench_function("flat", |b| {
-        b.iter(|| {
-            let q = &queries[qi % QUERIES];
-            qi += 1;
-            black_box(index.search_top_k(black_box(q), K, None).expect("flat"))
-        });
-    });
-    // The REAL baseline: the production fast-tier default (int8 two-pass, recall-preserving).
-    g.bench_function("int8_two_pass", |b| {
-        b.iter(|| {
-            let q = &queries[qi % QUERIES];
-            qi += 1;
-            black_box(
-                index_f16
-                    .search_top_k_int8_two_pass(black_box(q), K, INT8_MULT)
-                    .expect("int8"),
-            )
-        });
-    });
-    for ef in [10usize, 20, 40, HNSW_DEFAULT_EF_SEARCH] {
-        g.bench_function(format!("hnsw_ef{ef}"), |b| {
+    {
+        let mut qi = 0usize;
+        let mut g = c.benchmark_group("hnsw_vs_flat_100k");
+        g.bench_function("flat", |b| {
             b.iter(|| {
                 let q = &queries[qi % QUERIES];
                 qi += 1;
-                black_box(hnsw.knn_search(black_box(q), K, ef).expect("ann"))
+                black_box(index.search_top_k(black_box(q), K, None).expect("flat"))
             });
         });
+        // The REAL baseline: the production fast-tier default (int8 two-pass, recall-preserving).
+        g.bench_function("int8_two_pass", |b| {
+            b.iter(|| {
+                let q = &queries[qi % QUERIES];
+                qi += 1;
+                black_box(
+                    index_f16
+                        .search_top_k_int8_two_pass(black_box(q), K, INT8_MULT)
+                        .expect("int8"),
+                )
+            });
+        });
+        for ef in [10usize, 20, 40, HNSW_DEFAULT_EF_SEARCH] {
+            g.bench_function(format!("hnsw_ef{ef}"), |b| {
+                b.iter(|| {
+                    let q = &queries[qi % QUERIES];
+                    qi += 1;
+                    black_box(hnsw.knn_search(black_box(q), K, ef).expect("ann"))
+                });
+            });
+        }
+        // The two certified efs — each one's latency vs `flat` above is the certified
+        // ANN-in-BOLD speedup under that guarantee mode.
+        g.bench_function(format!("hnsw_tail_certified_ef{tail_ef}"), |b| {
+            b.iter(|| {
+                let q = &queries[qi % QUERIES];
+                qi += 1;
+                black_box(hnsw.knn_search(black_box(q), K, tail_ef).expect("ann"))
+            });
+        });
+        g.bench_function(format!("hnsw_mean_certified_ef{mean_ef}"), |b| {
+            b.iter(|| {
+                let q = &queries[qi % QUERIES];
+                qi += 1;
+                black_box(hnsw.knn_search(black_box(q), K, mean_ef).expect("ann"))
+            });
+        });
+        g.finish();
     }
-    // The two certified efs — each one's latency vs `flat` above is the certified
-    // ANN-in-BOLD speedup under that guarantee mode.
-    g.bench_function(format!("hnsw_tail_certified_ef{tail_ef}"), |b| {
-        b.iter(|| {
-            let q = &queries[qi % QUERIES];
-            qi += 1;
-            black_box(hnsw.knn_search(black_box(q), K, tail_ef).expect("ann"))
-        });
-    });
-    g.bench_function(format!("hnsw_mean_certified_ef{mean_ef}"), |b| {
-        b.iter(|| {
-            let q = &queries[qi % QUERIES];
-            qi += 1;
-            black_box(hnsw.knn_search(black_box(q), K, mean_ef).expect("ann"))
-        });
-    });
-    g.finish();
 
     // Recall@K sweep printed AFTER criterion (to stdout) so it lands in the
     // captured output tail (rch keeps only the tail; a setup-time eprintln was

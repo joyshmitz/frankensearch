@@ -217,41 +217,43 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
          (per-group guarantee: compare stratified_routed vs global_pergroup_ef{pergroup_ef})"
     );
 
-    let mut g = c.benchmark_group("ann_stratified_ef");
-    let mut qi = 0usize;
-    g.bench_function(format!("global_population_ef{global_pop_ef}"), |b| {
-        b.iter(|| {
-            let i = qi % HOLDOUT;
-            qi += 1;
-            black_box(
-                hnsw.knn_search(black_box(&holdout[i]), K, global_pop_ef)
-                    .expect("ann"),
-            )
+    {
+        let mut g = c.benchmark_group("ann_stratified_ef");
+        let mut qi = 0usize;
+        g.bench_function(format!("global_population_ef{global_pop_ef}"), |b| {
+            b.iter(|| {
+                let i = qi % HOLDOUT;
+                qi += 1;
+                black_box(
+                    hnsw.knn_search(black_box(&holdout[i]), K, global_pop_ef)
+                        .expect("ann"),
+                )
+            });
         });
-    });
-    let mut qp = 0usize;
-    g.bench_function(format!("global_pergroup_ef{pergroup_ef}"), |b| {
-        b.iter(|| {
-            let i = qp % HOLDOUT;
-            qp += 1;
-            black_box(
-                hnsw.knn_search(black_box(&holdout[i]), K, pergroup_ef)
-                    .expect("ann"),
-            )
+        let mut qp = 0usize;
+        g.bench_function(format!("global_pergroup_ef{pergroup_ef}"), |b| {
+            b.iter(|| {
+                let i = qp % HOLDOUT;
+                qp += 1;
+                black_box(
+                    hnsw.knn_search(black_box(&holdout[i]), K, pergroup_ef)
+                        .expect("ann"),
+                )
+            });
         });
-    });
-    let mut qj = 0usize;
-    g.bench_function("stratified_routed", |b| {
-        b.iter(|| {
-            let i = qj % HOLDOUT;
-            qj += 1;
-            black_box(
-                hnsw.knn_search(black_box(&holdout[i]), K, routed[i])
-                    .expect("ann"),
-            )
+        let mut qj = 0usize;
+        g.bench_function("stratified_routed", |b| {
+            b.iter(|| {
+                let i = qj % HOLDOUT;
+                qj += 1;
+                black_box(
+                    hnsw.knn_search(black_box(&holdout[i]), K, routed[i])
+                        .expect("ann"),
+                )
+            });
         });
-    });
-    g.finish();
+        g.finish();
+    }
 
     let _ = std::fs::remove_file(&path);
 }

@@ -6,7 +6,7 @@
 //! graph + phase-1 corrections), whereas the SYNC searcher already switched the same tier to the int8
 //! two-pass (`sync_searcher::search_fast_hits`, "use int8 two-pass instead of the exact f16 scan").
 //! int8 two-pass is candidate-lossless on realistic embeddings (candidate-recall@k = 1.0 at mult=3),
-//! so the fused top-k is identical — this bench PROVES that (asserts the top-k doc_id set matches the
+//! so the fused top-k is identical — this bench PROVES that (asserts the top-k `doc_id` set matches the
 //! exact f16 scan for every query) and measures the median speedup.
 //!
 //! ```bash
@@ -167,11 +167,13 @@ fn bench(c: &mut Criterion) {
         }
     );
 
-    let mut g = c.benchmark_group("int8_vs_f16_fast");
-    g.sample_size(30);
-    g.bench_function("f16_exact", |b| b.iter(mk_f16()));
-    g.bench_function("int8_two_pass", |b| b.iter(mk_i8()));
-    g.finish();
+    {
+        let mut g = c.benchmark_group("int8_vs_f16_fast");
+        g.sample_size(30);
+        g.bench_function("f16_exact", |b| b.iter(mk_f16()));
+        g.bench_function("int8_two_pass", |b| b.iter(mk_i8()));
+        g.finish();
+    }
 
     let _ = std::fs::remove_file(&path);
 }
