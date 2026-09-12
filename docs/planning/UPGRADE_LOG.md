@@ -2,6 +2,63 @@
 
 ## 2026-09-12 — Stable dependency refresh (in progress)
 
+### Follow-up qualification at 23:36 UTC
+
+The current product compiler stages pass on `ovh-a`: formatting, workspace
+checking, workspace and hybrid Clippy, and the Windows index compile guard.
+The library stage fails in fsfs with 2,100 passed, four failed, and 14 existing
+ignores; the separate fsfs stage repeats those failures. Rerank setup rejects a
+producer identity mismatch, two watcher fixtures miss their startup hooks, and
+the socket capacity fixture times out reading the expected overflow refusal.
+The failed executable and output are retained in
+`dependencies/product-library-failure-receipt.json`. That run finished with
+exit 1 at 22:48:33 UTC and all 1,777 source hashes matching. The facade stage
+passed 144 tests. The end-to-end lane passed six tests but lacked native and
+multilingual fixture files for two others. Quickstart refused the dirty checkout's
+source provenance. Fourteen executed binary hashes are retained in
+`dependencies/product-current-executables.json`.
+
+Source investigation identifies two fixture races. The Asupersync 0.5
+current-thread runtime can transfer a pre-spawned test task from its background
+worker to the caller, losing thread-local overrides. Running the test directly
+in the registered root avoids that transfer; a new regression checks thread
+and TLS continuity across a forced yield and real blocking work. The socket
+fixture can reject a partial client before older handlers retire, then admit
+the designated overflow client into the freed slot. Restarting the server
+between responsiveness and saturation checks isolates those admissions.
+All five exact fixture regressions now pass on `hz3`, with formatting and all
+1,777 source hashes matching after each command. The normal watcher test passed
+in 101.13 seconds; its startup assertion succeeded. The executed binary hash and
+terminal counts are retained in `dependencies/fsfs-fixture-focused-receipt.json`.
+The fixture repair is committed as `491f151f`; production identity checks,
+capacity limits, and timeout bounds remain unchanged. Broader product checks
+continue against the isolated candidate.
+
+The attempt to reuse ovh after its original run was refused by RCH with exit 103
+for critical disk pressure; no build or local fallback ran. `hz3` admitted the
+replacement on a separate checkout. Its native fixture is available, and all
+five multilingual files were downloaded from the manifest's immutable revision
+and verified against their sizes and SHA-256 hashes. The next model checks use
+explicit fixture paths. Source-qualified quickstart still requires a clean
+checkout after validation; no provenance override was used.
+
+The retained-output Quill probes pass: 39 witness units, 12 replay tests, eight
+live Quill/Tantivy tests, and the existing refusal controls. The first full
+attempt exposed a test that incorrectly rejected the valid empty feature set
+and subprocess helpers that polluted the parent JSON stream. The corrected
+artifact module passes 64 tests in both feature configurations (one existing
+ignore each). Both subprocess parents also pass the unchanged strict JSON
+parser, while the original polluted output still produces `INVALID_OUTPUT`.
+The combined focused receipt is `dependencies/quill-combined-focused-receipt.json`.
+
+All-feature Clippy then exposed existing fuzz-harness documentation, callback
+type, visibility, and platform conversion lints. Direct repairs preserve
+checked conversions and introduce no suppressions. Formatting and all-target,
+all-feature Clippy with warnings denied pass at 22:23:25 UTC with all 1,777
+source hashes matching. These repairs are committed as `2c0b9e36`. The full
+default/all-feature gauntlet is running under SwiftWillow's monitoring;
+none of these focused passes is a full-suite or performance verdict.
+
 ### Current integration status at 21:16 UTC
 
 Main now resolves Asupersync 0.5.0 and FrankenSQLite 0.4, following a separate
