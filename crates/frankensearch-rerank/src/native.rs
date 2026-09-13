@@ -221,9 +221,89 @@ fn index_to_i64(index: usize, ctx: &str) -> SearchResult<i64> {
     i64::try_from(index).map_err(|_| rerank_err(ctx, format!("index {index} exceeds i64::MAX")))
 }
 
+// Adapted from wide 1.7.0's f32x8::exp, polynomial_5 and vm_pow2n.
+// Alteration: explicitly separate multiplication and addition on every target;
+// construct exponent bits through safe scalar lane access.
+//
+// Copyright (c) 2020 Daniel "Lokathor" Gee.
+//
+// This software is provided 'as-is', without any express or implied
+// warranty.  In no event will the authors be held liable for any damages
+// arising from the use of this software.
+//
+// Permission is granted to anyone to use this software for any purpose,
+// including commercial applications, and to alter it and redistribute it
+// freely, subject to the following restrictions:
+//
+// 1. The origin of this software must not be misrepresented; you must not
+// claim that you wrote the original software. If you use this software
+// in a product, an acknowledgment in the product documentation would be
+// appreciated but is not required.
+// 2. Altered source versions must be plainly marked as such, and must not be
+// misrepresented as being the original software.
+// 3. This notice may not be removed or altered from any source distribution.
+
+/// Preserve the non-FMA x86 exponential's rounding on every vector target.
+/// `wide::exp` uses fused operations on NEON, which changes model output bits.
+/// Keep this expression tree: reassociation or `mul_add` changes the producer.
+#[inline]
+fn exp_vec8_non_fused(input: f32x8) -> f32x8 {
+    fn pow2(exponents: f32x8) -> f32x8 {
+        f32x8::new(exponents.to_array().map(|n| {
+            debug_assert!((-150.0..=127.0).contains(&n));
+            if n < -149.0 {
+                0.0
+            } else if n < -126.0 {
+                // Adding 2^23 encodes an integral shift (0..=22) in the
+                // mantissa, without a float-to-integer conversion.
+                let shift = (n + 149.0 + 8_388_608.0).to_bits() & 0x007f_ffff;
+                f32::from_bits(1_u32 << shift)
+            } else {
+                f32::from_bits((n + (127.0 + 8_388_608.0)).to_bits() << 23)
+            }
+        }))
+    }
+
+    let lanes = input.to_array();
+    // Exceptional lanes have fixed outputs. Sanitize them before reduction so
+    // the exponent construction only receives finite, bounded integers.
+    let bounded = f32x8::new(lanes.map(|x| {
+        if (-103.63..=88.723).contains(&x) {
+            x
+        } else {
+            0.0
+        }
+    }));
+    let r = (bounded * f32x8::LOG2_E).round_ties_even();
+    let max_r = f32x8::splat(127.0);
+    let scale = pow2((r - max_r).max(f32x8::ZERO));
+    let n2 = pow2(r.min(max_r));
+    let x = bounded - r * f32x8::splat(0.693_359_4);
+    let x = x - r * f32x8::splat(-2.121_944_4e-4);
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    let a = f32x8::splat(1.0 / 120.0) * x + f32x8::splat(1.0 / 24.0);
+    let b = f32x8::splat(1.0 / 5040.0) * x + f32x8::splat(1.0 / 720.0);
+    let c = f32x8::splat(1.0 / 6.0) * x + f32x8::splat(1.0 / 2.0);
+    let p = a * x2 + (b * x4 + c);
+    let z = p * x2 + x;
+    let result = ((z + f32x8::ONE) * scale * n2).to_array();
+    f32x8::new(std::array::from_fn(|i| {
+        if lanes[i].is_nan() {
+            f32::from_bits(0x7fc0_0101)
+        } else if lanes[i] > 88.723 {
+            f32::INFINITY
+        } else if lanes[i] < -103.63 {
+            0.0
+        } else {
+            result[i]
+        }
+    }))
+}
+
 /// In-place fused scale + numerically-stable softmax for one attention-score row.
 /// Computes `softmax(scale · row)` over `row` (one head's query position), using
-/// `wide`'s 8-wide polynomial `exp` (~1-2 ULP) instead of scalar libm `expf`.
+/// The 8-wide non-fused polynomial `exp` (~1-2 ULP) instead of scalar libm `expf`.
 /// `scale > 0`, so the argmax (hence the stabilising max-subtraction) is
 /// unchanged by the scale: `exp(scale·(x − max)) == exp(scale·x)/exp(scale·max)`.
 fn softmax_row_fused(row: &mut [f32], scale: f32) {
@@ -246,10 +326,10 @@ fn softmax_row_fused(row: &mut [f32], scale: f32) {
     // breaks the sum chain wins LESS, confirming the bottleneck is exp latency (not
     // the reduction), so the bit-identical single-accumulator form is also the fastest.
     while i + 32 <= n {
-        let e0 = ((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v).exp();
-        let e1 = ((f32x8_from_slice(&row[i + 8..i + 16]) - max_v) * scale_v).exp();
-        let e2 = ((f32x8_from_slice(&row[i + 16..i + 24]) - max_v) * scale_v).exp();
-        let e3 = ((f32x8_from_slice(&row[i + 24..i + 32]) - max_v) * scale_v).exp();
+        let e0 = exp_vec8_non_fused((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v);
+        let e1 = exp_vec8_non_fused((f32x8_from_slice(&row[i + 8..i + 16]) - max_v) * scale_v);
+        let e2 = exp_vec8_non_fused((f32x8_from_slice(&row[i + 16..i + 24]) - max_v) * scale_v);
+        let e3 = exp_vec8_non_fused((f32x8_from_slice(&row[i + 24..i + 32]) - max_v) * scale_v);
         row[i..i + 8].copy_from_slice(&e0.to_array());
         row[i + 8..i + 16].copy_from_slice(&e1.to_array());
         row[i + 16..i + 24].copy_from_slice(&e2.to_array());
@@ -261,7 +341,7 @@ fn softmax_row_fused(row: &mut [f32], scale: f32) {
         i += 32;
     }
     while i + 8 <= n {
-        let e = ((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v).exp();
+        let e = exp_vec8_non_fused((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v);
         row[i..i + 8].copy_from_slice(&e.to_array());
         sum_v += e;
         i += 8;
@@ -327,7 +407,7 @@ fn gelu_vec8(x: f32x8) -> f32x8 {
     let a4 = f32x8::splat(-1.453_152);
     let a5 = f32x8::splat(1.061_405_4);
     let poly = t * (a1 + t * (a2 + t * (a3 + t * (a4 + t * a5))));
-    let erf_abs = one - poly * (-(z * z)).exp();
+    let erf_abs = one - poly * exp_vec8_non_fused(-(z * z));
     let erf = erf_abs.copysign(z);
     f32x8::splat(0.5) * x * (one + erf)
 }
@@ -2264,6 +2344,96 @@ impl frankensearch_core::traits::Reranker for NativeReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_fused_exp_preserves_exceptional_lanes() {
+        let input = f32x8::new([
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0xff80_0001),
+            f32::MAX,
+            -f32::MAX,
+        ]);
+        assert_eq!(
+            exp_vec8_non_fused(input).to_array().map(f32::to_bits),
+            [
+                1.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                f32::INFINITY.to_bits(),
+                0,
+                0x7fc0_0101,
+                0x7fc0_0101,
+                f32::INFINITY.to_bits(),
+                0,
+            ]
+        );
+        assert_eq!(
+            exp_vec8_non_fused(f32x8::splat(-104.0))
+                .to_array()
+                .map(f32::to_bits),
+            [0; 8]
+        );
+    }
+
+    // The oracle is the existing producer's actual separately rounded wide
+    // implementation. FMA-enabled builds use a different oracle and must not
+    // silently replace this comparison with a tolerance or another polynomial.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    #[test]
+    fn non_fused_exp_matches_existing_x86_producer_bits() {
+        fn check(lanes: [f32; 8]) {
+            let input = f32x8::new(lanes);
+            assert_eq!(
+                exp_vec8_non_fused(input).to_array().map(f32::to_bits),
+                input.exp().to_array().map(f32::to_bits),
+                "input bits: {:?}",
+                lanes.map(f32::to_bits)
+            );
+        }
+
+        for sample in 0_u16..=u16::MAX {
+            let x = -104.0 + f32::from(sample) * (193.0 / 65_535.0);
+            check([x, x.next_down(), x.next_up(), -x, 0.0, -0.0, 1.0, -1.0]);
+        }
+        check([
+            (-103.63_f32).next_down(),
+            -103.63,
+            (-103.63_f32).next_up(),
+            88.723_f32.next_down(),
+            88.723,
+            88.723_f32.next_up(),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ]);
+        for exponent in -150_i16..=128 {
+            let boundary = (f32::from(exponent) + 0.5) / std::f32::consts::LOG2_E;
+            let center = f32::from(exponent) / std::f32::consts::LOG2_E;
+            check([
+                boundary.next_down(),
+                boundary,
+                boundary.next_up(),
+                center.next_down(),
+                center,
+                center.next_up(),
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ]);
+        }
+        let mut seed = 0x6d2b_79f5_u32;
+        for _ in 0..8192 {
+            let lanes = std::array::from_fn(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                f32::from_bits(seed)
+            });
+            check(lanes);
+            let mut reversed = lanes;
+            reversed.reverse();
+            check(reversed);
+        }
+    }
 
     fn verified_async_fixture() -> NativeReranker {
         let dir = std::path::PathBuf::from(
