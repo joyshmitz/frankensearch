@@ -359,7 +359,10 @@ impl IndexBuilder {
     /// or [`TantivyIndex::open`]. This does not change [`open_hybrid`]'s feature
     /// requirements or migrate an existing lexical directory to a new format.
     /// A nonempty lexical directory must already be readable as Tantivy; the
-    /// build checks this before creating vector files or embedding documents.
+    /// build checks this and acquires its writer before creating vector files
+    /// or embedding documents. Conflicting Quill or blue-green markers refuse.
+    /// The adapter's field positions and options must match; older indexes
+    /// without the optional insertion-ordinal field remain supported.
     #[cfg(feature = "lexical-tantivy")]
     #[must_use]
     pub fn with_tantivy_lexical(mut self) -> Self {
@@ -469,12 +472,18 @@ impl IndexBuilder {
         }
 
         #[cfg(feature = "lexical-tantivy")]
-        if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy))
-            && let Err(error) = validate_tantivy_lexical_directory(&self.data_dir.join("lexical"))
-        {
-            export_error(metrics_exporter.as_ref(), &error);
-            return Err(error);
-        }
+        let tantivy_lexical =
+            if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy)) {
+                match prepare_existing_tantivy_lexical_index(&self.data_dir.join("lexical")) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        export_error(metrics_exporter.as_ref(), &error);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
 
         // Resolve embedder stack.
         let stack = match self.embedder_stack.take() {
@@ -841,7 +850,13 @@ impl IndexBuilder {
                     }
                     #[cfg(feature = "lexical-tantivy")]
                     IndexLexicalBackend::Tantivy => {
-                        build_tantivy_lexical_index(cx, &lexical_path, lexical_docs).await
+                        build_tantivy_lexical_index(
+                            cx,
+                            &lexical_path,
+                            lexical_docs,
+                            tantivy_lexical,
+                        )
+                        .await
                     }
                 };
                 match result {
@@ -1414,21 +1429,87 @@ async fn build_lexical_index(
 }
 
 #[cfg(feature = "lexical-tantivy")]
-fn validate_tantivy_lexical_directory(data_dir: &Path) -> SearchResult<()> {
+fn prepare_existing_tantivy_lexical_index(data_dir: &Path) -> SearchResult<Option<TantivyIndex>> {
     let map_io_error = |source| SearchError::SubsystemError {
         subsystem: "tantivy",
         source: Box::new(source),
     };
-    let mut entries = match std::fs::read_dir(data_dir) {
+    let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(map_io_error(error)),
     };
-    if entries.next().transpose().map_err(map_io_error)?.is_some() {
-        // Validate without acquiring a writer or modifying the existing
-        // directory. Foreign or damaged content must not be overlaid with a
-        // new format, even if no Tantivy metadata file exists yet.
-        drop(TantivyIndex::open_read_only(data_dir)?);
+    let mut nonempty = false;
+    for entry in entries {
+        let entry = entry.map_err(map_io_error)?;
+        let name = entry.file_name();
+        if name == "MANIFEST" || name == "CURRENT" {
+            return Err(SearchError::InvalidConfig {
+                field: "data_dir/lexical".to_owned(),
+                value: data_dir.display().to_string(),
+                reason: "refusing Tantivy writes over Quill or blue-green lexical markers"
+                    .to_owned(),
+            });
+        }
+        nonempty = true;
+    }
+    if !nonempty {
+        return Ok(None);
+    }
+    let reader = TantivyIndex::open_read_only(data_dir)?;
+    validate_tantivy_adapter_schema(&reader, data_dir)?;
+    drop(reader);
+    // `open`, unlike `create`, cannot initialize a new format over foreign or
+    // damaged content. Retain its writer through embedding: a read-only probe
+    // would admit an existing writer conflict until after vector publication.
+    let writer = TantivyIndex::open(data_dir)?;
+    validate_tantivy_adapter_schema(&writer, data_dir)?;
+    Ok(Some(writer))
+}
+
+#[cfg(feature = "lexical-tantivy")]
+fn validate_tantivy_adapter_schema(index: &TantivyIndex, data_dir: &Path) -> SearchResult<()> {
+    use frankensearch_lexical::tantivy_crate::schema::{
+        FAST, FieldType, IndexRecordOption, STORED, STRING, TextFieldIndexing, TextOptions,
+    };
+
+    // The adapter addresses these four fields by their original numeric slots.
+    // Merely opening Tantivy metadata does not validate those slots or options.
+    let searchable_text = TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("frankensearch_default")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        )
+        .set_stored();
+    let expected = [
+        ("id", STRING | STORED),
+        ("content", searchable_text.clone()),
+        ("title", searchable_text),
+        ("metadata_json", TextOptions::default().set_stored()),
+    ];
+    let schema = index.index_handle().schema();
+    let mut fields = schema.fields();
+    let mismatch = || SearchError::InvalidConfig {
+        field: "data_dir/lexical.schema".to_owned(),
+        value: data_dir.display().to_string(),
+        reason: "existing Tantivy schema is incompatible with the frankensearch adapter"
+            .to_owned(),
+    };
+    for (name, options) in expected {
+        let Some((_, entry)) = fields.next() else {
+            return Err(mismatch());
+        };
+        if entry.name() != name || entry.field_type() != &FieldType::Str(options) {
+            return Err(mismatch());
+        }
+    }
+    // The adapter resolves `ord` by name, and deliberately supports the older
+    // schema without it. Unrelated extra fields do not change the four slots.
+    if let Ok(ord) = schema.get_field("ord")
+        && schema.get_field_entry(ord).field_type() != &FieldType::U64(FAST | STORED)
+    {
+        return Err(mismatch());
     }
     Ok(())
 }
@@ -1438,11 +1519,15 @@ async fn build_tantivy_lexical_index(
     cx: &Cx,
     data_dir: &Path,
     documents: &[IndexableDocument],
+    existing: Option<TantivyIndex>,
 ) -> SearchResult<LexicalArmReceipt> {
     use frankensearch_core::traits::LexicalWrite;
 
     build_checkpoint(cx, "Tantivy lexical index initialization")?;
-    let lexical = TantivyIndex::create(data_dir)?;
+    let lexical = match existing {
+        Some(index) => index,
+        None => TantivyIndex::create(data_dir)?,
+    };
     let mut indexed = 0usize;
     let mut errors: Vec<(String, String)> = Vec::new();
     for document in documents {
@@ -2622,6 +2707,111 @@ mod tests {
                     .expect("query existing index");
                 assert_eq!(hits.len(), 1);
                 assert_eq!(hits[0].doc_id, expected);
+            }
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_writer_conflict_preserves_existing_vectors_and_documents() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .add_document("doc-retained", "retainedwritersentinel")
+                .build(&cx)
+                .await
+                .expect("publish existing generation");
+            let lexical_path = dir.join("lexical");
+            let existing = TantivyIndex::open(&lexical_path).expect("hold existing writer");
+            let vector_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let before_vectors = std::fs::read(&vector_path).expect("read existing vectors");
+            let before_meta = std::fs::read(lexical_path.join("meta.json"))
+                .expect("read existing Tantivy metadata");
+            let error = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .add_document("doc-refused", "refusedwritersentinel")
+                .build(&cx)
+                .await
+                .expect_err("writer contention must refuse before replacing vectors");
+            assert!(matches!(
+                error,
+                SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    ..
+                }
+            ));
+            assert_eq!(std::fs::read(&vector_path).unwrap(), before_vectors);
+            assert_eq!(
+                std::fs::read(lexical_path.join("meta.json")).unwrap(),
+                before_meta,
+            );
+            let hits = existing
+                .search(&cx, "retainedwritersentinel", 10)
+                .await
+                .expect("query retained document while original writer remains live");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-retained");
+            assert!(
+                existing
+                    .search(&cx, "refusedwritersentinel", 10)
+                    .await
+                    .expect("query refused document")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_refuses_mixed_markers_before_touching_vectors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for marker in ["MANIFEST", "CURRENT"] {
+                let dir = retained_tantivy_builder_dir();
+                let lexical_path = dir.join("lexical");
+                let lexical = TantivyIndex::create(&lexical_path).expect("create Tantivy");
+                frankensearch_core::traits::LexicalWrite::index_documents(
+                    &lexical,
+                    &cx,
+                    &[IndexableDocument::new("doc-retained", "mixedmarkersentinel")],
+                )
+                .await
+                .expect("index retained document");
+                frankensearch_core::traits::LexicalWrite::commit(&lexical, &cx)
+                    .await
+                    .expect("publish retained document");
+                drop(lexical);
+                let marker_path = lexical_path.join(marker);
+                std::fs::write(&marker_path, b"retained conflicting marker").unwrap();
+                let before_meta = std::fs::read(lexical_path.join("meta.json")).unwrap();
+                let error = IndexBuilder::new(&dir)
+                    .with_embedder_stack(tantivy_hash_stack())
+                    .with_tantivy_lexical()
+                    .with_progress(|_| panic!("mixed layout must refuse before embedding"))
+                    .add_document("doc-refused", "refusedmixedsentinel")
+                    .build(&cx)
+                    .await
+                    .expect_err("readable Tantivy does not authorize a mixed layout");
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, .. } if field == "data_dir/lexical"
+                ));
+                assert!(!dir.join(VECTOR_INDEX_FAST_FILENAME).exists());
+                assert!(!dir.join(VECTOR_INDEX_QUALITY_FILENAME).exists());
+                assert_eq!(
+                    std::fs::read(&marker_path).unwrap(),
+                    b"retained conflicting marker",
+                );
+                assert_eq!(
+                    std::fs::read(lexical_path.join("meta.json")).unwrap(),
+                    before_meta,
+                );
+                let lexical = TantivyIndex::open_read_only(&lexical_path).unwrap();
+                let hits = lexical.search(&cx, "mixedmarkersentinel", 10).await.unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id, "doc-retained");
             }
         });
     }
