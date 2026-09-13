@@ -2,12 +2,14 @@
 
 ## 2026-09-12 — Stable dependency refresh (in progress)
 
-### Current integration status at 19:49 UTC
+### Current integration status at 21:16 UTC
 
 Main now resolves Asupersync 0.5.0 and FrankenSQLite 0.4, following a separate
 publication session. Live crates.io records confirm facade 0.6.0, core/lexical/
 Quill 0.3.0, and rerank 0.4.0 were published today. The downloaded facade and
 lexical archives both identify source `dd093fb230404ab08be2ed6f27776ed6c4796485`.
+All ten newly published library archives have now been downloaded, checked
+against their registry SHA-256 values, and confirmed to identify that same source.
 fsfs remains 1.10.0. These published versions are immutable; publication alone
 does not establish that the complete release gates passed.
 
@@ -24,7 +26,65 @@ still named lexical 0.2.5, the built-in profile still named Quill 0.2.4, and the
 standalone fuzz crate still selected a different Asupersync `Cx` type. The
 candidate introduces oracle v9 and profile v7 for the actual 0.3.0 adapters,
 retains exact historical v8/v6 identities for archive inspection only, and
-aligns the fuzz runtime closure to 0.5.0. Focused remote tests are pending.
+aligns the fuzz runtime closure to 0.5.0. The focused RCH run on `vmi1156319`
+finished with exit 0 at 20:16:52 UTC: 12 version/oracle tests, four built-in
+profile tests, formatting, and the locked standalone fuzz-bin check passed.
+The candidate's 1,777 tracked non-coordination source files matched after the
+tests; the executed test binary SHA-256 and terminal log are retained in
+`dependencies/current-contracts-test-receipt.json` and
+`dependencies/current-contracts-vmi-admitted.log` under the release-work directory.
+This does not complete the full Quill or product gates.
+
+Further current-version boundaries still need qualification. The embedder's
+historical fixture reconstruction assumes adapter 0.2.7, although production now
+correctly identifies package 0.3.0. The same dependency update selected SafeTensors
+0.8.0 while Potion's production protocol still reported 0.7.0. The repair corrects
+that protocol, reconstructs the older adapters and dependencies for archival
+fixtures, and rejects an old protocol even when the adapter version is unchanged.
+Every historical fingerprint and vector certificate remains unchanged. The
+unmodified historical-fixture test failed as expected (zero passed, one failed),
+with all 1,777 source files matching. The corrected candidate passes 404 embedder
+unit tests, with five existing opt-in ignores; all eight fresh-process logging
+tests; the real Potion certificate test; and both real-model shared-load and
+streamed-decoding tests. The logging preflight now binds Asupersync 0.5.0 and
+checks Potion's declared Tokenizers/SafeTensors versions against Cargo.lock.
+Source and both executed ELF hashes are retained in
+`dependencies/producer-tests-receipt.json`. Focused core/embedder Clippy with
+warnings denied also passed; the RCH batch finished with exit 0 at 20:55:07 UTC.
+
+The first current core suite passed 1,128 tests but failed the concurrent anti-rollback
+publisher test: one loser observes a partially written version file and returns
+`UnresolvedAttempt` instead of a conflict. This race predates the dependency
+upgrade. The evidence and required preservation of torn-head refusal were sent
+to AzureCove under `bd-generation-antirollback-floor-ynwdi`. The previous owner
+has been inactive since August 30 and the file had no reservation or local edits,
+so ChartreuseCarp claimed the existing bead and reserved the bounded repair.
+The repair holds a fresh-descriptor kernel lock through load/CAS scanning,
+publication, and durability completion. It also syncs the store parent for a
+new root and reconciles completed record bytes before load or replay succeeds.
+Two bounded subprocess tests cover overlapping readers/publishers and an
+interrupted writer; genuinely torn heads still refuse further advancement.
+The RCH batch finished with exit 0 at 21:16:08 UTC: 1,131 core tests passed
+(one subprocess helper is ignored in the parent inventory), 404 embedder tests
+passed (five existing ignores), formatting and focused all-target Clippy passed,
+and the Windows index compile guard passed with nine existing warnings.
+All 1,777 source files matched after each command. The terminal log and executed
+core/embedder hashes are retained in `dependencies/floor-publication-receipt.json`.
+Consumer profile wiring remains unfinished; the broader floor bead stays open.
+
+PurpleBay's current-family consumer run passed 351 storage and 160 durability
+tests, with terminal exit 0 and retained executable hashes. All 25 source hashes
+in `.rch-results/storage-durability-20260912/source.sha256` match this checkout.
+The genuine-model doctor regression also passed, rejecting both stale producer
+tiers and accepting the byte-restored current indexes.
+
+The publication guard now pins exactly Asupersync 0.5.0 and FrankenSQLite 0.4.0.
+Its complete self-test passes, including new isolated negative controls for
+the preceding 0.4.10 runtime and coherent 0.3.18 storage family. Wrong-source,
+duplicate-runtime, patched-dependency, mixed-family, and source-cleanliness
+controls remain intact. These focused results do not complete the broader
+workspace/product or full Quill gates, and macOS ARM qualification remains
+blocked by host memory pressure and the unresolved native certificate mismatch.
 
 ### Earlier dependency census and isolated candidate
 
