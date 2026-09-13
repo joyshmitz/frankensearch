@@ -56,13 +56,52 @@ two distinct warm queries refined successfully; the mixed Chinese/English query
 exceeded the unchanged 500 ms deadline. One isolated probe using the same test
 executable also failed. Other projects' compiler workloads were active on the
 host, so this does not identify a runtime regression or a performance cause.
-The failure remains open; no timeout, numerical certificate, or acceptance
-assertion was relaxed. See `dependencies/multilingual-isolated-receipt.json`.
+That isolated failure is retained in
+`dependencies/multilingual-isolated-receipt.json`. On clean source `41e72e56`,
+the subsequent CSS end-to-end run passed multilingual testing but still missed
+the native cold-start deadline with a debug CLI. The stock optimized CLI then
+passed all eight unchanged end-to-end tests, including both model paths, in
+89.42 seconds. The actual tested release binary and its source hashes are bound
+by `dependencies/css-release-e2e-receipt.json`. No timeout or acceptance
+assertion changed; the debug failure remains separate evidence.
 
-The complete Quill gauntlet continues on its earlier frozen source snapshot.
-That result cannot certify subsequent producer metadata changes. Source-clean
-quickstart, final-source release qualification, and the unresolved ARM native
-certificate/admission work still prevent release completion.
+Source-qualified quickstart also passes on that clean source: 12 real commands,
+18 negative controls, and no remaining owned processes. The initial attempt
+could not admit old shared-cache verification receipts. A private copy of the
+registered model files was explicitly verified by the current public CLI before
+the unchanged gate ran. The shared cache was not modified. See
+`dependencies/css-clean-quickstart-pass-receipt.json`.
+
+The older frozen Quill gauntlet ended with SIGKILL (exit 137), without a suite
+terminal result. Its partial output contains 483 successful tests, four ignored
+tests, and two unfinished tests; the all-feature phase never started. The source
+and executed binary hashes still match. No matching kernel OOM evidence was
+found, so the termination cause is unproven. Retained logs in
+`dependencies/quill-gate-q3beg8in` are an interrupted run, not a qualification
+pass, and cannot certify subsequent producer metadata changes.
+
+The native ARM certificate failure is now independently reproduced on the same
+source and model bytes used for an x86 pass. Test-only stage capture preserves
+the existing certificate outcome: ARM observes `cf39f307...`, while x86 matches
+the registered `bed15455...`. The first 41-stage comparison agrees through
+tokenization, initial normalization, QKV, and attention scores. Scalar softmax
+and vector GELU differ, but those initial differences disappear before the first
+encoder-layer output. Layer two is the first output that remains different;
+only one of the four public corpus embeddings differs at the end. This narrows
+the investigation without yet proving which operation causes the certificate
+mismatch. See `dependencies/native-trace-comparison.json`.
+
+An expanded all-layer ARM probe was refused before transfer or execution by
+RCH's critical-memory-pressure admission check; no retry or policy change was
+made. The corrected test-only observer passes remote formatting, native rerank
+all-target Clippy with warnings denied, all 45 enabled native library tests
+(12 existing ignores), and the unchanged exact x86 certificate test. It captures
+116 records across all six layers. All 1,777 source hashes match throughout;
+`dependencies/native-observer-lintfixed-hz3.log` retains the terminal results and
+executed binary hash. The initial observer's eight Clippy findings were repaired
+without suppressions before this validation. Final-source full qualification,
+the complete Quill gauntlet, and native ARM qualification still prevent release
+completion.
 
 ### Follow-up qualification at 23:36 UTC
 

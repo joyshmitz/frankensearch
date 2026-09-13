@@ -36,6 +36,150 @@ use wide::f32x8;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{RerankDocument, RerankScore, SyncRerank};
 
+/// Observation of the existing public certificate execution, never another engine.
+#[cfg(test)]
+pub(crate) mod certificate_trace {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    struct Record {
+        label: String,
+        shape: Vec<usize>,
+        dtype: &'static str,
+        bytes: Vec<u8>,
+    }
+
+    struct Recorder {
+        directory: PathBuf,
+        records: Vec<Record>,
+        bytes: usize,
+        detail: bool,
+    }
+
+    thread_local! {
+        static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
+    }
+
+    pub struct Guard;
+
+    pub fn begin() -> Option<Guard> {
+        let directory = PathBuf::from(std::env::var_os("FSFS_NATIVE_CERTIFICATE_TRACE_DIR")?);
+        // create_dir refuses an existing directory, including a symlink.
+        std::fs::create_dir(&directory).expect("create new certificate trace directory");
+        RECORDER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "certificate trace already active");
+            *slot = Some(Recorder {
+                directory,
+                records: Vec::new(),
+                bytes: 0,
+                detail: false,
+            });
+        });
+        Some(Guard)
+    }
+
+    pub fn active() -> bool {
+        RECORDER.with(|slot| slot.borrow().is_some())
+    }
+
+    pub fn detail(enabled: bool) {
+        RECORDER.with(|slot| {
+            if let Some(recorder) = slot.borrow_mut().as_mut() {
+                recorder.detail = enabled;
+            }
+        });
+    }
+
+    fn record(label: &str, shape: &[usize], dtype: &'static str, bytes: Vec<u8>) {
+        RECORDER.with(|slot| {
+            if let Some(recorder) = slot.borrow_mut().as_mut() {
+                recorder.bytes += bytes.len();
+                assert!(
+                    recorder.bytes <= 32 * 1024 * 1024,
+                    "certificate trace exceeded 32 MiB"
+                );
+                recorder.records.push(Record {
+                    label: label.to_owned(),
+                    shape: shape.to_vec(),
+                    dtype,
+                    bytes,
+                });
+            }
+        });
+    }
+
+    pub fn floats(label: &str, shape: &[usize], values: &[f32]) {
+        if active() {
+            assert_eq!(shape.iter().product::<usize>(), values.len());
+            record(
+                label,
+                shape,
+                "f32-le",
+                values
+                    .iter()
+                    .flat_map(|v| v.to_bits().to_le_bytes())
+                    .collect(),
+            );
+        }
+    }
+
+    pub fn detailed(label: &str, shape: &[usize], values: &[f32]) {
+        if RECORDER.with(|slot| slot.borrow().as_ref().is_some_and(|r| r.detail)) {
+            floats(label, shape, values);
+        }
+    }
+
+    pub fn ids(label: &str, values: &[i64]) {
+        if active() {
+            record(
+                label,
+                &[values.len()],
+                "i64-le",
+                values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            );
+        }
+    }
+
+    impl Guard {
+        pub(crate) fn flush(self) {
+            let recorder = RECORDER
+                .with(|slot| slot.borrow_mut().take())
+                .expect("active trace");
+            let mut metadata = Vec::new();
+            for (ordinal, record) in recorder.records.into_iter().enumerate() {
+                let filename = format!("{ordinal:04}.bin");
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(recorder.directory.join(&filename))
+                    .expect("create trace record");
+                file.write_all(&record.bytes).expect("write trace record");
+                metadata.push(serde_json::json!({
+                    "ordinal": ordinal, "label": record.label, "shape": record.shape,
+                    "dtype": record.dtype, "file": filename,
+                }));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(recorder.directory.join("manifest.json"))
+                .expect("create trace manifest");
+            serde_json::to_writer_pretty(&mut file, &metadata).expect("write trace manifest");
+            drop(self);
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RECORDER.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
+        }
+    }
+}
+
 const H: usize = 384;
 const RERANKER_LAYERS: usize = 6;
 const NH: usize = 12;
@@ -419,7 +563,11 @@ fn fused_attention(
     let km = TensorMeta::from_shape(vec![NH, HD, s_len], DType::F32, Device::Cpu);
     ft_api::bmm_tensor_contiguous_f32_into(q_hm, kt, &qm, &km, scores)
         .expect("attn QKᵀ bmm: shapes are internally consistent");
+    #[cfg(test)]
+    certificate_trace::detailed("attention.scores", &[NH, s_len, s_len], scores);
     fast_softmax_inplace(scores, NH * s_len, s_len, scale);
+    #[cfg(test)]
+    certificate_trace::detailed("attention.softmax", &[NH, s_len, s_len], scores);
     // ctx_hm[NH, S, HD] = scores @ V.
     let sm = TensorMeta::from_shape(vec![NH, s_len, s_len], DType::F32, Device::Cpu);
     let vm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
@@ -711,6 +859,8 @@ impl Model {
         // Fused QKV projection (batched over all the chunk's tokens).
         // Fused QKV projection output shape: [total, 3H].
         let qkv = self.linear_raw(emb, total, &format!("{p}.attention.self.qkv"))?;
+        #[cfg(test)]
+        certificate_trace::detailed("layer.qkv", &[total, 3 * H], &qkv);
         // Per-document self-attention written straight into one re-concatenated
         // [total, H] context (no per-doc temporary).
         let mut ctx = vec![0.0f32; total * H];
@@ -725,6 +875,11 @@ impl Model {
             );
         }
         let attn = self.linear_raw(&ctx, total, &format!("{p}.attention.output.dense"))?;
+        #[cfg(test)]
+        {
+            certificate_trace::detailed("layer.context", &[total, H], &ctx);
+            certificate_trace::detailed("layer.attention_projection", &[total, H], &attn);
+        }
         let emb = self.add_ln_raw(
             emb,
             &attn,
@@ -733,9 +888,18 @@ impl Model {
         )?;
         // FFN: [total, H] -> [total, INTER] -> GELU -> [total, H].
         let mut inter = self.linear_raw(&emb, total, &format!("{p}.intermediate.dense"))?;
+        #[cfg(test)]
+        {
+            certificate_trace::detailed("layer.attention_norm", &[total, H], &emb);
+            certificate_trace::detailed("layer.ffn_projection", &[total, INTER], &inter);
+        }
         debug_assert_eq!(inter.len(), total * INTER);
         fast_gelu_inplace(&mut inter);
+        #[cfg(test)]
+        certificate_trace::detailed("layer.gelu", &[total, INTER], &inter);
         let ffn = self.linear_raw(&inter, total, &format!("{p}.output.dense"))?;
+        #[cfg(test)]
+        certificate_trace::detailed("layer.ffn_output", &[total, H], &ffn);
         self.add_ln_raw(&emb, &ffn, total, &format!("{p}.output.LayerNorm"))
     }
 
@@ -1296,6 +1460,12 @@ impl Model {
             }
         }
         // Embeddings → [total, H]: word + position + token_type, then LayerNorm.
+        #[cfg(test)]
+        {
+            certificate_trace::ids("embedding.token_ids", &ids_flat);
+            certificate_trace::ids("embedding.position_ids", &pos_flat);
+            certificate_trace::ids("embedding.type_ids", &typ_flat);
+        }
         let id_t = self.idx(&ids_flat)?;
         let pos_t = self.idx(&pos_flat)?;
         let typ_t = self.idx(&typ_flat)?;
@@ -1328,11 +1498,35 @@ impl Model {
             .s
             .tensor_values_f32(emb)
             .map_err(|e| rerank_err("embed.extract", e))?;
+        #[cfg(test)]
+        {
+            if certificate_trace::active() {
+                for (label, node) in [
+                    ("embedding.word", e_word),
+                    ("embedding.position", e_pos),
+                    ("embedding.type", e_typ),
+                    ("embedding.word_position_sum", emb_wp),
+                ] {
+                    let values = self
+                        .s
+                        .tensor_values_f32(node)
+                        .map_err(|e| rerank_err("embed.trace", e))?;
+                    certificate_trace::floats(label, &[total, H], &values);
+                }
+                certificate_trace::floats("embedding.normalized", &[total, H], &emb_vals);
+            }
+        }
         for i in 0..self.encoder_layers {
             let p = format!("bert.encoder.layer.{i}");
+            #[cfg(test)]
+            certificate_trace::detail(true);
             emb_vals =
                 self.encoder_layer_raw(&emb_vals, total, &offsets, &lens, &p, scale, &mut scratch)?;
+            #[cfg(test)]
+            certificate_trace::floats(&format!("{p}.output"), &[total, H], &emb_vals);
         }
+        #[cfg(test)]
+        certificate_trace::detail(false);
         self.s.truncate_autograd_graph(self.weights_boundary);
 
         // Mean-pool each input's token rows → [H], then L2-normalize to a unit vector.
@@ -1353,12 +1547,16 @@ impl Model {
                 }
             }
             let norm = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
+            #[cfg(test)]
+            certificate_trace::floats("embedding.mean_pool", &[H], &acc);
             if norm > 0.0 {
                 let inv = 1.0 / norm;
                 for a in &mut acc {
                     *a *= inv;
                 }
             }
+            #[cfg(test)]
+            certificate_trace::floats("embedding.output", &[H], &acc);
             out.push(acc);
         }
         Ok(out)
