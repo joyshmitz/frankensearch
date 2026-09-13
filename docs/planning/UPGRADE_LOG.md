@@ -2,6 +2,68 @@
 
 ## 2026-09-12 — Stable dependency refresh (in progress)
 
+### Follow-up qualification on September 13 (UTC)
+
+The repaired fsfs fixtures pass in the broader product run: 2,105 library tests
+passed with no failures and 14 existing ignores, both in the workspace lane and
+the separate fsfs lane. The fsfs and facade stages passed. Formatting, workspace
+checking, both Clippy configurations, and the Windows index guard also passed.
+The run ended at 00:33:03 UTC with all 1,777 source hashes matching, but failed
+the index library and two real-model end-to-end tests. The complete log and
+28 executed binary hashes are retained in `dependencies/product-fixture-terminal-receipt.json`
+and `dependencies/product-fixture-all-executables.json`.
+
+The index failure came from the test reading its temporary directory before
+checking the directory's access time. Commit `59d53a62` checks metadata before
+that read, retaining every metadata, entry-name, and byte assertion. The exact
+regression, all 774 enabled index library tests, formatting, and index Clippy
+pass; 15 existing tests remain ignored. The workspace continuation then reached
+Quill and exposed a separate producer-version inconsistency: the crate is 0.3.0
+but `CURRENT_ENGINE_VERSION` still names 0.2.4. That run ended with Quill at
+711 passed, one failed, and three ignored. Its source matched throughout.
+
+The native CLI fixture still expected the producer identity from Tokenizers
+0.23.1 after the protocol moved to 0.23.2. The proposed correction pins both
+historical and current fingerprints, proves that only protocol provenance
+changed, and retains the old producer's `CertificateRequired` refusal. That
+regression and the installation-receipt test with real native model files pass;
+their executable hash is retained in `dependencies/native-identity-focused-receipt.json`.
+The fixture correction is committed as `9cd2b365`.
+The real native CLI then passed identity verification, indexing, and doctor,
+but its first direct refinement exceeded the unchanged 500 ms budget. This is
+a separate timing failure, not a remaining fingerprint mismatch. The Quill
+correction retains the exact 0.2.4 and 0.2.3 wire fixtures while naming the current
+producer in new artifacts. Both focused version/manifest tests and all 712
+enabled Quill library tests pass, with three existing ignores. This correction
+is committed as `8738e50f`. All-target Clippy for embed, Quill, and fsfs passes
+with warnings denied at 01:32:20 UTC and all 1,777 source hashes matching.
+
+The workspace run with failure collection enabled completed every library:
+7,952 passed, one failed, and 58 existing ignores across 13 crates. Its only
+failure was a different index test: simultaneous thread release did not
+ensure that a retained-owner read overlapped a successor installation. The test
+correctly rejected that vacuous run. A bounded acknowledgement now
+requires a checked read after the real pathname rewrite and before installation;
+all original parity and non-vacuity assertions remain. This correction is
+validated by its exact regression, all 774 enabled index library tests, formatting,
+and all-target Clippy with warnings denied. The batch exited 0 at 01:41:35 UTC
+with all 1,777 source hashes matching; the repair is committed as `85612f0a`.
+The fsfs library again passed 2,105 tests, this time taking 188.56
+seconds as a whole. That suite duration is not a per-test shutdown measurement.
+
+Multilingual end-to-end testing now has all five verified model files. Its first
+two distinct warm queries refined successfully; the mixed Chinese/English query
+exceeded the unchanged 500 ms deadline. One isolated probe using the same test
+executable also failed. Other projects' compiler workloads were active on the
+host, so this does not identify a runtime regression or a performance cause.
+The failure remains open; no timeout, numerical certificate, or acceptance
+assertion was relaxed. See `dependencies/multilingual-isolated-receipt.json`.
+
+The complete Quill gauntlet continues on its earlier frozen source snapshot.
+That result cannot certify subsequent producer metadata changes. Source-clean
+quickstart, final-source release qualification, and the unresolved ARM native
+certificate/admission work still prevent release completion.
+
 ### Follow-up qualification at 23:36 UTC
 
 The current product compiler stages pass on `ovh-a`: formatting, workspace
