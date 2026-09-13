@@ -43,15 +43,7 @@ use frankensearch_index::{
     FsviV2IdentityBinding, TwoTierIndex, TwoTierIndexBuilder, TwoTierIndexPaths,
     VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME,
 };
-// bd-6281c: this module opens Tantivy in exactly two configurations — the
-// blue-green/direct arms of the `quill` reader, and the standalone
-// `lexical`-without-`quill` reader/writer below. `lexical-tantivy` on its own
-// (the cass-compat lane) only re-exports the namespace for foreign consumers,
-// so gating this import on that feature alone left it unused there.
-#[cfg(any(
-    all(feature = "quill", feature = "lexical-tantivy"),
-    all(feature = "lexical", not(feature = "quill"))
-))]
+#[cfg(feature = "lexical-tantivy")]
 use frankensearch_lexical::TantivyIndex;
 #[cfg(feature = "quill")]
 use frankensearch_quill::{
@@ -119,7 +111,7 @@ pub struct IndexBuildStats {
     /// These documents remain in the fast tier (fast-only degradation).
     pub quality_errors: Vec<(String, String)>,
     /// Receipt for the lexical arm. `None` when lexical indexing is compiled
-    /// out or no document reached lexical staging.
+    /// out, no backend is selected, or no document reached lexical staging.
     pub lexical: Option<LexicalArmReceipt>,
     /// Per-arm byte accounting (replaces vector-only size reporting).
     pub size_bytes: IndexSizeBreakdown,
@@ -285,6 +277,15 @@ pub async fn detect_embedder_stack_with_pool(
     })?
 }
 
+#[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+#[derive(Debug, Clone, Copy)]
+enum IndexLexicalBackend {
+    #[cfg(feature = "quill")]
+    Quill,
+    #[cfg(feature = "lexical-tantivy")]
+    Tantivy,
+}
+
 /// Fluent builder for creating frankensearch indexes.
 ///
 /// Handles embedder auto-detection, vector index creation, batch embedding,
@@ -294,6 +295,8 @@ pub struct IndexBuilder {
     config: TwoTierConfig,
     documents: Vec<IndexableDocument>,
     embedder_stack: Option<EmbedderStack>,
+    #[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+    lexical_backend: Option<IndexLexicalBackend>,
     #[cfg(any(feature = "native", feature = "rerank"))]
     native_quality: Option<(PathBuf, BlockingPoolHandle)>,
     batch_size: usize,
@@ -314,6 +317,10 @@ impl IndexBuilder {
             config: TwoTierConfig::default(),
             documents: Vec::new(),
             embedder_stack: None,
+            #[cfg(feature = "quill")]
+            lexical_backend: Some(IndexLexicalBackend::Quill),
+            #[cfg(all(feature = "lexical-tantivy", not(feature = "quill")))]
+            lexical_backend: None,
             #[cfg(any(feature = "native", feature = "rerank"))]
             native_quality: None,
             batch_size: 32,
@@ -337,6 +344,26 @@ impl IndexBuilder {
     #[must_use]
     pub fn with_embedder_stack(mut self, stack: EmbedderStack) -> Self {
         self.embedder_stack = Some(stack);
+        self
+    }
+
+    /// Write the lexical arm in Tantivy format for an explicitly selected
+    /// Tantivy consumer or comparator.
+    ///
+    /// This requires `lexical-tantivy`. Enabling that feature alone does not
+    /// select a writer: builds still default to Quill when `quill` is enabled,
+    /// and otherwise omit the lexical arm. This method overrides that choice
+    /// for this build only; it is never an automatic fallback from Quill.
+    ///
+    /// Open the resulting `lexical` directory with [`TantivyIndex::open_read_only`]
+    /// or [`TantivyIndex::open`]. This does not change [`open_hybrid`]'s feature
+    /// requirements or migrate an existing lexical directory to a new format.
+    /// A nonempty lexical directory must already be readable as Tantivy; the
+    /// build checks this before creating vector files or embedding documents.
+    #[cfg(feature = "lexical-tantivy")]
+    #[must_use]
+    pub fn with_tantivy_lexical(mut self) -> Self {
+        self.lexical_backend = Some(IndexLexicalBackend::Tantivy);
         self
     }
 
@@ -437,6 +464,14 @@ impl IndexBuilder {
                 value: "0".to_owned(),
                 reason: "at least one document is required".to_owned(),
             };
+            export_error(metrics_exporter.as_ref(), &error);
+            return Err(error);
+        }
+
+        #[cfg(feature = "lexical-tantivy")]
+        if matches!(self.lexical_backend, Some(IndexLexicalBackend::Tantivy))
+            && let Err(error) = validate_tantivy_lexical_directory(&self.data_dir.join("lexical"))
+        {
             export_error(metrics_exporter.as_ref(), &error);
             return Err(error);
         }
@@ -784,30 +819,48 @@ impl IndexBuilder {
         };
         build_checkpoint(cx, "vector index finalized")?;
 
-        #[cfg(not(any(feature = "lexical", feature = "quill")))]
+        #[cfg(not(any(feature = "quill", feature = "lexical-tantivy")))]
         let (lexical_receipt, lexical_ms): (Option<LexicalArmReceipt>, f64) = (None, 0.0);
-        #[cfg(any(feature = "lexical", feature = "quill"))]
-        let (lexical_receipt, lexical_ms) = if lexical_docs.is_empty() {
-            (None, 0.0)
-        } else {
-            build_checkpoint(cx, "lexical index build")?;
-            let lexical_path = self.data_dir.join("lexical");
-            let lexical_start = Instant::now();
-            match build_lexical_index(cx, &lexical_path, &lexical_docs).await {
-                Ok(receipt) => (
-                    Some(receipt),
-                    lexical_start.elapsed().as_secs_f64() * 1000.0,
-                ),
-                // Publication failure (create/seal/commit) stays fatal: a
-                // half-written lexical index is worse than an absent arm.
-                // Per-document indexing errors are NOT fatal; they are
-                // reported in the receipt.
-                Err(error) => {
-                    export_error(metrics_exporter.as_ref(), &error);
-                    return Err(error);
+        // The Tantivy-only feature lane retains the existing borrowed embedding
+        // loop and its input ownership. An explicit writer can use those same
+        // documents without a staging clone, including failed embeddings.
+        #[cfg(all(feature = "lexical-tantivy", not(feature = "quill")))]
+        let lexical_docs = self.documents.as_slice();
+        #[cfg(feature = "quill")]
+        let lexical_docs = lexical_docs.as_slice();
+        #[cfg(any(feature = "quill", feature = "lexical-tantivy"))]
+        let (lexical_receipt, lexical_ms) =
+            if let Some(backend) = self.lexical_backend.filter(|_| !lexical_docs.is_empty()) {
+                build_checkpoint(cx, "lexical index build")?;
+                let lexical_path = self.data_dir.join("lexical");
+                let lexical_start = Instant::now();
+                let result = match backend {
+                    #[cfg(feature = "quill")]
+                    IndexLexicalBackend::Quill => {
+                        build_lexical_index(cx, &lexical_path, lexical_docs).await
+                    }
+                    #[cfg(feature = "lexical-tantivy")]
+                    IndexLexicalBackend::Tantivy => {
+                        build_tantivy_lexical_index(cx, &lexical_path, lexical_docs).await
+                    }
+                };
+                match result {
+                    Ok(receipt) => (
+                        Some(receipt),
+                        lexical_start.elapsed().as_secs_f64() * 1000.0,
+                    ),
+                    // Publication failure (create/seal/commit) stays fatal: a
+                    // half-written lexical index is worse than an absent arm.
+                    // Per-document indexing errors are NOT fatal; they are
+                    // reported in the receipt.
+                    Err(error) => {
+                        export_error(metrics_exporter.as_ref(), &error);
+                        return Err(error);
+                    }
                 }
-            }
-        };
+            } else {
+                (None, 0.0)
+            };
 
         #[cfg(feature = "durability")]
         {
@@ -1360,15 +1413,32 @@ async fn build_lexical_index(
     })
 }
 
-#[cfg(all(feature = "lexical", not(feature = "quill")))]
-async fn build_lexical_index(
+#[cfg(feature = "lexical-tantivy")]
+fn validate_tantivy_lexical_directory(data_dir: &Path) -> SearchResult<()> {
+    let map_io_error = |source| SearchError::SubsystemError {
+        subsystem: "tantivy",
+        source: Box::new(source),
+    };
+    let mut entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(map_io_error(error)),
+    };
+    if entries.next().transpose().map_err(map_io_error)?.is_some() {
+        // Validate without acquiring a writer or modifying the existing
+        // directory. Foreign or damaged content must not be overlaid with a
+        // new format, even if no Tantivy metadata file exists yet.
+        drop(TantivyIndex::open_read_only(data_dir)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "lexical-tantivy")]
+async fn build_tantivy_lexical_index(
     cx: &Cx,
     data_dir: &Path,
     documents: &[IndexableDocument],
 ) -> SearchResult<LexicalArmReceipt> {
-    // bd-b7pz: the LexicalRead flip (0220d5c5) left this write-side arm
-    // without the trait that provides index_documents/commit; this cfg combo
-    // (lexical without quill) is not built by the default-feature gates.
     use frankensearch_core::traits::LexicalWrite;
 
     build_checkpoint(cx, "Tantivy lexical index initialization")?;
@@ -2400,6 +2470,327 @@ mod tests {
                 lexical.search(&cx, "Alpha", 5).await.unwrap()
             };
             assert!(!hits.is_empty());
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn retained_tantivy_builder_dir() -> PathBuf {
+        let dir = tempfile::Builder::new()
+            .prefix("frankensearch-tantivy-builder-")
+            .tempdir()
+            .expect("create Tantivy builder fixture")
+            .keep();
+        eprintln!("retained Tantivy builder fixture: {}", dir.display());
+        dir
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    fn tantivy_hash_stack() -> EmbedderStack {
+        EmbedderStack::from_parts(
+            Arc::new(frankensearch_embed::HashEmbedder::default_256()),
+            None,
+        )
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_explicit_selection_publishes_queryable_index() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let stats = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .add_document_with_title("doc-alpha", "ordinary body", "sentinelalpha")
+                .add_document("doc-beta", "sentinelbeta retrieval")
+                .build(&cx)
+                .await
+                .expect("publish explicit Tantivy index");
+
+            assert_eq!(stats.source_count, 2);
+            assert_eq!(stats.doc_count, 2);
+            assert_eq!(stats.error_count, 0);
+            let receipt = stats.lexical.expect("Tantivy receipt");
+            assert_eq!(receipt.backend, "tantivy");
+            assert_eq!(receipt.path, dir.join("lexical"));
+            assert_eq!(receipt.attempted, 2);
+            assert_eq!(receipt.indexed, 2);
+            assert!(receipt.errors.is_empty());
+            assert!(receipt.published);
+            assert!(stats.size_bytes.lexical > 0);
+            assert_eq!(
+                stats.size_bytes.total,
+                stats.size_bytes.vector_fast
+                    + stats.size_bytes.vector_quality
+                    + stats.size_bytes.lexical,
+            );
+            let vectors = TwoTierIndex::open(&dir, TwoTierConfig::default())
+                .expect("reopen vector generation from the same build");
+            assert_eq!(vectors.doc_count(), 2);
+            let lexical = TantivyIndex::open_read_only(&receipt.path)
+                .expect("reopen the committed Tantivy generation");
+            for (query, expected) in [("sentinelalpha", "doc-alpha"), ("sentinelbeta", "doc-beta")]
+            {
+                let hits = lexical.search(&cx, query, 10).await.expect("query Tantivy");
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id, expected);
+            }
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_admits_empty_lexical_directory() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let lexical_path = dir.join("lexical");
+            std::fs::create_dir(&lexical_path).expect("create empty lexical directory");
+            let stats = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .add_document("doc-empty-dir", "emptydirsentinel")
+                .build(&cx)
+                .await
+                .expect("build into an empty lexical directory");
+            let receipt = stats.lexical.expect("published lexical receipt");
+            assert_eq!(receipt.backend, "tantivy");
+            assert_eq!(receipt.indexed, 1);
+            assert!(receipt.published);
+            let lexical = TantivyIndex::open_read_only(&lexical_path).expect("reopen Tantivy");
+            let hits = lexical
+                .search(&cx, "emptydirsentinel", 10)
+                .await
+                .expect("query the published generation");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-empty-dir");
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_reopens_existing_tantivy_and_preserves_upserts() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let lexical_path = dir.join("lexical");
+            let existing = TantivyIndex::create(&lexical_path).expect("create existing Tantivy");
+            frankensearch_core::traits::LexicalWrite::index_documents(
+                &existing,
+                &cx,
+                &[
+                    IndexableDocument::new("doc-upsert", "oldsentinel"),
+                    IndexableDocument::new("doc-retained", "retainedsentinel"),
+                ],
+            )
+            .await
+            .expect("index existing documents");
+            frankensearch_core::traits::LexicalWrite::commit(&existing, &cx)
+                .await
+                .expect("commit existing Tantivy");
+            drop(existing);
+
+            let stats = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .add_document("doc-upsert", "newsentinel")
+                .build(&cx)
+                .await
+                .expect("reopen and update the existing Tantivy generation");
+            let receipt = stats.lexical.expect("updated lexical receipt");
+            assert_eq!(receipt.attempted, 1);
+            assert_eq!(receipt.indexed, 1);
+            assert!(receipt.errors.is_empty());
+            assert!(receipt.published);
+            let lexical =
+                TantivyIndex::open_read_only(&lexical_path).expect("reopen updated index");
+            assert_eq!(
+                LexicalRead::doc_count(&lexical).expect("count documents"),
+                2
+            );
+            assert!(
+                lexical
+                    .search(&cx, "oldsentinel", 10)
+                    .await
+                    .expect("query replaced content")
+                    .is_empty()
+            );
+            for (query, expected) in [
+                ("newsentinel", "doc-upsert"),
+                ("retainedsentinel", "doc-retained"),
+            ] {
+                let hits = lexical
+                    .search(&cx, query, 10)
+                    .await
+                    .expect("query existing index");
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id, expected);
+            }
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_refuses_foreign_directory_before_touching_vectors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let lexical_path = dir.join("lexical");
+            std::fs::create_dir(&lexical_path).expect("create foreign lexical fixture");
+            let foreign_path = lexical_path.join("foreign.format");
+            std::fs::write(&foreign_path, b"foreign lexical sentinel")
+                .expect("retain foreign-format bytes");
+            let vector_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            std::fs::write(&vector_path, b"existing vector sentinel").expect("retain vector bytes");
+            let error = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .with_progress(|_| panic!("foreign layout must refuse before embedding"))
+                .add_document("doc-denied", "not indexed")
+                .build(&cx)
+                .await
+                .expect_err("foreign lexical layout must refuse before vector creation");
+            assert!(matches!(
+                error,
+                SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    ..
+                }
+            ));
+            assert_eq!(
+                std::fs::read(&vector_path).expect("read retained vector bytes"),
+                b"existing vector sentinel",
+            );
+            assert_eq!(
+                std::fs::read(&foreign_path).expect("read retained foreign bytes"),
+                b"foreign lexical sentinel",
+            );
+            assert!(!lexical_path.join("meta.json").exists());
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_feature_alone_preserves_default_backend() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let stats = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .add_document("doc-default", "defaultsentinel")
+                .build(&cx)
+                .await
+                .expect("build without an explicit Tantivy selection");
+            assert_eq!(stats.doc_count, 1);
+            #[cfg(feature = "quill")]
+            {
+                let receipt = stats.lexical.expect("default Quill receipt");
+                assert_eq!(receipt.backend, "quill");
+                assert!(receipt.published);
+                assert!(!receipt.path.join("meta.json").exists());
+                let lexical = QuillIndex::open(&cx, &receipt.path, QuillConfig::default())
+                    .await
+                    .expect("reopen the default Quill generation");
+                let hits = lexical
+                    .search_results(&cx, "defaultsentinel", 10)
+                    .expect("query default Quill generation");
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].doc_id, "doc-default");
+            }
+            #[cfg(not(feature = "quill"))]
+            {
+                assert!(stats.lexical.is_none());
+                assert_eq!(stats.lexical_ms.to_bits(), 0.0_f64.to_bits());
+                assert_eq!(stats.size_bytes.lexical, 0);
+                assert!(!dir.join("lexical").exists());
+            }
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn tantivy_builder_keeps_failed_embedding_documents_searchable() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            // Inject only the embedding failure; indexing and query execution
+            // still use the real on-disk Tantivy backend.
+            let stack = EmbedderStack::from_parts(Arc::new(SelectiveFailEmbedder), None);
+            let stats = IndexBuilder::new(&dir)
+                .with_embedder_stack(stack)
+                .with_tantivy_lexical()
+                .add_document("doc-ok", "ordinary text")
+                .add_document("doc-failed", "fail-fast-embedding rescuedsentinel")
+                .build(&cx)
+                .await
+                .expect("publish partial vectors and complete lexical arm");
+
+            assert_eq!(stats.source_count, 2);
+            assert_eq!(stats.doc_count, 1);
+            assert_eq!(stats.error_count, 1);
+            assert_eq!(stats.errors.len(), 1);
+            assert_eq!(stats.errors[0].0, "doc-failed");
+            let receipt = stats.lexical.expect("Tantivy receipt");
+            assert_eq!(receipt.attempted, 2);
+            assert_eq!(receipt.indexed, 2);
+            assert!(receipt.errors.is_empty());
+            assert!(receipt.published);
+            let lexical = TantivyIndex::open_read_only(&receipt.path).expect("reopen Tantivy");
+            let hits = lexical
+                .search(&cx, "rescuedsentinel", 10)
+                .await
+                .expect("query document absent from vector tier");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-failed");
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_cancellation_prevents_lexical_publication() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let cancel_cx = cx.clone();
+            let error = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .with_progress(move |progress| {
+                    assert_eq!(progress.phase, "embedding");
+                    assert_eq!(progress.completed, progress.total);
+                    cancel_cx.cancel_fast(asupersync::CancelKind::User);
+                })
+                .add_document("doc-cancel", "cancelledsentinel")
+                .build(&cx)
+                .await
+                .expect_err("cancellation after embedding remains fatal");
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, .. } if phase == "vector index finalize"
+            ));
+            assert!(!dir.join("lexical").exists());
+        });
+    }
+
+    #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]
+    #[test]
+    fn tantivy_builder_lexical_publication_error_is_fatal() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = retained_tantivy_builder_dir();
+            let lexical_path = dir.join("lexical");
+            std::fs::write(&lexical_path, b"retained path obstruction")
+                .expect("create a file where the lexical directory is required");
+            let error = IndexBuilder::new(&dir)
+                .with_embedder_stack(tantivy_hash_stack())
+                .with_tantivy_lexical()
+                .add_document("doc-blocked", "blocked publication")
+                .build(&cx)
+                .await
+                .expect_err("lexical initialization failure cannot return successful stats");
+            assert!(matches!(
+                error,
+                SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    ..
+                }
+            ));
+            assert_eq!(
+                std::fs::read(&lexical_path).expect("read retained obstruction"),
+                b"retained path obstruction",
+            );
         });
     }
 
